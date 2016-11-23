@@ -1,0 +1,16 @@
+[Unit]
+Description=The nginx HTTP and reverse proxy server
+
+[Service]
+Type=forking
+Restart=on-failure
+PIDFile=/var/run/nginx/nginx.pid
+ExecStartPre=/bin/mkdir -p /var/run/nginx /var/log/nginx /run/lock/nginx
+# ExecStartPre=/sbin/nginx -t
+ExecStart=/sbin/nginx -q
+ExecReload=/bin/kill -s HUP $MAINPID
+ExecStop=/bin/kill -s QUIT $MAINPID
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
