@@ -335,6 +335,13 @@ unit after comparing their behavior.
 
 ## Validation
 
+GitHub Actions validates deployment profile coverage, exercises the installer,
+runs `nginx -t` against the current stable and mainline release families,
+checks the units with both the minimum supported systemd and a current release,
+and scans the complete Git history for secrets. The third-party Brotli modules
+cannot be loaded by the stock CI images, so Brotli is profile-validated in CI
+and must be syntax-tested with the exact modules on the target host.
+
 Run these checks on the target host before enabling the service:
 
 ```sh

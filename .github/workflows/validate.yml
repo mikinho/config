@@ -1,0 +1,150 @@
+name: Validate configuration
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: configuration-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  profiles:
+    name: Deployment profiles
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install shellcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends shellcheck
+
+      - name: Validate installer and profile coverage
+        run: |
+          shellcheck deploy/install-nginx
+          deploy/install-nginx --check
+
+      - name: Exercise a full profile render
+        run: |
+          deploy/install-nginx \
+            --output build/full \
+            --profile brotli \
+            --profile gzip \
+            --profile quic-bpf \
+            --profile trusted-proxy \
+            --profile websocket \
+            --profile wordpress
+          test -s build/full/quic_host.key
+          test "$(stat --format='%a' build/full/quic_host.key)" = 600
+          if deploy/install-nginx --output build/full; then
+            echo 'installer unexpectedly overwrote an existing output' >&2
+            exit 1
+          fi
+
+  nginx:
+    name: nginx ${{ matrix.version }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        version:
+          - 1.30.4-alpine
+          - 1.31.4-alpine
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Render CI profile
+        run: |
+          deploy/install-nginx \
+            --output build/ci \
+            --profile gzip \
+            --profile trusted-proxy \
+            --profile websocket \
+            --profile wordpress
+
+      - name: Test nginx configuration
+        run: |
+          docker run --rm \
+            --volume "$PWD/build/ci:/profile:ro" \
+            --volume "$PWD/build/ci/quic_host.key:/etc/nginx/quic_host.key:ro" \
+            "nginx:${{ matrix.version }}" \
+            /bin/sh -eu -c '
+              mkdir -p \
+                /tmp/nginx/includes \
+                /tmp/nginx/sites \
+                /tmp/nginx/stubs/http \
+                /tmp/nginx/upstreams \
+                /tmp/nginx/trusted-proxies \
+                /var/lib/nginx/client_tmp \
+                /var/lib/nginx/fastcgi \
+                /var/lib/nginx/fastcgi_tmp \
+                /var/lib/nginx/proxy_tmp \
+                /var/run/nginx \
+                /var/run/lock/nginx \
+                /var/www/letsencrypt
+              cp -R /profile/. /tmp/nginx/
+              cp /etc/nginx/mime.types /etc/nginx/fastcgi_params /tmp/nginx/
+              nginx -t -p /tmp/nginx/ -c nginx.conf
+            '
+
+  systemd:
+    name: systemd ${{ matrix.version }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: ubuntu:22.04
+            version: "249"
+          - image: ubuntu:24.04
+            version: "255"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Verify unit files
+        run: |
+          docker run --rm \
+            --volume "$PWD:/workspace:ro" \
+            "${{ matrix.image }}" \
+            /bin/bash -euxo pipefail -c '
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update
+              apt-get install --yes --no-install-recommends systemd
+              ln -s /bin/true /usr/sbin/nginx
+              ln -s /bin/true /bin/certbot
+              systemd-analyze --version
+              systemd-analyze verify \
+                /workspace/systemd/nginx.service \
+                /workspace/systemd/certbot.service \
+                /workspace/systemd/certbot.timer
+            '
+
+  secrets:
+    name: Public secret scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out complete history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Scan repository history
+        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
