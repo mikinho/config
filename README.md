@@ -24,6 +24,7 @@ this public repository.
 | Certbot | A currently supported release | Required only for the included ACME renewal service and timer. |
 | logrotate | A currently supported release | Required only when installing the included nginx file-log rotation policy. |
 | fail2ban | A currently supported EPEL release | Required only for the optional intrusion-ban policy in `fail2ban/`. |
+| OpenSSH | A supported RHEL-family sshd with the stock `sshd_config.d` include | Required only for the `ssh/` drop-ins; RHEL 8-era sshd lacks the include and silently ignores them. |
 | SELinux | Enforcing mode with the RHEL `httpd` policy | Expected on the supported platforms; do not disable it to deploy this baseline. |
 
 nginx 1.29.3 is the minimum version that can parse the complete configuration,
@@ -166,6 +167,8 @@ TCP 443 so clients always have an HTTP/2 or HTTP/1.1 fallback.
   receive client traffic directly.
 - `sysctl/` contains the kernel socket-buffer limits the QUIC listeners
   depend on.
+- `ssh/` contains `sshd_config.d` drop-ins hardening the distribution
+  OpenSSH daemon.
 
 Each component directory carries its own README covering that component's
 installation and validation; this document remains authoritative for the
