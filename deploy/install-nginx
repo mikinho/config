@@ -38,63 +38,66 @@ cleanup() {
 
 trap cleanup EXIT HUP INT TERM
 
+# POSIX sh has no local variables, so every helper uses names unique to
+# itself; a helper reusing its caller's loop variable would silently corrupt
+# the caller's state.
 validate_profile_name() {
-    profile_name=$1
+    candidate_name=$1
 
-    case "$profile_name" in
+    case "$candidate_name" in
         '' | -* | *- | *[!a-z0-9-]*)
-            fail "invalid profile name: $profile_name"
+            fail "invalid profile name: $candidate_name"
             ;;
     esac
 }
 
 validate_stub_entry() {
-    stub_entry=$1
-    profile_file=$2
+    entry=$1
+    origin_file=$2
 
-    case "$stub_entry" in
+    case "$entry" in
         /* | *..* | *[!a-z0-9./-]*)
-            fail "invalid stub path in $profile_file: $stub_entry"
+            fail "invalid stub path in $origin_file: $entry"
             ;;
         stubs/http/*.conf)
-            stub_name=${stub_entry#stubs/http/}
-            case "$stub_name" in
-                '' | */*) fail "invalid HTTP stub path in $profile_file: $stub_entry" ;;
+            entry_name=${entry#stubs/http/}
+            case "$entry_name" in
+                '' | */*) fail "invalid HTTP stub path in $origin_file: $entry" ;;
             esac
             ;;
         stubs/*.conf)
-            stub_name=${stub_entry#stubs/}
-            case "$stub_name" in
-                '' | */*) fail "invalid main stub path in $profile_file: $stub_entry" ;;
+            entry_name=${entry#stubs/}
+            case "$entry_name" in
+                '' | */*) fail "invalid main stub path in $origin_file: $entry" ;;
             esac
             ;;
         *)
-            fail "profile entry is not a stub in $profile_file: $stub_entry"
+            fail "profile entry is not a stub in $origin_file: $entry"
             ;;
     esac
 
-    stub_source=$NGINX_SOURCE/$stub_entry
-    [ -f "$stub_source" ] || fail "missing stub referenced by $profile_file: $stub_entry"
-    [ ! -L "$stub_source" ] || fail "profile stubs must not be symbolic links: $stub_entry"
+    entry_source=$NGINX_SOURCE/$entry
+    [ -f "$entry_source" ] || fail "missing stub referenced by $origin_file: $entry"
+    [ ! -L "$entry_source" ] || fail "profile stubs must not be symbolic links: $entry"
 }
 
 collect_profile() {
-    profile_name=$1
+    manifest_name=$1
     output_file=$2
-    validate_profile_name "$profile_name"
+    validate_profile_name "$manifest_name"
 
-    profile_file=$PROFILE_DIRECTORY/$profile_name.profile
-    [ -f "$profile_file" ] || fail "unknown profile: $profile_name"
-    [ ! -L "$profile_file" ] || fail "profile manifests must not be symbolic links: $profile_name"
+    manifest_file=$PROFILE_DIRECTORY/$manifest_name.profile
+    [ -f "$manifest_file" ] || fail "unknown profile: $manifest_name"
+    [ ! -L "$manifest_file" ] || fail "profile manifests must not be symbolic links: $manifest_name"
 
-    while IFS= read -r stub_entry || [ -n "$stub_entry" ]; do
-        case "$stub_entry" in
+    while IFS= read -r manifest_entry || [ -n "$manifest_entry" ]; do
+        case "$manifest_entry" in
             '' | \#*) continue ;;
         esac
 
-        validate_stub_entry "$stub_entry" "$profile_file"
-        printf '%s\n' "$stub_entry" >> "$output_file"
-    done < "$profile_file"
+        validate_stub_entry "$manifest_entry" "$manifest_file"
+        printf '%s\n' "$manifest_entry" >> "$output_file"
+    done < "$manifest_file"
 }
 
 validate_all_profiles() {
