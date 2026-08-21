@@ -1,16 +1,72 @@
+# system/nginx.service
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
 [Unit]
-Description=The nginx HTTP and reverse proxy server
+Description=nginx HTTP and reverse proxy server
+Documentation=man:nginx(8) https://nginx.org/en/docs/
+After=network-online.target remote-fs.target nss-lookup.target
+Wants=network-online.target
+StartLimitIntervalSec=60s
+StartLimitBurst=3
 
 [Service]
 Type=forking
-Restart=on-failure
-PIDFile=/var/run/nginx/nginx.pid
-ExecStartPre=/bin/mkdir -p /var/run/nginx /var/log/nginx /run/lock/nginx
-# ExecStartPre=/sbin/nginx -t
-ExecStart=/sbin/nginx -q
+PIDFile=%t/%p/%p.pid
+
+UMask=0027
+RuntimeDirectory=%p lock/%p
+RuntimeDirectoryMode=0755
+StateDirectory=%p
+StateDirectoryMode=0755
+LogsDirectory=%p
+LogsDirectoryMode=0750
+
+ExecStartPre=/usr/sbin/%p -t -q -c /etc/%p/%p.conf
+ExecStart=/usr/sbin/%p -c /etc/%p/%p.conf
+ExecReload=/usr/sbin/%p -t -q -c /etc/%p/%p.conf
 ExecReload=/bin/kill -s HUP $MAINPID
-ExecStop=/bin/kill -s QUIT $MAINPID
-PrivateTmp=true
+
+KillSignal=SIGQUIT
+KillMode=mixed
+TimeoutStopSec=60s
+Restart=on-failure
+RestartSec=5s
+
+# Match nginx.conf's worker_rlimit_nofile and provide enough locked memory for
+# the QUIC reuseport eBPF map enabled by quic_bpf.
+LimitNOFILE=100000
+LimitMEMLOCK=64M
+
+# Baseline containment. Sites that intentionally write outside the managed
+# runtime, state, and log directories must add a narrowly scoped drop-in.
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectProc=invisible
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+LockPersonality=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+MemoryDenyWriteExecute=yes
+TasksMax=512
+
+# CapabilityBoundingSet and SystemCallFilter are intentionally not constrained
+# here. The root master must bind privileged ports, change worker identity,
+# raise resource limits, signal workers, and initialize quic_bpf. Tightening
+# either setting requires validation against the target kernel and nginx build.
 
 [Install]
 WantedBy=multi-user.target
