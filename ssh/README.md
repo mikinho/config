@@ -39,11 +39,17 @@ console access exists before starting. Install and prepare:
 ```sh
 install -m 0644 ssh/sshd_config.d/*.conf /etc/ssh/sshd_config.d/
 semanage port -a -t ssh_port_t -p tcp 2356
-firewall-cmd --permanent --add-port=2356/tcp
+install -m 0644 firewalld/services/ssh-hardened.xml /etc/firewalld/services/
+firewall-cmd --reload
+firewall-cmd --permanent --add-service=ssh-hardened
 firewall-cmd --reload
 sshd -t
 systemctl reload sshd
 ```
+
+The `ssh-hardened` firewalld service is this port's definition of record;
+`firewalld/README.md` covers the service files. On a host without them,
+`firewall-cmd --permanent --add-port=2356/tcp` is the raw equivalent.
 
 SELinux confines sshd to `ssh_port_t`; without the `semanage` rule the
 daemon cannot bind 2356 under enforcing mode. If the rule already exists,
@@ -59,7 +65,8 @@ ssh -p 2356 -o PreferredAuthentications=password,keyboard-interactive -o PubkeyA
 ssh -p 2356 root@HOST                                                                                   # must be refused
 ```
 
-Only after the new session works, close port 22:
+Only after the new session works, close port 22 (the built-in `ssh` service,
+distinct from `ssh-hardened`):
 
 ```sh
 firewall-cmd --permanent --remove-service=ssh
