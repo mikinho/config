@@ -160,8 +160,8 @@ headers. Upstream applications may provide their own values for CSP,
 `X-Content-Type-Options`, `Referrer-Policy`, `X-Frame-Options`, and
 `Permissions-Policy`; nginx uses the upstream value instead of duplicating it.
 For proxied responses, nginx hides upstream HSTS and supplies the edge policy.
-FastCGI applications should not emit HSTS, or the site must hide that header
-with `fastcgi_hide_header`, to avoid duplicate values.
+The shared PHP-FPM include likewise hides application-provided HSTS and
+`X-Powered-By`; custom FastCGI configurations should do the same.
 
 The baseline selects `add_header_inherit merge`, so headers defined by a
 `server` or `location` are appended without discarding the inherited security
@@ -221,6 +221,18 @@ The PHP-FPM and WordPress includes are opt-in. A site using them must:
 - provision the writable FastCGI cache directory when caching is enabled; and
 - review the WordPress cache exclusions and response-header handling against
   the application's authentication, personalization, and cache policy.
+
+The default WordPress PHP locations accept only requests whose URI ends in
+`.php`; PATH_INFO routing broadens the executable request surface and is not a
+universal default. An application that requires it must use a narrowly scoped
+location and include `includes/php-fpm-path-info-by-tag.conf` instead of the
+standard PHP-FPM include. The shared PHP-FPM includes forward HTTPS state to
+the application so WordPress and other frameworks can generate secure URLs.
+
+The WordPress upload policy rejects PHP variants, scripts, and active browser
+content such as HTML, JavaScript, and SVG, including common double-extension
+forms. A site that intentionally accepts one of those formats must replace
+that location with an application-specific validation and serving policy.
 
 The shared WordPress cache configuration intentionally ignores upstream
 `Cache-Control` and `Expires` headers. Do not enable it for an application
