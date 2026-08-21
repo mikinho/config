@@ -12,7 +12,7 @@ this file covers only what someone editing this directory needs first.
 | `includes/` | Reusable `server`/`location` behavior included by site definitions. |
 | `stubs/*.conf` | Installer-selected main-context fragments (module loaders, `quic_bpf`). |
 | `stubs/http/*.conf` | Installer-selected `http {}` policies, maps, cache zones, and rate-limit zones. |
-| `sites/` | Public-safe site definitions, including the default servers. |
+| `sites/` | Tracked defaults and inert public examples; deployment-local site definitions are ignored by Git. |
 | `upstreams/` | Deployment-local upstream definitions; ignored by Git. |
 | `trusted-proxies/` | Deployment-local `set_real_ip_from` directives; ignored by Git. |
 
@@ -42,6 +42,10 @@ it in the root README's stub-dependency table and covered by a profile.
   `/run/$site_tag/php-fpm.sock`, and include the `*-by-tag.conf` file. Use
   `php-fpm-path-info-by-tag.conf` only for a narrowly scoped location that
   genuinely requires PATH_INFO.
+
+`sites/sample_wp.conf.example` matches the `sample_wp` PHP-FPM pool and systemd
+instance. Replace its domains, certificate paths, and site tag, then install it
+as `sites/SITE_TAG.conf`; only the installed `*.conf` copy becomes active.
 
 ## Validation
 
