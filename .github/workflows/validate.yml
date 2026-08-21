@@ -99,7 +99,11 @@ jobs:
                 > /etc/yum.repos.d/nginx.repo
               dnf install --assumeyes \
                 ca-certificates \
-                "nginx-${EXPECTED_NGINX_VERSION}"
+                "nginx-${EXPECTED_NGINX_VERSION}" \
+                openssl
+              openssl version
+              openssl list -tls1_3 -tls-groups |
+                grep --fixed-strings X25519MLKEM768
               nginx -v 2>&1 |
                 grep --fixed-strings "nginx/${EXPECTED_NGINX_VERSION}"
               nginx -V 2>&1 |
