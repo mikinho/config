@@ -1,0 +1,54 @@
+# sites/sample_wp.conf.example
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+# Copy this file to sites/sample_wp.conf after replacing the example domains,
+# certificate paths, and sample_wp site tag. Keep the primary domain first:
+# includes/redir.conf redirects every other listed name to $server_name.
+#
+# Requires the wordpress deployment profile and the matching
+# php-fpm@sample_wp.service instance. PHP-FPM owns this site's socket at
+# /run/sample_wp/php-fpm.sock.
+#
+
+server {
+    server_name example.com www.example.com;
+
+    include includes/http.conf;
+}
+
+server {
+    set $site_tag sample_wp;
+
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    # The default HTTPS server owns reuseport for these shared UDP sockets.
+    listen 443 quic;
+    listen [::]:443 quic;
+
+    server_name example.com www.example.com;
+
+    # Keep site logs in nginx.service's managed LogsDirectory. The shared JSON
+    # format preserves request IDs, upstream timing, cache status, and TLS data.
+    access_log /var/log/nginx/sample_wp.access.log main buffer=32k flush=5s;
+    error_log /var/log/nginx/sample_wp.error.log warn;
+
+    ssl_certificate /etc/letsencrypt/live/example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/example.com/privkey.pem;
+
+    include includes/http3.conf;
+
+    # Redirect secondary domains to the primary server_name above.
+    include includes/redir.conf;
+
+    root /var/www/sample_wp/wordpress;
+    index index.php;
+
+    include includes/maintenance.conf;
+    include includes/secure.conf;
+    include includes/quiet-common-requests.conf;
+
+    # Optional: WordPress
+    include includes/wordpress-by-tag.conf;
+}
