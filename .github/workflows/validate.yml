@@ -14,7 +14,9 @@ concurrency:
 
 jobs:
   profiles:
-    name: Deployment profiles
+    # GitHub's hosted Linux executor is Ubuntu. It only runs portable repository
+    # tooling here; deployment-facing validation runs in RHEL-family containers.
+    name: Deployment profiles (hosted executor)
     runs-on: ubuntu-24.04
     timeout-minutes: 10
 
@@ -25,19 +27,12 @@ jobs:
       - name: Install validation tools
         run: |
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends logrotate shellcheck
+          sudo apt-get install --yes --no-install-recommends shellcheck
 
       - name: Validate installer and profile coverage
         run: |
           shellcheck deploy/install-nginx
           deploy/install-nginx --check
-          if ! getent group nginx >/dev/null; then
-            sudo groupadd --system nginx
-          fi
-          if ! id nginx >/dev/null 2>&1; then
-            sudo useradd --system --gid nginx --no-create-home nginx
-          fi
-          logrotate --debug logrotate/nginx
 
       - name: Exercise a full profile render
         run: |
@@ -57,15 +52,19 @@ jobs:
           fi
 
   nginx:
-    name: nginx ${{ matrix.version }}
+    name: nginx ${{ matrix.version }} on Rocky Linux 9
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
-        version:
-          - 1.30.4-alpine
-          - 1.31.4-alpine
+        include:
+          - channel: stable
+            repository: packages
+            version: 1.30.4
+          - channel: mainline
+            repository: packages/mainline
+            version: 1.31.3
 
     steps:
       - name: Check out repository
@@ -83,10 +82,28 @@ jobs:
       - name: Test nginx configuration
         run: |
           docker run --rm \
+            --env EXPECTED_NGINX_VERSION="${{ matrix.version }}" \
+            --env NGINX_REPOSITORY="${{ matrix.repository }}" \
             --volume "$PWD/build/ci:/profile:ro" \
             --volume "$PWD/build/ci/quic_host.key:/etc/nginx/quic_host.key:ro" \
-            "nginx:${{ matrix.version }}" \
-            /bin/sh -eu -c '
+            rockylinux:9 \
+            /bin/bash -euxo pipefail -c '
+              printf "%s\n" \
+                "[nginx]" \
+                "name=nginx ${{ matrix.channel }} repository" \
+                "baseurl=https://nginx.org/${NGINX_REPOSITORY}/centos/\$releasever/\$basearch/" \
+                "gpgcheck=1" \
+                "enabled=1" \
+                "gpgkey=https://nginx.org/keys/nginx_signing.key" \
+                "module_hotfixes=true" \
+                > /etc/yum.repos.d/nginx.repo
+              dnf install --assumeyes \
+                ca-certificates \
+                "nginx-${EXPECTED_NGINX_VERSION}"
+              nginx -v 2>&1 |
+                grep --fixed-strings "nginx/${EXPECTED_NGINX_VERSION}"
+              nginx -V 2>&1 |
+                grep --fixed-strings -- "--with-http_v3_module"
               mkdir -p \
                 /tmp/nginx/includes \
                 /tmp/nginx/sites \
@@ -106,17 +123,17 @@ jobs:
             '
 
   systemd:
-    name: systemd ${{ matrix.version }}
+    name: Units on ${{ matrix.target }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
         include:
-          - image: ubuntu:22.04
-            version: "249"
-          - image: ubuntu:24.04
-            version: "255"
+          - image: rockylinux:9
+            target: Rocky Linux 9
+          - image: quay.io/centos/centos:stream10
+            target: CentOS Stream 10
 
     steps:
       - name: Check out repository
@@ -128,16 +145,18 @@ jobs:
             --volume "$PWD:/workspace:ro" \
             "${{ matrix.image }}" \
             /bin/bash -euxo pipefail -c '
-              export DEBIAN_FRONTEND=noninteractive
-              apt-get update
-              apt-get install --yes --no-install-recommends systemd
-              ln -s /bin/true /usr/sbin/nginx
-              ln -s /bin/true /bin/certbot
+              dnf install --assumeyes logrotate shadow-utils systemd
+              install -D -m 0755 /usr/bin/true /usr/sbin/nginx
+              install -D -m 0755 /usr/bin/true /bin/certbot
               systemd-analyze --version
               systemd-analyze verify \
                 /workspace/systemd/nginx.service \
                 /workspace/systemd/certbot.service \
                 /workspace/systemd/certbot.timer
+              getent group nginx >/dev/null || groupadd --system nginx
+              id nginx >/dev/null 2>&1 ||
+                useradd --system --gid nginx --no-create-home nginx
+              logrotate --debug /workspace/logrotate/nginx
             '
 
   secrets:

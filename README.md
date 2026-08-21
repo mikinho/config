@@ -1,10 +1,12 @@
 # Secure nginx baseline
 
 This repository provides a reusable, security-oriented nginx baseline for
-Linux hosts managed by systemd. It supplies conservative HTTP and HTTPS
-defaults, TLS, HTTP/2 and HTTP/3, compression, rate limiting, security-header
-fallbacks, ACME handling, a local status endpoint, and optional integration
-points for Node.js, PHP-FPM, and WordPress applications.
+RHEL-compatible hosts managed by systemd. Red Hat Enterprise Linux, CentOS
+Stream, and Rocky Linux are the deployment authority; other distributions are
+best-effort ports. The baseline supplies conservative HTTP and HTTPS defaults,
+TLS, HTTP/2 and HTTP/3, compression, rate limiting, security-header fallbacks,
+ACME handling, a local status endpoint, and optional integration points for
+Node.js, PHP-FPM, and WordPress applications.
 
 Site-specific virtual hosts may override the baseline where an application
 has different requirements. Deployment-specific upstream addresses,
@@ -15,19 +17,25 @@ this public repository.
 
 | Component | Supported baseline | Reason |
 | --- | --- | --- |
-| nginx | **1.30.4 stable** or **1.31.4 mainline**; syntax floor **1.29.3** | `add_header_inherit` was introduced in 1.29.3. CI tests the listed current release families. |
-| Linux kernel | Linux; **5.7** for `quic_bpf` | The baseline uses `epoll` and systemd. The optional eBPF QUIC acceleration stub requires Linux 5.7 or newer. |
-| OpenSSL | **3.5.1 or newer** | nginx recommends 3.5.1+ for QUIC, and OpenSSL 3.5 is the supported LTS line through April 2030. |
-| systemd | **249** | Required for the service sandbox, including `ProtectProc` and `SocketBindDeny`. |
+| nginx | **1.30.4 stable** or **1.31.3 mainline** from nginx.org; syntax floor **1.29.3** | `add_header_inherit` was introduced in 1.29.3. CI tests the listed RHEL 9 packages. |
+| Linux kernel | A supported RHEL-family kernel; **5.7** for `quic_bpf` | The baseline uses `epoll` and systemd. The optional eBPF QUIC acceleration stub requires Linux 5.7 or newer. |
+| OpenSSL | A vendor-supported RHEL-family package; **3.5.1 or newer** for custom upstream QUIC builds | RHEL security fixes may be backported without changing the upstream version. nginx recommends OpenSSL 3.5.1+ when selecting a library for a custom QUIC build. |
+| systemd | **249** syntax floor; validated on Rocky Linux 9 and CentOS Stream 10 | Required for the service sandbox, including `ProtectProc` and `SocketBindDeny`. |
 | Certbot | A currently supported release | Required only for the included ACME renewal service and timer. |
 | logrotate | A currently supported release | Required only when installing the included nginx file-log rotation policy. |
+| SELinux | Enforcing mode with the RHEL `httpd` policy | Expected on the supported platforms; do not disable it to deploy this baseline. |
 
 nginx 1.29.3 is the minimum version that can parse the complete configuration,
-not a supported deployment target. The release versions above were current on
-August 21, 2026; advance the CI matrix and this table together as nginx release
-families change. OpenSSL 1.1.1 can satisfy nginx's minimum HTTP/3 parser and
-linker requirements, but it is unsupported upstream and is not an acceptable
-secure deployment baseline.
+not a supported deployment target. The package versions above were available
+from nginx.org's RHEL-compatible repositories on August 21, 2026; advance the
+CI matrix and this table together as those package families change.
+
+Do not judge a RHEL-family package's security status from its upstream version
+string alone. Red Hat backports security fixes, so vendor errata, package
+release fields, and lifecycle status are authoritative. OpenSSL 1.1.1 is
+unsupported upstream and is not an acceptable custom-build baseline; the
+vendor-supported exception applies only while the distribution maintains its
+package.
 
 NGINX Plus is not required. The configuration works with an appropriately
 built nginx Open Source binary and does not rely on Plus-only directives.
@@ -69,6 +77,12 @@ load even when the version number appears similar.
 
 ## Host prerequisites
 
+Use the official nginx.org repositories for RHEL and derivatives unless a
+reviewed vendor package supplies the required version and build options. The
+distribution package may lag below this configuration's syntax floor or omit
+HTTP/3. Install runtime dependencies with `dnf`, keep the host within its
+vendor lifecycle, and apply the vendor's current security errata.
+
 The checked-in paths assume this layout:
 
 | Path or resource | Requirement |
@@ -94,6 +108,16 @@ The checked-in paths assume this layout:
 The host firewall must allow TCP ports 80 and 443. Allow UDP port 443 as well
 to make HTTP/3 available; clients fall back to HTTP/2 or HTTP/1.1 when UDP is
 unavailable.
+
+Keep SELinux enforcing. Restore the distribution labels after installing the
+configuration and content, and use `matchpathcon` or `ausearch` to investigate
+any denial instead of weakening the policy globally. Non-standard content
+roots need a persistent `semanage fcontext` rule followed by `restorecon`.
+When nginx must proxy to a TCP upstream, review and enable the standard
+`httpd_can_network_connect` boolean; a Unix-domain socket or a tighter local
+policy is preferable when practical. The `policycoreutils` and
+`policycoreutils-python-utils` packages provide the relevant administration
+tools on RHEL-family systems.
 
 nginx still describes its HTTP/3 module as experimental. Validate it against
 the deployed TLS library and clients, monitor QUIC-specific errors, and retain
@@ -356,11 +380,13 @@ unit after comparing their behavior.
 ## Validation
 
 GitHub Actions validates deployment profile coverage, exercises the installer,
-runs `nginx -t` against the current stable and mainline release families,
-checks the units with both the minimum supported systemd and a current release,
-and scans the complete Git history for secrets. The third-party Brotli modules
-cannot be loaded by the stock CI images, so Brotli is profile-validated in CI
-and must be syntax-tested with the exact modules on the target host.
+runs `nginx -t` against stable and mainline nginx.org packages on Rocky Linux
+9, checks the units and logrotate policy on Rocky Linux 9 and CentOS Stream 10,
+and scans the complete Git history for secrets. GitHub's Ubuntu hosted runner
+is only the Docker and portable-tooling executor; it is not a supported
+deployment target. The third-party Brotli modules cannot be loaded by the
+stock CI packages, so Brotli is profile-validated in CI and must be
+syntax-tested with the exact modules on the target host.
 
 Run these checks on the target host before enabling the service:
 
@@ -399,10 +425,13 @@ This repository is available under the [MIT License](LICENSE).
 - [nginx HTTP/2 module](https://nginx.org/en/docs/http/ngx_http_v2_module.html)
 - [nginx HTTP/3 module](https://nginx.org/en/docs/http/ngx_http_v3_module.html)
 - [nginx current releases](https://nginx.org/en/download.html)
+- [nginx packages for RHEL and derivatives](https://nginx.org/en/linux_packages.html#RHEL-CentOS)
 - [nginx header inheritance](https://nginx.org/en/docs/http/ngx_http_headers_module.html#add_header_inherit)
 - [nginx real IP module](https://nginx.org/en/docs/http/ngx_http_realip_module.html)
 - [nginx build options](https://nginx.org/en/docs/configure.html)
 - [nginx SSL module](https://nginx.org/en/docs/http/ngx_http_ssl_module.html)
 - [OpenSSL release strategy](https://openssl-library.org/policies/releasestrat/)
+- [Red Hat security backporting policy](https://access.redhat.com/security/updates/backporting)
+- [RHEL 9 SELinux guidance](https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/9/html/using_selinux/configuring-selinux-for-applications-and-services-with-non-standard-configurations_using-selinux)
 - [ngx_brotli build instructions](https://github.com/google/ngx_brotli)
 - [Certbot automated renewal](https://eff-certbot.readthedocs.io/en/stable/using.html#setting-up-automated-renewal)
