@@ -135,9 +135,10 @@ When nginx must proxy to a TCP upstream, review and enable the standard
 `httpd_can_network_connect` boolean; a Unix-domain socket or a tighter local
 policy is preferable when practical. The `policycoreutils` and
 `policycoreutils-python-utils` packages provide the relevant administration
-tools on RHEL-family systems. The `selinux/` directory supplies the
-file-context registrations and the optional `quic_bpf` policy module that
-this baseline needs beyond the distribution policy.
+tools on RHEL-family systems. The `selinux/` directory supplies the policy
+registrations this baseline needs beyond the distribution policy — runtime
+file contexts, the QUIC UDP port label, the setrlimit boolean — and the
+optional `quic_bpf` policy module.
 
 nginx still describes its HTTP/3 module as experimental. Validate it against
 the deployed TLS library and clients, monitor QUIC-specific errors, and retain

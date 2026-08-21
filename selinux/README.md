@@ -12,52 +12,78 @@ Install the administration tooling first:
 dnf install policycoreutils policycoreutils-python-utils libselinux-utils
 ```
 
-## File contexts
-
-`apply-nginx-file-contexts` registers persistent local rules for the two
-runtime directories created by `systemd/nginx.service`, which the base policy
-does not label:
-
-| Path | Context |
-| --- | --- |
-| `/run/nginx(/.*)?` | `httpd_var_run_t` |
-| `/run/lock/nginx(/.*)?` | `httpd_var_run_t` |
-
-The script is idempotent and relabels the directories when they already
-exist. It deliberately adds nothing else: `/var/log/nginx`, `/var/lib/nginx`,
-`/var/www`, and `/etc/nginx` are labeled correctly by the distribution
-policy, and duplicate local rules would only obscure future policy updates.
+After installing or overlaying configuration and content, restore labels
+before starting services:
 
 ```sh
-sudo selinux/apply-nginx-file-contexts
+restorecon -RF /etc/nginx /var/lib/nginx /var/www
 ```
 
-## Per-site PHP-FPM sockets
+## The nginx policy script
 
-The PHP-FPM contract places each site's socket at `/run/$site_tag/php-fpm.sock`.
-Those directories are deployment-specific, so register each one where the
-site is provisioned:
+`apply-nginx-policy` registers everything the nginx baseline needs beyond
+the distribution policy. It is idempotent and safe to re-run after policy
+updates:
+
+| Registration | Why |
+| --- | --- |
+| `/run/nginx(/.*)?` and `/run/lock/nginx(/.*)?` as `httpd_var_run_t` | The base policy labels only `/var/run/nginx.pid`, not the PID and lock directories `systemd/nginx.service` creates. |
+| `http_port_t` on UDP 443 | Port labels are per protocol and `http_port_t` historically lists TCP only; without this the QUIC listener cannot bind under enforcing mode. |
+| `httpd_setrlimit` on | `worker_rlimit_nofile` needs setrlimit permission. Without it nginx starts normally and workers silently keep the default descriptor limit — a failure that only surfaces under load. |
+
+```sh
+sudo selinux/apply-nginx-policy
+```
+
+It deliberately registers nothing else: `/var/log/nginx`, `/var/lib/nginx`,
+`/var/www`, and `/etc/nginx` are labeled correctly by the distribution
+policy, and duplicate local rules would only obscure future policy updates.
+The hardened SSH port has its own registration in `ssh/README.md`.
+
+## Per-site application sockets
+
+The by-tag contract places each site's application socket under
+`/run/$site_tag/` — the PHP-FPM socket, or a Node.js socket proxied with the
+shared includes. Those directories are deployment-specific, so register each
+one where the site is provisioned:
 
 ```sh
 sudo semanage fcontext --add --type httpd_var_run_t "/run/SITE_TAG(/.*)?"
 sudo restorecon -RF /run/SITE_TAG
 ```
 
-Replace `SITE_TAG` with the site's tag. Without the rule, the socket is
-created as plain `var_run_t` and nginx's connection to it is denied.
+Replace `SITE_TAG` with the site's tag. Without the rule the socket is
+created as plain `var_run_t` and nginx's connection to it is denied. When
+the socket is created by a systemd socket unit, register the rule before the
+unit first starts so the socket is born with the right label.
 
 ## Booleans
 
-Enable `httpd_can_network_connect` only on hosts where nginx proxies to a TCP
-upstream; Unix-domain sockets do not need it and are preferred when the
+Enable `httpd_can_network_connect` only on hosts where nginx proxies to a
+TCP upstream; Unix-domain sockets do not need it and are preferred when the
 application runs on the same host:
 
 ```sh
 sudo setsebool -P httpd_can_network_connect on
 ```
 
+A tighter alternative for TCP upstreams: label the upstream port
+`http_port_t` and enable only `httpd_can_network_relay`, which permits
+connecting to web ports without opening general outbound network access.
+Check first — many application ports carry an unrelated label that must be
+modified rather than added:
+
+```sh
+sudo semanage port --modify --type http_port_t --proto tcp 3000
+sudo setsebool -P httpd_can_network_relay on
+```
+
 Do not enable broader booleans preemptively. Add each one in response to an
-audited denial for a workload the host actually runs.
+audited denial for a workload the host actually runs. In particular,
+`httpd_execmem` pairs with a build that uses PCRE JIT: the systemd unit's
+`MemoryDenyWriteExecute=` already blocks JIT by default, and a reviewed
+deployment that relaxes it must relax both controls together or the JIT
+still fails.
 
 ## quic_bpf policy module
 
@@ -76,7 +102,8 @@ sudo semodule -i nginx_quic_bpf.pp
 Remove it with `semodule -r nginx_quic_bpf` when the profile is removed. The
 module targets the CAP_BPF capability path used by RHEL 9 era kernels; if the
 target kernel or nginx build still produces a denial, extend the module only
-with the specific audited permission.
+with the specific audited permission. CI builds the module on Rocky Linux 9
+and CentOS Stream 10 so a syntax error cannot reach a host.
 
 ## Investigating denials
 
@@ -90,6 +117,7 @@ sudo ausearch -m avc -ts recent | audit2allow
 Treat `audit2allow` output as a diagnosis, not a patch: prefer the correct
 file context or an existing boolean over a custom allow rule, and never widen
 policy for a denial that indicates misbehavior. `matchpathcon PATH` shows the
-label a path should carry. Non-standard content roots need a persistent
-`semanage fcontext` rule followed by `restorecon`, exactly as the root README
-describes.
+label a path should carry, and `semanage port -l | grep http_port_t` shows
+the effective port labels. Remember that some failures are silent — the
+setrlimit case above never logs at startup unless auditing is watched — so
+verify effective behavior, not just the absence of errors.
