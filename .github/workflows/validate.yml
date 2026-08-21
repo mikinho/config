@@ -31,7 +31,7 @@ jobs:
 
       - name: Validate installer and profile coverage
         run: |
-          shellcheck deploy/install-nginx
+          shellcheck deploy/install-nginx selinux/apply-nginx-file-contexts
           deploy/install-nginx --check
 
       - name: Exercise a full profile render

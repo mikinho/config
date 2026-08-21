@@ -1,0 +1,22 @@
+module nginx_quic_bpf 1.0;
+
+# Optional: SELinux policy module for the quic-bpf deployment profile.
+#
+# The base RHEL httpd policy grants httpd_t no BPF permissions, so enabling
+# quic_bpf under enforcing mode fails at startup without this module. Load it
+# only on hosts that select stubs/quic-bpf.conf, and remove it with
+# `semodule -r nginx_quic_bpf` when the profile is removed.
+#
+# Validated against the CAP_BPF path used by RHEL 9 era kernels. If ausearch
+# still reports an AVC denial for capability net_admin or sys_admin on the
+# target kernel and nginx build, extend this module only with the audited
+# permission.
+
+require {
+    type httpd_t;
+    class bpf { map_create map_read map_write prog_load prog_run };
+    class capability2 bpf;
+}
+
+allow httpd_t self:capability2 bpf;
+allow httpd_t self:bpf { map_create map_read map_write prog_load prog_run };
