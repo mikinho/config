@@ -92,16 +92,32 @@ unavailable.
 
 - `nginx/nginx.conf` is the top-level configuration.
 - `nginx/includes/` contains reusable behavior included by site definitions.
-- `nginx/stubs/` defines shared maps, cache zones, and rate-limit zones.
+- `nginx/stubs/` contains optional `http {}`-level maps, cache zones, and
+  rate-limit zones selected by the installer. `nginx.conf` loads every
+  `*.conf` stub present on the deployed host, so the installer must copy only
+  the features that host needs.
 - `nginx/sites/` contains public-safe site configuration.
 - `nginx/upstreams/` is reserved for deployment-specific upstream definitions.
   Its contents are ignored by Git, while its `.gitignore` keeps the empty
   directory in the repository.
 - `systemd/` contains the nginx service and Certbot renewal units.
 
-Deploy the contents of `nginx/` to `/etc/nginx/`, preserving this directory
-structure. Install the unit files in the host's system unit directory only
-after reviewing their absolute paths for that distribution.
+Deploy the selected contents of `nginx/` to `/etc/nginx/`, preserving this
+directory structure. The installer must populate `stubs/` with the features
+selected for that host; copying every source stub enables every optional
+feature. Install the unit files in the host's system unit directory only after
+reviewing their absolute paths for that distribution.
+
+The selected configuration has these stub dependencies:
+
+| Stub | Install when |
+| --- | --- |
+| `upstreamfallback.conf` | The baseline `security-headers.conf` include is enabled. This is required by the provided `nginx.conf`. |
+| `ratelimit.conf` | A selected site or include uses `limit_req` or `limit_conn`, including `_http_.conf`, `http.conf`, and `wordpress-by-tag.conf`. |
+| `fastcgi-cache.conf` | WordPress FastCGI caching is enabled through `wordpress-cache.conf`. |
+| `websocket.conf` | A reverse-proxy site uses `$connection_upgrade`. |
+| `gzip.conf` | gzip response compression is desired. |
+| `brotli.conf` | Brotli response compression is desired and the modules loaded by `nginx.conf` are installed. |
 
 ### nginx service sandbox
 
