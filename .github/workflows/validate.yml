@@ -168,16 +168,76 @@ jobs:
             /bin/bash -euxo pipefail -c '
               dnf install --assumeyes logrotate shadow-utils systemd
               install -D -m 0755 /usr/bin/true /usr/sbin/nginx
+              install -D -m 0755 /usr/bin/true /sbin/php-fpm
               install -D -m 0755 /usr/bin/true /bin/certbot
+              getent group nginx >/dev/null || groupadd --system nginx
+              id nginx >/dev/null 2>&1 ||
+                useradd --system --gid nginx --no-create-home nginx
+              id sample_wp >/dev/null 2>&1 ||
+                useradd --system --user-group --no-create-home sample_wp
+              install -d -o sample_wp -g sample_wp -m 0700 \
+                /var/www/sample_wp/var
+              install -m 0644 /workspace/systemd/php-fpm@.service \
+                /etc/systemd/system/php-fpm@.service
+              install -D -m 0644 \
+                /workspace/systemd/php-fpm@sample_wp.service.d/writable-paths.conf \
+                /etc/systemd/system/php-fpm@sample_wp.service.d/writable-paths.conf
               systemd-analyze --version
               systemd-analyze verify \
                 /workspace/systemd/nginx.service \
                 /workspace/systemd/certbot.service \
-                /workspace/systemd/certbot.timer
+                /workspace/systemd/certbot.timer \
+                php-fpm@sample_wp.service
+              logrotate --debug /workspace/logrotate/nginx
+            '
+
+  php-fpm:
+    name: PHP-FPM configuration on ${{ matrix.target }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: rockylinux:9
+            target: Rocky Linux 9
+          - image: quay.io/centos/centos:stream10
+            target: CentOS Stream 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Test the public PHP-FPM sample
+        run: |
+          docker run --rm \
+            --volume "$PWD:/workspace:ro" \
+            "${{ matrix.image }}" \
+            /bin/bash -euxo pipefail -c '
+              if grep --quiet "release 9" /etc/redhat-release; then
+                dnf module install --assumeyes php:8.3/common
+              else
+                dnf install --assumeyes php-fpm
+              fi
+              dnf install --assumeyes shadow-utils
               getent group nginx >/dev/null || groupadd --system nginx
               id nginx >/dev/null 2>&1 ||
                 useradd --system --gid nginx --no-create-home nginx
-              logrotate --debug /workspace/logrotate/nginx
+              id sample_wp >/dev/null 2>&1 ||
+                useradd --system --user-group --no-create-home sample_wp
+              install -D -m 0644 /workspace/php-fpm/sites/sample_wp.conf \
+                /etc/php-fpm.d/sites/sample_wp.conf
+              install -D -m 0644 /workspace/php-fpm/pool/sample_wp.conf \
+                /etc/php-fpm.d/pool/sample_wp.conf
+              install -d -o sample_wp -g sample_wp -m 0711 /run/sample_wp
+              install -d -o sample_wp -g sample_wp -m 0700 \
+                /var/lib/php/session/sample_wp \
+                /var/www/sample_wp/var/tmp
+              /sbin/php-fpm --version |
+                grep --extended-regexp "^PHP (8\.[3-9]|9\.)"
+              runuser --user sample_wp -- \
+                /sbin/php-fpm --test \
+                  --fpm-config /etc/php-fpm.d/sites/sample_wp.conf
             '
 
   ssh:
