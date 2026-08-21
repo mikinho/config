@@ -16,7 +16,7 @@ this public repository.
 | Component | Minimum | Reason |
 | --- | --- | --- |
 | nginx | **1.29.3** | `add_header_inherit` was introduced in 1.29.3 and preserves the shared security-header baseline across nested configuration scopes. |
-| Linux kernel | **5.7** | Required by `quic_bpf on;`. This configuration is Linux-specific because it also uses `epoll` and systemd. |
+| Linux kernel | Linux; **5.7** for `quic_bpf` | The baseline uses `epoll` and systemd. The optional eBPF QUIC acceleration stub requires Linux 5.7 or newer. |
 | OpenSSL | **1.1.1** | Required for TLS 1.3 and nginx's HTTP/3 support. |
 | systemd | **249** | Required for the service sandbox, including `ProtectProc` and `SocketBindDeny`. |
 | Certbot | A currently supported release | Required only for the included ACME renewal service and timer. |
@@ -51,8 +51,8 @@ gzip, and limit-request modules must not have been disabled. Building nginx
 requires the corresponding OpenSSL, zlib, and PCRE2 (or compatible PCRE)
 development libraries.
 
-The following dynamic Brotli modules must also be installed under nginx's
-module directory:
+When Brotli is selected, the following dynamic modules must also be installed
+under nginx's module directory:
 
 ```text
 ngx_http_brotli_filter_module.so
@@ -93,10 +93,12 @@ unavailable.
 
 - `nginx/nginx.conf` is the top-level configuration.
 - `nginx/includes/` contains reusable behavior included by site definitions.
-- `nginx/stubs/` contains installer-selected `http {}`-level policies, maps,
-  cache zones, and rate-limit zones. `nginx.conf` loads every `*.conf` stub
-  present on the deployed host, so the installer must copy only the features
-  that host needs.
+- `nginx/stubs/*.conf` contains installer-selected main-context fragments such
+  as dynamic module loaders and optional QUIC eBPF acceleration.
+- `nginx/stubs/http/*.conf` contains installer-selected `http {}` policies,
+  maps, cache zones, and rate-limit zones. `nginx.conf` loads every matching
+  stub present on the deployed host, so the installer must copy only the
+  features that host needs.
 - `nginx/sites/` contains public-safe site configuration.
 - `nginx/upstreams/` is reserved for deployment-specific upstream definitions.
   Its contents are ignored by Git, while its `.gitignore` keeps the empty
@@ -104,22 +106,24 @@ unavailable.
 - `systemd/` contains the nginx service and Certbot renewal units.
 
 Deploy the selected contents of `nginx/` to `/etc/nginx/`, preserving this
-directory structure. The installer must populate `stubs/` with the features
-selected for that host; copying every source stub enables every optional
-feature. Install the unit files in the host's system unit directory only after
-reviewing their absolute paths for that distribution.
+directory structure. The installer must populate both stub levels with the
+features selected for that host; copying every source stub enables every
+optional feature. Install the unit files in the host's system unit directory
+only after reviewing their absolute paths for that distribution.
 
 The selected configuration has these stub dependencies:
 
-| Stub | Install when |
-| --- | --- |
-| `tls.conf` | Any selected site listens with `ssl`, including `_https_.conf`. This is required for HTTPS deployments. |
-| `upstreamfallback.conf` | The baseline `security-headers.conf` include is enabled. This is required by the provided `nginx.conf`. |
-| `ratelimit.conf` | A selected site or include uses `limit_req` or `limit_conn`, including `_http_.conf`, `http.conf`, and `wordpress-by-tag.conf`. |
-| `fastcgi-cache.conf` | WordPress FastCGI caching is enabled through `wordpress-cache.conf`. |
-| `websocket.conf` | A reverse-proxy site uses `$connection_upgrade`. |
-| `gzip.conf` | gzip response compression is desired. |
-| `brotli.conf` | Brotli response compression is desired and the modules loaded by `nginx.conf` are installed. |
+| Stub | Context | Install when |
+| --- | --- | --- |
+| `brotli.conf` | main | Brotli is selected; install together with `http/brotli.conf` and compatible dynamic modules. |
+| `quic-bpf.conf` | main | Linux 5.7+ eBPF acceleration for QUIC connection migration has been validated on the host. |
+| `http/tls.conf` | http | Any selected site listens with `ssl`, including `_https_.conf`. This is required for HTTPS deployments. |
+| `http/upstreamfallback.conf` | http | The baseline `security-headers.conf` include is enabled. This is required by the provided `nginx.conf`. |
+| `http/ratelimit.conf` | http | A selected site or include uses `limit_req` or `limit_conn`, including `_http_.conf`, `http.conf`, and `wordpress-by-tag.conf`. |
+| `http/fastcgi-cache.conf` | http | WordPress FastCGI caching is enabled through `wordpress-cache.conf`. |
+| `http/websocket.conf` | http | A reverse-proxy site uses `$connection_upgrade`. |
+| `http/gzip.conf` | http | gzip response compression is desired. |
+| `http/brotli.conf` | http | Brotli response compression is desired; install together with `brotli.conf`. |
 
 The TLS stub deliberately omits `ssl_stapling off` because stapling is already
 disabled by default, and whether to enable it depends on the certificate
@@ -142,10 +146,10 @@ JIT-based dynamic module must override `MemoryDenyWriteExecute=` after review.
 
 The unit does not restrict nginx's capability bounding set or system-call
 allowlist. The privileged master must bind ports 80 and 443, change worker
-identity, raise file limits, signal workers, and initialize the eBPF map used
-by `quic_bpf on;`. Those controls require host-specific validation against the
-installed kernel and nginx build. `LimitMEMLOCK=64M` is provided for the eBPF
-map.
+identity, raise file limits, and signal workers. Selecting `quic_bpf` also
+initializes an eBPF map and may require additional capabilities. Those controls
+require host-specific validation against the installed kernel, selected stubs,
+and nginx build. `LimitMEMLOCK=64M` is provided for the optional eBPF map.
 
 ## Site configuration contract
 

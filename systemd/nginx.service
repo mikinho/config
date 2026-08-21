@@ -35,8 +35,8 @@ TimeoutStopSec=60s
 Restart=on-failure
 RestartSec=5s
 
-# Match nginx.conf's worker_rlimit_nofile and provide enough locked memory for
-# the QUIC reuseport eBPF map enabled by quic_bpf.
+# Match nginx.conf's worker_rlimit_nofile. Locked memory is available when the
+# optional quic_bpf stub is selected and validated on the target host.
 LimitNOFILE=100000
 LimitMEMLOCK=64M
 
@@ -65,8 +65,9 @@ TasksMax=512
 
 # CapabilityBoundingSet and SystemCallFilter are intentionally not constrained
 # here. The root master must bind privileged ports, change worker identity,
-# raise resource limits, signal workers, and initialize quic_bpf. Tightening
-# either setting requires validation against the target kernel and nginx build.
+# raise resource limits and signal workers. A deployment selecting quic_bpf
+# may need additional BPF capabilities. Tightening either setting requires
+# validation against the target kernel, selected stubs, and nginx build.
 
 [Install]
 WantedBy=multi-user.target
