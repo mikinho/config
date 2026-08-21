@@ -45,6 +45,10 @@ server {
     root /var/www/sample_wp/wordpress;
     index index.php;
 
+    # Per-site raise over the 16M baseline, covering the pool's 20M
+    # post_max_size so nginx is not the surprise limit for media uploads.
+    client_max_body_size 20M;
+
     include includes/maintenance.conf;
     include includes/secure.conf;
     include includes/quiet-common-requests.conf;
