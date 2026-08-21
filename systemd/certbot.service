@@ -1,6 +1,17 @@
+# system/certbot.service
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
 [Unit]
 Description=Let's Encrypt Auto Renew
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/certbot renew --post-hook "/usr/bin/systemctl reload nginx.service" --post-hook "/usr/bin/systemctl reload httpd.service" --quiet --agree-tos
+# Certbot can renew some certificates while returning a non-zero status because
+# other renewals failed. Ignore that aggregate status so ExecStartPost always
+# reloads nginx and activates every certificate that was renewed successfully.
+# Renewal failures remain available in the journal and Certbot's own log.
+ExecStart=-/bin/certbot renew --quiet --agree-tos
+ExecStartPost=/bin/systemctl reload nginx.service
