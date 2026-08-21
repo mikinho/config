@@ -13,18 +13,21 @@ this public repository.
 
 ## Compatibility baseline
 
-| Component | Minimum | Reason |
+| Component | Supported baseline | Reason |
 | --- | --- | --- |
-| nginx | **1.29.3** | `add_header_inherit` was introduced in 1.29.3 and preserves the shared security-header baseline across nested configuration scopes. |
+| nginx | **1.30.4 stable** or **1.31.4 mainline**; syntax floor **1.29.3** | `add_header_inherit` was introduced in 1.29.3. CI tests the listed current release families. |
 | Linux kernel | Linux; **5.7** for `quic_bpf` | The baseline uses `epoll` and systemd. The optional eBPF QUIC acceleration stub requires Linux 5.7 or newer. |
-| OpenSSL | **1.1.1** | Required for TLS 1.3 and nginx's HTTP/3 support. |
+| OpenSSL | **3.5.1 or newer** | nginx recommends 3.5.1+ for QUIC, and OpenSSL 3.5 is the supported LTS line through April 2030. |
 | systemd | **249** | Required for the service sandbox, including `ProtectProc` and `SocketBindDeny`. |
 | Certbot | A currently supported release | Required only for the included ACME renewal service and timer. |
+| logrotate | A currently supported release | Required only when installing the included nginx file-log rotation policy. |
 
-nginx 1.29.3 is the minimum version that can parse the complete configuration;
-it is not a recommendation to deploy an obsolete release. Use a
-currently supported stable or mainline nginx release that provides the build
-features below.
+nginx 1.29.3 is the minimum version that can parse the complete configuration,
+not a supported deployment target. The release versions above were current on
+August 21, 2026; advance the CI matrix and this table together as nginx release
+families change. OpenSSL 1.1.1 can satisfy nginx's minimum HTTP/3 parser and
+linker requirements, but it is unsupported upstream and is not an acceptable
+secure deployment baseline.
 
 NGINX Plus is not required. The configuration works with an appropriately
 built nginx Open Source binary and does not rely on Plus-only directives.
@@ -92,6 +95,10 @@ The host firewall must allow TCP ports 80 and 443. Allow UDP port 443 as well
 to make HTTP/3 available; clients fall back to HTTP/2 or HTTP/1.1 when UDP is
 unavailable.
 
+nginx still describes its HTTP/3 module as experimental. Validate it against
+the deployed TLS library and clients, monitor QUIC-specific errors, and retain
+TCP 443 so clients always have an HTTP/2 or HTTP/1.1 fallback.
+
 ## Deployment layout
 
 - `nginx/nginx.conf` is the top-level configuration.
@@ -109,12 +116,15 @@ unavailable.
 - `nginx/trusted-proxies/` is reserved for deployment-specific trusted proxy
   CIDRs. Its contents are likewise ignored by Git.
 - `systemd/` contains the nginx service and Certbot renewal units.
+- `logrotate/` contains the nginx file-log rotation policy.
 
 Deploy the selected contents of `nginx/` to `/etc/nginx/`, preserving this
 directory structure. The installer must populate both stub levels with the
 features selected for that host; copying every source stub enables every
 optional feature. Install the unit files in the host's system unit directory
-only after reviewing their absolute paths for that distribution.
+only after reviewing their absolute paths for that distribution. Install
+`logrotate/nginx` as `/etc/logrotate.d/nginx` only if the package has not
+already installed an nginx rotation policy.
 
 The profile installer renders a new, non-existing staging directory and never
 writes directly to the live nginx configuration. The `baseline` profile is
@@ -197,6 +207,10 @@ and nginx build. `LimitMEMLOCK=64M` is provided for the optional eBPF map.
 The shared configuration is a baseline, not an application policy engine.
 Individual sites and upstream applications may set stricter or
 application-specific behavior.
+
+The default request-body limit is 16 MiB. Sites that need larger uploads should
+raise `client_max_body_size` only at the narrowest applicable `server` or
+`location`; sites that accept only small requests may lower it further.
 
 ### Trusted proxy client addresses
 
@@ -313,6 +327,12 @@ not renew. The reload runs from `ExecStopPost`, so Certbot's original nonzero
 status is preserved rather than ignored. A failed nginx reload also causes the
 unit to fail visibly.
 
+The timer checks at midnight and noon in the host's local time with up to six
+hours of randomized delay. Frequent checks are safe because `certbot renew`
+acts only on certificates near expiry, while the randomized windows avoid
+synchronized ACME traffic. Keep `Persistent=true` so a missed run is triggered
+after the host returns.
+
 The included nginx HTTP listener serves `/.well-known/acme-challenge/` from
 `/var/www/letsencrypt`. Certificates and account data under `/etc/letsencrypt`
 are host state and must never be committed.
@@ -368,14 +388,21 @@ Before committing, confirm that the diff contains none of the following:
 - customer or production hostnames that are not already public; or
 - generated logs, caches, PID files, temporary files, or local editor state.
 
-The root and `nginx/upstreams/` `.gitignore` files enforce the common cases,
-but they are not a substitute for reviewing the staged diff.
+The root, `nginx/upstreams/`, and `nginx/trusted-proxies/` `.gitignore` files
+enforce the common cases, but they are not a substitute for reviewing the
+staged diff.
+
+This repository is available under the [MIT License](LICENSE).
 
 ## References
 
 - [nginx HTTP/2 module](https://nginx.org/en/docs/http/ngx_http_v2_module.html)
 - [nginx HTTP/3 module](https://nginx.org/en/docs/http/ngx_http_v3_module.html)
+- [nginx current releases](https://nginx.org/en/download.html)
+- [nginx header inheritance](https://nginx.org/en/docs/http/ngx_http_headers_module.html#add_header_inherit)
+- [nginx real IP module](https://nginx.org/en/docs/http/ngx_http_realip_module.html)
 - [nginx build options](https://nginx.org/en/docs/configure.html)
 - [nginx SSL module](https://nginx.org/en/docs/http/ngx_http_ssl_module.html)
+- [OpenSSL release strategy](https://openssl-library.org/policies/releasestrat/)
 - [ngx_brotli build instructions](https://github.com/google/ngx_brotli)
-- [Certbot renewal documentation](https://eff-certbot.readthedocs.io/en/stable/using.html#renewing-certificates)
+- [Certbot automated renewal](https://eff-certbot.readthedocs.io/en/stable/using.html#setting-up-automated-renewal)

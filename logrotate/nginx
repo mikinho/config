@@ -1,0 +1,22 @@
+# logrotate/nginx
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
+/var/log/nginx/*.log {
+    daily
+    rotate 14
+    missingok
+    notifempty
+    compress
+    delaycompress
+    create 0640 nginx nginx
+    sharedscripts
+
+    postrotate
+        if /bin/systemctl --quiet is-active nginx.service; then
+            /bin/systemctl kill --kill-who=main --signal=USR1 nginx.service
+        fi
+    endscript
+}
