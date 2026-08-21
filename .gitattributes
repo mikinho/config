@@ -1,0 +1,2 @@
+# Configuration is deployed to Linux hosts; keep repository text files on LF.
+* text=auto eol=lf
