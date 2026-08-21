@@ -19,7 +19,7 @@ this public repository.
 | --- | --- | --- |
 | nginx | **1.30.4 stable** or **1.31.3 mainline** from nginx.org; syntax floor **1.29.3** | `add_header_inherit` was introduced in 1.29.3. CI tests the listed RHEL 9 packages. |
 | Linux kernel | A supported RHEL-family kernel; **5.7** for `quic_bpf` | The baseline uses `epoll` and systemd. The optional eBPF QUIC acceleration stub requires Linux 5.7 or newer. |
-| OpenSSL | A vendor-supported RHEL-family package; **3.5.1 or newer** for custom upstream QUIC builds | RHEL security fixes may be backported without changing the upstream version. nginx recommends OpenSSL 3.5.1+ when selecting a library for a custom QUIC build. |
+| OpenSSL | **3.5.1 or newer** | Required for the baseline `X25519MLKEM768` group and recommended by nginx for QUIC. |
 | systemd | **249** syntax floor; validated on Rocky Linux 9 and CentOS Stream 10 | Required for the service sandbox, including `ProtectProc` and `SocketBindDeny`. |
 | Certbot | A currently supported release | Required only for the included ACME renewal service and timer. |
 | logrotate | A currently supported release | Required only when installing the included nginx file-log rotation policy. |
@@ -32,10 +32,9 @@ CI matrix and this table together as those package families change.
 
 Do not judge a RHEL-family package's security status from its upstream version
 string alone. Red Hat backports security fixes, so vendor errata, package
-release fields, and lifecycle status are authoritative. OpenSSL 1.1.1 is
-unsupported upstream and is not an acceptable custom-build baseline; the
-vendor-supported exception applies only while the distribution maintains its
-package.
+release fields, and lifecycle status remain authoritative. That security
+policy does not replace this configuration's functional OpenSSL 3.5.1 floor:
+the TLS provider must expose the `X25519MLKEM768` group or `nginx -t` will fail.
 
 NGINX Plus is not required. The configuration works with an appropriately
 built nginx Open Source binary and does not rely on Plus-only directives.
@@ -202,12 +201,13 @@ deployment must create an equivalently private persistent key before running
 
 The TLS stub deliberately omits `ssl_stapling off` because stapling is already
 disabled by default, and whether to enable it depends on the certificate
-authority and deployment. Experimental curve configuration, including hybrid
-post-quantum groups, should be added only after the deployed nginx and TLS
-library versions have been tested. `ssl_protocols` is selected before nginx
-can apply an SNI-selected virtual host's configuration, so a deployment that
-overrides it must do so on the listener's default server rather than only on a
-non-default site.
+authority and deployment. Its explicit curve list prefers the OpenSSL 3.5
+hybrid post-quantum `X25519MLKEM768` group, then retains X25519 and P-256 as
+classical compatibility fallbacks. A site using an ECDSA certificate on a
+different curve must override the list and include that certificate's curve.
+`ssl_protocols` is selected before nginx can apply an SNI-selected virtual
+host's configuration, so a deployment that overrides it must do so on the
+listener's default server rather than only on a non-default site.
 
 ### nginx service sandbox
 
@@ -391,6 +391,8 @@ syntax-tested with the exact modules on the target host.
 Run these checks on the target host before enabling the service:
 
 ```sh
+openssl version
+openssl list -tls1_3 -tls-groups | grep X25519MLKEM768
 nginx -v
 nginx -V 2>&1
 sudo nginx -t -c /etc/nginx/nginx.conf
@@ -431,6 +433,7 @@ This repository is available under the [MIT License](LICENSE).
 - [nginx build options](https://nginx.org/en/docs/configure.html)
 - [nginx SSL module](https://nginx.org/en/docs/http/ngx_http_ssl_module.html)
 - [OpenSSL release strategy](https://openssl-library.org/policies/releasestrat/)
+- [OpenSSL TLS group configuration](https://docs.openssl.org/3.5/man3/SSL_CONF_cmd/)
 - [Red Hat security backporting policy](https://access.redhat.com/security/updates/backporting)
 - [RHEL 9 SELinux guidance](https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/9/html/using_selinux/configuring-selinux-for-applications-and-services-with-non-standard-configurations_using-selinux)
 - [ngx_brotli build instructions](https://github.com/google/ngx_brotli)
