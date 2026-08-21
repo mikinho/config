@@ -18,7 +18,7 @@ this public repository.
 | nginx | **1.25.1** | `http2 on;` was introduced in 1.25.1; the HTTP/3 and QUIC module was introduced in 1.25.0. |
 | Linux kernel | **5.7** | Required by `quic_bpf on;`. This configuration is Linux-specific because it also uses `epoll` and systemd. |
 | OpenSSL | **1.1.1** | Required for TLS 1.3 and nginx's HTTP/3 support. |
-| systemd | A release supporting `%t`, `%p`, and `%L` unit specifiers | Required by `systemd/nginx.service`. Validate the units on the target host before installation. |
+| systemd | **247** | Required for the service sandbox, including `ProtectProc`. |
 | Certbot | A currently supported release | Required only for the included ACME renewal service and timer. |
 
 nginx 1.25.1 is the minimum version that can parse the complete configuration;
@@ -26,9 +26,8 @@ it is not a recommendation to deploy the obsolete 1.25 release. Use a
 currently supported stable or mainline nginx release that provides the build
 features below.
 
-NGINX Plus is not required. Although the service unit retains an NGINX Plus
-description, the configuration works with an appropriately built nginx Open
-Source binary and does not rely on Plus-only directives.
+NGINX Plus is not required. The configuration works with an appropriately
+built nginx Open Source binary and does not rely on Plus-only directives.
 
 ## Required nginx build features
 
@@ -76,9 +75,9 @@ The checked-in paths assume this layout:
 | `/usr/sbin/nginx` | nginx binary used by `systemd/nginx.service`. Adjust the unit if the package installs it elsewhere. |
 | `/bin/certbot` | Certbot binary used by `systemd/certbot.service`. Adjust the unit if needed. |
 | `/bin/systemctl` | systemctl binary used by the Certbot post-renewal reload. |
-| `nginx` user and group | Worker identity and ownership used by the nginx unit. |
+| `nginx` user and group | Worker identity configured by `nginx/nginx.conf`. |
 | `/run/nginx` | PID directory; created by the nginx unit. |
-| `/run/lock/nginx` | Parent directory for the configured lock file; provision it if the distribution does not. |
+| `/run/lock/nginx` | Lock directory; created by the nginx unit. |
 | `/var/log/nginx` | nginx log directory; created by the nginx unit. |
 | `/var/lib/nginx/client_tmp` | Writable client-body temporary directory. |
 | `/var/lib/nginx/proxy_tmp` | Writable proxy temporary directory. |
@@ -103,6 +102,23 @@ unavailable.
 Deploy the contents of `nginx/` to `/etc/nginx/`, preserving this directory
 structure. Install the unit files in the host's system unit directory only
 after reviewing their absolute paths for that distribution.
+
+### nginx service sandbox
+
+`systemd/nginx.service` makes the host filesystem read-only to nginx except
+for its systemd-managed runtime, state, and log directories. It also hides
+home directories, restricts process and kernel views, limits address families,
+and denies writable-executable memory. A site that needs to write uploads or
+generated content outside `/var/lib/nginx` must add only the required path with
+a systemd `ReadWritePaths=` drop-in. A build that enables PCRE JIT or another
+JIT-based dynamic module must override `MemoryDenyWriteExecute=` after review.
+
+The unit does not restrict nginx's capability bounding set or system-call
+allowlist. The privileged master must bind ports 80 and 443, change worker
+identity, raise file limits, signal workers, and initialize the eBPF map used
+by `quic_bpf on;`. Those controls require host-specific validation against the
+installed kernel and nginx build. `LimitMEMLOCK=64M` is provided for the eBPF
+map.
 
 ## Site configuration contract
 
