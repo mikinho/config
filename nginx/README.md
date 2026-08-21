@@ -37,7 +37,8 @@ it in the root README's stub-dependency table and covered by a profile.
   must declare their own `server_name` and must not claim `default_server`.
 - TLS policy is shared in `stubs/http/tls.conf`. `ssl_protocols` is selected
   before SNI routing, so protocol changes belong there or on the listener's
-  default server, never only on a non-default site.
+  default server, never only on a non-default site. Hybrid post-quantum group
+  selection is isolated in the optional `stubs/http/post-quantum.conf` profile.
 - PHP-FPM integration is by tag: define `$site_tag`, provide the socket at
   `/run/$site_tag/php-fpm.sock`, and include the `*-by-tag.conf` file. Use
   `php-fpm-path-info-by-tag.conf` only for a narrowly scoped location that

@@ -44,11 +44,13 @@ jobs:
             --output build/full \
             --profile brotli \
             --profile gzip \
+            --profile post-quantum \
             --profile quic-bpf \
             --profile trusted-proxy \
             --profile websocket \
             --profile wordpress
           test -s build/full/quic_host.key
+          test -s build/full/stubs/http/post-quantum.conf
           test "$(stat --format='%a' build/full/quic_host.key)" = 600
           if deploy/install-nginx --output build/full; then
             echo 'installer unexpectedly overwrote an existing output' >&2
@@ -88,6 +90,7 @@ jobs:
             --profile trusted-proxy \
             --profile websocket \
             --profile wordpress
+          test ! -e build/ci/stubs/http/post-quantum.conf
 
       - name: Test nginx configuration
         run: |
@@ -116,8 +119,6 @@ jobs:
                 "${nginx_package}" \
                 openssl
               openssl version
-              openssl list -tls1_3 -tls-groups |
-                grep --fixed-strings X25519MLKEM768
               nginx -v
               if [ "${EXPECTED_NGINX_VERSION}" != latest ]; then
                 nginx -v 2>&1 |

@@ -19,7 +19,7 @@ this public repository.
 | --- | --- | --- |
 | nginx | **1.30.4 stable** or **1.31.3 mainline** from nginx.org; syntax floor **1.29.3** | `add_header_inherit` was introduced in 1.29.3. CI tests the listed RHEL 9 packages. |
 | Linux kernel | A supported RHEL-family kernel; **5.7** for `quic_bpf` | The baseline uses `epoll` and systemd. The optional eBPF QUIC acceleration stub requires Linux 5.7 or newer. |
-| OpenSSL | **3.5.1 or newer** | Required for the baseline `X25519MLKEM768` group and recommended by nginx for QUIC. |
+| OpenSSL | A vendor-supported version compatible with the selected nginx build; **3.5.1 or newer** for the `post-quantum` profile | The baseline uses the TLS provider's supported group defaults. The optional profile requires `X25519MLKEM768`. |
 | systemd | **249** syntax floor; validated on Rocky Linux 9 and CentOS Stream 10 | Required for the service sandbox, including `ProtectProc` and `SocketBindDeny`. |
 | PHP-FPM | **PHP 8.3 or newer** with systemd and POSIX ACL support | Required only for the optional per-site PHP-FPM service and configuration under `php-fpm/`. |
 | Certbot | A currently supported release | Required only for the included ACME renewal service and timer. |
@@ -37,8 +37,9 @@ CI matrix and this table together as those package families change.
 Do not judge a RHEL-family package's security status from its upstream version
 string alone. Red Hat backports security fixes, so vendor errata, package
 release fields, and lifecycle status remain authoritative. That security
-policy does not replace this configuration's functional OpenSSL 3.5.1 floor:
-the TLS provider must expose the `X25519MLKEM768` group or `nginx -t` will fail.
+policy does not replace the optional `post-quantum` profile's functional
+OpenSSL 3.5.1 floor: when that profile is selected, the TLS provider used by
+nginx must expose `X25519MLKEM768` or `nginx -t` will fail.
 
 NGINX Plus is not required. The configuration works with an appropriately
 built nginx Open Source binary and does not rely on Plus-only directives.
@@ -217,6 +218,7 @@ earlier profile.
 | `websocket` | WebSocket connection-upgrade map. |
 | `wordpress` | WordPress FastCGI cache zone and bypass maps. |
 | `trusted-proxy` | Client address restoration; deployment-local trusted CIDRs are still required. |
+| `post-quantum` | Hybrid `X25519MLKEM768` TLS key exchange for compatible OpenSSL 3.5.1+ builds. |
 | `quic-bpf` | Linux eBPF acceleration for QUIC connection migration after host validation. |
 
 The selected configuration has these stub dependencies:
@@ -227,6 +229,7 @@ The selected configuration has these stub dependencies:
 | `quic-bpf.conf` | main | Linux 5.7+ eBPF acceleration for QUIC connection migration has been validated on the host. |
 | `http/quic.conf` | http | The provided HTTP/3 listener is installed. This is required by the `baseline` profile. |
 | `http/tls.conf` | http | Any selected site listens with `ssl`, including `_https_.conf`. This is required for HTTPS deployments. |
+| `http/post-quantum.conf` | http | nginx uses a TLS provider exposing `X25519MLKEM768`; select through the optional `post-quantum` profile. |
 | `http/upstreamfallback.conf` | http | The baseline `security-headers.conf` include is enabled. This is required by the provided `nginx.conf`. |
 | `http/ratelimit.conf` | http | A selected site or include uses `limit_req` or `limit_conn`, including `_http_.conf`, `http.conf`, and `wordpress-by-tag.conf`. |
 | `http/fastcgi-cache.conf` | http | WordPress FastCGI caching is enabled through `wordpress-cache.conf`. |
@@ -242,13 +245,13 @@ deployment must create an equivalently private persistent key before running
 
 The TLS stub deliberately omits `ssl_stapling off` because stapling is already
 disabled by default, and whether to enable it depends on the certificate
-authority and deployment. Its explicit curve list prefers the OpenSSL 3.5
-hybrid post-quantum `X25519MLKEM768` group, then retains X25519 and P-256 as
-classical compatibility fallbacks. A site using an ECDSA certificate on a
-different curve must override the list and include that certificate's curve.
-`ssl_protocols` is selected before nginx can apply an SNI-selected virtual
-host's configuration, so a deployment that overrides it must do so on the
-listener's default server rather than only on a non-default site.
+authority and deployment. It also leaves TLS group selection to the installed
+provider. The optional `post-quantum` profile instead prefers the OpenSSL 3.5
+hybrid `X25519MLKEM768` group, then retains X25519 and P-256 as classical
+fallbacks. A site using an ECDSA certificate on another curve must include that
+curve. `ssl_protocols` is selected before nginx can apply an SNI-selected
+virtual host's configuration, so a deployment that overrides it must do so on
+the listener's default server rather than only on a non-default site.
 
 ### nginx service sandbox
 
@@ -455,14 +458,16 @@ runs `nginx -t` against stable and mainline nginx.org packages on Rocky Linux
 9, checks the units and logrotate policy on Rocky Linux 9 and CentOS Stream 10,
 and scans the complete Git history for secrets. GitHub's Ubuntu hosted runner
 is only the Docker and portable-tooling executor; it is not a supported
-deployment target. The third-party Brotli modules cannot be loaded by the
-stock CI packages, so Brotli is profile-validated in CI and must be
-syntax-tested with the exact modules on the target host.
+deployment target. The third-party Brotli modules and OpenSSL 3.5 hybrid group
+cannot be loaded by the stock CI packages. The `brotli` and `post-quantum`
+profiles are therefore profile-validated in public CI and must be syntax-tested
+with the exact modules and TLS provider on the target host.
 
 Run these checks on the target host before enabling the service:
 
 ```sh
 openssl version
+# Required only when the post-quantum profile is selected:
 openssl list -tls1_3 -tls-groups | grep X25519MLKEM768
 nginx -v
 nginx -V 2>&1
