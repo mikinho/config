@@ -5,13 +5,59 @@
 #
 
 [Unit]
-Description=Let's Encrypt Auto Renew
+Description=Renew Let's Encrypt certificates
+Documentation=https://eff-certbot.readthedocs.io/en/stable/using.html#renewing-certificates
+After=network-online.target nginx.service
+Wants=network-online.target
 
 [Service]
 Type=oneshot
-# Certbot can renew some certificates while returning a non-zero status because
-# other renewals failed. Ignore that aggregate status so ExecStartPost always
-# reloads nginx and activates every certificate that was renewed successfully.
-# Renewal failures remain available in the journal and Certbot's own log.
-ExecStart=-/bin/certbot renew --quiet --agree-tos
-ExecStartPost=/bin/systemctl reload nginx.service
+
+# Renewal may involve multiple certificates and slow ACME responses.
+UMask=0077
+TimeoutStartSec=1h
+Environment=HOME=/var/lib/letsencrypt
+
+# Keep Certbot's exit status intact. ExecStopPost runs after both successful and
+# failed oneshot execution, so nginx still loads certificates from successful
+# partial renewals while the unit remains failed when any renewal failed.
+ExecStart=/bin/certbot renew --quiet --agree-tos
+ExecStopPost=/bin/systemctl reload nginx.service
+
+# Certbot's standard configuration, work, and log directories. The ACME
+# webroot is provisioned separately because it is also served by nginx.
+ConfigurationDirectory=letsencrypt
+ConfigurationDirectoryMode=0700
+StateDirectory=letsencrypt
+StateDirectoryMode=0700
+LogsDirectory=letsencrypt
+LogsDirectoryMode=0700
+ReadWritePaths=/var/www/letsencrypt
+
+# This unit supports the webroot renewal flow used by the nginx baseline.
+# Standalone authenticators, hooks, or plugins that need additional files,
+# devices, capabilities, or bind sockets require an explicit local drop-in.
+CapabilityBoundingSet=
+SocketBindDeny=any
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+LockPersonality=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+TasksMax=64
+
+# SystemCallFilter and MemoryDenyWriteExecute are intentionally deferred until
+# they have been tested with the host's Certbot, Python, cryptography, and
+# authenticator/plugin builds.
