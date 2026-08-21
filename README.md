@@ -15,14 +15,14 @@ this public repository.
 
 | Component | Minimum | Reason |
 | --- | --- | --- |
-| nginx | **1.25.1** | `http2 on;` was introduced in 1.25.1; the HTTP/3 and QUIC module was introduced in 1.25.0. |
+| nginx | **1.29.3** | `add_header_inherit` was introduced in 1.29.3 and preserves the shared security-header baseline across nested configuration scopes. |
 | Linux kernel | **5.7** | Required by `quic_bpf on;`. This configuration is Linux-specific because it also uses `epoll` and systemd. |
 | OpenSSL | **1.1.1** | Required for TLS 1.3 and nginx's HTTP/3 support. |
 | systemd | **249** | Required for the service sandbox, including `ProtectProc` and `SocketBindDeny`. |
 | Certbot | A currently supported release | Required only for the included ACME renewal service and timer. |
 
-nginx 1.25.1 is the minimum version that can parse the complete configuration;
-it is not a recommendation to deploy the obsolete 1.25 release. Use a
+nginx 1.29.3 is the minimum version that can parse the complete configuration;
+it is not a recommendation to deploy an obsolete release. Use a
 currently supported stable or mainline nginx release that provides the build
 features below.
 
@@ -163,19 +163,21 @@ For proxied responses, nginx hides upstream HSTS and supplies the edge policy.
 FastCGI applications should not emit HSTS, or the site must hide that header
 with `fastcgi_hide_header`, to avoid duplicate values.
 
-nginx header inheritance is scope-sensitive: adding any `add_header` directive
-inside a lower-level `server` or `location` block prevents headers from the
-parent scope from being inherited. Such a block must explicitly include the
-shared security-header and HTTP/3 header files again when those headers should
-remain present.
+The baseline selects `add_header_inherit merge`, so headers defined by a
+`server` or `location` are appended without discarding the inherited security
+headers. A site that must replace the complete inherited policy can set
+`add_header_inherit off` at that scope and then define every required header
+explicitly. This escape hatch is intentionally conspicuous because it also
+removes inherited HSTS.
 
 The baseline HSTS policy deliberately omits `includeSubDomains` and `preload`.
 Either directive commits more than the current hostname and is unsafe as a
 universal default. An individual site may opt into `includeSubDomains`, and
 later preload, only after its entire namespace and the preload requirements
-have been verified. Because nginx header inheritance is scope-sensitive, a
-site-level HSTS override must also restate the other required `add_header`
-directives at that scope.
+have been verified. A site-level HSTS override must select
+`add_header_inherit off` and restate the other required `add_header` directives
+at that scope so the baseline and site-specific HSTS values are not both
+emitted.
 
 ### Optional Node.js Cache-Control fallback
 
