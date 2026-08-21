@@ -1,0 +1,77 @@
+# system/php-fpm@.service
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
+[Unit]
+Description=PHP-FPM instance for %i
+Documentation=man:php-fpm(8) https://www.php.net/manual/en/install.fpm.php
+After=network.target
+StartLimitIntervalSec=60s
+StartLimitBurst=3
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=%i
+Group=%i
+# Public site assets remain readable by nginx; the private state and var
+# directories retain explicit 0700 modes.
+UMask=0022
+
+# /sbin/php-fpm is an administrator-owned, version-neutral contract. On hosts
+# using parallel Remi packages it resolves to the selected versioned binary.
+ExecStartPre=/sbin/php-fpm --test --fpm-config /etc/php-fpm.d/sites/%i.conf
+ExecStart=/sbin/php-fpm --nodaemonize --force-stderr --fpm-config /etc/php-fpm.d/sites/%i.conf
+ExecReload=/bin/kill -USR2 $MAINPID
+
+KillSignal=SIGQUIT
+KillMode=mixed
+TimeoutStopSec=60s
+Restart=on-failure
+RestartSec=5s
+
+# PHP-FPM owns its listening socket. The pool grants nginx access with a POSIX
+# ACL; mode 0711 permits traversal without exposing the runtime directory list.
+RuntimeDirectory=%i
+RuntimeDirectoryMode=0711
+StateDirectory=php/session/%i
+StateDirectoryMode=0700
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=php-fpm-%i
+
+# Baseline containment. Runtime and session state are writable through the
+# managed directories above. Every application write path is instance-specific
+# and must be added through a narrowly scoped local drop-in.
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectProc=invisible
+ProcSubset=pid
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+LockPersonality=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RemoveIPC=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+MemoryDenyWriteExecute=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+TasksMax=128
+
+[Install]
+WantedBy=multi-user.target

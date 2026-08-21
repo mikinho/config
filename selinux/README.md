@@ -53,9 +53,27 @@ sudo restorecon -RF /run/SITE_TAG
 ```
 
 Replace `SITE_TAG` with the site's tag. Without the rule the socket is
-created as plain `var_run_t` and nginx's connection to it is denied. When
-the socket is created by a systemd socket unit, register the rule before the
-unit first starts so the socket is born with the right label.
+created as plain `var_run_t` and nginx's connection to it is denied. Register
+the rule before the application service first starts so its runtime directory
+and socket are born with the right label. PHP-FPM owns its socket; this
+baseline does not use a PHP systemd socket unit.
+
+PHP sites also need writable application content labeled narrowly. The
+per-site service permits its `var` directory and, when present, WordPress
+uploads; label those locations without making the complete site tree writable:
+
+```sh
+sudo semanage fcontext --add --type httpd_sys_rw_content_t \
+  "/var/www/SITE_TAG/var(/.*)?"
+sudo semanage fcontext --add --type httpd_sys_rw_content_t \
+  "/var/www/SITE_TAG/wordpress/wp-content/uploads(/.*)?"
+sudo restorecon -RF /var/www/SITE_TAG
+```
+
+The RHEL-family policy normally covers `/var/lib/php/session(/.*)?` with an
+`httpd`-writable type. Verify the per-site systemd state directory with
+`matchpathcon /var/lib/php/session/SITE_TAG` rather than adding a duplicate
+local rule. See `php-fpm/README.md` for the complete provisioning contract.
 
 ## Booleans
 
