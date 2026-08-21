@@ -21,6 +21,7 @@ this public repository.
 | Linux kernel | A supported RHEL-family kernel; **5.7** for `quic_bpf` | The baseline uses `epoll` and systemd. The optional eBPF QUIC acceleration stub requires Linux 5.7 or newer. |
 | OpenSSL | **3.5.1 or newer** | Required for the baseline `X25519MLKEM768` group and recommended by nginx for QUIC. |
 | systemd | **249** syntax floor; validated on Rocky Linux 9 and CentOS Stream 10 | Required for the service sandbox, including `ProtectProc` and `SocketBindDeny`. |
+| PHP-FPM | **PHP 8.3 or newer** with systemd and POSIX ACL support | Required only for the optional per-site PHP-FPM service and configuration under `php-fpm/`. |
 | Certbot | A currently supported release | Required only for the included ACME renewal service and timer. |
 | logrotate | A currently supported release | Required only when installing the included nginx file-log rotation policy. |
 | fail2ban | A currently supported EPEL release | Required only for the optional intrusion-ban policy in `fail2ban/`. |
@@ -111,6 +112,7 @@ The checked-in paths assume this layout:
 | `/usr/sbin/nginx` | nginx binary used by `systemd/nginx.service`. Adjust the unit if the package installs it elsewhere. |
 | `/bin/certbot` | Certbot binary used by `systemd/certbot.service`. Adjust the unit if needed. |
 | `/bin/systemctl` | systemctl binary used by the Certbot post-renewal reload. |
+| `/sbin/php-fpm` | Administrator-managed, version-neutral PHP-FPM binary contract used by `systemd/php-fpm@.service`. |
 | `nginx` user and group | Worker identity configured by `nginx/nginx.conf`. |
 | `/run/nginx` | PID directory; created by the nginx unit. |
 | `/run/lock/nginx` | Lock directory; created by the nginx unit. |
@@ -160,7 +162,9 @@ TCP 443 so clients always have an HTTP/2 or HTTP/1.1 fallback.
   directory in the repository.
 - `nginx/trusted-proxies/` is reserved for deployment-specific trusted proxy
   CIDRs. Its contents are likewise ignored by Git.
-- `systemd/` contains the nginx service and Certbot renewal units.
+- `systemd/` contains the nginx, per-site PHP-FPM, and Certbot renewal units.
+- `php-fpm/` contains the optional per-site PHP-FPM pool, main configuration,
+  provisioning contract, and validation guidance.
 - `logrotate/` contains the nginx file-log rotation policy.
 - `deploy/` contains the profile installer and its profile manifests.
 - `selinux/` contains the SELinux file-context and policy-module assets that
@@ -386,6 +390,11 @@ The PHP-FPM and WordPress includes are opt-in. A site using them must:
 - provision the writable FastCGI cache directory when caching is enabled; and
 - review the WordPress cache exclusions and response-header handling against
   the application's authentication, personalization, and cache policy.
+
+The corresponding per-site PHP-FPM implementation is documented in
+[`php-fpm/README.md`](php-fpm/README.md). PHP-FPM owns each socket; no systemd
+socket unit is used. The service runs as the site tag, grants nginx access with
+a POSIX ACL, and confines writable state to explicitly provisioned paths.
 
 The default WordPress PHP locations accept only requests whose URI ends in
 `.php`; PATH_INFO routing broadens the executable request surface and is not a
