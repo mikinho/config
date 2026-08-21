@@ -180,6 +180,41 @@ jobs:
               logrotate --debug /workspace/logrotate/nginx
             '
 
+  ssh:
+    name: sshd drop-ins on ${{ matrix.target }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: rockylinux:9
+            target: Rocky Linux 9
+          - image: quay.io/centos/centos:stream10
+            target: CentOS Stream 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Verify effective sshd configuration
+        run: |
+          docker run --rm \
+            --volume "$PWD:/workspace:ro" \
+            "${{ matrix.image }}" \
+            /bin/bash -euxo pipefail -c '
+              dnf install --assumeyes openssh-server
+              grep -q "^Include /etc/ssh/sshd_config.d/\*.conf" /etc/ssh/sshd_config
+              install -m 0644 /workspace/ssh/sshd_config.d/*.conf /etc/ssh/sshd_config.d/
+              ssh-keygen -A
+              /usr/sbin/sshd -t
+              /usr/sbin/sshd -T | grep -x "port 2356"
+              test "$(/usr/sbin/sshd -T | grep -c "^port ")" = 1
+              /usr/sbin/sshd -T | grep -x "permitrootlogin no"
+              /usr/sbin/sshd -T | grep -x "passwordauthentication no"
+              /usr/sbin/sshd -T | grep -x "kbdinteractiveauthentication no"
+            '
+
   secrets:
     name: Public secret scan
     runs-on: ubuntu-24.04
