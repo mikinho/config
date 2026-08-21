@@ -23,6 +23,7 @@ this public repository.
 | systemd | **249** syntax floor; validated on Rocky Linux 9 and CentOS Stream 10 | Required for the service sandbox, including `ProtectProc` and `SocketBindDeny`. |
 | Certbot | A currently supported release | Required only for the included ACME renewal service and timer. |
 | logrotate | A currently supported release | Required only when installing the included nginx file-log rotation policy. |
+| fail2ban | A currently supported EPEL release | Required only for the optional intrusion-ban policy in `fail2ban/`. |
 | SELinux | Enforcing mode with the RHEL `httpd` policy | Expected on the supported platforms; do not disable it to deploy this baseline. |
 
 nginx 1.29.3 is the minimum version that can parse the complete configuration,
@@ -116,7 +117,9 @@ When nginx must proxy to a TCP upstream, review and enable the standard
 `httpd_can_network_connect` boolean; a Unix-domain socket or a tighter local
 policy is preferable when practical. The `policycoreutils` and
 `policycoreutils-python-utils` packages provide the relevant administration
-tools on RHEL-family systems.
+tools on RHEL-family systems. The `selinux/` directory supplies the
+file-context registrations and the optional `quic_bpf` policy module that
+this baseline needs beyond the distribution policy.
 
 nginx still describes its HTTP/3 module as experimental. Validate it against
 the deployed TLS library and clients, monitor QUIC-specific errors, and retain
@@ -140,6 +143,15 @@ TCP 443 so clients always have an HTTP/2 or HTTP/1.1 fallback.
   CIDRs. Its contents are likewise ignored by Git.
 - `systemd/` contains the nginx service and Certbot renewal units.
 - `logrotate/` contains the nginx file-log rotation policy.
+- `deploy/` contains the profile installer and its profile manifests.
+- `selinux/` contains the SELinux file-context and policy-module assets that
+  enforcing-mode deployments need beyond the distribution policy.
+- `fail2ban/` contains an optional intrusion-ban policy for deployments that
+  receive client traffic directly.
+
+Each component directory carries its own README covering that component's
+installation and validation; this document remains authoritative for the
+platform baseline and the cross-component contracts.
 
 Deploy the selected contents of `nginx/` to `/etc/nginx/`, preserving this
 directory structure. The installer must populate both stub levels with the
