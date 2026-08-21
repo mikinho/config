@@ -4,6 +4,10 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+  schedule:
+    # Weekly run so pinned-package staleness and repository drift surface
+    # without waiting for a push.
+    - cron: '17 9 * * 1'
 
 permissions:
   contents: read
@@ -65,6 +69,12 @@ jobs:
           - channel: mainline
             repository: packages/mainline
             version: 1.31.3
+          # Unpinned drift check: installs whatever the stable repository
+          # currently ships, so a package family the pinned entries no longer
+          # represent fails here first.
+          - channel: stable
+            repository: packages
+            version: latest
 
     steps:
       - name: Check out repository
@@ -97,15 +107,22 @@ jobs:
                 "gpgkey=https://nginx.org/keys/nginx_signing.key" \
                 "module_hotfixes=true" \
                 > /etc/yum.repos.d/nginx.repo
+              nginx_package="nginx-${EXPECTED_NGINX_VERSION}"
+              if [ "${EXPECTED_NGINX_VERSION}" = latest ]; then
+                nginx_package=nginx
+              fi
               dnf install --assumeyes \
                 ca-certificates \
-                "nginx-${EXPECTED_NGINX_VERSION}" \
+                "${nginx_package}" \
                 openssl
               openssl version
               openssl list -tls1_3 -tls-groups |
                 grep --fixed-strings X25519MLKEM768
-              nginx -v 2>&1 |
-                grep --fixed-strings "nginx/${EXPECTED_NGINX_VERSION}"
+              nginx -v
+              if [ "${EXPECTED_NGINX_VERSION}" != latest ]; then
+                nginx -v 2>&1 |
+                  grep --fixed-strings "nginx/${EXPECTED_NGINX_VERSION}"
+              fi
               nginx -V 2>&1 |
                 grep --fixed-strings -- "--with-http_v3_module"
               mkdir -p \
