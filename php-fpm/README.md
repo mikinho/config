@@ -72,8 +72,10 @@ systemd socket unit, creates the listening socket and grants nginx access with
 
 The example uses `pm = ondemand`, which starts workers when requests arrive;
 the small supervised master remains running. Size `pm.max_children` from the
-site's measured worker RSS and its assigned memory budget. The example value
-is not a capacity recommendation.
+site's measured worker RSS and its assigned memory budget; the pool pins
+`memory_limit` explicitly so the worst case — `pm.max_children` multiplied by
+`memory_limit` — is legible in one file. The example values are not capacity
+recommendations.
 
 ## Provisioning an instance
 
