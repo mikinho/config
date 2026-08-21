@@ -1,10 +1,144 @@
-# config
+# Secure nginx baseline
 
-## Optional Node.js Cache-Control fallback
+This repository provides a reusable, security-oriented nginx baseline for
+Linux hosts managed by systemd. It supplies conservative HTTP and HTTPS
+defaults, TLS, HTTP/2 and HTTP/3, compression, rate limiting, security-header
+fallbacks, ACME handling, a local status endpoint, and optional integration
+points for Node.js, PHP-FPM, and WordPress applications.
 
-The shared nginx configuration provides an opt-in `$cache_control_fallback`
-for applications that serve static files through nginx and proxy other
-responses to Node.js.
+Site-specific virtual hosts may override the baseline where an application
+has different requirements. Deployment-specific upstream addresses,
+certificates, private keys, credentials, and other secrets do not belong in
+this public repository.
+
+## Compatibility baseline
+
+| Component | Minimum | Reason |
+| --- | --- | --- |
+| nginx | **1.25.1** | `http2 on;` was introduced in 1.25.1; the HTTP/3 and QUIC module was introduced in 1.25.0. |
+| Linux kernel | **5.7** | Required by `quic_bpf on;`. This configuration is Linux-specific because it also uses `epoll` and systemd. |
+| OpenSSL | **1.1.1** | Required for TLS 1.3 and nginx's HTTP/3 support. |
+| systemd | A release supporting `%t`, `%p`, and `%L` unit specifiers | Required by `systemd/nginx.service`. Validate the units on the target host before installation. |
+| Certbot | A currently supported release | Required only for the included ACME renewal service and timer. |
+
+nginx 1.25.1 is the minimum version that can parse the complete configuration;
+it is not a recommendation to deploy the obsolete 1.25 release. Use a
+currently supported stable or mainline nginx release that provides the build
+features below.
+
+NGINX Plus is not required. Although the service unit retains an NGINX Plus
+description, the configuration works with an appropriately built nginx Open
+Source binary and does not rely on Plus-only directives.
+
+## Required nginx build features
+
+Check the installed binary with:
+
+```sh
+nginx -V 2>&1
+```
+
+The build must provide these non-default modules:
+
+- `--with-http_ssl_module`
+- `--with-http_v2_module`
+- `--with-http_v3_module`
+- `--with-http_gzip_static_module`
+- `--with-http_stub_status_module`
+- `--with-http_sub_module` when `includes/relativeurls.conf` is used
+
+The normally built HTTP proxy, FastCGI, cache, map, geo, rewrite, access,
+gzip, and limit-request modules must not have been disabled. Building nginx
+requires the corresponding OpenSSL, zlib, and PCRE2 (or compatible PCRE)
+development libraries.
+
+The following dynamic Brotli modules must also be installed under nginx's
+module directory:
+
+```text
+ngx_http_brotli_filter_module.so
+ngx_http_brotli_static_module.so
+```
+
+They must be built for the exact nginx binary and compatible configure
+arguments in use. A module copied from a different nginx build may fail to
+load even when the version number appears similar.
+
+## Host prerequisites
+
+The checked-in paths assume this layout:
+
+| Path or resource | Requirement |
+| --- | --- |
+| `/etc/nginx` | Deployment root for this repository's nginx files. |
+| `/etc/nginx/mime.types` | nginx MIME type database, normally supplied by the nginx package. |
+| `/etc/nginx/fastcgi_params` | FastCGI parameter file, required by the PHP-FPM includes. |
+| `/usr/sbin/nginx` | nginx binary used by `systemd/nginx.service`. Adjust the unit if the package installs it elsewhere. |
+| `/bin/certbot` | Certbot binary used by `systemd/certbot.service`. Adjust the unit if needed. |
+| `/bin/systemctl` | systemctl binary used by the Certbot post-renewal reload. |
+| `nginx` user and group | Worker identity and ownership used by the nginx unit. |
+| `/run/nginx` | PID directory; created by the nginx unit. |
+| `/run/lock/nginx` | Parent directory for the configured lock file; provision it if the distribution does not. |
+| `/var/log/nginx` | nginx log directory; created by the nginx unit. |
+| `/var/lib/nginx/client_tmp` | Writable client-body temporary directory. |
+| `/var/lib/nginx/proxy_tmp` | Writable proxy temporary directory. |
+| `/var/lib/nginx/fastcgi` | Writable FastCGI cache directory when PHP or WordPress caching is enabled. |
+| `/var/www/letsencrypt` | ACME HTTP-01 webroot, readable by nginx and writable by Certbot. |
+
+The host firewall must allow TCP ports 80 and 443. Allow UDP port 443 as well
+to make HTTP/3 available; clients fall back to HTTP/2 or HTTP/1.1 when UDP is
+unavailable.
+
+## Deployment layout
+
+- `nginx/nginx.conf` is the top-level configuration.
+- `nginx/includes/` contains reusable behavior included by site definitions.
+- `nginx/stubs/` defines shared maps, cache zones, and rate-limit zones.
+- `nginx/sites/` contains public-safe site configuration.
+- `nginx/upstreams/` is reserved for deployment-specific upstream definitions.
+  Its contents are ignored by Git, while its `.gitignore` keeps the empty
+  directory in the repository.
+- `systemd/` contains the nginx service and Certbot renewal units.
+
+Deploy the contents of `nginx/` to `/etc/nginx/`, preserving this directory
+structure. Install the unit files in the host's system unit directory only
+after reviewing their absolute paths for that distribution.
+
+## Site configuration contract
+
+The shared configuration is a baseline, not an application policy engine.
+Individual sites and upstream applications may set stricter or
+application-specific behavior.
+
+### Security headers
+
+`includes/security-headers.conf` supplies fallback values for common security
+headers. Upstream applications may provide their own values for CSP,
+`X-Content-Type-Options`, `Referrer-Policy`, `X-Frame-Options`, and
+`Permissions-Policy`; nginx uses the upstream value instead of duplicating it.
+For proxied responses, nginx hides upstream HSTS and supplies the edge policy.
+FastCGI applications should not emit HSTS, or the site must hide that header
+with `fastcgi_hide_header`, to avoid duplicate values.
+
+nginx header inheritance is scope-sensitive: adding any `add_header` directive
+inside a lower-level `server` or `location` block prevents headers from the
+parent scope from being inherited. Such a block must explicitly include the
+shared security-header and HTTP/3 header files again when those headers should
+remain present.
+
+The baseline HSTS policy deliberately omits `includeSubDomains` and `preload`.
+Either directive commits more than the current hostname and is unsafe as a
+universal default. An individual site may opt into `includeSubDomains`, and
+later preload, only after its entire namespace and the preload requirements
+have been verified. Because nginx header inheritance is scope-sensitive, a
+site-level HSTS override must also restate the other required `add_header`
+directives at that scope.
+
+### Optional Node.js Cache-Control fallback
+
+Some Node.js applications serve static files through nginx while generating
+their other responses in the application. The shared configuration therefore
+provides an opt-in `$cache_control_fallback` map.
 
 The map is not loaded globally because its `$static_cache_control` input is
 owned by the application. Loading it when no participating application is
@@ -32,3 +166,72 @@ add_header Cache-Control $cache_control_fallback always;
 For a response served by nginx, the application's static policy is emitted.
 For a proxied response, the fallback is empty, allowing the Node.js
 application's own `Cache-Control` header to pass through without duplication.
+
+### Optional PHP-FPM and WordPress support
+
+The PHP-FPM and WordPress includes are opt-in. A site using them must:
+
+- define `$site_tag` before including a `*-by-tag.conf` file;
+- provide a PHP-FPM socket at `/run/$site_tag/php-fpm.sock`;
+- provision the writable FastCGI cache directory when caching is enabled; and
+- review the WordPress cache exclusions and response-header handling against
+  the application's authentication, personalization, and cache policy.
+
+The shared WordPress cache configuration intentionally ignores upstream
+`Cache-Control` and `Expires` headers. Do not enable it for an application
+unless that edge-controlled cache behavior is understood and desired.
+
+## Certbot renewal behavior
+
+`systemd/certbot.timer` invokes `systemd/certbot.service`. The service always
+attempts an nginx reload after Certbot exits, including when Certbot reports a
+partial renewal failure. This is intentional: certificates that did renew
+successfully must be loaded even when another certificate in the same run did
+not renew. A failed nginx reload still causes the unit to fail visibly.
+
+The included nginx HTTP listener serves `/.well-known/acme-challenge/` from
+`/var/www/letsencrypt`. Certificates and account data under `/etc/letsencrypt`
+are host state and must never be committed.
+
+Many distributions install their own Certbot timer. Do not leave two renewal
+schedulers active; choose either the distribution unit or this repository's
+unit after comparing their behavior.
+
+## Validation
+
+Run these checks on the target host before enabling the service:
+
+```sh
+nginx -v
+nginx -V 2>&1
+sudo nginx -t -c /etc/nginx/nginx.conf
+sudo systemd-analyze verify /etc/systemd/system/nginx.service
+sudo systemd-analyze verify /etc/systemd/system/certbot.service /etc/systemd/system/certbot.timer
+sudo certbot renew --dry-run
+```
+
+After deployment, verify the expected headers and protocol behavior against a
+non-production hostname before moving public traffic. Be cautious with
+`nginx -T`: its output may disclose hostnames, upstream addresses, filesystem
+paths, and other deployment details unsuitable for a public issue or log.
+
+## Public repository rules
+
+Before committing, confirm that the diff contains none of the following:
+
+- private keys, certificates, ACME account state, or credentials;
+- real upstream IP addresses, ports, or internal DNS names;
+- customer or production hostnames that are not already public; or
+- generated logs, caches, PID files, temporary files, or local editor state.
+
+The root and `nginx/upstreams/` `.gitignore` files enforce the common cases,
+but they are not a substitute for reviewing the staged diff.
+
+## References
+
+- [nginx HTTP/2 module](https://nginx.org/en/docs/http/ngx_http_v2_module.html)
+- [nginx HTTP/3 module](https://nginx.org/en/docs/http/ngx_http_v3_module.html)
+- [nginx build options](https://nginx.org/en/docs/configure.html)
+- [nginx SSL module](https://nginx.org/en/docs/http/ngx_http_ssl_module.html)
+- [ngx_brotli build instructions](https://github.com/google/ngx_brotli)
+- [Certbot renewal documentation](https://eff-certbot.readthedocs.io/en/stable/using.html#renewing-certificates)
