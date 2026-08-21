@@ -24,6 +24,10 @@ bantime.maxtime = 1w
 [sshd]
 enabled = true
 backend = systemd
+# Ban where sshd actually listens; the default action scopes bans to the
+# jail's ports. Matches ssh/sshd_config.d/40-baseline-port.conf — change the
+# two together.
+port = 2356
 
 [nginx-http-auth]
 enabled = true
