@@ -1,0 +1,4 @@
+# Upstream definitions are deployment-specific and may expose private hosts.
+# Keep this placeholder so nginx/upstreams exists in a fresh checkout.
+*
+!.gitignore
