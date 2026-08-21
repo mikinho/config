@@ -18,7 +18,7 @@ this public repository.
 | nginx | **1.25.1** | `http2 on;` was introduced in 1.25.1; the HTTP/3 and QUIC module was introduced in 1.25.0. |
 | Linux kernel | **5.7** | Required by `quic_bpf on;`. This configuration is Linux-specific because it also uses `epoll` and systemd. |
 | OpenSSL | **1.1.1** | Required for TLS 1.3 and nginx's HTTP/3 support. |
-| systemd | **247** | Required for the service sandbox, including `ProtectProc`. |
+| systemd | **249** | Required for the service sandbox, including `ProtectProc` and `SocketBindDeny`. |
 | Certbot | A currently supported release | Required only for the included ACME renewal service and timer. |
 
 nginx 1.25.1 is the minimum version that can parse the complete configuration;
@@ -82,7 +82,7 @@ The checked-in paths assume this layout:
 | `/var/lib/nginx/client_tmp` | Writable client-body temporary directory. |
 | `/var/lib/nginx/proxy_tmp` | Writable proxy temporary directory. |
 | `/var/lib/nginx/fastcgi` | Writable FastCGI cache directory when PHP or WordPress caching is enabled. |
-| `/var/www/letsencrypt` | ACME HTTP-01 webroot, readable by nginx and writable by Certbot. |
+| `/var/www/letsencrypt` | Root-owned ACME HTTP-01 webroot; mode `0750` with group `nginx` is recommended so Certbot can write and nginx can read. |
 
 The host firewall must allow TCP ports 80 and 443. Allow UDP port 443 as well
 to make HTTP/3 available; clients fall back to HTTP/2 or HTTP/1.1 when UDP is
@@ -203,11 +203,25 @@ unless that edge-controlled cache behavior is understood and desired.
 attempts an nginx reload after Certbot exits, including when Certbot reports a
 partial renewal failure. This is intentional: certificates that did renew
 successfully must be loaded even when another certificate in the same run did
-not renew. A failed nginx reload still causes the unit to fail visibly.
+not renew. The reload runs from `ExecStopPost`, so Certbot's original nonzero
+status is preserved rather than ignored. A failed nginx reload also causes the
+unit to fail visibly.
 
 The included nginx HTTP listener serves `/.well-known/acme-challenge/` from
 `/var/www/letsencrypt`. Certificates and account data under `/etc/letsencrypt`
 are host state and must never be committed.
+
+The Certbot unit is confined to the webroot renewal flow used by this
+repository. It can write only its systemd-managed configuration, state, and
+log directories plus `/var/www/letsencrypt`; it cannot bind a listening
+socket and has no Linux capabilities. Renewal hooks and authenticator plugins
+inherit this sandbox. A deployment using the standalone authenticator, an HSM,
+or a hook that writes elsewhere must add the smallest necessary systemd
+drop-in and re-run the dry-run validation.
+
+`SystemCallFilter` and `MemoryDenyWriteExecute` are intentionally not enabled
+for Certbot until they have been tested with the target host's Python,
+cryptography library, and installed plugins.
 
 Many distributions install their own Certbot timer. Do not leave two renewal
 schedulers active; choose either the distribution unit or this repository's
@@ -223,6 +237,7 @@ nginx -V 2>&1
 sudo nginx -t -c /etc/nginx/nginx.conf
 sudo systemd-analyze verify /etc/systemd/system/nginx.service
 sudo systemd-analyze verify /etc/systemd/system/certbot.service /etc/systemd/system/certbot.timer
+sudo systemd-analyze security nginx.service certbot.service
 sudo certbot renew --dry-run
 ```
 
