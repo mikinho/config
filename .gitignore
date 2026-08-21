@@ -22,11 +22,22 @@
 .env.*
 !.env.example
 !.env.*.example
+.envrc
 *.key
 *.pem
+*.csr
+*.crt
+*.cer
+*.der
 *.p12
 *.pfx
+*.p7b
+*.p7c
 *.jks
+.htpasswd
+.htpasswd.*
+acme.json
+letsencrypt/
 credentials/
 secrets/
 
@@ -34,4 +45,3 @@ secrets/
 *.log
 *.pid
 *.pid.lock
-
