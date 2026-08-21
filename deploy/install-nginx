@@ -1,0 +1,291 @@
+#!/bin/sh
+
+set -eu
+
+PROGRAM_NAME=${0##*/}
+SCRIPT_DIRECTORY=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+REPOSITORY_ROOT=$(CDPATH= cd -- "$SCRIPT_DIRECTORY/.." && pwd)
+NGINX_SOURCE=$REPOSITORY_ROOT/nginx
+PROFILE_DIRECTORY=$SCRIPT_DIRECTORY/profiles
+SCRATCH_DIRECTORY=
+STAGING_DIRECTORY=
+
+usage() {
+    cat <<EOF
+Usage:
+  $PROGRAM_NAME --check
+  $PROGRAM_NAME --list-profiles
+  $PROGRAM_NAME --output DIRECTORY [--profile NAME ...]
+
+The baseline profile is always selected. The output must not already exist.
+EOF
+}
+
+fail() {
+    printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2
+    exit 1
+}
+
+cleanup() {
+    if [ -n "$STAGING_DIRECTORY" ] && [ -d "$STAGING_DIRECTORY" ]; then
+        rm -rf -- "$STAGING_DIRECTORY"
+    fi
+
+    if [ -n "$SCRATCH_DIRECTORY" ] && [ -d "$SCRATCH_DIRECTORY" ]; then
+        rm -rf -- "$SCRATCH_DIRECTORY"
+    fi
+}
+
+trap cleanup EXIT HUP INT TERM
+
+validate_profile_name() {
+    profile_name=$1
+
+    case "$profile_name" in
+        '' | -* | *- | *[!a-z0-9-]*)
+            fail "invalid profile name: $profile_name"
+            ;;
+    esac
+}
+
+validate_stub_entry() {
+    stub_entry=$1
+    profile_file=$2
+
+    case "$stub_entry" in
+        /* | *..* | *[!a-z0-9./-]*)
+            fail "invalid stub path in $profile_file: $stub_entry"
+            ;;
+        stubs/http/*.conf)
+            stub_name=${stub_entry#stubs/http/}
+            case "$stub_name" in
+                '' | */*) fail "invalid HTTP stub path in $profile_file: $stub_entry" ;;
+            esac
+            ;;
+        stubs/*.conf)
+            stub_name=${stub_entry#stubs/}
+            case "$stub_name" in
+                '' | */*) fail "invalid main stub path in $profile_file: $stub_entry" ;;
+            esac
+            ;;
+        *)
+            fail "profile entry is not a stub in $profile_file: $stub_entry"
+            ;;
+    esac
+
+    stub_source=$NGINX_SOURCE/$stub_entry
+    [ -f "$stub_source" ] || fail "missing stub referenced by $profile_file: $stub_entry"
+    [ ! -L "$stub_source" ] || fail "profile stubs must not be symbolic links: $stub_entry"
+}
+
+collect_profile() {
+    profile_name=$1
+    output_file=$2
+    validate_profile_name "$profile_name"
+
+    profile_file=$PROFILE_DIRECTORY/$profile_name.profile
+    [ -f "$profile_file" ] || fail "unknown profile: $profile_name"
+    [ ! -L "$profile_file" ] || fail "profile manifests must not be symbolic links: $profile_name"
+
+    while IFS= read -r stub_entry || [ -n "$stub_entry" ]; do
+        case "$stub_entry" in
+            '' | \#*) continue ;;
+        esac
+
+        validate_stub_entry "$stub_entry" "$profile_file"
+        printf '%s\n' "$stub_entry" >> "$output_file"
+    done < "$profile_file"
+}
+
+validate_all_profiles() {
+    all_profile_stubs=$SCRATCH_DIRECTORY/all-profile-stubs
+    all_source_stubs=$SCRATCH_DIRECTORY/all-source-stubs
+    : > "$all_profile_stubs"
+
+    profile_count=0
+    for profile_file in "$PROFILE_DIRECTORY"/*.profile; do
+        [ -f "$profile_file" ] || fail "no deployment profiles found"
+        profile_name=${profile_file##*/}
+        profile_name=${profile_name%.profile}
+        collect_profile "$profile_name" "$all_profile_stubs"
+        profile_count=$((profile_count + 1))
+    done
+
+    LC_ALL=C sort -u "$all_profile_stubs" -o "$all_profile_stubs"
+    find "$NGINX_SOURCE/stubs" -type f -name '*.conf' -print \
+        | sed "s|$NGINX_SOURCE/||" \
+        | LC_ALL=C sort > "$all_source_stubs"
+
+    if ! diff -u "$all_source_stubs" "$all_profile_stubs"; then
+        fail "every stub must be assigned to at least one deployment profile"
+    fi
+
+    printf 'Validated %s profiles and all stub assignments.\n' "$profile_count"
+}
+
+list_profiles() {
+    for profile_file in "$PROFILE_DIRECTORY"/*.profile; do
+        [ -f "$profile_file" ] || fail "no deployment profiles found"
+        profile_name=${profile_file##*/}
+        printf '%s\n' "${profile_name%.profile}"
+    done
+}
+
+copy_configuration() {
+    selected_stubs=$1
+
+    mkdir -p \
+        "$STAGING_DIRECTORY/includes" \
+        "$STAGING_DIRECTORY/sites" \
+        "$STAGING_DIRECTORY/stubs/http" \
+        "$STAGING_DIRECTORY/upstreams" \
+        "$STAGING_DIRECTORY/trusted-proxies"
+
+    cp "$NGINX_SOURCE/nginx.conf" "$STAGING_DIRECTORY/nginx.conf"
+
+    for source_file in "$NGINX_SOURCE"/includes/*.conf; do
+        cp "$source_file" "$STAGING_DIRECTORY/includes/"
+    done
+
+    for source_file in "$NGINX_SOURCE"/sites/*.conf; do
+        cp "$source_file" "$STAGING_DIRECTORY/sites/"
+    done
+
+    while IFS= read -r stub_entry || [ -n "$stub_entry" ]; do
+        destination_file=$STAGING_DIRECTORY/$stub_entry
+        destination_directory=${destination_file%/*}
+        mkdir -p "$destination_directory"
+        cp "$NGINX_SOURCE/$stub_entry" "$destination_file"
+    done < "$selected_stubs"
+}
+
+generate_quic_host_key() {
+    selected_stubs=$1
+
+    if grep -qx 'stubs/http/quic.conf' "$selected_stubs"; then
+        (
+            umask 077
+            dd if=/dev/urandom of="$STAGING_DIRECTORY/quic_host.key" bs=80 count=1 2>/dev/null
+        )
+
+        key_size=$(wc -c < "$STAGING_DIRECTORY/quic_host.key" | tr -d ' ')
+        [ "$key_size" = 80 ] || fail "failed to generate the QUIC host key"
+    fi
+}
+
+write_install_manifest() {
+    selected_profiles=$1
+    selected_stubs=$2
+    manifest=$STAGING_DIRECTORY/INSTALL-PROFILE
+
+    {
+        printf '%s\n' '# Selected profiles'
+        sed 's/^/profile /' "$selected_profiles"
+        printf '%s\n' '# Selected stubs'
+        sed 's/^/stub /' "$selected_stubs"
+    } > "$manifest"
+}
+
+render_configuration() {
+    output_directory=$1
+    requested_profiles=$2
+
+    case "$output_directory" in
+        '' | / | . | ..) fail "refusing unsafe output directory: $output_directory" ;;
+    esac
+
+    [ ! -e "$output_directory" ] || fail "output already exists: $output_directory"
+
+    output_parent=${output_directory%/*}
+    if [ "$output_parent" = "$output_directory" ]; then
+        output_parent=.
+    fi
+    output_name=${output_directory##*/}
+    [ -n "$output_name" ] || fail "invalid output directory: $output_directory"
+
+    mkdir -p "$output_parent"
+    STAGING_DIRECTORY=$(mktemp -d "$output_parent/.$output_name.XXXXXX")
+
+    selected_profiles=$SCRATCH_DIRECTORY/selected-profiles
+    selected_stubs=$SCRATCH_DIRECTORY/selected-stubs
+    {
+        printf '%s\n' baseline
+        printf '%s\n' "$requested_profiles"
+    } | sed '/^$/d' | LC_ALL=C sort -u > "$selected_profiles"
+    : > "$selected_stubs"
+
+    while IFS= read -r profile_name || [ -n "$profile_name" ]; do
+        collect_profile "$profile_name" "$selected_stubs"
+    done < "$selected_profiles"
+    LC_ALL=C sort -u "$selected_stubs" -o "$selected_stubs"
+
+    copy_configuration "$selected_stubs"
+    generate_quic_host_key "$selected_stubs"
+    write_install_manifest "$selected_profiles" "$selected_stubs"
+
+    mv "$STAGING_DIRECTORY" "$output_directory"
+    STAGING_DIRECTORY=
+    printf 'Rendered nginx install tree: %s\n' "$output_directory"
+}
+
+mode=
+output_directory=
+requested_profiles=
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --check)
+            [ -z "$mode" ] || fail "select exactly one operating mode"
+            mode=check
+            shift
+            ;;
+        --list-profiles)
+            [ -z "$mode" ] || fail "select exactly one operating mode"
+            mode=list
+            shift
+            ;;
+        --output)
+            [ -z "$mode" ] || [ "$mode" = render ] || fail "select exactly one operating mode"
+            [ "$#" -ge 2 ] || fail "--output requires a directory"
+            mode=render
+            output_directory=$2
+            shift 2
+            ;;
+        --profile)
+            [ "$#" -ge 2 ] || fail "--profile requires a name"
+            validate_profile_name "$2"
+            requested_profiles=$requested_profiles${requested_profiles:+"
+"}$2
+            shift 2
+            ;;
+        --help | -h)
+            usage
+            exit 0
+            ;;
+        *)
+            fail "unknown argument: $1"
+            ;;
+    esac
+done
+
+[ -n "$mode" ] || {
+    usage >&2
+    exit 1
+}
+
+SCRATCH_DIRECTORY=$(mktemp -d "${TMPDIR:-/tmp}/config-nginx.XXXXXX")
+
+case "$mode" in
+    check)
+        [ -z "$requested_profiles" ] || fail "--profile is valid only with --output"
+        validate_all_profiles
+        ;;
+    list)
+        [ -z "$requested_profiles" ] || fail "--profile is valid only with --output"
+        list_profiles
+        ;;
+    render)
+        [ -n "$output_directory" ] || fail "--output requires a directory"
+        render_configuration "$output_directory" "$requested_profiles"
+        ;;
+esac
