@@ -157,6 +157,14 @@ those paths for a different layout, and add any other required location with
 `systemctl edit php-fpm@SITE_TAG.service`; then rerun configuration and
 application tests.
 
+`SocketBindDeny=any` blocks network listeners while leaving outbound client
+connections and the Unix-domain socket untouched; a pool mistakenly changed
+to a TCP `listen` fails at startup instead of exposing a port. A candidate
+further step is `PrivateUsers=yes`, reasonable because the master runs
+unprivileged — but validate the socket ACL grant and mixed-ownership content
+reads on a real site before adopting it, in the same deferred spirit as the
+nginx capability set.
+
 `MemoryDenyWriteExecute=yes` intentionally prevents PHP, PCRE, and extensions
 from creating writable executable mappings. A workload that truly requires
 JIT must set it to `no` in a local drop-in and review the corresponding SELinux

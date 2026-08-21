@@ -68,6 +68,9 @@ SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# Outbound client connections stay available for application APIs, but a pool
+# misconfigured with a TCP listen fails hard instead of opening a port.
+SocketBindDeny=any
 MemoryDenyWriteExecute=yes
 CapabilityBoundingSet=
 AmbientCapabilities=
