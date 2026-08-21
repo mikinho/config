@@ -170,6 +170,17 @@ plugins or deployment tools require functions in the disabled list. Adjust
 the site pool after compatibility testing; do not weaken the systemd or SELinux
 boundary merely to preserve those PHP settings.
 
+The sample hard-stops a web request after 60 seconds and leaves nginx at its
+default 60-second FastCGI read timeout. These controls have different semantics:
+FPM limits total request lifetime, while nginx limits silence between upstream
+reads. Neither slows a successful request. Raising both to 300 seconds would
+increase the worst-case occupancy of each FPM worker fivefold, so use
+[WP-CLI](https://developer.wordpress.org/cli/) or a background worker for
+long-running updates, imports, backups, and maintenance.
+If a site genuinely needs a longer browser-driven operation, raise both its
+pool deadline and its custom nginx location timeout, then re-evaluate
+`pm.max_children`, rate limits, and failure recovery together.
+
 Master, worker, and application errors are routed to the per-instance journal;
 the baseline creates no writable log file under the website. PHP-FPM slow logs
 are deliberately opt-in because collecting a worker backtrace uses `ptrace`
