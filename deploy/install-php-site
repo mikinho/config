@@ -1,0 +1,140 @@
+#!/bin/sh
+
+set -eu
+
+PROGRAM_NAME=${0##*/}
+SCRIPT_DIRECTORY=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+REPOSITORY_ROOT=$(CDPATH= cd -- "$SCRIPT_DIRECTORY/.." && pwd)
+SAMPLE_TAG=sample_wp
+STAGING_DIRECTORY=
+
+usage() {
+    cat <<EOF
+Usage:
+  $PROGRAM_NAME --output DIRECTORY --tag SITE_TAG
+
+Renders the per-site PHP-FPM configuration set for SITE_TAG from the public
+$SAMPLE_TAG example: the FPM main configuration, the pool, and the systemd
+writable-paths drop-in, laid out under etc/ exactly as they install. The
+output must not already exist and the live system is never written. Review
+the render, then follow php-fpm/README.md to provision the site identity,
+SELinux labels, and installation.
+EOF
+}
+
+fail() {
+    printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2
+    exit 1
+}
+
+cleanup() {
+    if [ -n "$STAGING_DIRECTORY" ] && [ -d "$STAGING_DIRECTORY" ]; then
+        rm -rf -- "$STAGING_DIRECTORY"
+    fi
+}
+
+trap cleanup EXIT HUP INT TERM
+
+validate_site_tag() {
+    candidate_tag=$1
+
+    case "$candidate_tag" in
+        [a-z]*) ;;
+        *) fail "site tag must start with a lowercase letter: $candidate_tag" ;;
+    esac
+
+    case "$candidate_tag" in
+        *[!a-z0-9_]*)
+            fail "site tag may contain only lowercase letters, digits, and underscores: $candidate_tag"
+            ;;
+    esac
+}
+
+render_file() {
+    source_relative=$1
+    destination_relative=$2
+
+    source_path=$REPOSITORY_ROOT/$source_relative
+    destination_path=$STAGING_DIRECTORY/$destination_relative
+
+    [ -f "$source_path" ] || fail "missing source file: $source_relative"
+    mkdir -p "${destination_path%/*}"
+    sed "s/$SAMPLE_TAG/$site_tag/g" "$source_path" > "$destination_path"
+}
+
+render_site() {
+    target_directory=$1
+
+    case "$target_directory" in
+        '' | / | . | ..) fail "refusing unsafe output directory: $target_directory" ;;
+    esac
+
+    [ ! -e "$target_directory" ] || fail "output already exists: $target_directory"
+
+    target_parent=${target_directory%/*}
+    if [ "$target_parent" = "$target_directory" ]; then
+        target_parent=.
+    fi
+    target_name=${target_directory##*/}
+    [ -n "$target_name" ] || fail "invalid output directory: $target_directory"
+
+    mkdir -p "$target_parent"
+    STAGING_DIRECTORY=$(mktemp -d "$target_parent/.$target_name.XXXXXX")
+
+    render_file "php-fpm/sites/$SAMPLE_TAG.conf" \
+        "etc/php-fpm.d/sites/$site_tag.conf"
+    render_file "php-fpm/pool/$SAMPLE_TAG.conf" \
+        "etc/php-fpm.d/pool/$site_tag.conf"
+    render_file "systemd/php-fpm@$SAMPLE_TAG.service.d/writable-paths.conf" \
+        "etc/systemd/system/php-fpm@$site_tag.service.d/writable-paths.conf"
+
+    if [ "$site_tag" != "$SAMPLE_TAG" ] \
+        && grep -q -r -- "$SAMPLE_TAG" "$STAGING_DIRECTORY"; then
+        fail "render left $SAMPLE_TAG tokens behind"
+    fi
+
+    {
+        printf '%s\n' '# Rendered PHP-FPM site'
+        printf 'tag %s\n' "$site_tag"
+        find "$STAGING_DIRECTORY/etc" -type f \
+            | sed "s|$STAGING_DIRECTORY/|file |" \
+            | LC_ALL=C sort
+    } > "$STAGING_DIRECTORY/INSTALL-SITE"
+
+    mv "$STAGING_DIRECTORY" "$target_directory"
+    STAGING_DIRECTORY=
+    printf 'Rendered PHP-FPM site tree: %s\n' "$target_directory"
+}
+
+output_directory=
+site_tag=
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --output)
+            [ "$#" -ge 2 ] || fail "--output requires a directory"
+            output_directory=$2
+            shift 2
+            ;;
+        --tag)
+            [ "$#" -ge 2 ] || fail "--tag requires a site tag"
+            site_tag=$2
+            shift 2
+            ;;
+        --help | -h)
+            usage
+            exit 0
+            ;;
+        *)
+            fail "unknown argument: $1"
+            ;;
+    esac
+done
+
+[ -n "$output_directory" ] && [ -n "$site_tag" ] || {
+    usage >&2
+    exit 1
+}
+
+validate_site_tag "$site_tag"
+render_site "$output_directory"

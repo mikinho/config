@@ -97,31 +97,33 @@ install -d -o SITE_TAG -g SITE_TAG -m 0755 \
   /var/www/SITE_TAG/wordpress/wp-content/uploads
 ```
 
-Install site-specific copies of the two example configurations, writable-path
-drop-in, and template unit under their documented paths. The example below
-uses a shell-safe tag accepted by both systemd and the local user database. Do
-not enable a corresponding `.socket` unit; PHP-FPM owns the socket.
+Render the site-specific configuration set with the repository renderer,
+which validates the tag against `^[a-z][a-z0-9_]*$`, refuses an existing
+output, never touches the live system, and verifies that no `sample_wp`
+token survives:
+
+```sh
+deploy/install-php-site --output /tmp/php-example_wp --tag example_wp
+```
+
+Review the rendered tree and its `INSTALL-SITE` manifest, then install it as
+laid out — the paths under `etc/` mirror their destinations exactly. Do not
+enable a corresponding `.socket` unit; PHP-FPM owns the socket.
 
 ```sh
 site_tag=example_wp
 install -d -m 0755 /etc/php-fpm.d/sites /etc/php-fpm.d/pool
-install -m 0644 php-fpm/sites/sample_wp.conf "/etc/php-fpm.d/sites/$site_tag.conf"
-install -m 0644 php-fpm/pool/sample_wp.conf "/etc/php-fpm.d/pool/$site_tag.conf"
+install -m 0644 "/tmp/php-$site_tag/etc/php-fpm.d/sites/$site_tag.conf" \
+  "/etc/php-fpm.d/sites/$site_tag.conf"
+install -m 0644 "/tmp/php-$site_tag/etc/php-fpm.d/pool/$site_tag.conf" \
+  "/etc/php-fpm.d/pool/$site_tag.conf"
 install -D -m 0644 \
-  systemd/php-fpm@sample_wp.service.d/writable-paths.conf \
-  "/etc/systemd/system/php-fpm@$site_tag.service.d/writable-paths.conf"
-sed -i "s/sample_wp/$site_tag/g" \
-  "/etc/php-fpm.d/sites/$site_tag.conf" \
-  "/etc/php-fpm.d/pool/$site_tag.conf" \
+  "/tmp/php-$site_tag/etc/systemd/system/php-fpm@$site_tag.service.d/writable-paths.conf" \
   "/etc/systemd/system/php-fpm@$site_tag.service.d/writable-paths.conf"
 install -m 0644 systemd/php-fpm@.service /etc/systemd/system/php-fpm@.service
 systemctl daemon-reload
 systemctl enable --now "php-fpm@$site_tag.service"
 ```
-
-Validate the tag against `^[a-z][a-z0-9_]*$` before using an automated value in
-these commands. The installed copies must have every `sample_wp` token
-replaced with the actual tag before validation or startup.
 
 ## SELinux
 
