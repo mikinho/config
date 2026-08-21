@@ -9,9 +9,10 @@ usage() {
 Usage:
   $PROGRAM_NAME
 
-Registers the persistent SELinux file contexts required by the nginx baseline
-beyond the distribution policy, then relabels the affected paths when they
-exist. Run as root on an SELinux-enabled RHEL-family host after installing
+Registers the persistent SELinux policy the nginx baseline requires beyond
+the distribution policy: file contexts for the unit's runtime directories,
+the QUIC UDP port label, and the setrlimit boolean. Idempotent; run as root
+on an SELinux-enabled RHEL-family host after installing
 systemd/nginx.service.
 EOF
 }
@@ -30,6 +31,8 @@ command -v semanage >/dev/null 2>&1 \
     || fail 'semanage not found; install policycoreutils-python-utils'
 command -v restorecon >/dev/null 2>&1 \
     || fail 'restorecon not found; install policycoreutils'
+command -v setsebool >/dev/null 2>&1 \
+    || fail 'setsebool not found; install policycoreutils'
 command -v selinuxenabled >/dev/null 2>&1 \
     || fail 'selinuxenabled not found; install libselinux-utils'
 selinuxenabled || fail 'SELinux is not enabled on this host'
@@ -44,6 +47,17 @@ ensure_file_context() {
             "$path_specification"
 }
 
+ensure_port_type() {
+    port_type=$1
+    protocol=$2
+    port_number=$3
+
+    semanage port --add --type "$port_type" --proto "$protocol" \
+        "$port_number" 2>/dev/null \
+        || semanage port --modify --type "$port_type" --proto "$protocol" \
+            "$port_number"
+}
+
 # The distribution policy already labels /var/log/nginx, /var/lib/nginx,
 # /var/www, and /etc/nginx correctly. It covers only the /var/run/nginx.pid
 # file, not the PID and lock directories that systemd/nginx.service creates,
@@ -56,4 +70,15 @@ for runtime_directory in /run/nginx /run/lock/nginx; do
     restorecon -RF "$runtime_directory"
 done
 
-printf 'Registered nginx runtime file contexts.\n'
+# SELinux checks port labels per protocol, and http_port_t historically
+# lists only TCP ports. Without a UDP 443 label the QUIC listener cannot
+# bind under enforcing mode. Policies that already define it are modified
+# to the same value, which keeps this safe to re-run everywhere.
+ensure_port_type http_port_t udp 443
+
+# worker_rlimit_nofile requires setrlimit permission. Recent policies enable
+# this boolean by default; setting it explicitly keeps the baseline correct
+# on the ones that do not, and re-running is harmless.
+setsebool -P httpd_setrlimit on
+
+printf 'Registered nginx SELinux policy.\n'

@@ -16,9 +16,9 @@ systemctl enable --now nginx.service certbot.timer
 ```
 
 Enable the timer, not `certbot.service` directly; the service is its oneshot
-payload. On SELinux-enforcing hosts, run `selinux/apply-nginx-file-contexts`
-before the first start so the unit's `/run/nginx` and `/run/lock/nginx`
-directories are created with the right labels. Mask or remove any
+payload. On SELinux-enforcing hosts, run `selinux/apply-nginx-policy` before
+the first start so the unit's runtime directories are created with the right
+labels and the QUIC listener and worker rlimits are permitted. Mask or remove any
 distribution-provided nginx unit and Certbot renewal scheduler first — two
 active renewal schedulers is a misconfiguration.
 
