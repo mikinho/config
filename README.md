@@ -80,6 +80,7 @@ The checked-in paths assume this layout:
 | `/run/lock/nginx` | Lock directory; created by the nginx unit. |
 | `/var/log/nginx` | nginx log directory; created by the nginx unit. |
 | `/var/lib/nginx/client_tmp` | Writable client-body temporary directory. |
+| `/var/lib/nginx/fastcgi_tmp` | Writable FastCGI temporary directory. |
 | `/var/lib/nginx/proxy_tmp` | Writable proxy temporary directory. |
 | `/var/lib/nginx/fastcgi` | Writable FastCGI cache directory when PHP or WordPress caching is enabled. |
 | `/var/www/letsencrypt` | Root-owned ACME HTTP-01 webroot; mode `0750` with group `nginx` is recommended so Certbot can write and nginx can read. |
