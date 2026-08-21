@@ -1,0 +1,45 @@
+# fail2ban/jail.local
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
+[DEFAULT]
+# Never ban loopback. Deployment-specific administrative ranges belong in a
+# local /etc/fail2ban/jail.d drop-in, not in this shared policy.
+ignoreip = 127.0.0.1/8 ::1
+
+bantime = 1h
+findtime = 10m
+maxretry = 5
+
+# Escalate repeat offenders instead of raising the base ban time for everyone.
+bantime.increment = true
+bantime.factor = 2
+bantime.maxtime = 1w
+
+# The fail2ban-firewalld package selects the firewalld ban action through its
+# own jail.d drop-in on RHEL-family hosts; do not override banaction here.
+
+[sshd]
+enabled = true
+backend = systemd
+
+[nginx-http-auth]
+enabled = true
+logpath = /var/log/nginx/error.log
+
+# The nginx baseline logs limit_req and limit_conn events at warn, which this
+# stock filter matches. Bursts from legitimate clients are expected, so ban
+# only sustained abuse.
+[nginx-limit-req]
+enabled = true
+logpath = /var/log/nginx/error.log
+maxretry = 10
+
+# Requests answered 444 come from the default HTTP server for host names this
+# deployment does not serve. Legitimate site traffic never produces them.
+[nginx-444]
+enabled = true
+logpath = /var/log/nginx/access.log
+maxretry = 3
