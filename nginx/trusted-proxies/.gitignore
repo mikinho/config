@@ -1,0 +1,4 @@
+# Trusted proxy ranges are deployment-specific and may expose infrastructure.
+# Keep this placeholder so nginx/trusted-proxies exists in a fresh checkout.
+*
+!.gitignore
