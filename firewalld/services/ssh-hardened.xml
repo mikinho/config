@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  firewalld/services/ssh-hardened.xml
+
+  Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+
+  OpenSSH on the baseline's non-default port from
+  ssh/sshd_config.d/40-baseline-port.conf; change the two together. Named
+  distinctly from the built-in ssh service so both can be enabled during a
+  cutover and the built-in removed only after key login on this port is
+  proven.
+-->
+<service>
+  <short>ssh-hardened</short>
+  <description>OpenSSH on the baseline port 2356, matching ssh/sshd_config.d/40-baseline-port.conf.</description>
+  <port protocol="tcp" port="2356"/>
+</service>

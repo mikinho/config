@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  firewalld/zones/public.xml
+
+  Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+
+  Reference public zone for baseline hosts: exactly the product services plus
+  DHCPv6 client addressing. A zone file replaces the host's zone completely -
+  review it against the host's actual services, and never install it before
+  ssh-hardened login is proven. Compared with the stock public zone, cockpit
+  is deliberately absent, the built-in ssh service is absent because sshd
+  listens only on the hardened port, and no forward element is present
+  because these hosts do not forward between interfaces.
+-->
+<zone>
+  <short>Public</short>
+  <description>Baseline public zone: nginx edge, hardened OpenSSH, and DHCPv6 client addressing only.</description>
+  <service name="nginx"/>
+  <service name="ssh-hardened"/>
+  <service name="dhcpv6-client"/>
+</zone>

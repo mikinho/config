@@ -215,6 +215,41 @@ jobs:
               /usr/sbin/sshd -T | grep -x "kbdinteractiveauthentication no"
             '
 
+  firewalld:
+    name: firewalld config on ${{ matrix.target }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: rockylinux:9
+            target: Rocky Linux 9
+          - image: quay.io/centos/centos:stream10
+            target: CentOS Stream 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Validate services and zone
+        run: |
+          docker run --rm \
+            --volume "$PWD:/workspace:ro" \
+            "${{ matrix.image }}" \
+            /bin/bash -euxo pipefail -c '
+              dnf install --assumeyes firewalld
+              install -m 0644 /workspace/firewalld/services/*.xml /etc/firewalld/services/
+              install -m 0644 /workspace/firewalld/zones/*.xml /etc/firewalld/zones/
+              firewall-offline-cmd --check-config
+              firewall-offline-cmd --info-service=nginx
+              firewall-offline-cmd --info-service=ssh-hardened
+              firewall-offline-cmd --zone=public --list-services |
+                grep -w nginx
+              firewall-offline-cmd --zone=public --list-services |
+                grep -w ssh-hardened
+            '
+
   secrets:
     name: Public secret scan
     runs-on: ubuntu-24.04
