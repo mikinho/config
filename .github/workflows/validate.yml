@@ -211,7 +211,7 @@ jobs:
             '
 
   php-fpm:
-    name: PHP-FPM configuration on ${{ matrix.target }}
+    name: PHP-FPM sample on ${{ matrix.target }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     strategy:
@@ -227,7 +227,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Test the public PHP-FPM sample
+      - name: Test the public PHP-FPM configuration and socket ACL
         run: |
           docker run --rm \
             --volume "$PWD:/workspace:ro" \
@@ -238,7 +238,7 @@ jobs:
               else
                 dnf install --assumeyes php-fpm
               fi
-              dnf install --assumeyes shadow-utils
+              dnf install --assumeyes acl shadow-utils util-linux
               getent group nginx >/dev/null || groupadd --system nginx
               id nginx >/dev/null 2>&1 ||
                 useradd --system --gid nginx --no-create-home nginx
@@ -257,6 +257,50 @@ jobs:
               runuser --user sample_wp -- \
                 /sbin/php-fpm --test \
                   --fpm-config /etc/php-fpm.d/sites/sample_wp.conf
+
+              fpm_pid=
+              cleanup_fpm() {
+                if [ -n "${fpm_pid}" ] && kill -0 "${fpm_pid}" 2>/dev/null; then
+                  kill -QUIT "${fpm_pid}"
+                  wait "${fpm_pid}" || true
+                fi
+              }
+              trap cleanup_fpm EXIT
+
+              sample_uid=$(id -u sample_wp)
+              sample_gid=$(id -g sample_wp)
+              setpriv \
+                --reuid="${sample_uid}" \
+                --regid="${sample_gid}" \
+                --init-groups \
+                /sbin/php-fpm \
+                  --nodaemonize \
+                  --force-stderr \
+                  --fpm-config /etc/php-fpm.d/sites/sample_wp.conf &
+              fpm_pid=$!
+
+              for attempt in {1..50}; do
+                if [ -S /run/sample_wp/php-fpm.sock ]; then
+                  break
+                fi
+                if ! kill -0 "${fpm_pid}" 2>/dev/null; then
+                  wait "${fpm_pid}"
+                  exit 1
+                fi
+                sleep 0.1
+              done
+
+              test -S /run/sample_wp/php-fpm.sock
+              getfacl --absolute-names /run/sample_wp/php-fpm.sock |
+                grep --fixed-strings "user:nginx:rw-"
+              runuser --user nginx -- test -r /run/sample_wp/php-fpm.sock
+              runuser --user nginx -- test -w /run/sample_wp/php-fpm.sock
+
+              kill -QUIT "${fpm_pid}"
+              wait "${fpm_pid}"
+              fpm_pid=
+              trap - EXIT
+              test ! -S /run/sample_wp/php-fpm.sock
             '
 
   ssh:

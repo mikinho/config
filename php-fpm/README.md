@@ -205,6 +205,12 @@ sudo -u nginx test -w /run/SITE_TAG/php-fpm.sock
 journalctl --unit php-fpm@SITE_TAG.service
 ```
 
+Public CI performs the configuration test on Rocky Linux 9 and CentOS Stream
+10, starts the sample master directly as `sample_wp`, verifies the live socket
+ACL as `nginx`, and exercises graceful `SIGQUIT` shutdown. It does not emulate
+a booted systemd manager or enforcing SELinux; the unit, labels, application
+traffic, and complete sandbox still require the target-host checks above.
+
 `systemd-analyze security` is advisory; verify the application, outbound
 dependencies, uploads, sessions, reload, and graceful shutdown on the target
 host. Reloading sends PHP-FPM `SIGUSR2`; stopping sends `SIGQUIT` for graceful
