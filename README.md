@@ -43,6 +43,7 @@ The build must provide these non-default modules:
 - `--with-http_v2_module`
 - `--with-http_v3_module`
 - `--with-http_gzip_static_module`
+- `--with-http_realip_module` when `stubs/http/realip.conf` is selected
 - `--with-http_stub_status_module`
 - `--with-http_sub_module` when `includes/relativeurls.conf` is used
 
@@ -84,6 +85,7 @@ The checked-in paths assume this layout:
 | `/var/lib/nginx/proxy_tmp` | Writable proxy temporary directory. |
 | `/var/lib/nginx/fastcgi` | Writable FastCGI cache directory when PHP or WordPress caching is enabled. |
 | `/var/www/letsencrypt` | Root-owned ACME HTTP-01 webroot; mode `0750` with group `nginx` is recommended so Certbot can write and nginx can read. |
+| `/etc/nginx/trusted-proxies` | Deployment-local `set_real_ip_from` directives when trusted proxy address restoration is enabled. |
 
 The host firewall must allow TCP ports 80 and 443. Allow UDP port 443 as well
 to make HTTP/3 available; clients fall back to HTTP/2 or HTTP/1.1 when UDP is
@@ -103,6 +105,8 @@ unavailable.
 - `nginx/upstreams/` is reserved for deployment-specific upstream definitions.
   Its contents are ignored by Git, while its `.gitignore` keeps the empty
   directory in the repository.
+- `nginx/trusted-proxies/` is reserved for deployment-specific trusted proxy
+  CIDRs. Its contents are likewise ignored by Git.
 - `systemd/` contains the nginx service and Certbot renewal units.
 
 Deploy the selected contents of `nginx/` to `/etc/nginx/`, preserving this
@@ -122,6 +126,7 @@ The selected configuration has these stub dependencies:
 | `http/ratelimit.conf` | http | A selected site or include uses `limit_req` or `limit_conn`, including `_http_.conf`, `http.conf`, and `wordpress-by-tag.conf`. |
 | `http/fastcgi-cache.conf` | http | WordPress FastCGI caching is enabled through `wordpress-cache.conf`. |
 | `http/websocket.conf` | http | A reverse-proxy site uses `$connection_upgrade`. |
+| `http/realip.conf` | http | nginx receives traffic through explicitly trusted reverse proxies and rate limits must use the restored client address. |
 | `http/gzip.conf` | http | gzip response compression is desired. |
 | `http/brotli.conf` | http | Brotli response compression is desired; install together with `brotli.conf`. |
 
@@ -156,6 +161,26 @@ and nginx build. `LimitMEMLOCK=64M` is provided for the optional eBPF map.
 The shared configuration is a baseline, not an application policy engine.
 Individual sites and upstream applications may set stricter or
 application-specific behavior.
+
+### Trusted proxy client addresses
+
+Direct clients can forge forwarding headers, so the baseline never trusts
+them automatically. Selecting `stubs/http/realip.conf` enables recursive
+`X-Forwarded-For` processing only for peers listed by `set_real_ip_from` in
+deployment-local `trusted-proxies/*.conf` files. For example, a reverse proxy
+on the same host can be declared with:
+
+```nginx
+set_real_ip_from 127.0.0.1;
+set_real_ip_from ::1;
+```
+
+Use only the immediate proxy addresses or exact provider-published networks;
+never use an unrestricted range. The restored address becomes `$remote_addr`
+and `$binary_remote_addr`, so the shared rate limits apply per client instead
+of treating every request as the proxy or exempt loopback. A provider-specific
+header or the PROXY protocol requires a reviewed site-specific configuration,
+matching listener settings, and controls that prevent direct origin access.
 
 ### Security headers
 
