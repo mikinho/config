@@ -50,6 +50,7 @@ nginx -V 2>&1
 
 The build must provide these non-default modules:
 
+- `--with-threads`
 - `--with-http_ssl_module`
 - `--with-http_v2_module`
 - `--with-http_v3_module`
