@@ -92,10 +92,10 @@ unavailable.
 
 - `nginx/nginx.conf` is the top-level configuration.
 - `nginx/includes/` contains reusable behavior included by site definitions.
-- `nginx/stubs/` contains optional `http {}`-level maps, cache zones, and
-  rate-limit zones selected by the installer. `nginx.conf` loads every
-  `*.conf` stub present on the deployed host, so the installer must copy only
-  the features that host needs.
+- `nginx/stubs/` contains installer-selected `http {}`-level policies, maps,
+  cache zones, and rate-limit zones. `nginx.conf` loads every `*.conf` stub
+  present on the deployed host, so the installer must copy only the features
+  that host needs.
 - `nginx/sites/` contains public-safe site configuration.
 - `nginx/upstreams/` is reserved for deployment-specific upstream definitions.
   Its contents are ignored by Git, while its `.gitignore` keeps the empty
@@ -112,12 +112,22 @@ The selected configuration has these stub dependencies:
 
 | Stub | Install when |
 | --- | --- |
+| `tls.conf` | Any selected site listens with `ssl`, including `_https_.conf`. This is required for HTTPS deployments. |
 | `upstreamfallback.conf` | The baseline `security-headers.conf` include is enabled. This is required by the provided `nginx.conf`. |
 | `ratelimit.conf` | A selected site or include uses `limit_req` or `limit_conn`, including `_http_.conf`, `http.conf`, and `wordpress-by-tag.conf`. |
 | `fastcgi-cache.conf` | WordPress FastCGI caching is enabled through `wordpress-cache.conf`. |
 | `websocket.conf` | A reverse-proxy site uses `$connection_upgrade`. |
 | `gzip.conf` | gzip response compression is desired. |
 | `brotli.conf` | Brotli response compression is desired and the modules loaded by `nginx.conf` are installed. |
+
+The TLS stub deliberately omits `ssl_stapling off` because stapling is already
+disabled by default, and whether to enable it depends on the certificate
+authority and deployment. Experimental curve configuration, including hybrid
+post-quantum groups, should be added only after the deployed nginx and TLS
+library versions have been tested. `ssl_protocols` is selected before nginx
+can apply an SNI-selected virtual host's configuration, so a deployment that
+overrides it must do so on the listener's default server rather than only on a
+non-default site.
 
 ### nginx service sandbox
 
