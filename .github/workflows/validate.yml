@@ -250,6 +250,45 @@ jobs:
                 grep -w ssh-hardened
             '
 
+  selinux:
+    name: SELinux assets on ${{ matrix.target }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: rockylinux:9
+            target: Rocky Linux 9
+          - image: quay.io/centos/centos:stream10
+            target: CentOS Stream 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Build policy module and inspect port labels
+        run: |
+          docker run --rm \
+            --volume "$PWD:/workspace:ro" \
+            "${{ matrix.image }}" \
+            /bin/bash -euxo pipefail -c '
+              dnf install --assumeyes \
+                checkpolicy \
+                policycoreutils \
+                policycoreutils-python-utils \
+                selinux-policy-targeted
+              checkmodule -M -m \
+                -o /tmp/nginx_quic_bpf.mod \
+                /workspace/selinux/nginx_quic_bpf.te
+              semodule_package \
+                -o /tmp/nginx_quic_bpf.pp \
+                -m /tmp/nginx_quic_bpf.mod
+              # Informational: shows whether this policy release already
+              # labels UDP 443; apply-nginx-policy handles either state.
+              semanage port -l | grep ^http_port_t
+            '
+
   secrets:
     name: Public secret scan
     runs-on: ubuntu-24.04
