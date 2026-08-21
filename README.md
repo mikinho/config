@@ -75,6 +75,13 @@ They must be built for the exact nginx binary and compatible configure
 arguments in use. A module copied from a different nginx build may fail to
 load even when the version number appears similar.
 
+[GetPageSpeed NGINX Extras](https://www.getpagespeed.com/) is an intended
+RHEL-family package source for deployments that need pre-built dynamic-module
+RPMs. Its `nginx-module-brotli` package provides both modules named above.
+Keep nginx and every dynamic module as one publisher-supported,
+binary-compatible package set; do not leave EPEL, nginx.org, or GetPageSpeed
+modules from a different nginx build installed alongside it.
+
 ## Host prerequisites
 
 Use the official nginx.org repositories for RHEL and derivatives unless a
@@ -82,6 +89,13 @@ reviewed vendor package supplies the required version and build options. The
 distribution package may lag below this configuration's syntax floor or omit
 HTTP/3. Install runtime dependencies with `dnf`, keep the host within its
 vendor lifecycle, and apply the vendor's current security errata.
+
+Several deployments use GetPageSpeed's subscription repository for nginx,
+NGINX-MOD, and matching module RPMs. Those packages are not downloaded by this
+public repository's CI, so validate their actual `nginx -V`, OpenSSL provider,
+module set, and `nginx -t` result on every target host and after every package
+upgrade. The nginx.org RPMs remain the reproducible public CI reference, not a
+requirement to replace a validated GetPageSpeed installation.
 
 The checked-in paths assume this layout:
 
@@ -440,6 +454,8 @@ This repository is available under the [MIT License](LICENSE).
 - [nginx HTTP/3 module](https://nginx.org/en/docs/http/ngx_http_v3_module.html)
 - [nginx current releases](https://nginx.org/en/download.html)
 - [nginx packages for RHEL and derivatives](https://nginx.org/en/linux_packages.html#RHEL-CentOS)
+- [GetPageSpeed NGINX modules for enterprise Linux](https://www.getpagespeed.com/)
+- [GetPageSpeed Brotli RPM installation](https://www.getpagespeed.com/server-setup/nginx/install-nginx-with-brotli-module-in-centos-redhat-amzn-linux)
 - [nginx header inheritance](https://nginx.org/en/docs/http/ngx_http_headers_module.html#add_header_inherit)
 - [nginx real IP module](https://nginx.org/en/docs/http/ngx_http_realip_module.html)
 - [nginx build options](https://nginx.org/en/docs/configure.html)
