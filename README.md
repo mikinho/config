@@ -122,7 +122,8 @@ The checked-in paths assume this layout:
 
 The host firewall must allow TCP ports 80 and 443. Allow UDP port 443 as well
 to make HTTP/3 available; clients fall back to HTTP/2 or HTTP/1.1 when UDP is
-unavailable.
+unavailable. Install `sysctl/99-nginx-quic.conf` so the kernel honors the
+QUIC listeners' requested socket buffers instead of silently capping them.
 
 Keep SELinux enforcing. Restore the distribution labels after installing the
 configuration and content, and use `matchpathcon` or `ausearch` to investigate
@@ -163,6 +164,8 @@ TCP 443 so clients always have an HTTP/2 or HTTP/1.1 fallback.
   enforcing-mode deployments need beyond the distribution policy.
 - `fail2ban/` contains an optional intrusion-ban policy for deployments that
   receive client traffic directly.
+- `sysctl/` contains the kernel socket-buffer limits the QUIC listeners
+  depend on.
 
 Each component directory carries its own README covering that component's
 installation and validation; this document remains authoritative for the
