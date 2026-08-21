@@ -35,7 +35,7 @@ jobs:
 
       - name: Validate installer and profile coverage
         run: |
-          shellcheck deploy/install-nginx selinux/apply-nginx-policy
+          shellcheck deploy/install-nginx deploy/install-php-site selinux/apply-nginx-policy
           deploy/install-nginx --check
 
       - name: Exercise a full profile render
@@ -54,6 +54,21 @@ jobs:
           test "$(stat --format='%a' build/full/quic_host.key)" = 600
           if deploy/install-nginx --output build/full; then
             echo 'installer unexpectedly overwrote an existing output' >&2
+            exit 1
+          fi
+
+      - name: Exercise the PHP site renderer
+        run: |
+          deploy/install-php-site --output build/php-site --tag example_wp
+          test -f build/php-site/etc/php-fpm.d/sites/example_wp.conf
+          test -f build/php-site/etc/php-fpm.d/pool/example_wp.conf
+          test -f build/php-site/etc/systemd/system/php-fpm@example_wp.service.d/writable-paths.conf
+          if grep -r sample_wp build/php-site/etc; then
+            echo 'renderer left sample tokens behind' >&2
+            exit 1
+          fi
+          if deploy/install-php-site --output build/php-site --tag example_wp; then
+            echo 'renderer unexpectedly overwrote an existing output' >&2
             exit 1
           fi
 

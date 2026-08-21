@@ -26,6 +26,20 @@ preserving package files (`mime.types`, `fastcgi_params`) and
 deployment-local content (`sites`, `upstreams`, `trusted-proxies`), as the
 [root README](../README.md) describes.
 
+## PHP site renderer
+
+`install-php-site` applies the same render-only philosophy to the per-site
+PHP-FPM configuration set: it validates the site tag, renders the FPM main
+configuration, pool, and systemd writable-paths drop-in from the public
+`sample_wp` example into a new directory laid out as the files install, and
+refuses an existing output. It never touches the live system and verifies no
+sample token survives the render. `php-fpm/README.md` documents the
+provisioning steps around it.
+
+```sh
+deploy/install-php-site --output /tmp/php-example_wp --tag example_wp
+```
+
 ## Profiles
 
 Profiles are line-per-stub manifests in `profiles/`. The profile table and
