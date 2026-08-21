@@ -215,7 +215,7 @@ The selected configuration has these stub dependencies:
 | `http/upstreamfallback.conf` | http | The baseline `security-headers.conf` include is enabled. This is required by the provided `nginx.conf`. |
 | `http/ratelimit.conf` | http | A selected site or include uses `limit_req` or `limit_conn`, including `_http_.conf`, `http.conf`, and `wordpress-by-tag.conf`. |
 | `http/fastcgi-cache.conf` | http | WordPress FastCGI caching is enabled through `wordpress-cache.conf`. |
-| `http/websocket.conf` | http | A reverse-proxy site uses `$connection_upgrade`. |
+| `http/websocket.conf` | http | A reverse-proxy site uses `$connection_upgrade`, including through `includes/proxy-websocket.conf`. |
 | `http/realip.conf` | http | nginx receives traffic through explicitly trusted reverse proxies and rate limits must use the restored client address. |
 | `http/gzip.conf` | http | gzip response compression is desired. |
 | `http/brotli.conf` | http | Brotli response compression is desired; install together with `brotli.conf`. |
@@ -307,6 +307,31 @@ have been verified. A site-level HSTS override must select
 `add_header_inherit off` and restate the other required `add_header` directives
 at that scope so the baseline and site-specific HSTS values are not both
 emitted.
+
+### Reverse-proxied applications
+
+Proxy locations include `includes/proxy-common.conf`, then set `proxy_pass`
+and any application-specific overrides. The include fixes HTTP/1.1 with an
+empty `Connection` header, forwards `Host`, `X-Real-IP`, `X-Forwarded-For`,
+and `X-Forwarded-Proto`, and sets conservative connect, send, and read
+timeouts. Upstream keepalive additionally requires a `keepalive` pool in the
+deployment-local upstream block:
+
+```nginx
+upstream app {
+    server unix:/run/app/node.sock;
+    keepalive 16;
+}
+```
+
+WebSocket endpoints include `includes/proxy-websocket.conf` instead — never
+both in one location — which carries the same forwarding policy with
+connection upgrading and a longer read timeout. It requires the `websocket`
+profile's `$connection_upgrade` map.
+
+The forwarded headers state what this edge observed. `X-Forwarded-For` may
+already contain client-supplied entries; an application must trust only the
+rightmost address, or rely on the trusted-proxy address restoration above.
 
 ### Optional Node.js Cache-Control fallback
 
