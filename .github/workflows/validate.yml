@@ -91,6 +91,10 @@ jobs:
             --profile websocket \
             --profile wordpress
           test ! -e build/ci/stubs/http/post-quantum.conf
+          test ! -e build/ci/sites/sample_wp.conf.example
+          install -m 0644 \
+            nginx/sites/sample_wp.conf.example \
+            build/ci/sites/sample_wp.conf
 
       - name: Test nginx configuration
         run: |
@@ -139,6 +143,20 @@ jobs:
                 /var/run/nginx \
                 /var/run/lock/nginx \
                 /var/www/letsencrypt
+              install -d -m 0700 /etc/letsencrypt/live/example.com
+              (
+                umask 077
+                openssl req \
+                  -x509 \
+                  -newkey rsa:2048 \
+                  -nodes \
+                  -sha256 \
+                  -days 1 \
+                  -subj "/CN=example.com" \
+                  -addext "subjectAltName=DNS:example.com,DNS:www.example.com" \
+                  -keyout /etc/letsencrypt/live/example.com/privkey.pem \
+                  -out /etc/letsencrypt/live/example.com/fullchain.pem
+              )
               cp -R /profile/. /tmp/nginx/
               cp /etc/nginx/mime.types /etc/nginx/fastcgi_params /tmp/nginx/
               nginx -t -p /tmp/nginx/ -c nginx.conf

@@ -53,5 +53,8 @@ as `sites/SITE_TAG.conf`; only the installed `*.conf` copy becomes active.
 Render a profile and syntax-check it exactly as CI does, or run
 `sudo nginx -t -c /etc/nginx/nginx.conf` on the target host. CI exercises
 `nginx -t` for every push against the pinned stable and mainline nginx.org
-packages on Rocky Linux 9; a change that adds a directive must stay within
-the root README's syntax floor or advance it deliberately.
+packages on Rocky Linux 9. It activates `sample_wp.conf.example` only in the
+ephemeral CI tree and generates a one-day self-signed certificate, so the
+complete public WordPress site is parsed without making it part of an installed
+baseline. A change that adds a directive must stay within the root README's
+syntax floor or advance it deliberately.
