@@ -44,6 +44,7 @@ and updating the root README's tables in the same change.
 CI shellchecks the installer, runs `--check`, exercises a full render, and
 verifies the refusal to overwrite an existing output. It then renders a CI
 profile and runs `nginx -t` against the pinned stable and mainline nginx.org
-packages on Rocky Linux 9. The Brotli modules cannot be loaded by stock CI
-packages, so the brotli profile is validated for coverage in CI and must be
-syntax-tested with the exact modules on the target host.
+packages on Rocky Linux 9. The Brotli modules and OpenSSL 3.5 hybrid group
+cannot be loaded by stock CI packages, so the `brotli` and `post-quantum`
+profiles are validated for coverage in CI and must be syntax-tested with the
+exact modules and TLS provider on the target host.
