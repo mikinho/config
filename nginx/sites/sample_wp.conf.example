@@ -46,6 +46,11 @@ server {
     root /var/www/sample_wp/wordpress;
     index index.php;
 
+    # A file dropped into a writable tree must not be able to publish content
+    # from elsewhere by symlink. if_not_owner still permits the deliberate
+    # same-owner symlinks some WordPress deployments use for plugins or themes.
+    disable_symlinks if_not_owner;
+
     # Per-site raise over the 16M baseline, covering the pool's 20M
     # post_max_size so nginx is not the surprise limit for media uploads.
     client_max_body_size 20M;
