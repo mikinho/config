@@ -37,11 +37,16 @@ it in the root README's stub-dependency table and covered by a profile.
   layout). A reverse-proxy site including it would serve nginx's default
   root for those paths instead of the application; proxy sites declare their
   own quieted locations around `proxy_pass`.
-- `includes/block-php.conf` and `includes/block-wordpress-probes.conf` are
-  server-context opt-ins that return nginx's non-standard `444` without access
-  logging. Use the PHP guard only on sites with no PHP runtime and the
-  WordPress guard only on sites that do not run WordPress; neither belongs in
-  the universal security baseline.
+- `includes/block-php.conf`, `includes/block-cgi.conf`,
+  `includes/block-wordpress-probes.conf`, and
+  `includes/block-project-files.conf` are server-context opt-ins that return
+  nginx's non-standard `444` without access logging. Use runtime guards only
+  on sites that do not expose those runtimes, the WordPress guard only on
+  non-WordPress sites, and the project-file guard only where build metadata is
+  never intentionally public. The project-file guard is defense in depth for
+  OWASP's [guidance on old, backup, and unreferenced files](https://owasp.org/www-project-web-security-testing-guide/v42/4-Web_Application_Security_Testing/02-Configuration_and_Deployment_Management_Testing/04-Review_Old_Backup_and_Unreferenced_Files_for_Sensitive_Information),
+  not a substitute for keeping those artifacts outside the web root. None of
+  these opt-ins belongs in the universal security baseline.
 - `sites/_http_.conf` and `sites/_https_.conf` are the default servers for
   unknown host names (444, and 421 with `ssl_reject_handshake`). Site files
   must declare their own `server_name` and must not claim `default_server`.

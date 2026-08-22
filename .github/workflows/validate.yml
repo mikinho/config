@@ -132,7 +132,9 @@ jobs:
             'server {' \
             '    listen 127.0.0.1:8080;' \
             '    server_name probe-guards.invalid;' \
+            '    include includes/block-cgi.conf;' \
             '    include includes/block-php.conf;' \
+            '    include includes/block-project-files.conf;' \
             '    include includes/block-wordpress-probes.conf;' \
             '}' \
             > build/ci-safe/sites/probe-guards.conf
