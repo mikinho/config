@@ -555,7 +555,9 @@ material application, plugin, theme, proxy, or CDN change.
 GitHub Actions validates deployment profile coverage, exercises the installer,
 runs `nginx -t` against stable and mainline nginx.org packages on Rocky Linux
 9, checks the units and logrotate policy on Rocky Linux 9 and CentOS Stream 10,
-and scans the complete Git history for secrets. GitHub's Ubuntu hosted runner
+and scans the complete Git history for secrets. The weekly run also compares
+the checksum-pinned Actionlint release with its current upstream release so a
+manual binary pin cannot silently become stale. GitHub's Ubuntu hosted runner
 is only the Docker and portable-tooling executor; it is not a supported
 deployment target. The third-party Brotli modules, `quic_bpf` kernel/SELinux
 path, and OpenSSL 3.5 hybrid group cannot be fully exercised by the stock CI
