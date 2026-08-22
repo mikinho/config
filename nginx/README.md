@@ -37,6 +37,11 @@ it in the root README's stub-dependency table and covered by a profile.
   layout). A reverse-proxy site including it would serve nginx's default
   root for those paths instead of the application; proxy sites declare their
   own quieted locations around `proxy_pass`.
+- `includes/block-php.conf` and `includes/block-wordpress-probes.conf` are
+  server-context opt-ins that return nginx's non-standard `444` without access
+  logging. Use the PHP guard only on sites with no PHP runtime and the
+  WordPress guard only on sites that do not run WordPress; neither belongs in
+  the universal security baseline.
 - `sites/_http_.conf` and `sites/_https_.conf` are the default servers for
   unknown host names (444, and 421 with `ssl_reject_handshake`). Site files
   must declare their own `server_name` and must not claim `default_server`.
