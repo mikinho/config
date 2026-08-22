@@ -32,9 +32,27 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends shellcheck
+          # Pin both the release and archive digest; do not execute the
+          # project's mutable download helper directly from the network.
+          actionlint_version=1.7.12
+          actionlint_archive="/tmp/actionlint_${actionlint_version}_linux_amd64.tar.gz"
+          curl --fail --location --silent --show-error \
+            --output "${actionlint_archive}" \
+            "https://github.com/rhysd/actionlint/releases/download/v${actionlint_version}/actionlint_${actionlint_version}_linux_amd64.tar.gz"
+          printf '%s  %s\n' \
+            '8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8' \
+            "${actionlint_archive}" |
+            sha256sum --check --strict
+          tar --extract --gzip \
+            --file "${actionlint_archive}" \
+            --directory /tmp \
+            actionlint
+          sudo install -m 0755 /tmp/actionlint /usr/local/bin/actionlint
+          actionlint -version
 
       - name: Validate installer and profile coverage
         run: |
+          actionlint -color
           shellcheck deploy/install-nginx deploy/install-php-site selinux/apply-nginx-policy
           deploy/install-nginx --check
 
