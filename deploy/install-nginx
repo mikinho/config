@@ -7,6 +7,7 @@ SCRIPT_DIRECTORY=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 REPOSITORY_ROOT=$(CDPATH= cd -- "$SCRIPT_DIRECTORY/.." && pwd)
 NGINX_SOURCE=$REPOSITORY_ROOT/nginx
 PROFILE_DIRECTORY=$SCRIPT_DIRECTORY/profiles
+NGINX_BINARY=/usr/sbin/nginx
 SCRATCH_DIRECTORY=
 STAGING_DIRECTORY=
 
@@ -23,8 +24,10 @@ Usage:
   $PROGRAM_NAME --output DIRECTORY [--profile NAME ...]
 
 The baseline profile is always selected. The output must not already exist.
-Run --verify-host on the target host before installing a rendered tree; it
-fails when the local nginx cannot parse this configuration.
+Run --verify-host on the target before installing a rendered tree. It checks
+the fixed /usr/sbin/nginx service binary's version and required build options;
+it does not parse a rendered or live configuration, so nginx -t is still
+required after assembling the exact target tree.
 EOF
 }
 
@@ -75,16 +78,34 @@ version_at_least() {
 # Rendering can happen on a build machine, so the floor is enforced against
 # the host that will actually load the tree, not at render time.
 verify_host_nginx() {
-    command -v nginx >/dev/null 2>&1 || fail "nginx is not installed on this host"
+    [ -x "$NGINX_BINARY" ] \
+        || fail "required nginx service binary is not executable: $NGINX_BINARY"
 
-    host_version_raw=$(nginx -v 2>&1) || fail "unable to read the nginx version"
+    host_version_raw=$("$NGINX_BINARY" -v 2>&1) \
+        || fail "unable to read the nginx version from $NGINX_BINARY"
     host_version=$(printf '%s' "$host_version_raw" | sed 's|^.*nginx/||; s|[^0-9.].*$||')
     [ -n "$host_version" ] || fail "unable to parse an nginx version from: $host_version_raw"
 
     version_at_least "$host_version" "$NGINX_VERSION_FLOOR" \
         || fail "nginx $host_version is older than the $NGINX_VERSION_FLOOR floor required by add_header_inherit"
 
-    printf 'nginx %s meets the %s configuration floor.\n' "$host_version" "$NGINX_VERSION_FLOOR"
+    host_build_raw=$("$NGINX_BINARY" -V 2>&1) \
+        || fail "unable to read nginx build options from $NGINX_BINARY"
+
+    for required_option in \
+        --with-threads \
+        --with-http_ssl_module \
+        --with-http_v2_module \
+        --with-http_v3_module \
+        --with-http_gzip_static_module \
+        --with-http_stub_status_module
+    do
+        printf '%s\n' "$host_build_raw" | grep -F -- "$required_option" >/dev/null \
+            || fail "$NGINX_BINARY is missing required build option: $required_option"
+    done
+
+    printf '%s %s meets the version and required-build baseline.\n' \
+        "$NGINX_BINARY" "$host_version"
 }
 
 validate_profile_name() {

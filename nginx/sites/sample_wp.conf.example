@@ -7,8 +7,9 @@
 # certificate paths, and sample_wp site tag. Keep the primary domain first:
 # includes/redir.conf redirects every other listed name to $server_name.
 #
-# Requires the wordpress deployment profile and the matching
-# php-fpm@sample_wp.service instance. PHP-FPM owns this site's socket at
+# Requires the baseline deployment profile and the matching
+# php-fpm@sample_wp.service instance. The optional cached variant additionally
+# requires the wordpress-cache profile. PHP-FPM owns this site's socket at
 # /run/sample_wp/php-fpm.sock.
 #
 
@@ -53,6 +54,9 @@ server {
     include includes/secure.conf;
     include includes/quiet-common-requests.conf;
 
-    # Optional: WordPress
+    # Optional: WordPress. This safe default does not share page responses.
+    # To enable the audited cache variant, replace this include with
+    # includes/wordpress-cache-by-tag.conf and select the wordpress-cache
+    # deployment profile.
     include includes/wordpress-by-tag.conf;
 }
