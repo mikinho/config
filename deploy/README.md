@@ -3,7 +3,7 @@
 `install-nginx` renders a complete nginx install tree from the repository
 sources and the selected feature profiles. It only ever writes a new staging
 directory — never the live `/etc/nginx` — so the rendered result can be
-reviewed and installed as a deliberate overlay.
+reviewed and installed deliberately.
 
 ## Usage
 
@@ -18,10 +18,15 @@ deploy/install-nginx --output /tmp/nginx-install \
 
 Because a render may happen on a build machine, the nginx version floor is
 enforced where the tree actually loads: run `--verify-host` on the target
-host before installing a render. It fails when the local nginx predates
-1.29.3 (`add_header_inherit`, the floor in the root README's compatibility
-table), and each render records the same floor as an `nginx-version-floor`
-line in its `INSTALL-PROFILE` manifest so other tooling can check it.
+host before installing a render. It checks the exact `/usr/sbin/nginx` binary
+used by the supplied systemd unit, fails when it predates 1.29.3
+(`add_header_inherit`), and verifies the required compile-time modules listed
+in the root README. Each render records the same floor as an
+`nginx-version-floor` line in its `INSTALL-PROFILE` manifest.
+
+`--verify-host` does not parse a rendered or live configuration and cannot
+prove that optional dynamic modules or a selected TLS group load. The final
+`/usr/sbin/nginx -t` against the exact installed tree remains mandatory.
 
 The `baseline` profile is always selected. The output directory must not
 exist; refusing to reuse one guarantees stale or deselected stubs cannot
@@ -29,10 +34,21 @@ survive from an earlier render. Each render writes an `INSTALL-PROFILE`
 manifest recording the selected profiles and stubs, and generates a private
 `quic_host.key` when the QUIC stub is selected.
 
-Install the reviewed result over the package-provided `/etc/nginx`,
-preserving package files (`mime.types`, `fastcgi_params`) and
-deployment-local content (`sites`, `upstreams`, `trusted-proxies`), as the
-[root README](../README.md) describes.
+Install the reviewed result over the package-provided `/etc/nginx` using these
+ownership boundaries:
+
+- fully replace the repository-managed `nginx.conf`, `includes/`, and `stubs/`
+  paths, deleting files absent from the new render;
+- preserve package files such as `mime.types` and `fastcgi_params`;
+- preserve deployment-local `sites/`, `upstreams/`, and `trusted-proxies/`;
+- preserve an existing `/etc/nginx/quic_host.key`; copy the rendered key only
+  for a host's initial installation; and
+- take a recoverable backup, validate an assembled candidate, install it, run
+  `/usr/sbin/nginx -t` again, and reload only after that exact test passes.
+
+If using `rsync`, apply `--delete` only to the exact managed `includes/` and
+`stubs/` directories, never to `/etc/nginx` as a whole. This prevents stale
+fragments without deleting package, certificate, or deployment-local state.
 
 ## PHP site renderer
 
@@ -71,7 +87,7 @@ deploy/install-nginx --output nginx-production \
     --profile gzip \
     --profile brotli \
     --profile quic-bpf \
-    --profile wordpress
+    --profile wordpress-cache
 ```
 
 Selection rationale, so the host's choices stay written down:
@@ -80,8 +96,9 @@ Selection rationale, so the host's choices stay written down:
   build outputs, so `gzip_static`/`brotli_static` serve siblings and the
   runtime compressors cover proxied HTML and legacy assets.
 - `quic-bpf` — the host kernel supports the QUIC reuseport eBPF map.
-- `wordpress` — PHP sites remain on this host; drop the profile once the
-  last one is retired.
+- `wordpress-cache` — the cache zone is available only to audited sites that
+  explicitly include `wordpress-cache-by-tag.conf`; ordinary WordPress sites
+  use the uncached `wordpress-by-tag.conf` and need no cache profile.
 - `websocket` deliberately not selected — no deployed site uses
   `$connection_upgrade`; a site adding WebSockets must add the profile in
   the same change.
@@ -97,7 +114,10 @@ Selection rationale, so the host's choices stay written down:
 CI shellchecks the installer, runs `--check`, exercises a full render, and
 verifies the refusal to overwrite an existing output. It then renders a CI
 profile and runs `nginx -t` against the pinned stable and mainline nginx.org
-packages on Rocky Linux 9. The Brotli modules and OpenSSL 3.5 hybrid group
-cannot be loaded by stock CI packages, so the `brotli` and `post-quantum`
-profiles are validated for coverage in CI and must be syntax-tested with the
-exact modules and TLS provider on the target host.
+packages on Rocky Linux 9. CI parses both the uncached and explicitly cached
+WordPress site variants. It also renders the documented production profile so
+profile drift is visible. The Brotli modules, `quic_bpf` kernel/SELinux path,
+and OpenSSL 3.5 hybrid group cannot be fully exercised by the stock CI
+environment, so `brotli`, `quic-bpf`, and `post-quantum` must be syntax- and
+runtime-tested with the exact modules, TLS provider, kernel, and policy on the
+target host.

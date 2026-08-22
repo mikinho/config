@@ -13,6 +13,13 @@ has different requirements. Deployment-specific upstream addresses,
 certificates, private keys, credentials, and other secrets do not belong in
 this public repository.
 
+This baseline assumes nginx is the edge server directly exposed to the public
+internet. For traffic it proxies to an application, the edge must derive the
+client identity from `$remote_addr` and overwrite client-supplied forwarding
+headers; appending an untrusted `X-Forwarded-For` value permits IP spoofing.
+The optional trusted-proxy profile changes where nginx obtains `$remote_addr`,
+but only for explicitly trusted immediate peers.
+
 ## Compatibility baseline
 
 | Component | Supported baseline | Reason |
@@ -21,7 +28,7 @@ this public repository.
 | Linux kernel | A supported RHEL-family kernel; **5.7** for `quic_bpf` | The baseline uses `epoll` and systemd. The optional eBPF QUIC acceleration stub requires Linux 5.7 or newer. |
 | OpenSSL | A vendor-supported version compatible with the selected nginx build; **3.5.1 or newer** for the `post-quantum` profile | The baseline uses the TLS provider's supported group defaults. The optional profile requires `X25519MLKEM768`. |
 | systemd | **249** syntax floor; validated on Rocky Linux 9 and CentOS Stream 10 | Required for the service sandbox, including `ProtectProc` and `SocketBindDeny`. |
-| PHP-FPM | **PHP 8.3 or newer** with systemd and POSIX ACL support | Required only for the optional per-site PHP-FPM service and configuration under `php-fpm/`. |
+| PHP-FPM | **PHP 8.3 or newer** with systemd and POSIX ACL support; OPcache for production | Required only for the optional per-site PHP-FPM service and configuration under `php-fpm/`. |
 | Certbot | A currently supported release | Required only for the included ACME renewal service and timer. |
 | logrotate | A currently supported release | Required only when installing the included nginx file-log rotation policy. |
 | fail2ban | A currently supported EPEL release | Required only for the optional intrusion-ban policy in `fail2ban/`. |
@@ -203,20 +210,24 @@ deploy/install-nginx --output /tmp/nginx-install \
     --profile websocket
 ```
 
-Review the rendered `INSTALL-PROFILE` and configuration, then install it as an
-overlay on the package-provided `/etc/nginx`. Preserve package files such as
-`mime.types` and `fastcgi_params`, and preserve deployment-local `sites`,
-`upstreams`, and `trusted-proxies` content. The renderer refuses an existing
-output directory so stale or unselected stubs cannot silently survive from an
-earlier profile.
+Review the rendered `INSTALL-PROFILE` and configuration, then install it over
+the package-provided `/etc/nginx`. Treat `includes/`, `stubs/`, and `nginx.conf`
+as repository-managed: fully replace those paths so a deselected or removed
+fragment cannot survive. Preserve package files such as `mime.types` and
+`fastcgi_params`, and preserve deployment-local `sites`, `upstreams`, and
+`trusted-proxies` content. Preserve an existing `/etc/nginx/quic_host.key`;
+the generated key is for a host's initial install only. Take a recoverable
+backup, assemble the exact candidate tree, run `/usr/sbin/nginx -t`, and only
+then reload. The renderer refuses an existing output directory so stale or
+unselected stubs cannot silently survive inside a render.
 
 | Profile | Adds |
 | --- | --- |
-| `baseline` | Required rate-limit, security-header fallback, TLS, and persistent HTTP/3 key stubs. Always selected. |
+| `baseline` | Required privacy-minimized logging, rate-limit, security-header fallback, TLS, and persistent HTTP/3 key stubs. Always selected. |
 | `gzip` | gzip response compression. |
 | `brotli` | Paired Brotli module-loader and HTTP compression stubs. |
 | `websocket` | WebSocket connection-upgrade map. |
-| `wordpress` | WordPress FastCGI cache zone and bypass maps. |
+| `wordpress-cache` | Opt-in WordPress FastCGI page-cache zone and conservative bypass maps. Ordinary WordPress routing needs no profile. |
 | `trusted-proxy` | Client address restoration; deployment-local trusted CIDRs are still required. |
 | `post-quantum` | Hybrid `X25519MLKEM768` TLS key exchange for compatible OpenSSL 3.5.1+ builds. |
 | `quic-bpf` | Linux eBPF acceleration for QUIC connection migration after host validation. |
@@ -231,17 +242,20 @@ The selected configuration has these stub dependencies:
 | `http/tls.conf` | http | Any selected site listens with `ssl`, including `_https_.conf`. This is required for HTTPS deployments. |
 | `http/post-quantum.conf` | http | nginx uses a TLS provider exposing `X25519MLKEM768`; select through the optional `post-quantum` profile. |
 | `http/upstreamfallback.conf` | http | The baseline `security-headers.conf` include is enabled. This is required by the provided `nginx.conf`. |
+| `http/logging.conf` | http | The privacy-minimized JSON access log is enabled. This is required by the provided `nginx.conf`. |
 | `http/ratelimit.conf` | http | A selected site or include uses `limit_req` or `limit_conn`, including `_http_.conf`, `http.conf`, and `wordpress-by-tag.conf`. |
-| `http/fastcgi-cache.conf` | http | WordPress FastCGI caching is enabled through `wordpress-cache.conf`. |
+| `http/fastcgi-cache.conf` | http | A site includes `wordpress-cache-by-tag.conf`; select the `wordpress-cache` profile. |
 | `http/websocket.conf` | http | A reverse-proxy site uses `$connection_upgrade`, including through `includes/proxy-websocket.conf`. |
 | `http/realip.conf` | http | nginx receives traffic through explicitly trusted reverse proxies and rate limits must use the restored client address. |
 | `http/gzip.conf` | http | gzip response compression is desired. |
 | `http/brotli.conf` | http | Brotli response compression is desired; install together with `brotli.conf`. |
 
 The installer generates `quic_host.key` with 80 bytes from the operating
-system random source and mode `0600`; it never prints the key. A manual
-deployment must create an equivalently private persistent key before running
-`nginx -t`. The key is operational secret state and must never be committed.
+system random source and mode `0600`; it never prints the key. This is initial
+host state, not a rotation mechanism: subsequent installs must preserve the
+existing `/etc/nginx/quic_host.key`. A manual deployment must create an
+equivalently private persistent key before running `nginx -t`. The key is
+operational secret state and must never be committed.
 
 The TLS stub deliberately omits `ssl_stapling off` because stapling is already
 disabled by default, and whether to enable it depends on the certificate
@@ -347,9 +361,14 @@ both in one location — which carries the same forwarding policy with
 connection upgrading and a longer read timeout. It requires the `websocket`
 profile's `$connection_upgrade` map.
 
-The forwarded headers state what this edge observed. `X-Forwarded-For` may
-already contain client-supplied entries; an application must trust only the
-rightmost address, or rely on the trusted-proxy address restoration above.
+This configuration is for an nginx edge server directly exposed to the public
+internet. Both shared proxy includes therefore set `X-Real-IP` and
+`X-Forwarded-For` to nginx's `$remote_addr`; they never append the incoming
+`X-Forwarded-For` chain. Using `$proxy_add_x_forwarded_for` here would preserve
+attacker-supplied addresses and could let an application authorize, rate-limit,
+or audit the wrong client. When the trusted-proxy profile is selected, the real
+IP module first updates `$remote_addr` from only an explicitly trusted peer, so
+the same forwarding rule remains correct.
 
 ### Optional Node.js Cache-Control fallback
 
@@ -390,9 +409,10 @@ The PHP-FPM and WordPress includes are opt-in. A site using them must:
 
 - define `$site_tag` before including a `*-by-tag.conf` file;
 - provide a PHP-FPM socket at `/run/$site_tag/php-fpm.sock`;
-- provision the writable FastCGI cache directory when caching is enabled; and
-- review the WordPress cache exclusions and response-header handling against
-  the application's authentication, personalization, and cache policy.
+- select `wordpress-by-tag.conf` for the safe, uncached routing default; or
+- select `wordpress-cache-by-tag.conf` plus the `wordpress-cache` deployment
+  profile only after reviewing the application's complete authentication,
+  query-parameter, personalization, commerce, and consent behavior.
 
 The corresponding per-site PHP-FPM implementation is documented in
 [`php-fpm/README.md`](php-fpm/README.md). PHP-FPM owns each socket; no systemd
@@ -411,9 +431,19 @@ content such as HTML, JavaScript, and SVG, including common double-extension
 forms. A site that intentionally accepts one of those formats must replace
 that location with an application-specific validation and serving policy.
 
-The shared WordPress cache configuration intentionally ignores upstream
-`Cache-Control` and `Expires` headers. Do not enable it for an application
-unless that edge-controlled cache behavior is understood and desired.
+The optional WordPress cache bypasses every request carrying any `Cookie`,
+`Authorization` header, or query string, plus non-GET/HEAD methods and known
+WordPress private routes. It also honors application `Cache-Control`,
+`Expires`, `Set-Cookie`, and `Vary` response behavior. These are conservative
+guards, not proof that a site is safe to cache: opt in only after testing every
+personalized, logged-in, commerce, consent, and parameter-driven path. The
+uncached include is the universal default.
+
+`includes/relativeurls.conf` remains available only for narrowly reviewed
+legacy applications. It rewrites HTML attributes in response bodies and can
+change canonical or alternate-language URLs, so it is not included by the
+shared WordPress path and should not be enabled on an SEO-indexed site in place
+of correct application URL generation.
 
 ## Certbot renewal behavior
 
@@ -451,6 +481,51 @@ Many distributions install their own Certbot timer. Do not leave two renewal
 schedulers active; choose either the distribution unit or this repository's
 unit after comparing their behavior.
 
+## Logging and privacy contract
+
+The JSON access log records the client IP address, authenticated username when
+present, host, method, URL path, whether a query string existed, status,
+response size, referrer without its query string, user agent, negotiated
+protocol and TLS details, timings, and upstream cache status. Query-string
+values are deliberately not recorded from either the request or referrer
+because applications and links sometimes place personal data or credentials
+there. The included logrotate policy retains 14 rotations by default; a
+deployment may reduce that period to meet its actual operational need.
+
+IP addresses, usernames, referrers, user agents, and paths can still be
+personal data. Restrict journal and log-file access, document the actual
+purpose, recipients/processors, retention, and user rights in the deployed
+site's privacy materials, and do not reuse operational logs for analytics
+without a separate review. This repository supplies technical minimization,
+not a jurisdiction-specific legal determination.
+
+## Production application release gate
+
+Passing the infrastructure checks below does not certify a website's content,
+WordPress installation, consent implementation, or SEO. Those artifacts are
+deployment-local and intentionally absent from this public configuration
+repository. Before moving public traffic, the application owner must verify:
+
+- the published Privacy Policy accurately describes the site's real data
+  collection, processors, purposes, retention, choices, and contact process,
+  including the server logging described above;
+- a clean browser session sets no nonessential cookies or storage before
+  consent, rejecting optional categories keeps them absent, accepting enables
+  only the selected categories, and Cookie Preferences can later revoke them;
+- canonical and `hreflang` URLs are absolute and correct, the primary-host
+  redirect is permanent, intended pages are indexable, and `robots.txt`, XML
+  sitemaps, titles, descriptions, and structured data match the production
+  hostname rather than a staging environment;
+- WordPress core is on a vendor-supported security release, plugins and themes
+  are patched and necessary, debug display is off, administrator access is
+  least-privilege, and backups plus restoration have been tested; and
+- PHP OPcache, the selected compression profiles, static cache headers, and
+  application performance have been measured on the production build without
+  weakening the security or consent behavior above.
+
+Repeat the consent, caching, headers, redirects, and HTML checks after each
+material application, plugin, theme, proxy, or CDN change.
+
 ## Validation
 
 GitHub Actions validates deployment profile coverage, exercises the installer,
@@ -458,10 +533,11 @@ runs `nginx -t` against stable and mainline nginx.org packages on Rocky Linux
 9, checks the units and logrotate policy on Rocky Linux 9 and CentOS Stream 10,
 and scans the complete Git history for secrets. GitHub's Ubuntu hosted runner
 is only the Docker and portable-tooling executor; it is not a supported
-deployment target. The third-party Brotli modules and OpenSSL 3.5 hybrid group
-cannot be loaded by the stock CI packages. The `brotli` and `post-quantum`
-profiles are therefore profile-validated in public CI and must be syntax-tested
-with the exact modules and TLS provider on the target host.
+deployment target. The third-party Brotli modules, `quic_bpf` kernel/SELinux
+path, and OpenSSL 3.5 hybrid group cannot be fully exercised by the stock CI
+environment. The `brotli`, `quic-bpf`, and `post-quantum` profiles are therefore
+profile-validated in public CI and must be syntax- and runtime-tested with the
+exact modules, kernel, policy, and TLS provider on the target host.
 
 Run these checks on the target host before enabling the service:
 
@@ -469,9 +545,10 @@ Run these checks on the target host before enabling the service:
 openssl version
 # Required only when the post-quantum profile is selected:
 openssl list -tls1_3 -tls-groups | grep X25519MLKEM768
-nginx -v
-nginx -V 2>&1
-sudo nginx -t -c /etc/nginx/nginx.conf
+deploy/install-nginx --verify-host
+/usr/sbin/nginx -v
+/usr/sbin/nginx -V 2>&1
+sudo /usr/sbin/nginx -t -c /etc/nginx/nginx.conf
 sudo systemd-analyze verify /etc/systemd/system/nginx.service
 sudo systemd-analyze verify /etc/systemd/system/certbot.service /etc/systemd/system/certbot.timer
 sudo systemd-analyze security nginx.service certbot.service

@@ -42,14 +42,18 @@ remote host; a typo in an aggressive jail can lock the operator out.
 | Jail | Signal | Source |
 | --- | --- | --- |
 | `sshd` | Failed SSH authentication, via the systemd journal. | sshd |
-| `nginx-http-auth` | Failed HTTP basic authentication. | `/var/log/nginx/error.log` |
-| `nginx-limit-req` | Sustained `limit_req`/`limit_conn` violations. The baseline's `limit_req_log_level warn` writes these events where the stock filter finds them. | `/var/log/nginx/error.log` |
+| `nginx-http-auth` | Failed HTTP basic authentication. | `/var/log/nginx/*error.log` |
+| `nginx-limit-req` | Sustained `limit_req`/`limit_conn` violations. The baseline's `limit_req_log_level warn` writes these events where the stock filter finds them. | `/var/log/nginx/*error.log` |
 | `nginx-444` | Requests for host names this deployment does not serve, answered 444 by `sites/_http_.conf`. Custom filter in `filter.d/`. | `/var/log/nginx/access.log` |
 
 The `nginx-444` filter deliberately ignores status 421 from the HTTPS default
 server: HTTP/2 and HTTP/3 connection reuse can produce legitimate 421
 responses that clients transparently retry, so banning on them risks real
 users.
+
+The error-log glob covers the baseline global log and per-site error logs such
+as the public WordPress sample. Keep site logs under `/var/log/nginx` or add a
+deployment-local jail override for any deliberate alternate location.
 
 ## Validation
 
