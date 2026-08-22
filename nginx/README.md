@@ -62,6 +62,9 @@ it in the root README's stub-dependency table and covered by a profile.
   requires both `wordpress-cache-by-tag.conf` and the `wordpress-cache`
   profile, and is an application-specific opt-in after cookie, authorization,
   query-parameter, personalization, commerce, and consent testing.
+- `maintenance.conf` exposes its document only to an internal `error_page`
+  redirect. If the optional file is absent, the route returns 503 so an
+  upstream outage never becomes a false 404.
 - Shared proxy includes treat this nginx instance as the public edge. They
   overwrite `X-Real-IP` and `X-Forwarded-For` with `$remote_addr`; never append
   an untrusted incoming forwarding chain. The trusted-proxy profile may update

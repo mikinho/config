@@ -434,6 +434,14 @@ content such as HTML, JavaScript, and SVG, including common double-extension
 forms. A site that intentionally accepts one of those formats must replace
 that location with an application-specific validation and serving policy.
 
+The shared WordPress route handles upstream 502, 503, and 504 responses through
+the optional document at the site's `/maintenance.html` filesystem path. That
+URI is internal-only: clients cannot request or index the maintenance document
+directly. If the file is absent, nginx returns 503 rather than converting an
+application outage into a false 404. A deployment that provisions the document
+should keep it static, free of tracking, and appropriate for every error in
+that class.
+
 The optional WordPress cache bypasses every request carrying any `Cookie`,
 `Authorization` header, or query string, plus non-GET/HEAD methods and known
 WordPress private routes. It also honors application `Cache-Control`,
