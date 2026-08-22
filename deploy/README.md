@@ -61,6 +61,37 @@ per-stub dependency rules live in the root README. Constraints enforced by
 Adding a feature therefore means adding the stub, assigning it to a profile,
 and updating the root README's tables in the same change.
 
+### Example: production web server
+
+The production server that fronts the Node.js and WordPress sites renders
+with:
+
+```sh
+deploy/install-nginx --output nginx-production \
+    --profile gzip \
+    --profile brotli \
+    --profile quic-bpf \
+    --profile wordpress
+```
+
+Selection rationale, so the host's choices stay written down:
+
+- `gzip` + `brotli` — both compressors; the applications precompress their
+  build outputs, so `gzip_static`/`brotli_static` serve siblings and the
+  runtime compressors cover proxied HTML and legacy assets.
+- `quic-bpf` — the host kernel supports the QUIC reuseport eBPF map.
+- `wordpress` — PHP sites remain on this host; drop the profile once the
+  last one is retired.
+- `websocket` deliberately not selected — no deployed site uses
+  `$connection_upgrade`; a site adding WebSockets must add the profile in
+  the same change.
+- `trusted-proxy` not selected — clients connect directly, so
+  `$remote_addr` is already the client. Select it only if a CDN or other
+  proxy is ever placed in front, together with its `trusted-proxies/`
+  entries.
+- `post-quantum` not selected until the host's TLS provider passes the
+  syntax test described under Validation.
+
 ## Validation
 
 CI shellchecks the installer, runs `--check`, exercises a full render, and
