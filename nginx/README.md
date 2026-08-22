@@ -78,6 +78,11 @@ it in the root README's stub-dependency table and covered by a profile.
   Do not enable response-body URL rewriting on an SEO-indexed site instead of
   generating correct absolute canonical and alternate-language URLs.
 
+CI also starts the rendered safe profile and verifies these response-level
+contracts: HTTPS redirection, inherited baseline headers, application CSP
+preservation, untrusted forwarding-header replacement, internal-only
+maintenance responses, and failure-only static asset logging.
+
 `sites/sample_wp.conf.example` matches the `sample_wp` PHP-FPM pool and systemd
 instance. Replace its domains, certificate paths, and site tag, then install it
 as `sites/SITE_TAG.conf`; only the installed `*.conf` copy becomes active.
@@ -90,6 +95,7 @@ Render a profile and syntax-check it exactly as CI does, or run
 packages on Rocky Linux 9. It activates `sample_wp.conf.example` only in the
 ephemeral CI tree and generates a one-day self-signed certificate, so the
 complete public WordPress site is parsed without making it part of an installed
-baseline. CI then replaces the site's routing include with the cached variant
-and parses that configuration too. A change that adds a directive must stay
-within the root README's syntax floor or advance it deliberately.
+baseline. It starts the safe profile for response-level policy checks, then
+replaces the site's routing include with the cached variant and parses that
+configuration too. A change that adds a directive must stay within the root
+README's syntax floor or advance it deliberately.
