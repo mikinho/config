@@ -64,13 +64,15 @@ jobs:
             --profile gzip \
             --profile brotli \
             --profile quic-bpf \
+            --profile websocket \
             --profile wordpress-cache
           grep --fixed-strings 'profile brotli' build/production/INSTALL-PROFILE
           grep --fixed-strings 'profile gzip' build/production/INSTALL-PROFILE
           grep --fixed-strings 'profile quic-bpf' build/production/INSTALL-PROFILE
+          grep --fixed-strings 'profile websocket' build/production/INSTALL-PROFILE
           grep --fixed-strings 'profile wordpress-cache' build/production/INSTALL-PROFILE
+          test -e build/production/stubs/http/websocket.conf
           test ! -e build/production/stubs/http/realip.conf
-          test ! -e build/production/stubs/http/websocket.conf
           test ! -e build/production/stubs/http/post-quantum.conf
 
       - name: Exercise the PHP site renderer
