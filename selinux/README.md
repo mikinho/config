@@ -27,7 +27,7 @@ updates:
 
 | Registration | Why |
 | --- | --- |
-| `/run/nginx(/.*)?` and `/run/lock/nginx(/.*)?` as `httpd_var_run_t` | The base policy labels only `/var/run/nginx.pid`, not the PID and lock directories `systemd/nginx.service` creates. |
+| `/run/nginx(/.*)?` and `/run/lock/nginx(/.*)?` as `httpd_var_run_t` | The base policy labels only `/var/run/nginx.pid`, not the PID and lock directories `systemd/system/nginx.service` creates. |
 | `http_port_t` on UDP 443 | Port labels are per protocol and `http_port_t` historically lists TCP only; without this the QUIC listener cannot bind under enforcing mode. |
 | `httpd_setrlimit` on | `worker_rlimit_nofile` needs setrlimit permission. Without it nginx starts normally and workers silently keep the default descriptor limit — a failure that only surfaces under load. |
 

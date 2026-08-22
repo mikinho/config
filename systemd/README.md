@@ -5,13 +5,16 @@ design rationale and cross-component contracts are documented in the
 [root README](../README.md); PHP-specific provisioning is documented in the
 [PHP-FPM README](../php-fpm/README.md).
 
+Installable units live under `systemd/system/` to mirror their destination
+under `/etc/systemd/system/`; repository-only documentation remains here.
+
 ## Installation
 
 ```sh
-install -m 0644 systemd/nginx.service /etc/systemd/system/nginx.service
-install -m 0644 systemd/certbot.service /etc/systemd/system/certbot.service
-install -m 0644 systemd/certbot.timer /etc/systemd/system/certbot.timer
-install -m 0644 systemd/php-fpm@.service /etc/systemd/system/php-fpm@.service
+install -m 0644 systemd/system/nginx.service /etc/systemd/system/nginx.service
+install -m 0644 systemd/system/certbot.service /etc/systemd/system/certbot.service
+install -m 0644 systemd/system/certbot.timer /etc/systemd/system/certbot.timer
+install -m 0644 systemd/system/php-fpm@.service /etc/systemd/system/php-fpm@.service
 systemctl daemon-reload
 systemctl enable --now nginx.service certbot.timer
 ```

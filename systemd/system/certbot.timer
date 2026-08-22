@@ -1,4 +1,4 @@
-# systemd/certbot.timer
+# systemd/system/certbot.timer
 
 #
 # Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho

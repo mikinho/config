@@ -124,7 +124,7 @@ install -m 0644 "/tmp/php-$site_tag/etc/php-fpm.d/pool/$site_tag.conf" \
 install -D -m 0644 \
   "/tmp/php-$site_tag/etc/systemd/system/php-fpm@$site_tag.service.d/writable-paths.conf" \
   "/etc/systemd/system/php-fpm@$site_tag.service.d/writable-paths.conf"
-install -m 0644 systemd/php-fpm@.service /etc/systemd/system/php-fpm@.service
+install -m 0644 systemd/system/php-fpm@.service /etc/systemd/system/php-fpm@.service
 systemctl daemon-reload
 systemctl enable --now "php-fpm@$site_tag.service"
 ```
