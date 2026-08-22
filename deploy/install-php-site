@@ -83,8 +83,9 @@ render_site() {
     esac
 
     mkdir -p "$target_parent"
-    [ ! -e "$target_directory" ] && [ ! -L "$target_directory" ] \
-        || fail "output appeared while preparing render: $target_directory"
+    if [ -e "$target_directory" ] || [ -L "$target_directory" ]; then
+        fail "output appeared while preparing render: $target_directory"
+    fi
     STAGING_DIRECTORY=$(mktemp -d "$target_parent/.$target_name.XXXXXX")
 
     render_file "php-fpm/sites/$SAMPLE_TAG.conf" \
@@ -107,8 +108,9 @@ render_site() {
             | LC_ALL=C sort
     } > "$STAGING_DIRECTORY/INSTALL-SITE"
 
-    [ ! -e "$target_directory" ] && [ ! -L "$target_directory" ] \
-        || fail "output appeared while rendering: $target_directory"
+    if [ -e "$target_directory" ] || [ -L "$target_directory" ]; then
+        fail "output appeared while rendering: $target_directory"
+    fi
     staging_name=${STAGING_DIRECTORY##*/}
     publish_marker=.config-render-$staging_name
     : > "$STAGING_DIRECTORY/$publish_marker"

@@ -207,12 +207,15 @@ list_profiles() {
 copy_configuration() {
     selected_stubs=$1
 
-    [ -d "$NGINX_SOURCE/includes" ] && [ ! -L "$NGINX_SOURCE/includes" ] \
-        || fail "nginx includes source must be a real directory"
-    [ -d "$NGINX_SOURCE/sites" ] && [ ! -L "$NGINX_SOURCE/sites" ] \
-        || fail "nginx sites source must be a real directory"
-    [ -f "$NGINX_SOURCE/nginx.conf" ] && [ ! -L "$NGINX_SOURCE/nginx.conf" ] \
-        || fail "nginx.conf source must be a regular file, not a symbolic link"
+    if [ ! -d "$NGINX_SOURCE/includes" ] || [ -L "$NGINX_SOURCE/includes" ]; then
+        fail "nginx includes source must be a real directory"
+    fi
+    if [ ! -d "$NGINX_SOURCE/sites" ] || [ -L "$NGINX_SOURCE/sites" ]; then
+        fail "nginx sites source must be a real directory"
+    fi
+    if [ ! -f "$NGINX_SOURCE/nginx.conf" ] || [ -L "$NGINX_SOURCE/nginx.conf" ]; then
+        fail "nginx.conf source must be a regular file, not a symbolic link"
+    fi
 
     mkdir -p \
         "$STAGING_DIRECTORY/includes" \
@@ -224,14 +227,16 @@ copy_configuration() {
     cp "$NGINX_SOURCE/nginx.conf" "$STAGING_DIRECTORY/nginx.conf"
 
     for source_file in "$NGINX_SOURCE"/includes/*.conf; do
-        [ -f "$source_file" ] && [ ! -L "$source_file" ] \
-            || fail "nginx include source must be a regular file, not a symbolic link: $source_file"
+        if [ ! -f "$source_file" ] || [ -L "$source_file" ]; then
+            fail "nginx include source must be a regular file, not a symbolic link: $source_file"
+        fi
         cp "$source_file" "$STAGING_DIRECTORY/includes/"
     done
 
     for source_file in "$NGINX_SOURCE"/sites/*.conf; do
-        [ -f "$source_file" ] && [ ! -L "$source_file" ] \
-            || fail "nginx site source must be a regular file, not a symbolic link: $source_file"
+        if [ ! -f "$source_file" ] || [ -L "$source_file" ]; then
+            fail "nginx site source must be a regular file, not a symbolic link: $source_file"
+        fi
         cp "$source_file" "$STAGING_DIRECTORY/sites/"
     done
 
@@ -292,8 +297,9 @@ render_configuration() {
     esac
 
     mkdir -p "$output_parent"
-    [ ! -e "$output_directory" ] && [ ! -L "$output_directory" ] \
-        || fail "output appeared while preparing render: $output_directory"
+    if [ -e "$output_directory" ] || [ -L "$output_directory" ]; then
+        fail "output appeared while preparing render: $output_directory"
+    fi
     STAGING_DIRECTORY=$(mktemp -d "$output_parent/.$output_name.XXXXXX")
 
     selected_profiles=$SCRATCH_DIRECTORY/selected-profiles
@@ -313,8 +319,9 @@ render_configuration() {
     generate_quic_host_key "$selected_stubs"
     write_install_manifest "$selected_profiles" "$selected_stubs"
 
-    [ ! -e "$output_directory" ] && [ ! -L "$output_directory" ] \
-        || fail "output appeared while rendering: $output_directory"
+    if [ -e "$output_directory" ] || [ -L "$output_directory" ]; then
+        fail "output appeared while rendering: $output_directory"
+    fi
     staging_name=${STAGING_DIRECTORY##*/}
     publish_marker=.config-render-$staging_name
     : > "$STAGING_DIRECTORY/$publish_marker"
