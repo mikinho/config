@@ -32,6 +32,11 @@ it in the root README's stub-dependency table and covered by a profile.
 - The security-header values come from the `$*_fallback` maps in
   `stubs/http/upstreamfallback.conf`; an application-supplied header wins and
   the edge stays silent.
+- `includes/quiet-common-requests.conf` serves from the enclosing server's
+  filesystem `root` and belongs only in root-based sites (the WordPress
+  layout). A reverse-proxy site including it would serve nginx's default
+  root for those paths instead of the application; proxy sites declare their
+  own quieted locations around `proxy_pass`.
 - `sites/_http_.conf` and `sites/_https_.conf` are the default servers for
   unknown host names (444, and 421 with `ssl_reject_handshake`). Site files
   must declare their own `server_name` and must not claim `default_server`.
