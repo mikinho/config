@@ -58,6 +58,8 @@ render_file() {
     destination_path=$STAGING_DIRECTORY/$destination_relative
 
     [ -f "$source_path" ] || fail "missing source file: $source_relative"
+    [ ! -L "$source_path" ] \
+        || fail "source file must not be a symbolic link: $source_relative"
     mkdir -p "${destination_path%/*}"
     sed "s/$SAMPLE_TAG/$site_tag/g" "$source_path" > "$destination_path"
 }
@@ -76,9 +78,13 @@ render_site() {
         target_parent=.
     fi
     target_name=${target_directory##*/}
-    [ -n "$target_name" ] || fail "invalid output directory: $target_directory"
+    case "$target_name" in
+        '' | . | ..) fail "invalid output directory: $target_directory" ;;
+    esac
 
     mkdir -p "$target_parent"
+    [ ! -e "$target_directory" ] && [ ! -L "$target_directory" ] \
+        || fail "output appeared while preparing render: $target_directory"
     STAGING_DIRECTORY=$(mktemp -d "$target_parent/.$target_name.XXXXXX")
 
     render_file "php-fpm/sites/$SAMPLE_TAG.conf" \
@@ -101,7 +107,20 @@ render_site() {
             | LC_ALL=C sort
     } > "$STAGING_DIRECTORY/INSTALL-SITE"
 
+    [ ! -e "$target_directory" ] && [ ! -L "$target_directory" ] \
+        || fail "output appeared while rendering: $target_directory"
+    staging_name=${STAGING_DIRECTORY##*/}
+    publish_marker=.config-render-$staging_name
+    : > "$STAGING_DIRECTORY/$publish_marker"
     mv "$STAGING_DIRECTORY" "$target_directory"
+    if [ ! -f "$target_directory/$publish_marker" ]; then
+        nested_staging=$target_directory/$staging_name
+        if [ -d "$nested_staging" ]; then
+            STAGING_DIRECTORY=$nested_staging
+        fi
+        fail "render was not published at the requested output: $target_directory"
+    fi
+    rm "$target_directory/$publish_marker"
     STAGING_DIRECTORY=
     printf 'Rendered PHP-FPM site tree: %s\n' "$target_directory"
 }

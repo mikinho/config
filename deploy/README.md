@@ -34,6 +34,12 @@ survive from an earlier render. Each render writes an `INSTALL-PROFILE`
 manifest recording the selected profiles and stubs, and generates a private
 `quic_host.key` when the QUIC stub is selected.
 
+Both renderers reject a final `.` or `..` path component, refuse symbolic-link
+template inputs, recheck the output before publication, and verify that the
+manifest landed at the requested root. These are build-output boundaries, not
+permission to render an unreviewed checkout; review repository changes before
+executing its tooling.
+
 Install the reviewed result over the package-provided `/etc/nginx` using these
 ownership boundaries:
 
@@ -114,8 +120,9 @@ Selection rationale, so the host's choices stay written down:
 
 ## Validation
 
-CI shellchecks the installer, runs `--check`, exercises a full render, and
-verifies the refusal to overwrite an existing output. It then renders a CI
+CI shellchecks the installers and their negative-path test, runs `--check`,
+exercises a full render, and verifies rejection of existing or ambiguous
+outputs and symbolic-link source files. It then renders a CI
 profile and runs `nginx -t` against the pinned stable and mainline nginx.org
 packages on Rocky Linux 9. CI parses both the uncached and explicitly cached
 WordPress site variants. It also renders the documented production profile so

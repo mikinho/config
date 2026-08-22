@@ -53,8 +53,13 @@ jobs:
       - name: Validate installer and profile coverage
         run: |
           actionlint -color
-          shellcheck deploy/install-nginx deploy/install-php-site selinux/apply-nginx-policy
+          shellcheck \
+            deploy/install-nginx \
+            deploy/install-php-site \
+            selinux/apply-nginx-policy \
+            tests/deploy-renderers.sh
           deploy/install-nginx --check
+          tests/deploy-renderers.sh
 
       - name: Exercise a full profile render
         run: |
