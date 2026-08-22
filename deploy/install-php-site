@@ -3,8 +3,8 @@
 set -eu
 
 PROGRAM_NAME=${0##*/}
-SCRIPT_DIRECTORY=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-REPOSITORY_ROOT=$(CDPATH= cd -- "$SCRIPT_DIRECTORY/.." && pwd)
+SCRIPT_DIRECTORY=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+REPOSITORY_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIRECTORY/.." && pwd)
 SAMPLE_TAG=sample_wp
 STAGING_DIRECTORY=
 
@@ -131,10 +131,10 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
-[ -n "$output_directory" ] && [ -n "$site_tag" ] || {
+if [ -z "$output_directory" ] || [ -z "$site_tag" ]; then
     usage >&2
     exit 1
-}
+fi
 
 validate_site_tag "$site_tag"
 render_site "$output_directory"

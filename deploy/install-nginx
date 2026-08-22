@@ -3,8 +3,8 @@
 set -eu
 
 PROGRAM_NAME=${0##*/}
-SCRIPT_DIRECTORY=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-REPOSITORY_ROOT=$(CDPATH= cd -- "$SCRIPT_DIRECTORY/.." && pwd)
+SCRIPT_DIRECTORY=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+REPOSITORY_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIRECTORY/.." && pwd)
 NGINX_SOURCE=$REPOSITORY_ROOT/nginx
 PROFILE_DIRECTORY=$SCRIPT_DIRECTORY/profiles
 NGINX_BINARY=/usr/sbin/nginx
@@ -157,6 +157,9 @@ collect_profile() {
     [ -f "$manifest_file" ] || fail "unknown profile: $manifest_name"
     [ ! -L "$manifest_file" ] || fail "profile manifests must not be symbolic links: $manifest_name"
 
+    # The manifest is repository-owned input and output_file is always a
+    # scratch-file path supplied by this script, so they cannot be the same.
+    # shellcheck disable=SC2094
     while IFS= read -r manifest_entry || [ -n "$manifest_entry" ]; do
         case "$manifest_entry" in
             '' | \#*) continue ;;
