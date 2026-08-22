@@ -318,7 +318,12 @@ jobs:
               else
                 dnf install --assumeyes php-fpm
               fi
-              dnf install --assumeyes acl php-opcache shadow-utils util-linux
+              dnf install --assumeyes \
+                acl \
+                php-cli \
+                php-opcache \
+                shadow-utils \
+                util-linux
               getent group nginx >/dev/null || groupadd --system nginx
               id nginx >/dev/null 2>&1 ||
                 useradd --system --gid nginx --no-create-home nginx
@@ -332,12 +337,18 @@ jobs:
               install -d -o sample_wp -g sample_wp -m 0700 \
                 /var/lib/php/session/sample_wp \
                 /var/www/sample_wp/var/tmp
+              # Docker attaches stderr to a root-owned pipe. Give non-root FPM
+              # a writable target it can reopen through /proc/self/fd/2.
+              php_fpm_stderr=/tmp/php-fpm-sample.log
+              install -o sample_wp -g sample_wp -m 0600 \
+                /dev/null "${php_fpm_stderr}"
               /sbin/php-fpm --version |
                 grep --extended-regexp "^PHP (8\.[3-9]|9\.)"
               php -r "exit(extension_loaded(\"Zend OPcache\") ? 0 : 1);"
               runuser --user sample_wp -- \
                 /sbin/php-fpm --test \
-                  --fpm-config /etc/php-fpm.d/sites/sample_wp.conf
+                  --fpm-config /etc/php-fpm.d/sites/sample_wp.conf \
+                  2>>"${php_fpm_stderr}"
 
               fpm_pid=
               cleanup_fpm() {
@@ -357,7 +368,8 @@ jobs:
                 /sbin/php-fpm \
                   --nodaemonize \
                   --force-stderr \
-                  --fpm-config /etc/php-fpm.d/sites/sample_wp.conf &
+                  --fpm-config /etc/php-fpm.d/sites/sample_wp.conf \
+                  2>>"${php_fpm_stderr}" &
               fpm_pid=$!
 
               for attempt in {1..50}; do
@@ -380,6 +392,7 @@ jobs:
               kill -QUIT "${fpm_pid}"
               wait "${fpm_pid}"
               fpm_pid=
+              cat "${php_fpm_stderr}"
               trap - EXIT
               test ! -S /run/sample_wp/php-fpm.sock
             '
