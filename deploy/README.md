@@ -87,6 +87,7 @@ deploy/install-nginx --output nginx-production \
     --profile gzip \
     --profile brotli \
     --profile quic-bpf \
+    --profile websocket \
     --profile wordpress-cache
 ```
 
@@ -99,9 +100,11 @@ Selection rationale, so the host's choices stay written down:
 - `wordpress-cache` — the cache zone is available only to audited sites that
   explicitly include `wordpress-cache-by-tag.conf`; ordinary WordPress sites
   use the uncached `wordpress-by-tag.conf` and need no cache profile.
-- `websocket` deliberately not selected — no deployed site uses
-  `$connection_upgrade`; a site adding WebSockets must add the profile in
-  the same change.
+- `websocket` — the private_application_a_web site proxies through
+  `includes/proxy-websocket.conf`, which requires the profile's
+  `$connection_upgrade` map. The map degrades to an empty `Connection` header
+  for ordinary requests, so the application's upstream keepalive pool is
+  unaffected.
 - `trusted-proxy` not selected — clients connect directly, so
   `$remote_addr` is already the client. Select it only if a CDN or other
   proxy is ever placed in front, together with its `trusted-proxies/`
