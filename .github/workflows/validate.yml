@@ -287,7 +287,10 @@ jobs:
                 /workspace/systemd/certbot.service \
                 /workspace/systemd/certbot.timer \
                 php-fpm@sample_wp.service
-              logrotate --debug /workspace/logrotate/nginx
+              install -D -o root -g root -m 0644 \
+                /workspace/logrotate/nginx \
+                /etc/logrotate.d/nginx
+              logrotate --debug /etc/logrotate.d/nginx
             '
 
   php-fpm:
