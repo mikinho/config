@@ -48,7 +48,7 @@ jobs:
             --profile quic-bpf \
             --profile trusted-proxy \
             --profile websocket \
-            --profile wordpress
+            --profile wordpress-cache
           test -s build/full/quic_host.key
           test -s build/full/stubs/http/post-quantum.conf
           test "$(stat --format='%a' build/full/quic_host.key)" = 600
@@ -56,6 +56,22 @@ jobs:
             echo 'installer unexpectedly overwrote an existing output' >&2
             exit 1
           fi
+
+      - name: Exercise documented production render
+        run: |
+          deploy/install-nginx \
+            --output build/production \
+            --profile gzip \
+            --profile brotli \
+            --profile quic-bpf \
+            --profile wordpress-cache
+          grep --fixed-strings 'profile brotli' build/production/INSTALL-PROFILE
+          grep --fixed-strings 'profile gzip' build/production/INSTALL-PROFILE
+          grep --fixed-strings 'profile quic-bpf' build/production/INSTALL-PROFILE
+          grep --fixed-strings 'profile wordpress-cache' build/production/INSTALL-PROFILE
+          test ! -e build/production/stubs/http/realip.conf
+          test ! -e build/production/stubs/http/websocket.conf
+          test ! -e build/production/stubs/http/post-quantum.conf
 
       - name: Exercise the PHP site renderer
         run: |
@@ -100,24 +116,44 @@ jobs:
       - name: Render CI profile
         run: |
           deploy/install-nginx \
-            --output build/ci \
+            --output build/ci-safe \
+            --profile gzip \
+            --profile trusted-proxy \
+            --profile websocket
+          test ! -e build/ci-safe/stubs/http/fastcgi-cache.conf
+          test ! -e build/ci-safe/stubs/http/post-quantum.conf
+          test ! -e build/ci-safe/sites/sample_wp.conf.example
+          install -m 0644 \
+            nginx/sites/sample_wp.conf.example \
+            build/ci-safe/sites/sample_wp.conf
+
+          deploy/install-nginx \
+            --output build/ci-cache \
             --profile gzip \
             --profile trusted-proxy \
             --profile websocket \
-            --profile wordpress
-          test ! -e build/ci/stubs/http/post-quantum.conf
-          test ! -e build/ci/sites/sample_wp.conf.example
+            --profile wordpress-cache
+          test -e build/ci-cache/stubs/http/fastcgi-cache.conf
+          test ! -e build/ci-cache/stubs/http/post-quantum.conf
           install -m 0644 \
             nginx/sites/sample_wp.conf.example \
-            build/ci/sites/sample_wp.conf
+            build/ci-cache/sites/sample_wp.conf
+          sed -i \
+            's|includes/wordpress-by-tag.conf|includes/wordpress-cache-by-tag.conf|' \
+            build/ci-cache/sites/sample_wp.conf
+          grep --fixed-strings \
+            'include includes/wordpress-cache-by-tag.conf;' \
+            build/ci-cache/sites/sample_wp.conf
 
       - name: Test nginx configuration
         run: |
           docker run --rm \
             --env EXPECTED_NGINX_VERSION="${{ matrix.version }}" \
             --env NGINX_REPOSITORY="${{ matrix.repository }}" \
-            --volume "$PWD/build/ci:/profile:ro" \
-            --volume "$PWD/build/ci/quic_host.key:/etc/nginx/quic_host.key:ro" \
+            --volume "$PWD:/workspace:ro" \
+            --volume "$PWD/build/ci-safe:/profile-safe:ro" \
+            --volume "$PWD/build/ci-cache:/profile-cache:ro" \
+            --volume "$PWD/build/ci-safe/quic_host.key:/etc/nginx/quic_host.key:ro" \
             rockylinux:9 \
             /bin/bash -euxo pipefail -c '
               printf "%s\n" \
@@ -143,14 +179,16 @@ jobs:
                 nginx -v 2>&1 |
                   grep --fixed-strings "nginx/${EXPECTED_NGINX_VERSION}"
               fi
-              nginx -V 2>&1 |
-                grep --fixed-strings -- "--with-http_v3_module"
+              /workspace/deploy/install-nginx --verify-host
+              for nginx_prefix in /tmp/nginx-safe /tmp/nginx-cache; do
+                mkdir -p \
+                  "${nginx_prefix}/includes" \
+                  "${nginx_prefix}/sites" \
+                  "${nginx_prefix}/stubs/http" \
+                  "${nginx_prefix}/upstreams" \
+                  "${nginx_prefix}/trusted-proxies"
+              done
               mkdir -p \
-                /tmp/nginx/includes \
-                /tmp/nginx/sites \
-                /tmp/nginx/stubs/http \
-                /tmp/nginx/upstreams \
-                /tmp/nginx/trusted-proxies \
                 /var/lib/nginx/client_tmp \
                 /var/lib/nginx/fastcgi \
                 /var/lib/nginx/fastcgi_tmp \
@@ -172,9 +210,19 @@ jobs:
                   -keyout /etc/letsencrypt/live/example.com/privkey.pem \
                   -out /etc/letsencrypt/live/example.com/fullchain.pem
               )
-              cp -R /profile/. /tmp/nginx/
-              cp /etc/nginx/mime.types /etc/nginx/fastcgi_params /tmp/nginx/
-              nginx -t -p /tmp/nginx/ -c nginx.conf
+              cp -R /profile-safe/. /tmp/nginx-safe/
+              cp /etc/nginx/mime.types /etc/nginx/fastcgi_params /tmp/nginx-safe/
+              grep --fixed-strings \
+                "include includes/wordpress-by-tag.conf;" \
+                /tmp/nginx-safe/sites/sample_wp.conf
+              nginx -t -p /tmp/nginx-safe/ -c nginx.conf
+
+              cp -R /profile-cache/. /tmp/nginx-cache/
+              cp /etc/nginx/mime.types /etc/nginx/fastcgi_params /tmp/nginx-cache/
+              grep --fixed-strings \
+                "include includes/wordpress-cache-by-tag.conf;" \
+                /tmp/nginx-cache/sites/sample_wp.conf
+              nginx -t -p /tmp/nginx-cache/ -c nginx.conf
             '
 
   systemd:
@@ -253,7 +301,7 @@ jobs:
               else
                 dnf install --assumeyes php-fpm
               fi
-              dnf install --assumeyes acl shadow-utils util-linux
+              dnf install --assumeyes acl php-opcache shadow-utils util-linux
               getent group nginx >/dev/null || groupadd --system nginx
               id nginx >/dev/null 2>&1 ||
                 useradd --system --gid nginx --no-create-home nginx
@@ -269,6 +317,7 @@ jobs:
                 /var/www/sample_wp/var/tmp
               /sbin/php-fpm --version |
                 grep --extended-regexp "^PHP (8\.[3-9]|9\.)"
+              php -r "exit(extension_loaded(\"Zend OPcache\") ? 0 : 1);"
               runuser --user sample_wp -- \
                 /sbin/php-fpm --test \
                   --fpm-config /etc/php-fpm.d/sites/sample_wp.conf

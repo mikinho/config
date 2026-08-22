@@ -31,14 +31,14 @@ port = 2356
 
 [nginx-http-auth]
 enabled = true
-logpath = /var/log/nginx/error.log
+logpath = /var/log/nginx/*error.log
 
 # The nginx baseline logs limit_req and limit_conn events at warn, which this
 # stock filter matches. Bursts from legitimate clients are expected, so ban
 # only sustained abuse.
 [nginx-limit-req]
 enabled = true
-logpath = /var/log/nginx/error.log
+logpath = /var/log/nginx/*error.log
 maxretry = 10
 
 # Requests answered 444 come from the default HTTP server for host names this
