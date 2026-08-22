@@ -91,7 +91,7 @@ render_site() {
         "etc/php-fpm.d/sites/$site_tag.conf"
     render_file "php-fpm/pool/$SAMPLE_TAG.conf" \
         "etc/php-fpm.d/pool/$site_tag.conf"
-    render_file "systemd/php-fpm@$SAMPLE_TAG.service.d/writable-paths.conf" \
+    render_file "systemd/system/php-fpm@$SAMPLE_TAG.service.d/writable-paths.conf" \
         "etc/systemd/system/php-fpm@$site_tag.service.d/writable-paths.conf"
 
     if [ "$site_tag" != "$SAMPLE_TAG" ] \

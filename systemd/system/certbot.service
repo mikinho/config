@@ -1,4 +1,4 @@
-# systemd/certbot.service
+# systemd/system/certbot.service
 
 #
 # Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho

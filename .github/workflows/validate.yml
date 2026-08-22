@@ -338,18 +338,18 @@ jobs:
                 useradd --system --user-group --no-create-home sample_wp
               install -d -o sample_wp -g sample_wp -m 0700 \
                 /var/www/sample_wp/var
-              install -m 0644 /workspace/systemd/php-fpm@.service \
+              install -m 0644 /workspace/systemd/system/php-fpm@.service \
                 /etc/systemd/system/php-fpm@.service
               install -D -m 0644 \
-                /workspace/systemd/php-fpm@sample_wp.service.d/writable-paths.conf \
+                /workspace/systemd/system/php-fpm@sample_wp.service.d/writable-paths.conf \
                 /etc/systemd/system/php-fpm@sample_wp.service.d/writable-paths.conf
               systemd-analyze --version
               # The container uses executable shims for services that are not
               # installed, so their Documentation= man pages are absent.
               systemd-analyze --man=no verify \
-                /workspace/systemd/nginx.service \
-                /workspace/systemd/certbot.service \
-                /workspace/systemd/certbot.timer \
+                /workspace/systemd/system/nginx.service \
+                /workspace/systemd/system/certbot.service \
+                /workspace/systemd/system/certbot.timer \
                 php-fpm@sample_wp.service
               install -D -o root -g root -m 0644 \
                 /workspace/logrotate/nginx \

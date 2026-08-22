@@ -13,7 +13,7 @@ Registers the persistent SELinux policy the nginx baseline requires beyond
 the distribution policy: file contexts for the unit's runtime directories,
 the QUIC UDP port label, and the setrlimit boolean. Idempotent; run as root
 on an SELinux-enabled RHEL-family host after installing
-systemd/nginx.service.
+systemd/system/nginx.service.
 EOF
 }
 
@@ -60,7 +60,7 @@ ensure_port_type() {
 
 # The distribution policy already labels /var/log/nginx, /var/lib/nginx,
 # /var/www, and /etc/nginx correctly. It covers only the /var/run/nginx.pid
-# file, not the PID and lock directories that systemd/nginx.service creates,
+# file, not the PID and lock directories that systemd/system/nginx.service creates,
 # so those two need persistent local rules.
 ensure_file_context httpd_var_run_t '/run/nginx(/.*)?'
 ensure_file_context httpd_var_run_t '/run/lock/nginx(/.*)?'

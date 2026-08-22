@@ -1,4 +1,4 @@
-# systemd/nginx.service
+# systemd/system/nginx.service
 
 #
 # Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
