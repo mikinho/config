@@ -5,7 +5,7 @@ set -eu
 PROGRAM_NAME=${0##*/}
 NGINX_PREFIX=${1:-/tmp/nginx-safe}
 NGINX_CONFIGURATION=nginx.conf
-NGINX_PID_FILE=/var/run/nginx/nginx.pid
+NGINX_PID_FILE=/run/nginx/nginx.pid
 SAMPLE_ROOT=/var/www/sample_wp/wordpress
 STATIC_FAILURE_LOG=/var/log/nginx/static-asset-failures.log
 TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/config-nginx-runtime.XXXXXX")

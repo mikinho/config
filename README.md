@@ -241,7 +241,7 @@ The selected configuration has these stub dependencies:
 | `http/quic.conf` | http | The provided HTTP/3 listener is installed. This is required by the `baseline` profile. |
 | `http/tls.conf` | http | Any selected site listens with `ssl`, including `_https_.conf`. This is required for HTTPS deployments. |
 | `http/post-quantum.conf` | http | nginx uses a TLS provider exposing `X25519MLKEM768`; select through the optional `post-quantum` profile. |
-| `http/upstreamfallback.conf` | http | The baseline `security-headers.conf` include is enabled. This is required by the provided `nginx.conf`. |
+| `http/upstream-fallback.conf` | http | The baseline `security-headers.conf` include is enabled. This is required by the provided `nginx.conf`. |
 | `http/logging.conf` | http | The privacy-minimized JSON access log is enabled. This is required by the provided `nginx.conf`. |
 | `http/ratelimit.conf` | http | A selected site or include uses `limit_req` or `limit_conn`, including `_http_.conf`, `http.conf`, and `wordpress-by-tag.conf`. |
 | `http/fastcgi-cache.conf` | http | A site includes `wordpress-cache-by-tag.conf`; select the `wordpress-cache` profile. |

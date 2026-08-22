@@ -269,8 +269,8 @@ jobs:
                 /var/lib/nginx/fastcgi \
                 /var/lib/nginx/fastcgi_tmp \
                 /var/lib/nginx/proxy_tmp \
-                /var/run/nginx \
-                /var/run/lock/nginx \
+                /run/nginx \
+                /run/lock/nginx \
                 /var/www/letsencrypt
               install -d -m 0700 /etc/letsencrypt/live/example.com
               (
