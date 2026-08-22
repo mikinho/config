@@ -30,7 +30,7 @@ it in the root README's stub-dependency table and covered by a profile.
   Replacing the baseline at a scope requires `add_header_inherit off` plus
   every required header restated there.
 - The security-header values come from the `$*_fallback` maps in
-  `stubs/http/upstreamfallback.conf`; an application-supplied header wins and
+  `stubs/http/upstream-fallback.conf`; an application-supplied header wins and
   the edge stays silent.
 - `includes/quiet-common-requests.conf` serves from the enclosing server's
   filesystem `root` and belongs only in root-based sites (the WordPress
