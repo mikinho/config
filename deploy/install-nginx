@@ -10,14 +10,21 @@ PROFILE_DIRECTORY=$SCRIPT_DIRECTORY/profiles
 SCRATCH_DIRECTORY=
 STAGING_DIRECTORY=
 
+# add_header_inherit, used by includes/security-headers.conf, first shipped in
+# nginx 1.29.3. Keep in step with the compatibility table in the root README.
+NGINX_VERSION_FLOOR=1.29.3
+
 usage() {
     cat <<EOF
 Usage:
   $PROGRAM_NAME --check
   $PROGRAM_NAME --list-profiles
+  $PROGRAM_NAME --verify-host
   $PROGRAM_NAME --output DIRECTORY [--profile NAME ...]
 
 The baseline profile is always selected. The output must not already exist.
+Run --verify-host on the target host before installing a rendered tree; it
+fails when the local nginx cannot parse this configuration.
 EOF
 }
 
@@ -41,6 +48,45 @@ trap cleanup EXIT HUP INT TERM
 # POSIX sh has no local variables, so every helper uses names unique to
 # itself; a helper reusing its caller's loop variable would silently corrupt
 # the caller's state.
+version_at_least() {
+    version_candidate=$1
+    version_floor=$2
+
+    version_index=1
+    while [ "$version_index" -le 3 ]; do
+        candidate_part=$(printf '%s' "$version_candidate" | cut -d. -f"$version_index")
+        floor_part=$(printf '%s' "$version_floor" | cut -d. -f"$version_index")
+        candidate_part=${candidate_part:-0}
+        floor_part=${floor_part:-0}
+
+        if [ "$candidate_part" -gt "$floor_part" ]; then
+            return 0
+        fi
+        if [ "$candidate_part" -lt "$floor_part" ]; then
+            return 1
+        fi
+
+        version_index=$((version_index + 1))
+    done
+
+    return 0
+}
+
+# Rendering can happen on a build machine, so the floor is enforced against
+# the host that will actually load the tree, not at render time.
+verify_host_nginx() {
+    command -v nginx >/dev/null 2>&1 || fail "nginx is not installed on this host"
+
+    host_version_raw=$(nginx -v 2>&1) || fail "unable to read the nginx version"
+    host_version=$(printf '%s' "$host_version_raw" | sed 's|^.*nginx/||; s|[^0-9.].*$||')
+    [ -n "$host_version" ] || fail "unable to parse an nginx version from: $host_version_raw"
+
+    version_at_least "$host_version" "$NGINX_VERSION_FLOOR" \
+        || fail "nginx $host_version is older than the $NGINX_VERSION_FLOOR floor required by add_header_inherit"
+
+    printf 'nginx %s meets the %s configuration floor.\n' "$host_version" "$NGINX_VERSION_FLOOR"
+}
+
 validate_profile_name() {
     candidate_name=$1
 
@@ -182,6 +228,8 @@ write_install_manifest() {
     manifest=$STAGING_DIRECTORY/INSTALL-PROFILE
 
     {
+        printf '%s\n' '# Minimum nginx version able to parse this tree'
+        printf 'nginx-version-floor %s\n' "$NGINX_VERSION_FLOOR"
         printf '%s\n' '# Selected profiles'
         sed 's/^/profile /' "$selected_profiles"
         printf '%s\n' '# Selected stubs'
@@ -247,6 +295,11 @@ while [ "$#" -gt 0 ]; do
             mode=list
             shift
             ;;
+        --verify-host)
+            [ -z "$mode" ] || fail "select exactly one operating mode"
+            mode=verify
+            shift
+            ;;
         --output)
             [ -z "$mode" ] || [ "$mode" = render ] || fail "select exactly one operating mode"
             [ "$#" -ge 2 ] || fail "--output requires a directory"
@@ -286,6 +339,10 @@ case "$mode" in
     list)
         [ -z "$requested_profiles" ] || fail "--profile is valid only with --output"
         list_profiles
+        ;;
+    verify)
+        [ -z "$requested_profiles" ] || fail "--profile is valid only with --output"
+        verify_host_nginx
         ;;
     render)
         [ -n "$output_directory" ] || fail "--output requires a directory"

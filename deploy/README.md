@@ -10,10 +10,18 @@ reviewed and installed as a deliberate overlay.
 ```sh
 deploy/install-nginx --check
 deploy/install-nginx --list-profiles
+deploy/install-nginx --verify-host
 deploy/install-nginx --output /tmp/nginx-install \
     --profile gzip \
     --profile websocket
 ```
+
+Because a render may happen on a build machine, the nginx version floor is
+enforced where the tree actually loads: run `--verify-host` on the target
+host before installing a render. It fails when the local nginx predates
+1.29.3 (`add_header_inherit`, the floor in the root README's compatibility
+table), and each render records the same floor as an `nginx-version-floor`
+line in its `INSTALL-PROFILE` manifest so other tooling can check it.
 
 The `baseline` profile is always selected. The output directory must not
 exist; refusing to reuse one guarantees stale or deselected stubs cannot
