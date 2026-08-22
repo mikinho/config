@@ -71,7 +71,8 @@ jobs:
             deploy/install-nginx \
             deploy/install-php-site \
             selinux/apply-nginx-policy \
-            tests/deploy-renderers.sh
+            tests/deploy-renderers.sh \
+            tests/nginx-runtime.sh
           deploy/install-nginx --check
           tests/deploy-renderers.sh
 
@@ -177,6 +178,23 @@ jobs:
             '    include includes/block-wordpress-probes.conf;' \
             '}' \
             > build/ci-safe/sites/probe-guards.conf
+          printf '%s\n' \
+            'server {' \
+            '    listen 127.0.0.1:18081;' \
+            '    server_name runtime-backend.invalid;' \
+            '    add_header_inherit off;' \
+            "    add_header Content-Security-Policy \"default-src 'none'\" always;" \
+            "    return 200 \"proxy=\$http_proxy\\nxff=\$http_x_forwarded_for\\n\";" \
+            '}' \
+            'server {' \
+            '    listen 127.0.0.1:18080;' \
+            '    server_name runtime-edge.invalid;' \
+            '    location / {' \
+            '        include includes/proxy-common.conf;' \
+            '        proxy_pass http://127.0.0.1:18081;' \
+            '    }' \
+            '}' \
+            > build/ci-safe/sites/runtime-policy.conf
 
           deploy/install-nginx \
             --output build/ci-cache \
@@ -192,6 +210,9 @@ jobs:
           cp \
             build/ci-safe/sites/probe-guards.conf \
             build/ci-cache/sites/probe-guards.conf
+          cp \
+            build/ci-safe/sites/runtime-policy.conf \
+            build/ci-cache/sites/runtime-policy.conf
           sed -i \
             's|includes/wordpress-by-tag.conf|includes/wordpress-cache-by-tag.conf|' \
             build/ci-cache/sites/sample_wp.conf
@@ -225,6 +246,7 @@ jobs:
               fi
               dnf install --assumeyes \
                 ca-certificates \
+                curl-minimal \
                 "${nginx_package}" \
                 openssl
               openssl version
@@ -270,6 +292,7 @@ jobs:
                 "include includes/wordpress-by-tag.conf;" \
                 /tmp/nginx-safe/sites/sample_wp.conf
               nginx -t -p /tmp/nginx-safe/ -c nginx.conf
+              /workspace/tests/nginx-runtime.sh /tmp/nginx-safe
 
               cp -R /profile-cache/. /tmp/nginx-cache/
               cp /etc/nginx/mime.types /etc/nginx/fastcgi_params /tmp/nginx-cache/

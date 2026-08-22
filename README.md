@@ -554,8 +554,9 @@ material application, plugin, theme, proxy, or CDN change.
 
 GitHub Actions validates deployment profile coverage, exercises the installer,
 runs `nginx -t` against stable and mainline nginx.org packages on Rocky Linux
-9, checks the units and logrotate policy on Rocky Linux 9 and CentOS Stream 10,
-and scans the complete Git history for secrets. The weekly run also compares
+9, exercises security and failure behavior against a running nginx, checks the
+units and logrotate policy on Rocky Linux 9 and CentOS Stream 10, and scans the
+complete Git history for secrets. The weekly run also compares
 the checksum-pinned Actionlint release with its current upstream release so a
 manual binary pin cannot silently become stale. GitHub's Ubuntu hosted runner
 is only the Docker and portable-tooling executor; it is not a supported
