@@ -53,7 +53,9 @@ users.
 
 The error-log glob covers the baseline global log and per-site error logs such
 as the public WordPress sample. Keep site logs under `/var/log/nginx` or add a
-deployment-local jail override for any deliberate alternate location.
+deployment-local jail override for any deliberate alternate location. fail2ban
+expands the glob when the service starts or reloads, so reload it after a new
+site log first appears.
 
 ## Validation
 
