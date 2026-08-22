@@ -436,6 +436,15 @@ content such as HTML, JavaScript, and SVG, including common double-extension
 forms. A site that intentionally accepts one of those formats must replace
 that location with an application-specific validation and serving policy.
 
+The generic WordPress static route uses a 30-day browser lifetime because the
+baseline cannot assume every theme, plugin, image, font, script, or stylesheet
+gets a new URL when its content changes. A site whose release process guarantees
+fingerprinted filenames or a changed version parameter may replace that policy
+with a one-year immutable lifetime. Successful assets remain out of access
+logs; 4xx and 5xx asset responses and a failing `robots.txt` are written to
+`/var/log/nginx/static-asset-failures.log` using the same privacy-minimized JSON
+format and rotation policy as the main access log.
+
 The shared WordPress route handles upstream 502, 503, and 504 responses through
 the optional document at the site's `/maintenance.html` filesystem path. That
 URI is internal-only: clients cannot request or index the maintenance document
@@ -496,14 +505,16 @@ unit after comparing their behavior.
 
 ## Logging and privacy contract
 
-The JSON access log records the client IP address, authenticated username when
+The JSON access logs record the client IP address, authenticated username when
 present, host, method, URL path, whether a query string existed, status,
 response size, referrer without its query string, user agent, negotiated
-protocol and TLS details, timings, and upstream cache status. Query-string
-values are deliberately not recorded from either the request or referrer
-because applications and links sometimes place personal data or credentials
-there. The included logrotate policy retains 14 rotations by default; a
-deployment may reduce that period to meet its actual operational need.
+protocol and TLS details, timings, and upstream cache status. The dedicated
+static-asset failure log uses that same format but records only 4xx and 5xx
+responses. Query-string values are deliberately not recorded from either the
+request or referrer because applications and links sometimes place personal
+data or credentials there. The included logrotate policy retains 14 rotations
+by default; a deployment may reduce that period to meet its actual operational
+need.
 
 IP addresses, usernames, referrers, user agents, and paths can still be
 personal data. Restrict journal and log-file access, document the actual

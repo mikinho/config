@@ -1,7 +1,8 @@
 # logrotate policy
 
-Daily rotation for nginx's file logs with fourteen kept generations,
-compression deferred one cycle, and a signaled reopen.
+Daily rotation for nginx's global, per-site, and conditional static-asset
+failure logs with fourteen kept generations, compression deferred one cycle,
+and a signaled reopen.
 
 ## Installation
 
