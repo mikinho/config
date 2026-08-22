@@ -345,9 +345,12 @@ emitted.
 Proxy locations include `includes/proxy-common.conf`, then set `proxy_pass`
 and any application-specific overrides. The include fixes HTTP/1.1 with an
 empty `Connection` header, forwards `Host`, `X-Real-IP`, `X-Forwarded-For`,
-and `X-Forwarded-Proto`, and sets conservative connect, send, and read
-timeouts. Upstream keepalive additionally requires a `keepalive` pool in the
-deployment-local upstream block:
+`X-Forwarded-Proto`, and an edge-assigned `X-Request-Id` matching the access
+log's `request_id` field, and sets conservative connect, send, and read
+timeouts. An application that adopts the request id header as its own can be
+correlated with the edge log line for the same request. Upstream keepalive
+additionally requires a `keepalive` pool in the deployment-local upstream
+block:
 
 ```nginx
 upstream app {
