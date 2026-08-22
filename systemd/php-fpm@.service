@@ -1,4 +1,4 @@
-# system/php-fpm@.service
+# systemd/php-fpm@.service
 
 #
 # Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
