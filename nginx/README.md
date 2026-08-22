@@ -48,6 +48,17 @@ it in the root README's stub-dependency table and covered by a profile.
   `/run/$site_tag/php-fpm.sock`, and include the `*-by-tag.conf` file. Use
   `php-fpm-path-info-by-tag.conf` only for a narrowly scoped location that
   genuinely requires PATH_INFO.
+- `wordpress-by-tag.conf` is the safe uncached WordPress default. Page caching
+  requires both `wordpress-cache-by-tag.conf` and the `wordpress-cache`
+  profile, and is an application-specific opt-in after cookie, authorization,
+  query-parameter, personalization, commerce, and consent testing.
+- Shared proxy includes treat this nginx instance as the public edge. They
+  overwrite `X-Real-IP` and `X-Forwarded-For` with `$remote_addr`; never append
+  an untrusted incoming forwarding chain. The trusted-proxy profile may update
+  `$remote_addr` only from explicitly trusted immediate peers.
+- `includes/relativeurls.conf` is a legacy opt-in, not shared WordPress policy.
+  Do not enable response-body URL rewriting on an SEO-indexed site instead of
+  generating correct absolute canonical and alternate-language URLs.
 
 `sites/sample_wp.conf.example` matches the `sample_wp` PHP-FPM pool and systemd
 instance. Replace its domains, certificate paths, and site tag, then install it
@@ -61,5 +72,6 @@ Render a profile and syntax-check it exactly as CI does, or run
 packages on Rocky Linux 9. It activates `sample_wp.conf.example` only in the
 ephemeral CI tree and generates a one-day self-signed certificate, so the
 complete public WordPress site is parsed without making it part of an installed
-baseline. A change that adds a directive must stay within the root README's
-syntax floor or advance it deliberately.
+baseline. CI then replaces the site's routing include with the cached variant
+and parses that configuration too. A change that adds a directive must stay
+within the root README's syntax floor or advance it deliberately.

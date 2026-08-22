@@ -9,7 +9,7 @@ ports.
 
 | Component | Supported baseline | Requirement |
 | --- | --- | --- |
-| PHP-FPM | PHP 8.3 or newer | The binary must include systemd notification and POSIX ACL support. |
+| PHP-FPM | PHP 8.3 or newer | The binary must include systemd notification and POSIX ACL support; install OPcache for production. |
 | systemd | 249 or newer | Required for the service sandbox used by `php-fpm@.service`. |
 | SELinux | Enforcing with the RHEL `httpd` policy | Runtime, session, and application write paths must carry the correct labels. |
 | nginx | The repository nginx baseline | nginx connects through `/run/$site_tag/php-fpm.sock`. |
@@ -20,10 +20,10 @@ command matching the selected packaging model:
 
 ```sh
 # Native RHEL-family PHP stream
-dnf install php-fpm policycoreutils policycoreutils-python-utils libselinux-utils
+dnf install php-fpm php-opcache policycoreutils policycoreutils-python-utils libselinux-utils
 
 # Parallel Remi PHP 8.3 collection
-dnf install php83-php-fpm policycoreutils policycoreutils-python-utils libselinux-utils
+dnf install php83-php-fpm php83-php-opcache policycoreutils policycoreutils-python-utils libselinux-utils
 ```
 
 Parallel Remi packages may use a versioned executable under `/opt/remi`. This
@@ -38,6 +38,7 @@ Validate that contract before installing an instance:
 readlink -f /sbin/php-fpm
 /sbin/php-fpm --version
 /sbin/php-fpm --info | grep -E 'Configure Command|Configuration File|Scan this dir'
+/sbin/php-fpm --info | grep -E 'opcache.enable|opcache.memory_consumption|opcache.validate_timestamps'
 ```
 
 Treat the symlink as managed host configuration and revalidate it after PHP
@@ -182,6 +183,18 @@ particular, `open_basedir` disables PHP's realpath cache, and some WordPress
 plugins or deployment tools require functions in the disabled list. Adjust
 the site pool after compatibility testing; do not weaken the systemd or SELinux
 boundary merely to preserve those PHP settings.
+
+The pool pins both `display_errors` and `display_startup_errors` off with
+`php_admin_flag`, so a development-oriented package `php.ini` cannot disclose
+paths, queries, or stack details in a production HTTP response. Errors remain
+available in the per-instance journal through `log_errors`; keep journal access
+restricted and align its retention with the deployed site's privacy policy.
+
+For production performance, enable and size OPcache in the selected package's
+PHP configuration, then verify the effective settings with the same
+version-neutral binary used by the service. Whether timestamp validation can
+be disabled depends on the deployment process: only do so when every release
+restarts or resets OPcache reliably.
 
 The sample hard-stops a web request after 60 seconds and leaves nginx at its
 default 60-second FastCGI read timeout. These controls have different semantics:
