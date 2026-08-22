@@ -280,7 +280,9 @@ jobs:
                 /workspace/systemd/php-fpm@sample_wp.service.d/writable-paths.conf \
                 /etc/systemd/system/php-fpm@sample_wp.service.d/writable-paths.conf
               systemd-analyze --version
-              systemd-analyze verify \
+              # The container uses executable shims for services that are not
+              # installed, so their Documentation= man pages are absent.
+              systemd-analyze --man=no verify \
                 /workspace/systemd/nginx.service \
                 /workspace/systemd/certbot.service \
                 /workspace/systemd/certbot.timer \
