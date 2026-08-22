@@ -67,8 +67,10 @@ it in the root README's stub-dependency table and covered by a profile.
   upstream outage never becomes a false 404.
 - Shared proxy includes treat this nginx instance as the public edge. They
   overwrite `X-Real-IP` and `X-Forwarded-For` with `$remote_addr`; never append
-  an untrusted incoming forwarding chain. The trusted-proxy profile may update
-  `$remote_addr` only from explicitly trusted immediate peers.
+  an untrusted incoming forwarding chain, and strip the legacy `Proxy` request
+  header before it reaches an application environment. The trusted-proxy
+  profile may update `$remote_addr` only from explicitly trusted immediate
+  peers.
 - `includes/relativeurls.conf` is a legacy opt-in, not shared WordPress policy.
   Do not enable response-body URL rewriting on an SEO-indexed site instead of
   generating correct absolute canonical and alternate-language URLs.
