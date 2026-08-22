@@ -6,6 +6,9 @@ PROGRAM_NAME=${0##*/}
 NGINX_PREFIX=${1:-/tmp/nginx-safe}
 NGINX_CONFIGURATION=nginx.conf
 NGINX_PID_FILE=/run/nginx/nginx.pid
+# The status site owns the exact 127.0.0.1:80 listener. Another address in
+# Linux's loopback /8 reaches the wildcard listener without exposing CI ports.
+PUBLIC_EDGE_ADDRESS=127.0.0.2
 SAMPLE_ROOT=/var/www/sample_wp/wordpress
 STATIC_FAILURE_LOG=/var/log/nginx/static-asset-failures.log
 TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/config-nginx-runtime.XXXXXX")
@@ -88,7 +91,7 @@ kill -0 "$NGINX_PID" 2>/dev/null \
     || fail 'nginx did not start'
 
 status=$(request redirect \
-    --resolve example.com:80:127.0.0.1 \
+    --resolve "example.com:80:$PUBLIC_EDGE_ADDRESS" \
     'http://example.com/path?retained=yes')
 assert_status 308 "$status" redirect
 assert_header redirect 'Location: https://example.com/path\?retained=yes'
@@ -112,7 +115,7 @@ csp_count=$(grep --ignore-case --count \
 
 status=$(request maintenance_missing \
     --insecure \
-    --resolve example.com:443:127.0.0.1 \
+    --resolve "example.com:443:$PUBLIC_EDGE_ADDRESS" \
     'https://example.com/index.php')
 assert_status 503 "$status" maintenance_missing
 assert_header maintenance_missing 'Strict-Transport-Security: max-age=31536000'
@@ -121,7 +124,7 @@ assert_header maintenance_missing 'X-Content-Type-Options: nosniff'
 printf '%s\n' 'Temporarily unavailable' >"$SAMPLE_ROOT/maintenance.html"
 status=$(request maintenance_present \
     --insecure \
-    --resolve example.com:443:127.0.0.1 \
+    --resolve "example.com:443:$PUBLIC_EDGE_ADDRESS" \
     'https://example.com/index.php')
 assert_status 502 "$status" maintenance_present
 grep --fixed-strings 'Temporarily unavailable' \
@@ -130,26 +133,26 @@ grep --fixed-strings 'Temporarily unavailable' \
 
 status=$(request maintenance_direct \
     --insecure \
-    --resolve example.com:443:127.0.0.1 \
+    --resolve "example.com:443:$PUBLIC_EDGE_ADDRESS" \
     'https://example.com/maintenance.html')
 assert_status 404 "$status" maintenance_direct
 
 status=$(request static_success \
     --insecure \
-    --resolve example.com:443:127.0.0.1 \
+    --resolve "example.com:443:$PUBLIC_EDGE_ADDRESS" \
     'https://example.com/app.css')
 assert_status 200 "$status" static_success
 assert_header static_success 'Cache-Control: max-age=2592000'
 
 status=$(request static_missing \
     --insecure \
-    --resolve example.com:443:127.0.0.1 \
+    --resolve "example.com:443:$PUBLIC_EDGE_ADDRESS" \
     'https://example.com/missing.css')
 assert_status 404 "$status" static_missing
 
 status=$(request robots_missing \
     --insecure \
-    --resolve example.com:443:127.0.0.1 \
+    --resolve "example.com:443:$PUBLIC_EDGE_ADDRESS" \
     'https://example.com/robots.txt')
 assert_status 404 "$status" robots_missing
 
