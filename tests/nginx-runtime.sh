@@ -56,9 +56,9 @@ assert_header() {
     request_name=$1
     expected_header=$2
 
-    grep --ignore-case --extended-regexp \
-        "^${expected_header}\r?$" \
-        "$TEST_ROOT/$request_name.headers" >/dev/null \
+    tr -d '\r' <"$TEST_ROOT/$request_name.headers" \
+        | grep --fixed-strings --ignore-case --line-regexp \
+            -- "$expected_header" >/dev/null \
         || fail "$request_name omitted expected header: $expected_header"
 }
 
@@ -94,7 +94,7 @@ status=$(request redirect \
     --resolve "example.com:80:$PUBLIC_EDGE_ADDRESS" \
     'http://example.com/path?retained=yes')
 assert_status 308 "$status" redirect
-assert_header redirect 'Location: https://example.com/path\?retained=yes'
+assert_header redirect 'Location: https://example.com/path?retained=yes'
 
 status=$(request proxied \
     --header 'Host: runtime-edge.invalid' \
