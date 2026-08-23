@@ -27,7 +27,7 @@ updates:
 
 | Registration | Why |
 | --- | --- |
-| `/run/nginx(/.*)?` and `/run/lock/nginx(/.*)?` as `httpd_var_run_t` | The base policy labels only `/var/run/nginx.pid`, not the PID and lock directories `systemd/system/nginx.service` creates. |
+| `/var/run/nginx(/.*)?` and `/var/run/lock/nginx(/.*)?` as `httpd_var_run_t` | RHEL's fcontext equivalency maps these canonical specifications onto the `/run/nginx` and `/run/lock/nginx` runtime paths. The base policy labels only `/var/run/nginx.pid`, not the complete directories `systemd/system/nginx.service` creates. |
 | `http_port_t` on UDP 443 | Port labels are per protocol and `http_port_t` historically lists TCP only; without this the QUIC listener cannot bind under enforcing mode. |
 | `httpd_setrlimit` on | `worker_rlimit_nofile` needs setrlimit permission. Without it nginx starts normally and workers silently keep the default descriptor limit — a failure that only surfaces under load. |
 
@@ -48,12 +48,15 @@ shared includes. Those directories are deployment-specific, so register each
 one where the site is provisioned:
 
 ```sh
-sudo semanage fcontext --add --type httpd_var_run_t "/run/SITE_TAG(/.*)?"
+sudo semanage fcontext --add --type httpd_var_run_t "/var/run/SITE_TAG(/.*)?"
 sudo restorecon -RF /run/SITE_TAG
 ```
 
-Replace `SITE_TAG` with the site's tag. Without the rule the socket is
-created as plain `var_run_t` and nginx's connection to it is denied. Register
+Replace `SITE_TAG` with the site's tag. The `/var/run` spelling is required
+when registering the rule because RHEL maps `/run` through an SELinux
+fcontext equivalency; the service and socket still use `/run/SITE_TAG`.
+Without the rule, the socket is created as plain `var_run_t` and nginx's
+connection to it is denied. Register
 the rule before the application service first starts so its runtime directory
 and socket are born with the right label. PHP-FPM owns its socket; this
 baseline does not use a PHP systemd socket unit.
