@@ -382,15 +382,29 @@ jobs:
                 "Type=oneshot" \
                 "ExecStart=/usr/bin/snap run --timer=00:00~24:00/2 certbot.renew" \
                 > /etc/systemd/system/snap.certbot.renew.service
-              systemd-analyze --man=no verify \
+              # The native payload must be absent here so an ignored or
+              # missing Snap target cannot fall back to certbot.service.
+              mv \
+                /etc/systemd/system/certbot.service \
+                /tmp/certbot.service.native
+              snap_verify_output=/tmp/systemd-snap-verify.log
+              if ! systemd-analyze --man=no verify \
                 certbot.timer \
                 snap.certbot.renew.service \
-                nginx.service
+                nginx.service \
+                > "${snap_verify_output}" 2>&1; then
+                cat "${snap_verify_output}" >&2
+                exit 1
+              fi
+              if [ -s "${snap_verify_output}" ]; then
+                cat "${snap_verify_output}" >&2
+                echo "Snap Certbot unit composition emitted diagnostics." >&2
+                exit 1
+              fi
 
               snap_timer_dropin=/workspace/systemd/system/certbot.timer.d/10-snap-runner.conf
               snap_service_dropin=/workspace/systemd/system/snap.certbot.renew.service.d/10-nginx.conf
               for timer_contract in \
-                "Unit=certbot.service" \
                 "OnCalendar=*-*-* 00,12:00:00" \
                 "RandomizedDelaySec=6h" \
                 "Persistent=true"; do
@@ -398,6 +412,12 @@ jobs:
                   "${timer_contract}" \
                   /workspace/systemd/system/certbot.timer
               done
+              if grep --extended-regexp --quiet \
+                "^[[:space:]]*Unit=" \
+                /workspace/systemd/system/certbot.timer; then
+                echo "Base Certbot timer must retain its name-derived payload." >&2
+                exit 1
+              fi
               snap_timer_directives=$(sed -n \
                 "/^[[:space:]]*[A-Za-z][A-Za-z0-9]*=/s/^[[:space:]]*//p" \
                 "${snap_timer_dropin}")
