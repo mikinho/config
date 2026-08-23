@@ -343,14 +343,120 @@ jobs:
               install -D -m 0644 \
                 /workspace/systemd/system/php-fpm@sample_wp.service.d/writable-paths.conf \
                 /etc/systemd/system/php-fpm@sample_wp.service.d/writable-paths.conf
+              install -D -m 0644 \
+                /workspace/systemd/system/nginx.service \
+                /etc/systemd/system/nginx.service
+              install -D -m 0644 \
+                /workspace/systemd/system/certbot.service \
+                /etc/systemd/system/certbot.service
+              install -D -m 0644 \
+                /workspace/systemd/system/certbot.timer \
+                /etc/systemd/system/certbot.timer
               systemd-analyze --version
               # The container uses executable shims for services that are not
               # installed, so their Documentation= man pages are absent.
               systemd-analyze --man=no verify \
-                /workspace/systemd/system/nginx.service \
-                /workspace/systemd/system/certbot.service \
-                /workspace/systemd/system/certbot.timer \
+                nginx.service \
+                certbot.service \
+                certbot.timer \
                 php-fpm@sample_wp.service
+
+              # Compose the optional Snap backend against a representative
+              # snapd-generated base service. Drop-ins cannot be verified in
+              # isolation, and running snapd inside this container would test
+              # the container rather than the unit contract.
+              install -D -m 0755 /usr/bin/true /usr/bin/snap
+              install -D -m 0644 \
+                /workspace/systemd/system/certbot.timer.d/10-snap-runner.conf \
+                /etc/systemd/system/certbot.timer.d/10-snap-runner.conf
+              install -D -m 0644 \
+                /workspace/systemd/system/snap.certbot.renew.service.d/10-nginx.conf \
+                /etc/systemd/system/snap.certbot.renew.service.d/10-nginx.conf
+              printf "%s\n" \
+                "[Unit]" \
+                "Description=Representative snap-managed Certbot renewal service" \
+                "Wants=network.target" \
+                "After=network.target" \
+                "" \
+                "[Service]" \
+                "Type=oneshot" \
+                "ExecStart=/usr/bin/snap run --timer=00:00~24:00/2 certbot.renew" \
+                > /etc/systemd/system/snap.certbot.renew.service
+              systemd-analyze --man=no verify \
+                certbot.timer \
+                snap.certbot.renew.service \
+                nginx.service
+
+              snap_timer_dropin=/workspace/systemd/system/certbot.timer.d/10-snap-runner.conf
+              snap_service_dropin=/workspace/systemd/system/snap.certbot.renew.service.d/10-nginx.conf
+              for timer_contract in \
+                "Unit=certbot.service" \
+                "OnCalendar=*-*-* 00,12:00:00" \
+                "RandomizedDelaySec=6h" \
+                "Persistent=true"; do
+                grep --fixed-strings --line-regexp \
+                  "${timer_contract}" \
+                  /workspace/systemd/system/certbot.timer
+              done
+              snap_timer_directives=$(sed -n \
+                "/^[[:space:]]*[A-Za-z][A-Za-z0-9]*=/s/^[[:space:]]*//p" \
+                "${snap_timer_dropin}")
+              if [ "${snap_timer_directives}" != \
+                "Unit=snap.certbot.renew.service" ]; then
+                echo "Snap timer drop-in must change only the renewal payload." >&2
+                exit 1
+              fi
+              for certbot_contract in \
+                "Requires=nginx.service" \
+                "Wants=network-online.target" \
+                "After=network-online.target nginx.service" \
+                "UMask=0077" \
+                "TimeoutStartSec=1h" \
+                "ExecStopPost=/bin/systemctl reload nginx.service"; do
+                grep --fixed-strings --line-regexp \
+                  "${certbot_contract}" \
+                  /workspace/systemd/system/certbot.service
+                grep --fixed-strings --line-regexp \
+                  "${certbot_contract}" \
+                  "${snap_service_dropin}"
+              done
+              for snap_owned_directive in \
+                CapabilityBoundingSet \
+                ConfigurationDirectory \
+                Environment \
+                ExecStart \
+                LockPersonality \
+                LogsDirectory \
+                MemoryDenyWriteExecute \
+                NoNewPrivileges \
+                PrivateDevices \
+                PrivateTmp \
+                ProtectClock \
+                ProtectControlGroups \
+                ProtectHome \
+                ProtectHostname \
+                ProtectKernelLogs \
+                ProtectKernelModules \
+                ProtectKernelTunables \
+                ProtectProc \
+                ProtectSystem \
+                ReadWritePaths \
+                RestrictAddressFamilies \
+                RestrictNamespaces \
+                RestrictRealtime \
+                RestrictSUIDSGID \
+                SocketBindDeny \
+                StateDirectory \
+                SystemCallArchitectures \
+                SystemCallFilter \
+                TasksMax; do
+                if grep --extended-regexp --quiet \
+                  "^${snap_owned_directive}=" \
+                  "${snap_service_dropin}"; then
+                  echo "Snap Certbot drop-in must not set ${snap_owned_directive}." >&2
+                  exit 1
+                fi
+              done
               install -D -o root -g root -m 0644 \
                 /workspace/logrotate/nginx \
                 /etc/logrotate.d/nginx
