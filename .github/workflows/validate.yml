@@ -192,6 +192,7 @@ jobs:
                 python3 \
                 rpm-build \
                 shadow-utils \
+                util-linux-core \
                 zlib-devel
 
               vendor_version="$(
