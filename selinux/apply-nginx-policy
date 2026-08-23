@@ -39,12 +39,19 @@ selinuxenabled || fail 'SELinux is not enabled on this host'
 
 ensure_file_context() {
     context_type=$1
-    path_specification=$2
+    shift
 
-    semanage fcontext --add --type "$context_type" "$path_specification" \
-        2>/dev/null \
-        || semanage fcontext --modify --type "$context_type" \
-            "$path_specification"
+    for path_specification in "$@"; do
+        if semanage fcontext --add --type "$context_type" \
+            "$path_specification" 2>/dev/null \
+            || semanage fcontext --modify --type "$context_type" \
+                "$path_specification" 2>/dev/null
+        then
+            return
+        fi
+    done
+
+    fail "unable to register $context_type for: $*"
 }
 
 remove_file_context_if_present() {
@@ -75,13 +82,18 @@ ensure_port_type() {
 # The distribution policy already labels /var/log/nginx, /var/lib/nginx,
 # /var/www, and /etc/nginx correctly. It covers only the /var/run/nginx.pid
 # file, not the PID and lock directories that systemd/system/nginx.service
-# creates, so those two need persistent local rules. RHEL-family policy maps
-# /run to /var/run and /run/lock to /var/lock with fcontext equivalency rules:
-# semanage therefore requires those canonical spellings even though the
-# runtime paths and restorecon targets remain under /run.
-ensure_file_context httpd_var_run_t '/var/run/nginx(/.*)?'
-ensure_file_context httpd_var_run_t '/var/lock/nginx(/.*)?'
+# creates, so those two need persistent local rules. RHEL 9 and newer policy
+# releases use opposite directions for the /run equivalencies, so semanage
+# accepts different spellings on different supported hosts. Try the runtime
+# path first and its policy alias second; either produces the same effective
+# label under /run.
 remove_file_context_if_present '/var/run/lock/nginx(/.*)?'
+ensure_file_context httpd_var_run_t \
+    '/run/nginx(/.*)?' \
+    '/var/run/nginx(/.*)?'
+ensure_file_context httpd_var_run_t \
+    '/run/lock/nginx(/.*)?' \
+    '/var/lock/nginx(/.*)?'
 
 for runtime_directory in /run/nginx /run/lock/nginx; do
     [ -d "$runtime_directory" ] || continue
