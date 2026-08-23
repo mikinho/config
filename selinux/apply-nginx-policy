@@ -47,6 +47,20 @@ ensure_file_context() {
             "$path_specification"
 }
 
+remove_file_context_if_present() {
+    path_specification=$1
+    local_file_contexts=$(
+        semanage fcontext --list --locallist --noheading
+    )
+
+    if printf '%s\n' "$local_file_contexts" |
+        awk -v candidate="$path_specification" \
+            '$1 == candidate { found = 1 } END { exit found ? 0 : 1 }'
+    then
+        semanage fcontext --delete "$path_specification"
+    fi
+}
+
 ensure_port_type() {
     port_type=$1
     protocol=$2
@@ -62,11 +76,12 @@ ensure_port_type() {
 # /var/www, and /etc/nginx correctly. It covers only the /var/run/nginx.pid
 # file, not the PID and lock directories that systemd/system/nginx.service
 # creates, so those two need persistent local rules. RHEL-family policy maps
-# /run to /var/run with an fcontext equivalency rule: semanage therefore
-# requires the canonical /var/run spelling even though the runtime paths and
-# restorecon targets remain under /run.
+# /run to /var/run and /run/lock to /var/lock with fcontext equivalency rules:
+# semanage therefore requires those canonical spellings even though the
+# runtime paths and restorecon targets remain under /run.
 ensure_file_context httpd_var_run_t '/var/run/nginx(/.*)?'
-ensure_file_context httpd_var_run_t '/var/run/lock/nginx(/.*)?'
+ensure_file_context httpd_var_run_t '/var/lock/nginx(/.*)?'
+remove_file_context_if_present '/var/run/lock/nginx(/.*)?'
 
 for runtime_directory in /run/nginx /run/lock/nginx; do
     [ -d "$runtime_directory" ] || continue

@@ -27,7 +27,7 @@ updates:
 
 | Registration | Why |
 | --- | --- |
-| `/var/run/nginx(/.*)?` and `/var/run/lock/nginx(/.*)?` as `httpd_var_run_t` | RHEL's fcontext equivalency maps these canonical specifications onto the `/run/nginx` and `/run/lock/nginx` runtime paths. The base policy labels only `/var/run/nginx.pid`, not the complete directories `systemd/system/nginx.service` creates. |
+| `/var/run/nginx(/.*)?` and `/var/lock/nginx(/.*)?` as `httpd_var_run_t` | RHEL's fcontext equivalencies map these canonical specifications onto the `/run/nginx` and `/run/lock/nginx` runtime paths. The base policy labels only `/var/run/nginx.pid`, not the complete directories `systemd/system/nginx.service` creates. |
 | `http_port_t` on UDP 443 | Port labels are per protocol and `http_port_t` historically lists TCP only; without this the QUIC listener cannot bind under enforcing mode. |
 | `httpd_setrlimit` on | `worker_rlimit_nofile` needs setrlimit permission. Without it nginx starts normally and workers silently keep the default descriptor limit — a failure that only surfaces under load. |
 

@@ -574,12 +574,21 @@ jobs:
                 "ensure_file_context httpd_var_run_t '\''/var/run/nginx(/.*)?'\''" \
                 /workspace/selinux/apply-nginx-policy
               grep --fixed-strings \
-                "ensure_file_context httpd_var_run_t '\''/var/run/lock/nginx(/.*)?'\''" \
+                "remove_file_context_if_present '\''/var/run/lock/nginx(/.*)?'\''" \
                 /workspace/selinux/apply-nginx-policy
+              grep --fixed-strings \
+                "ensure_file_context httpd_var_run_t '\''/var/lock/nginx(/.*)?'\''" \
+                /workspace/selinux/apply-nginx-policy
+              semanage fcontext --add --type httpd_var_run_t \
+                "/var/run/lock/nginx(/.*)?"
+              semanage fcontext --delete "/var/run/lock/nginx(/.*)?"
               semanage fcontext --add --type httpd_var_run_t \
                 "/var/run/nginx(/.*)?"
               semanage fcontext --add --type httpd_var_run_t \
-                "/var/run/lock/nginx(/.*)?"
+                "/var/lock/nginx(/.*)?"
+              mkdir -p /run/nginx /run/lock/nginx
+              matchpathcon /run/nginx | grep --fixed-strings httpd_var_run_t
+              matchpathcon /run/lock/nginx | grep --fixed-strings httpd_var_run_t
               checkmodule -M -m \
                 -o /tmp/nginx_quic_bpf.mod \
                 /workspace/selinux/nginx_quic_bpf.te
