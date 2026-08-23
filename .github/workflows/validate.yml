@@ -176,7 +176,7 @@ jobs:
                 attr \
                 binutils \
                 cpio \
-                curl \
+                curl-minimal \
                 dnf-plugins-core \
                 gcc \
                 gcc-c++ \
