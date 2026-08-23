@@ -18,8 +18,8 @@ readonly SIGNATURE_URL="$SOURCE_URL.asc"
 readonly SIGNING_KEY_URL='https://keys.openpgp.org/vks/v1/by-fingerprint/9FEF112DCE19A0DC7E882CB81BB24997A8535F6F'
 readonly SOURCE_SHA256=c7ffd1ef653e99540f661e47cb00b7f9cad1ee6b972399b16f93d672656e0d33
 readonly SIGNATURE_SHA256=d1991847892c02ba81834273f6bb9aa9107a30ba8bf5d16cc3e4560e4c2140d6
-readonly SIGNING_KEY_SHA256=4129e90b0b62e915a453f071641f363e8b07d888c763be00f83128fd63447a6f
-readonly SIGNING_KEY_FINGERPRINT=9FEF112DCE19A0DC7E882CB81BB24997A8535F6F
+readonly SIGNER_BLOB_SHA256=4129e90b0b62e915a453f071641f363e8b07d888c763be00f83128fd63447a6f
+readonly SIGNER_FINGERPRINT=9FEF112DCE19A0DC7E882CB81BB24997A8535F6F
 readonly -a BUILD_DEPENDENCY_PACKAGES=(
     acl
     attr
@@ -112,9 +112,9 @@ validate_repository_contract() {
         || fail 'invalid pinned source digest'
     [[ "$SIGNATURE_SHA256" =~ ^[0-9a-f]{64}$ ]] \
         || fail 'invalid pinned signature digest'
-    [[ "$SIGNING_KEY_SHA256" =~ ^[0-9a-f]{64}$ ]] \
+    [[ "$SIGNER_BLOB_SHA256" =~ ^[0-9a-f]{64}$ ]] \
         || fail 'invalid pinned signing-key digest'
-    [[ "$SIGNING_KEY_FINGERPRINT" =~ ^[0-9A-F]{40}$ ]] \
+    [[ "$SIGNER_FINGERPRINT" =~ ^[0-9A-F]{40}$ ]] \
         || fail 'invalid pinned signing-key fingerprint'
 }
 
@@ -186,7 +186,7 @@ verify_upstream_signature() {
         gpg --batch --homedir "$gnupg_home" --with-colons --fingerprint \
             | awk -F: '$1 == "fpr" { print $10; exit }'
     )"
-    [[ "$imported_fingerprint" == "$SIGNING_KEY_FINGERPRINT" ]] \
+    [[ "$imported_fingerprint" == "$SIGNER_FINGERPRINT" ]] \
         || fail "unexpected signing-key fingerprint: ${imported_fingerprint:-<empty>}"
     gpg --batch --homedir "$gnupg_home" --verify "$source_signature" "$source_archive"
 }
@@ -281,8 +281,8 @@ write_build_metadata() {
         printf 'source-url %s\n' "$SOURCE_URL"
         printf 'source-sha256 %s\n' "$SOURCE_SHA256"
         printf 'signature-sha256 %s\n' "$SIGNATURE_SHA256"
-        printf 'signing-key-fingerprint %s\n' "$SIGNING_KEY_FINGERPRINT"
-        printf 'signing-key-sha256 %s\n' "$SIGNING_KEY_SHA256"
+        printf 'signing-key-fingerprint %s\n' "$SIGNER_FINGERPRINT"
+        printf 'signing-key-sha256 %s\n' "$SIGNER_BLOB_SHA256"
         printf 'spec-sha256 %s\n' "$spec_sha256"
         printf 'builder-os %s\n' "$builder_os"
         printf 'builder-release-package %s\n' "$builder_release"
@@ -317,7 +317,7 @@ build_packages() {
 
     download_verified_input "$SOURCE_URL" "$source_archive" "$SOURCE_SHA256"
     download_verified_input "$SIGNATURE_URL" "$source_signature" "$SIGNATURE_SHA256"
-    download_verified_input "$SIGNING_KEY_URL" "$signing_key" "$SIGNING_KEY_SHA256"
+    download_verified_input "$SIGNING_KEY_URL" "$signing_key" "$SIGNER_BLOB_SHA256"
     verify_upstream_signature "$source_archive" "$source_signature" "$signing_key" "$gnupg_home"
 
     install -d \

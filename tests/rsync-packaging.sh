@@ -13,7 +13,9 @@ fail() {
 }
 
 [ -x "$BUILDER" ] || fail "builder is not executable: $BUILDER"
-[ -f "$SPEC" ] && [ ! -L "$SPEC" ] || fail "spec is not a real file: $SPEC"
+if [ ! -f "$SPEC" ] || [ -L "$SPEC" ]; then
+    fail "spec is not a real file: $SPEC"
+fi
 
 "$BUILDER" --check
 
