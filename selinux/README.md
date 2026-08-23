@@ -27,7 +27,7 @@ updates:
 
 | Registration | Why |
 | --- | --- |
-| `/var/run/nginx(/.*)?` and `/var/lock/nginx(/.*)?` as `httpd_var_run_t` | RHEL's fcontext equivalencies map these canonical specifications onto the `/run/nginx` and `/run/lock/nginx` runtime paths. The base policy labels only `/var/run/nginx.pid`, not the complete directories `systemd/system/nginx.service` creates. |
+| `/run/nginx(/.*)?` and `/run/lock/nginx(/.*)?` as `httpd_var_run_t` | The script transparently selects the path spelling accepted by the installed RHEL-family policy. Rocky Linux 9 aliases `/run` to legacy `/var` paths, while newer policy releases reverse that mapping. The effective labels always cover the runtime directories that `systemd/system/nginx.service` creates. |
 | `http_port_t` on UDP 443 | Port labels are per protocol and `http_port_t` historically lists TCP only; without this the QUIC listener cannot bind under enforcing mode. |
 | `httpd_setrlimit` on | `worker_rlimit_nofile` needs setrlimit permission. Without it nginx starts normally and workers silently keep the default descriptor limit — a failure that only surfaces under load. |
 
@@ -48,15 +48,20 @@ shared includes. Those directories are deployment-specific, so register each
 one where the site is provisioned:
 
 ```sh
+# Rocky Linux 9 and RHEL 9
 sudo semanage fcontext --add --type httpd_var_run_t "/var/run/SITE_TAG(/.*)?"
+
+# CentOS Stream 10 and policies that alias /var/run to /run
+sudo semanage fcontext --add --type httpd_var_run_t "/run/SITE_TAG(/.*)?"
+
 sudo restorecon -RF /run/SITE_TAG
 ```
 
-Replace `SITE_TAG` with the site's tag. The `/var/run` spelling is required
-when registering the rule because RHEL maps `/run` through an SELinux
-fcontext equivalency; the service and socket still use `/run/SITE_TAG`.
-Without the rule, the socket is created as plain `var_run_t` and nginx's
-connection to it is denied. Register
+Replace `SITE_TAG` with the site's tag and run only the `semanage` form for
+the installed policy. If the wrong spelling is used, `semanage` rejects it
+and names the required equivalent path; do not remove the distribution's
+equivalence rule. Without the local rule, the socket is created as plain
+`var_run_t` and nginx's connection to it is denied. Register
 the rule before the application service first starts so its runtime directory
 and socket are born with the right label. PHP-FPM owns its socket; this
 baseline does not use a PHP systemd socket unit.
