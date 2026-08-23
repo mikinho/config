@@ -1,0 +1,418 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+readonly PROGRAM_NAME=${0##*/}
+SCRIPT_DIRECTORY="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+readonly SCRIPT_DIRECTORY
+readonly SPEC_FILE="$SCRIPT_DIRECTORY/rsync.spec"
+readonly RSYNCD_CONFIG_FILE="$SCRIPT_DIRECTORY/rsyncd.conf"
+
+readonly RSYNC_VERSION=3.5.0
+readonly PACKAGE_RELEASE=0.1.mikinho.el9
+readonly SOURCE_NAME="rsync-$RSYNC_VERSION.tar.gz"
+readonly SIGNATURE_NAME="$SOURCE_NAME.asc"
+readonly SIGNING_KEY_NAME="rsync-$RSYNC_VERSION-signing-key.asc"
+readonly SOURCE_URL="https://download.samba.org/pub/rsync/src/$SOURCE_NAME"
+readonly SIGNATURE_URL="$SOURCE_URL.asc"
+readonly SIGNING_KEY_URL='https://keys.openpgp.org/vks/v1/by-fingerprint/9FEF112DCE19A0DC7E882CB81BB24997A8535F6F'
+readonly SOURCE_SHA256=c7ffd1ef653e99540f661e47cb00b7f9cad1ee6b972399b16f93d672656e0d33
+readonly SIGNATURE_SHA256=d1991847892c02ba81834273f6bb9aa9107a30ba8bf5d16cc3e4560e4c2140d6
+readonly SIGNING_KEY_SHA256=4129e90b0b62e915a453f071641f363e8b07d888c763be00f83128fd63447a6f
+readonly SIGNING_KEY_FINGERPRINT=9FEF112DCE19A0DC7E882CB81BB24997A8535F6F
+readonly -a BUILD_DEPENDENCY_PACKAGES=(
+    acl
+    attr
+    binutils
+    gcc
+    gcc-c++
+    gawk
+    gnupg2
+    libacl-devel
+    libattr-devel
+    libzstd-devel
+    lz4-devel
+    make
+    openssl-devel
+    popt-devel
+    python3
+    rpm-build
+    zlib-devel
+)
+
+OUTPUT_DIRECTORY=
+SCRATCH_DIRECTORY=
+OUTPUT_STAGING_DIRECTORY=
+
+usage() {
+    cat <<EOF
+Usage:
+  $PROGRAM_NAME --check
+  $PROGRAM_NAME --output DIRECTORY
+
+--check validates the repository-owned packaging contract without network
+access. --output performs a pinned, signature-verified EL9 x86_64 RPM build.
+The output directory and its parent must not be symbolic links, and the output
+directory must not already exist.
+EOF
+}
+
+fail() {
+    printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2
+    exit 1
+}
+
+cleanup() {
+    if [[ -n "$OUTPUT_STAGING_DIRECTORY" && -d "$OUTPUT_STAGING_DIRECTORY" ]]; then
+        rm -rf -- "$OUTPUT_STAGING_DIRECTORY"
+    fi
+    if [[ -n "$SCRATCH_DIRECTORY" && -d "$SCRATCH_DIRECTORY" ]]; then
+        rm -rf -- "$SCRATCH_DIRECTORY"
+    fi
+}
+
+trap cleanup EXIT HUP INT TERM
+
+require_command() {
+    local command_name=$1
+    command -v "$command_name" >/dev/null 2>&1 \
+        || fail "required command is unavailable: $command_name"
+}
+
+require_regular_repository_file() {
+    local target=$1
+    [[ -f "$target" && ! -L "$target" ]] \
+        || fail "repository input must be a real regular file: $target"
+}
+
+require_literal() {
+    local needle=$1 target=$2
+    grep -Fq -- "$needle" "$target" \
+        || fail "missing packaging contract in ${target##*/}: $needle"
+}
+
+validate_repository_contract() {
+    require_regular_repository_file "$SPEC_FILE"
+    require_regular_repository_file "$RSYNCD_CONFIG_FILE"
+
+    require_literal 'Version: 3.5.0' "$SPEC_FILE"
+    require_literal 'Release: 0.1.mikinho%{?dist}' "$SPEC_FILE"
+    require_literal 'Source0: https://download.samba.org/pub/rsync/src/rsync-%{version}.tar.gz' "$SPEC_FILE"
+    require_literal 'Source1: https://download.samba.org/pub/rsync/src/rsync-%{version}.tar.gz.asc' "$SPEC_FILE"
+    require_literal 'Source2: rsync-%{version}-signing-key.asc' "$SPEC_FILE"
+    require_literal '--with-included-popt=no' "$SPEC_FILE"
+    require_literal '--with-included-zlib=no' "$SPEC_FILE"
+    require_literal "grep -Fx '#define EXTERNAL_ZLIB 1' config.h" "$SPEC_FILE"
+    require_literal '--with-rrsync' "$SPEC_FILE"
+    require_literal 'make check' "$SPEC_FILE"
+    require_literal '%{_bindir}/rrsync' "$SPEC_FILE"
+    require_literal '%config(noreplace) %{_sysconfdir}/rsyncd.conf' "$SPEC_FILE"
+
+    [[ "$SOURCE_SHA256" =~ ^[0-9a-f]{64}$ ]] \
+        || fail 'invalid pinned source digest'
+    [[ "$SIGNATURE_SHA256" =~ ^[0-9a-f]{64}$ ]] \
+        || fail 'invalid pinned signature digest'
+    [[ "$SIGNING_KEY_SHA256" =~ ^[0-9a-f]{64}$ ]] \
+        || fail 'invalid pinned signing-key digest'
+    [[ "$SIGNING_KEY_FINGERPRINT" =~ ^[0-9A-F]{40}$ ]] \
+        || fail 'invalid pinned signing-key fingerprint'
+}
+
+validate_output_boundary() {
+    local output_parent output_parent_mode output_parent_uid
+
+    [[ -n "$OUTPUT_DIRECTORY" ]] || fail 'set --output DIRECTORY'
+    case "$OUTPUT_DIRECTORY" in
+        /|.|..|*/.|*/..)
+            fail "refusing ambiguous output directory: $OUTPUT_DIRECTORY"
+            ;;
+    esac
+    [[ ! -e "$OUTPUT_DIRECTORY" && ! -L "$OUTPUT_DIRECTORY" ]] \
+        || fail "output directory already exists: $OUTPUT_DIRECTORY"
+
+    output_parent=${OUTPUT_DIRECTORY%/*}
+    [[ "$output_parent" != "$OUTPUT_DIRECTORY" ]] || output_parent=.
+    [[ -d "$output_parent" && ! -L "$output_parent" ]] \
+        || fail "output parent must be a real directory: $output_parent"
+    output_parent_uid="$(stat -c '%u' -- "$output_parent")"
+    [[ "$output_parent_uid" == "$(id -u)" ]] \
+        || fail "output parent must be owned by the build user: $output_parent"
+    output_parent_mode="$(stat -c '%a' -- "$output_parent")"
+    (( (8#$output_parent_mode & 0022) == 0 )) \
+        || fail "output parent must not be group/world writable: $output_parent"
+}
+
+validate_build_host() {
+    local platform_id
+
+    [[ "$(uname -s)" == Linux ]] || fail 'RPM builds require Linux'
+    [[ "$(uname -m)" == x86_64 ]] || fail 'this deployment package targets EL9 x86_64'
+    [[ "$(id -u)" -ne 0 ]] || fail 'refusing to build or test upstream code as root'
+    [[ -f /etc/os-release ]] || fail 'cannot identify the build platform'
+    platform_id="$(sed -n 's/^PLATFORM_ID=//p' /etc/os-release | tr -d '"')"
+    [[ "$platform_id" == platform:el9 ]] \
+        || fail "build host is not EL9 (PLATFORM_ID=${platform_id:-<empty>})"
+
+    for command_name in \
+        awk cpio curl find gpg grep id install mktemp mv python3 readelf rm rpm \
+        rpm2cpio rpmbuild sed sha256sum sort stat tee tr xargs; do
+        require_command "$command_name"
+    done
+}
+
+download_verified_input() {
+    local url=$1 destination=$2 expected_sha256=$3
+
+    curl \
+        --fail \
+        --location \
+        --proto '=https' \
+        --silent \
+        --show-error \
+        --tlsv1.2 \
+        --output "$destination" \
+        "$url"
+    printf '%s  %s\n' "$expected_sha256" "$destination" \
+        | sha256sum --check --strict
+}
+
+verify_upstream_signature() {
+    local source_archive=$1 source_signature=$2 signing_key=$3 gnupg_home=$4
+    local imported_fingerprint
+
+    install -d -m 0700 "$gnupg_home"
+    gpg --batch --homedir "$gnupg_home" --import "$signing_key"
+    imported_fingerprint="$(
+        gpg --batch --homedir "$gnupg_home" --with-colons --fingerprint \
+            | awk -F: '$1 == "fpr" { print $10; exit }'
+    )"
+    [[ "$imported_fingerprint" == "$SIGNING_KEY_FINGERPRINT" ]] \
+        || fail "unexpected signing-key fingerprint: ${imported_fingerprint:-<empty>}"
+    gpg --batch --homedir "$gnupg_home" --verify "$source_signature" "$source_archive"
+}
+
+find_single_package() {
+    local package_name=$1 search_root=$2 candidate candidate_name matched=
+
+    while IFS= read -r -d '' candidate; do
+        candidate_name="$(rpm -qp --queryformat '%{NAME}' "$candidate")"
+        [[ "$candidate_name" == "$package_name" ]] || continue
+        [[ -z "$matched" ]] || fail "multiple $package_name RPMs were produced"
+        matched=$candidate
+    done < <(find "$search_root" -type f -name '*.rpm' -print0)
+
+    [[ -n "$matched" ]] || fail "build did not produce the $package_name RPM"
+    printf '%s\n' "$matched"
+}
+
+validate_built_packages() {
+    local core_rpm=$1 rrsync_rpm=$2 extraction_root=$3
+    local identity package_rpm required_option required_marker
+    local rsync_help rsync_version rrsync_help
+
+    identity="$(rpm -qp --queryformat '%{NAME} %{VERSION}-%{RELEASE} %{ARCH}' "$core_rpm")"
+    [[ "$identity" == "rsync $RSYNC_VERSION-$PACKAGE_RELEASE x86_64" ]] \
+        || fail "unexpected core RPM identity: $identity"
+    identity="$(rpm -qp --queryformat '%{NAME} %{VERSION}-%{RELEASE} %{ARCH}' "$rrsync_rpm")"
+    [[ "$identity" == "rsync-rrsync $RSYNC_VERSION-$PACKAGE_RELEASE noarch" ]] \
+        || fail "unexpected rrsync RPM identity: $identity"
+
+    rpm --checksig --nosignature "$core_rpm" "$rrsync_rpm"
+    for package_rpm in "$core_rpm" "$rrsync_rpm"; do
+        [[ -z "$(rpm -qp --scripts "$package_rpm")" ]] \
+            || fail "RPM contains an unexpected scriptlet: ${package_rpm##*/}"
+        if ! rpm -qp --queryformat '[%{FILEMODES:perms} %{FILENAMES}\n]' \
+            "$package_rpm" | awk '$1 ~ /[sS]/ { found = 1 } END { exit found }'; then
+            fail "RPM contains a set-ID file: ${package_rpm##*/}"
+        fi
+        if rpm -qp --queryformat '[%{FILECAPS}\n]' "$package_rpm" \
+            | grep -Ev '^(|\(none\))$' >/dev/null; then
+            fail "RPM contains a file capability: ${package_rpm##*/}"
+        fi
+        if rpm -qlp "$package_rpm" | grep -F '/systemd/' >/dev/null; then
+            fail "RPM unexpectedly installs a systemd unit: ${package_rpm##*/}"
+        fi
+    done
+    rpm -qlp "$core_rpm" | grep -Fx '/usr/bin/rsync' >/dev/null \
+        || fail 'core RPM does not own /usr/bin/rsync'
+    rpm -qlp "$rrsync_rpm" | grep -Fx '/usr/bin/rrsync' >/dev/null \
+        || fail 'rrsync RPM does not own /usr/bin/rrsync'
+
+    install -d -m 0700 "$extraction_root"
+    (
+        cd "$extraction_root"
+        rpm2cpio "$core_rpm" | cpio -idm --quiet
+        rpm2cpio "$rrsync_rpm" | cpio -idm --quiet
+    )
+
+    rsync_version="$(LC_ALL=C "$extraction_root/usr/bin/rsync" --version)" \
+        || fail 'built rsync version invocation failed'
+    printf '%s\n' "$rsync_version" | sed -n '1p' \
+        | grep -Eq 'rsync[[:space:]]+version 3[.]5[.]0([[:space:]]|$)' \
+        || fail 'built rsync does not report version 3.5.0'
+    rsync_help="$(LC_ALL=C "$extraction_root/usr/bin/rsync" --help)" \
+        || fail 'built rsync help invocation failed'
+    for required_option in '--confine-root=DIR' '--drop-D' '--fsync'; do
+        grep -Fq -- "$required_option" <<< "$rsync_help" \
+            || fail "built rsync lacks required option: $required_option"
+    done
+    rrsync_help="$(python3 "$extraction_root/usr/bin/rrsync" -help 2>&1)" \
+        || fail 'built rrsync help invocation failed'
+    grep -Fq -- '-no-lock' <<< "$rrsync_help" \
+        || fail 'built rrsync lacks required -no-lock mode'
+    for required_marker in \
+        'pinned_fds = []' \
+        "long_opts['copy-unsafe-links'] = -1" \
+        "rsync_opts.append('--drop-D')" \
+        "rsync_opts.append('--confine-root=' + os.getcwd())"; do
+        grep -Fq -- "$required_marker" "$extraction_root/usr/bin/rrsync" \
+            || fail "built rrsync lacks security marker: $required_marker"
+    done
+}
+
+write_build_metadata() {
+    local destination=$1 spec_sha256=$2 builder_os builder_release
+
+    builder_os="$(sed -n 's/^PRETTY_NAME=//p' /etc/os-release | tr -d '"')"
+    builder_release="$(rpm -q centos-stream-release 2>/dev/null || printf 'unavailable')"
+    {
+        printf 'rsync-version %s\n' "$RSYNC_VERSION"
+        printf 'package-release %s\n' "$PACKAGE_RELEASE"
+        printf 'source-url %s\n' "$SOURCE_URL"
+        printf 'source-sha256 %s\n' "$SOURCE_SHA256"
+        printf 'signature-sha256 %s\n' "$SIGNATURE_SHA256"
+        printf 'signing-key-fingerprint %s\n' "$SIGNING_KEY_FINGERPRINT"
+        printf 'signing-key-sha256 %s\n' "$SIGNING_KEY_SHA256"
+        printf 'spec-sha256 %s\n' "$spec_sha256"
+        printf 'builder-os %s\n' "$builder_os"
+        printf 'builder-release-package %s\n' "$builder_release"
+        printf 'builder-architecture %s\n' "$(uname -m)"
+        printf 'builder-image-reference %s\n' \
+            "${RSYNC_BUILD_IMAGE_REFERENCE:-direct-el9-host}"
+        printf 'rpmbuild-version %s\n' "$(rpmbuild --version)"
+        printf 'rpm-signature unsigned-local-build\n'
+        rpm -q \
+            --queryformat 'build-dependency %{NAME} %{VERSION}-%{RELEASE}.%{ARCH}\n' \
+            "${BUILD_DEPENDENCY_PACKAGES[@]}" \
+            | LC_ALL=C sort
+    } > "$destination"
+}
+
+build_packages() {
+    local top_directory source_archive source_signature signing_key gnupg_home
+    local build_log core_rpm rrsync_rpm source_rpm extraction_root spec_sha256
+    local output_parent package_rpm checksum_manifest
+
+    validate_output_boundary
+    validate_build_host
+
+    SCRATCH_DIRECTORY="$(mktemp -d "${TMPDIR:-/tmp}/rsync-rpm-build.XXXXXXXX")"
+    top_directory="$SCRATCH_DIRECTORY/rpmbuild"
+    source_archive="$SCRATCH_DIRECTORY/$SOURCE_NAME"
+    source_signature="$SCRATCH_DIRECTORY/$SIGNATURE_NAME"
+    signing_key="$SCRATCH_DIRECTORY/$SIGNING_KEY_NAME"
+    gnupg_home="$SCRATCH_DIRECTORY/gnupg"
+    build_log="$SCRATCH_DIRECTORY/rpmbuild.log"
+    extraction_root="$SCRATCH_DIRECTORY/extracted"
+
+    download_verified_input "$SOURCE_URL" "$source_archive" "$SOURCE_SHA256"
+    download_verified_input "$SIGNATURE_URL" "$source_signature" "$SIGNATURE_SHA256"
+    download_verified_input "$SIGNING_KEY_URL" "$signing_key" "$SIGNING_KEY_SHA256"
+    verify_upstream_signature "$source_archive" "$source_signature" "$signing_key" "$gnupg_home"
+
+    install -d \
+        "$top_directory/BUILD" \
+        "$top_directory/BUILDROOT" \
+        "$top_directory/RPMS" \
+        "$top_directory/SOURCES" \
+        "$top_directory/SPECS" \
+        "$top_directory/SRPMS"
+    install -m 0644 "$source_archive" "$top_directory/SOURCES/$SOURCE_NAME"
+    install -m 0644 "$source_signature" "$top_directory/SOURCES/$SIGNATURE_NAME"
+    install -m 0644 "$signing_key" "$top_directory/SOURCES/$SIGNING_KEY_NAME"
+    install -m 0644 "$RSYNCD_CONFIG_FILE" "$top_directory/SOURCES/rsyncd.conf"
+    install -m 0644 "$SPEC_FILE" "$top_directory/SPECS/rsync.spec"
+
+    rpmbuild -ba \
+        --define "_topdir $top_directory" \
+        "$top_directory/SPECS/rsync.spec" \
+        2>&1 | tee "$build_log"
+
+    core_rpm="$(find_single_package rsync "$top_directory/RPMS")"
+    rrsync_rpm="$(find_single_package rsync-rrsync "$top_directory/RPMS")"
+    source_rpm="$(find_single_package rsync "$top_directory/SRPMS")"
+    validate_built_packages "$core_rpm" "$rrsync_rpm" "$extraction_root"
+
+    output_parent=${OUTPUT_DIRECTORY%/*}
+    [[ "$output_parent" != "$OUTPUT_DIRECTORY" ]] || output_parent=.
+    OUTPUT_STAGING_DIRECTORY="$(mktemp -d "$output_parent/.rsync-rpm-output.XXXXXXXX")"
+
+    while IFS= read -r -d '' package_rpm; do
+        install -m 0644 "$package_rpm" "$OUTPUT_STAGING_DIRECTORY/"
+    done < <(find "$top_directory/RPMS" -type f -name '*.rpm' -print0)
+    install -m 0644 "$source_rpm" "$OUTPUT_STAGING_DIRECTORY/"
+    install -m 0644 "$source_archive" "$OUTPUT_STAGING_DIRECTORY/"
+    install -m 0644 "$source_signature" "$OUTPUT_STAGING_DIRECTORY/"
+    install -m 0644 "$signing_key" "$OUTPUT_STAGING_DIRECTORY/"
+    install -m 0644 "$SPEC_FILE" "$OUTPUT_STAGING_DIRECTORY/rsync.spec"
+    install -m 0644 "$RSYNCD_CONFIG_FILE" "$OUTPUT_STAGING_DIRECTORY/rsyncd.conf"
+    install -m 0644 "$build_log" "$OUTPUT_STAGING_DIRECTORY/rpmbuild.log"
+
+    spec_sha256="$(sha256sum "$SPEC_FILE" | awk '{print $1}')"
+    write_build_metadata "$OUTPUT_STAGING_DIRECTORY/BUILD-METADATA" "$spec_sha256"
+    checksum_manifest="$SCRATCH_DIRECTORY/SHA256SUMS"
+    (
+        cd "$OUTPUT_STAGING_DIRECTORY"
+        find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%f\0' \
+            | sort -z \
+            | xargs -0 sha256sum
+    ) > "$checksum_manifest"
+    install -m 0644 "$checksum_manifest" "$OUTPUT_STAGING_DIRECTORY/SHA256SUMS"
+
+    # The build can take several minutes. Revalidate immediately before the
+    # atomic publication so a destination created meanwhile cannot turn this
+    # move into a nested copy.
+    validate_output_boundary
+    mv -T -- "$OUTPUT_STAGING_DIRECTORY" "$OUTPUT_DIRECTORY"
+    OUTPUT_STAGING_DIRECTORY=
+    printf 'Built and verified rsync %s RPMs at %s\n' "$RSYNC_VERSION" "$OUTPUT_DIRECTORY"
+}
+
+mode=
+while (( $# > 0 )); do
+    case "$1" in
+        --check)
+            [[ -z "$mode" ]] || fail 'select exactly one mode'
+            mode=check
+            shift
+            ;;
+        --output)
+            [[ -z "$mode" ]] || fail 'select exactly one mode'
+            (( $# >= 2 )) || fail '--output requires a directory'
+            mode=build
+            OUTPUT_DIRECTORY=$2
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            fail "unknown argument: $1"
+            ;;
+    esac
+done
+
+validate_repository_contract
+case "$mode" in
+    check)
+        printf 'Validated rsync %s EL9 packaging contract.\n' "$RSYNC_VERSION"
+        ;;
+    build)
+        build_packages
+        ;;
+    *)
+        usage >&2
+        exit 1
+        ;;
+esac

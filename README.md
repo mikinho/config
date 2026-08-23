@@ -33,6 +33,7 @@ but only for explicitly trusted immediate peers.
 | logrotate | A currently supported release | Required only when installing the included nginx file-log rotation policy. |
 | fail2ban | A currently supported EPEL release | Required only for the optional intrusion-ban policy in `fail2ban/`. |
 | OpenSSH | A supported RHEL-family sshd with the stock `sshd_config.d` include | Required only for the `ssh/` drop-ins; RHEL 8-era sshd lacks the include and silently ignores them. |
+| rsync | **3.5.0 or newer** for restricted `rrsync` deployment identities | 3.5.0 adds the confinement contract needed to close CVE-2026-53783. `packages/rsync/` supplies an audited temporary EL9 rebuild while the vendor package lags. |
 | firewalld | A currently supported RHEL-family release | Required only for the `firewalld/` service definitions and reference zone. |
 | SELinux | Enforcing mode with the RHEL `httpd` policy | Expected on the supported platforms; do not disable it to deploy this baseline. |
 
@@ -187,6 +188,8 @@ TCP 443 so clients always have an HTTP/2 or HTTP/1.1 fallback.
   OpenSSH daemon.
 - `firewalld/` contains per-product firewall service definitions and a
   reference zone.
+- `packages/` contains pinned, source-signature-verified package bridges for
+  security interfaces not yet available from a supported RHEL-family vendor.
 
 Each component directory carries its own README covering that component's
 installation and validation; this document remains authoritative for the
@@ -587,16 +590,18 @@ material application, plugin, theme, proxy, or CDN change.
 GitHub Actions validates deployment profile coverage, exercises the installer,
 runs `nginx -t` against stable and mainline nginx.org packages on Rocky Linux
 9, exercises security and failure behavior against a running nginx, checks the
-units and logrotate policy on Rocky Linux 9 and CentOS Stream 10, and scans the
-complete Git history for secrets. The weekly run also compares
-the checksum-pinned Actionlint release with its current upstream release so a
-manual binary pin cannot silently become stale. GitHub's Ubuntu hosted runner
-is only the Docker and portable-tooling executor; it is not a supported
-deployment target. The third-party Brotli modules, `quic_bpf` kernel/SELinux
-path, and OpenSSL 3.5 hybrid group cannot be fully exercised by the stock CI
-environment. The `brotli`, `quic-bpf`, and `post-quantum` profiles are therefore
-profile-validated in public CI and must be syntax- and runtime-tested with the
-exact modules, kernel, policy, and TLS provider on the target host.
+units and logrotate policy on Rocky Linux 9 and CentOS Stream 10, builds the
+pinned rsync bridge as an unprivileged user on CentOS Stream 9, and scans the
+complete Git history for secrets. The weekly run also compares the pinned
+Actionlint and rsync releases with their current upstream releases; the rsync
+job fails as soon as CentOS supplies an eligible replacement. GitHub's Ubuntu
+hosted runner is only the Docker and portable-tooling executor; it is not a
+supported deployment target. The third-party Brotli modules, `quic_bpf`
+kernel/SELinux path, and OpenSSL 3.5 hybrid group cannot be fully exercised by
+the stock CI environment. The `brotli`, `quic-bpf`, and `post-quantum` profiles
+are therefore profile-validated in public CI and must be syntax- and
+runtime-tested with the exact modules, kernel, policy, and TLS provider on the
+target host.
 
 Run these checks on the target host before calling the deployment complete.
 Run only the block for the selected Certbot backend:
@@ -663,6 +668,8 @@ This repository is available under the [MIT License](LICENSE).
 - [OpenSSL release strategy](https://openssl-library.org/policies/releasestrat/)
 - [OpenSSL TLS group configuration](https://docs.openssl.org/3.5/man3/SSL_CONF_cmd/)
 - [Red Hat security backporting policy](https://access.redhat.com/security/updates/backporting)
+- [rsync 3.5.0 release](https://rsync.samba.org/)
+- [rsync security advisories](https://github.com/RsyncProject/rsync/security/advisories)
 - [RHEL 9 SELinux guidance](https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/9/html/using_selinux/configuring-selinux-for-applications-and-services-with-non-standard-configurations_using-selinux)
 - [ngx_brotli build instructions](https://github.com/google/ngx_brotli)
 - [Certbot automated renewal](https://eff-certbot.readthedocs.io/en/stable/using.html#setting-up-automated-renewal)
