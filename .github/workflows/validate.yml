@@ -70,11 +70,14 @@ jobs:
           shellcheck \
             deploy/install-nginx \
             deploy/install-php-site \
+            packages/rsync/build-el9 \
             selinux/apply-nginx-policy \
             tests/deploy-renderers.sh \
-            tests/nginx-runtime.sh
+            tests/nginx-runtime.sh \
+            tests/rsync-packaging.sh
           deploy/install-nginx --check
           tests/deploy-renderers.sh
+          tests/rsync-packaging.sh
 
       - name: Exercise a full profile render
         run: |
@@ -127,6 +130,94 @@ jobs:
             echo 'renderer unexpectedly overwrote an existing output' >&2
             exit 1
           fi
+
+  rsync-package:
+    name: rsync 3.5.0 package on CentOS Stream 9
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check pinned upstream release
+        if: github.event_name == 'schedule'
+        run: |
+          latest_tag=$(
+            curl --fail --location --silent --show-error \
+              https://api.github.com/repos/RsyncProject/rsync/releases/latest |
+              python3 -c \
+                'import json, sys; print(json.load(sys.stdin)["tag_name"])'
+          )
+          if [ "$latest_tag" != v3.5.0 ]; then
+            echo "Pinned rsync 3.5.0 is stale; latest release is ${latest_tag}." >&2
+            exit 1
+          fi
+
+      - name: Build and audit EL9 RPMs
+        run: |
+          rsync_image=quay.io/centos/centos:stream9
+          docker pull "$rsync_image"
+          rsync_image_reference=$(
+            docker image inspect \
+              --format '{{ index .RepoDigests 0 }}' \
+              "$rsync_image"
+          )
+          test -n "$rsync_image_reference"
+          docker run --rm \
+            --env "RSYNC_BUILD_IMAGE_REFERENCE=$rsync_image_reference" \
+            --volume "$PWD:/workspace:ro" \
+            "$rsync_image" \
+            /bin/bash -euxo pipefail -c '
+              dnf install --assumeyes \
+                acl \
+                attr \
+                binutils \
+                cpio \
+                curl \
+                dnf-plugins-core \
+                gcc \
+                gcc-c++ \
+                gawk \
+                gnupg2 \
+                libacl-devel \
+                libattr-devel \
+                libzstd-devel \
+                lz4-devel \
+                make \
+                openssl-devel \
+                popt-devel \
+                python3 \
+                rpm-build \
+                shadow-utils \
+                zlib-devel
+
+              vendor_version="$(
+                dnf --quiet repoquery --latest-limit 1 \
+                  --queryformat "%{version}" rsync |
+                  tail -n 1
+              )"
+              test -n "$vendor_version"
+              if [ "$(printf "%s\n%s\n" 3.5.0 "$vendor_version" |
+                    sort --version-sort | head -n 1)" = 3.5.0 ]; then
+                echo "CentOS now supplies rsync ${vendor_version}; retire the package bridge." >&2
+                exit 1
+              fi
+
+              useradd --create-home --uid 1000 rsync-builder
+              install -d -o rsync-builder -g rsync-builder -m 0755 \
+                /tmp/rsync-output
+              runuser -u rsync-builder -- \
+                /workspace/packages/rsync/build-el9 \
+                --output /tmp/rsync-output/rsync-3.5.0-el9
+              cd /tmp/rsync-output/rsync-3.5.0-el9
+              sha256sum --check --strict SHA256SUMS
+              test -f rsync-3.5.0-0.1.mikinho.el9.x86_64.rpm
+              test -f rsync-rrsync-3.5.0-0.1.mikinho.el9.noarch.rpm
+              test -f rsync-3.5.0-0.1.mikinho.el9.src.rpm
+            '
 
   nginx:
     name: nginx ${{ matrix.version }} on Rocky Linux 9
