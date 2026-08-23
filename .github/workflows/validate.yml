@@ -488,6 +488,32 @@ jobs:
                 cat "${snap_verify_output}" >&2
                 exit 1
               fi
+              # Rocky systemd 252 reports its own packaged aliases while
+              # scanning the unit path. Remove only the exact reviewed
+              # source/target pairs; every other diagnostic remains fatal.
+              known_alias_notices=/tmp/systemd-known-alias-notices
+              printf "%s\n" \
+                "Suspicious symlink /etc/systemd/system/ctrl-alt-del.target → /usr/lib/systemd/system/reboot.target, treating as alias." \
+                "Suspicious symlink /etc/systemd/system/dbus.service → /usr/lib/systemd/system/dbus-broker.service, treating as alias." \
+                "Suspicious symlink /usr/lib/systemd/system/default.target → /usr/lib/systemd/system/graphical.target, treating as alias." \
+                "Suspicious symlink /usr/lib/systemd/system/runlevel0.target → /usr/lib/systemd/system/poweroff.target, treating as alias." \
+                "Suspicious symlink /usr/lib/systemd/system/runlevel1.target → /usr/lib/systemd/system/rescue.target, treating as alias." \
+                "Suspicious symlink /usr/lib/systemd/system/runlevel2.target → /usr/lib/systemd/system/multi-user.target, treating as alias." \
+                "Suspicious symlink /usr/lib/systemd/system/runlevel3.target → /usr/lib/systemd/system/multi-user.target, treating as alias." \
+                "Suspicious symlink /usr/lib/systemd/system/runlevel4.target → /usr/lib/systemd/system/multi-user.target, treating as alias." \
+                "Suspicious symlink /usr/lib/systemd/system/runlevel5.target → /usr/lib/systemd/system/graphical.target, treating as alias." \
+                "Suspicious symlink /usr/lib/systemd/system/runlevel6.target → /usr/lib/systemd/system/reboot.target, treating as alias." \
+                "Suspicious symlink /usr/lib/systemd/system/autovt@.service → /usr/lib/systemd/system/getty@.service, treating as alias." \
+                "Suspicious symlink /usr/lib/systemd/system/dbus-org.freedesktop.locale1.service → /usr/lib/systemd/system/systemd-localed.service, treating as alias." \
+                "Suspicious symlink /usr/lib/systemd/system/dbus-org.freedesktop.timedate1.service → /usr/lib/systemd/system/systemd-timedated.service, treating as alias." \
+                "Suspicious symlink /usr/lib/systemd/system/dbus-org.freedesktop.login1.service → /usr/lib/systemd/system/systemd-logind.service, treating as alias." \
+                "Suspicious symlink /usr/lib/systemd/system/dbus-org.freedesktop.hostname1.service → /usr/lib/systemd/system/systemd-hostnamed.service, treating as alias." \
+                > "${known_alias_notices}"
+              grep --invert-match --fixed-strings --line-regexp \
+                --file="${known_alias_notices}" \
+                "${snap_verify_output}" \
+                > "${snap_verify_output}.filtered" || [ "$?" -eq 1 ]
+              mv "${snap_verify_output}.filtered" "${snap_verify_output}"
               if [ -s "${snap_verify_output}" ]; then
                 cat "${snap_verify_output}" >&2
                 echo "Snap Certbot unit composition emitted diagnostics." >&2
