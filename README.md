@@ -477,7 +477,7 @@ The repository timer owns renewal scheduling for both supported backends:
 | --- | --- | --- |
 | Scheduler | `certbot.timer` | `certbot.timer` |
 | Renewal payload | `certbot.service` | snapd-generated `snap.certbot.renew.service` |
-| Payload selection | timer's native `Unit=certbot.service` | `certbot.timer.d/10-snap-runner.conf` |
+| Payload selection | timer's name-derived `certbot.service` default | `certbot.timer.d/10-snap-runner.conf` |
 | nginx integration | native service | `snap.certbot.renew.service.d/10-nginx.conf` |
 | Scheduler to disable | all package-owned renewal timers | all package-owned renewal timers, including `snap.certbot.renew.timer` |
 

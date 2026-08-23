@@ -41,9 +41,10 @@ systemctl daemon-reload
 systemctl enable --now certbot.timer
 ```
 
-The timer explicitly selects `certbot.service` as its oneshot payload. Do not
-install the Snap drop-ins with this backend. When retiring the Snap backend,
-remove or park both of these exact files before reloading systemd:
+Without a `Unit=` directive, systemd derives `certbot.service` from the timer's
+name and uses it as the oneshot payload. Do not install the Snap drop-ins with
+this backend. When retiring the Snap backend, remove or park both of these
+exact files before reloading systemd:
 
 ```text
 /etc/systemd/system/certbot.timer.d/10-snap-runner.conf
