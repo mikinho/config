@@ -570,6 +570,16 @@ jobs:
                 policycoreutils \
                 policycoreutils-python-utils \
                 selinux-policy-targeted
+              grep --fixed-strings \
+                "ensure_file_context httpd_var_run_t '\''/var/run/nginx(/.*)?'\''" \
+                /workspace/selinux/apply-nginx-policy
+              grep --fixed-strings \
+                "ensure_file_context httpd_var_run_t '\''/var/run/lock/nginx(/.*)?'\''" \
+                /workspace/selinux/apply-nginx-policy
+              semanage fcontext --add --type httpd_var_run_t \
+                "/var/run/nginx(/.*)?"
+              semanage fcontext --add --type httpd_var_run_t \
+                "/var/run/lock/nginx(/.*)?"
               checkmodule -M -m \
                 -o /tmp/nginx_quic_bpf.mod \
                 /workspace/selinux/nginx_quic_bpf.te
