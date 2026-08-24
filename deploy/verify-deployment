@@ -7,10 +7,15 @@ NGINX_BINARY=/usr/sbin/nginx
 NGINX_CONFIG=/etc/nginx/nginx.conf
 NGINX_VERSION_FLOOR=1.29.3
 
-BACKEND=native
+BACKEND=auto
 SITE_TAG=
 VERBOSE=0
 FAILED_CHECKS=0
+
+CERTBOT_TIMER_UNIT=certbot.timer
+CERTBOT_SNAP_RUNNER_DROPIN=/etc/systemd/system/certbot.timer.d/10-snap-runner.conf
+CERTBOT_SNAP_NGINX_DROPIN=/etc/systemd/system/snap.certbot.renew.service.d/10-nginx.conf
+SELINUX_CONFIG=/etc/selinux/config
 
 usage() {
     cat <<EOF
@@ -22,7 +27,7 @@ systemd units, OpenSSH configuration, firewalld services, SELinux policies,
 QUIC kernel buffers, and runtime socket permissions.
 
 Options:
-  --backend BACKEND   Certbot renewal backend: 'native' (default) or 'snap'
+  --backend BACKEND   Certbot renewal backend: 'auto' (default), 'native', or 'snap'
   --site SITE_TAG     Validate per-site PHP-FPM socket and systemd instance
   --verbose, -v       Show detailed diagnostic outputs for each check
   --help, -h          Show this help message
@@ -44,6 +49,13 @@ pass_msg() {
 info_msg() {
     if [ "$VERBOSE" -eq 1 ]; then
         printf '       %s\n' "$*"
+    fi
+}
+
+require_root() {
+    if [ "$(id -u)" -ne 0 ]; then
+        fail_msg "run as root so every host baseline check can inspect live state"
+        return 1
     fi
 }
 
@@ -85,10 +97,14 @@ check_nginx() {
     host_version=$(printf '%s' "$host_version_raw" | sed 's|^.*nginx/||; s|[^0-9.].*$||')
     if [ -z "$host_version" ]; then
         fail_msg "unable to parse nginx version: $host_version_raw"
-    elif ! version_at_least "$host_version" "$NGINX_VERSION_FLOOR"; then
-        fail_msg "nginx $host_version is below syntax floor $NGINX_VERSION_FLOOR"
+    elif printf '%s\n' "$host_version" | grep -Eq '^[0-9]+([.][0-9]+){0,2}$'; then
+        if ! version_at_least "$host_version" "$NGINX_VERSION_FLOOR"; then
+            fail_msg "nginx $host_version is below syntax floor $NGINX_VERSION_FLOOR"
+        else
+            pass_msg "nginx binary version is $host_version (>= $NGINX_VERSION_FLOOR)"
+        fi
     else
-        pass_msg "nginx binary version is $host_version (>= $NGINX_VERSION_FLOOR)"
+        fail_msg "nginx reported an invalid numeric version: $host_version"
     fi
 
     host_build_raw=$("$NGINX_BINARY" -V 2>&1) || {
@@ -110,14 +126,12 @@ check_nginx() {
         fi
     done
 
-    if [ -f "$NGINX_CONFIG" ]; then
-        if "$NGINX_BINARY" -t -q -c "$NGINX_CONFIG" 2>/dev/null; then
-            pass_msg "nginx configuration test passed: $NGINX_CONFIG"
-        else
-            fail_msg "nginx configuration test failed: $NGINX_CONFIG"
-        fi
+    if [ ! -f "$NGINX_CONFIG" ]; then
+        fail_msg "live nginx config is missing: $NGINX_CONFIG"
+    elif "$NGINX_BINARY" -t -q -c "$NGINX_CONFIG" 2>/dev/null; then
+        pass_msg "nginx configuration test passed: $NGINX_CONFIG"
     else
-        info_msg "live nginx config not present at $NGINX_CONFIG (skipped nginx -t)"
+        fail_msg "nginx configuration test failed: $NGINX_CONFIG"
     fi
 }
 
@@ -132,50 +146,74 @@ check_quic_state() {
             fail_msg "quic_host.key has unexpected permissions ($key_mode) or size ($key_bytes bytes)"
         fi
     else
-        info_msg "quic_host.key not present at /etc/nginx/quic_host.key (initial host state)"
+        fail_msg "quic_host.key is missing: /etc/nginx/quic_host.key"
     fi
 
-    if command -v sysctl >/dev/null 2>&1; then
-        rmem=$(sysctl -n net.core.rmem_max 2>/dev/null || echo 0)
-        wmem=$(sysctl -n net.core.wmem_max 2>/dev/null || echo 0)
-        if [ "$rmem" -ge 2097152 ] && [ "$wmem" -ge 2097152 ]; then
-            pass_msg "kernel socket buffers net.core.rmem_max ($rmem) and wmem_max ($wmem) meet 2 MiB floor"
-        else
-            fail_msg "kernel socket buffers below 2 MiB (rmem_max: $rmem, wmem_max: $wmem); install sysctl/99-nginx-quic.conf"
-        fi
+    if ! command -v sysctl >/dev/null 2>&1; then
+        fail_msg "sysctl tooling is unavailable"
+        return
     fi
+
+    rmem=$(sysctl -n net.core.rmem_max 2>/dev/null || echo 0)
+    wmem=$(sysctl -n net.core.wmem_max 2>/dev/null || echo 0)
+    if [ "$rmem" -ge 2097152 ] && [ "$wmem" -ge 2097152 ]; then
+        pass_msg "kernel socket buffers net.core.rmem_max ($rmem) and wmem_max ($wmem) meet 2 MiB floor"
+    else
+        fail_msg "kernel socket buffers below 2 MiB (rmem_max: $rmem, wmem_max: $wmem); install sysctl/99-nginx-quic.conf"
+    fi
+}
+
+resolve_certbot_backend() {
+    case "$BACKEND" in
+        auto)
+            if [ -f "$CERTBOT_SNAP_RUNNER_DROPIN" ]; then
+                RESOLVED_BACKEND=snap
+            else
+                RESOLVED_BACKEND=native
+            fi
+            pass_msg "detected $RESOLVED_BACKEND Certbot renewal backend"
+            ;;
+        native | snap)
+            RESOLVED_BACKEND=$BACKEND
+            ;;
+        *)
+            fail_msg "unknown backend: $BACKEND"
+            return 1
+            ;;
+    esac
 }
 
 check_systemd_services() {
     printf 'Checking systemd services and timers...\n'
     if ! command -v systemctl >/dev/null 2>&1; then
-        info_msg "systemctl not available; skipping service status checks"
+        fail_msg "systemctl is unavailable"
         return
     fi
 
     if systemctl is-active --quiet nginx.service 2>/dev/null; then
         pass_msg "nginx.service is active"
     else
-        info_msg "nginx.service is not currently active"
+        fail_msg "nginx.service is not active"
     fi
 
-    if systemctl is-active --quiet certbot.timer 2>/dev/null; then
-        pass_msg "certbot.timer is active"
+    if systemctl is-active --quiet "$CERTBOT_TIMER_UNIT" 2>/dev/null; then
+        pass_msg "$CERTBOT_TIMER_UNIT is active"
     else
-        info_msg "certbot.timer is not currently active"
+        fail_msg "$CERTBOT_TIMER_UNIT is not active"
     fi
 
-    case "$BACKEND" in
+    resolve_certbot_backend || return
+    case "$RESOLVED_BACKEND" in
         native)
-            if [ -f /etc/systemd/system/certbot.timer.d/10-snap-runner.conf ]; then
+            if [ -f "$CERTBOT_SNAP_RUNNER_DROPIN" ]; then
                 fail_msg "snap runner drop-in present while native backend selected"
             else
                 pass_msg "native certbot backend configuration verified"
             fi
             ;;
         snap)
-            if [ -f /etc/systemd/system/certbot.timer.d/10-snap-runner.conf ] && \
-               [ -f /etc/systemd/system/snap.certbot.renew.service.d/10-nginx.conf ]; then
+            if [ -f "$CERTBOT_SNAP_RUNNER_DROPIN" ] && \
+               [ -f "$CERTBOT_SNAP_NGINX_DROPIN" ]; then
                 pass_msg "snap certbot drop-ins present"
             else
                 fail_msg "snap certbot backend selected but drop-ins missing under /etc/systemd/system/"
@@ -184,9 +222,6 @@ check_systemd_services() {
                 fail_msg "snap.certbot.renew.timer is active; must be disabled so repository timer is sole scheduler"
             fi
             ;;
-        *)
-            fail_msg "unknown backend: $BACKEND"
-            ;;
     esac
 
     if [ -n "$SITE_TAG" ]; then
@@ -194,7 +229,7 @@ check_systemd_services() {
         if systemctl is-active --quiet "$site_service" 2>/dev/null; then
             pass_msg "$site_service is active"
         else
-            info_msg "$site_service is not currently active"
+            fail_msg "$site_service is not active"
         fi
     fi
 }
@@ -202,7 +237,7 @@ check_systemd_services() {
 check_ssh_hardening() {
     printf 'Checking OpenSSH configuration...\n'
     if ! command -v sshd >/dev/null 2>&1; then
-        info_msg "sshd not available; skipping OpenSSH checks"
+        fail_msg "sshd is unavailable"
         return
     fi
 
@@ -213,11 +248,11 @@ check_ssh_hardening() {
 
     effective_config=$(sshd -T 2>/dev/null || true)
     if [ -z "$effective_config" ]; then
-        info_msg "unable to read effective sshd configuration via sshd -T"
+        fail_msg "unable to read effective sshd configuration via sshd -T"
         return
     fi
 
-    port_count=$(printf '%s\n' "$effective_config" | grep -c '^port ')
+    port_count=$(printf '%s\n' "$effective_config" | grep -c '^port ' || true)
     if [ "$port_count" -eq 1 ] && printf '%s\n' "$effective_config" | grep -qx 'port 2356'; then
         pass_msg "sshd listens exclusively on hardened port 2356"
     else
@@ -243,7 +278,7 @@ check_firewalld() {
     fi
 
     if [ -z "$cmd" ]; then
-        info_msg "firewalld not active or tooling unavailable; skipping firewall checks"
+        fail_msg "firewalld is inactive and offline tooling is unavailable"
         return
     fi
 
@@ -262,8 +297,18 @@ check_firewalld() {
 
 check_selinux() {
     printf 'Checking SELinux policy and labels...\n'
-    if ! command -v selinuxenabled >/dev/null 2>&1 || ! selinuxenabled 2>/dev/null; then
-        info_msg "SELinux is disabled or tooling unavailable; skipping SELinux checks"
+    missing_tool=0
+    for selinux_tool in selinuxenabled getenforce sestatus semanage getsebool; do
+        if ! command -v "$selinux_tool" >/dev/null 2>&1; then
+            fail_msg "required SELinux tool is unavailable: $selinux_tool"
+            missing_tool=1
+        fi
+    done
+    if [ "$missing_tool" -ne 0 ]; then
+        return
+    fi
+    if ! selinuxenabled 2>/dev/null; then
+        fail_msg "SELinux is disabled"
         return
     fi
 
@@ -274,27 +319,44 @@ check_selinux() {
         fail_msg "SELinux is in $current_mode mode (must be Enforcing)"
     fi
 
-    if command -v semanage >/dev/null 2>&1; then
-        port_list=$(semanage port -l 2>/dev/null || true)
-        if printf '%s\n' "$port_list" | grep '^http_port_t' | grep -F 'udp' | grep -qw '443'; then
-            pass_msg "UDP port 443 is labeled http_port_t for QUIC"
-        else
-            fail_msg "UDP port 443 is missing http_port_t label; run selinux/apply-nginx-policy"
-        fi
-
-        if printf '%s\n' "$port_list" | grep '^ssh_port_t' | grep -F 'tcp' | grep -qw '2356'; then
-            pass_msg "TCP port 2356 is labeled ssh_port_t"
-        else
-            fail_msg "TCP port 2356 is missing ssh_port_t label"
-        fi
+    if [ ! -f "$SELINUX_CONFIG" ]; then
+        fail_msg "SELinux configuration is missing: $SELINUX_CONFIG"
+    else
+        configured_mode=$(awk -F= '$1 == "SELINUX" { print $2 }' "$SELINUX_CONFIG" | tail -n 1)
+        configured_type=$(awk -F= '$1 == "SELINUXTYPE" { print $2 }' "$SELINUX_CONFIG" | tail -n 1)
+        [ "$configured_mode" = enforcing ] \
+            || fail_msg "$SELINUX_CONFIG must configure SELINUX=enforcing"
+        [ "$configured_type" = targeted ] \
+            || fail_msg "$SELINUX_CONFIG must configure SELINUXTYPE=targeted"
     fi
 
-    if command -v getsebool >/dev/null 2>&1; then
-        if getsebool httpd_setrlimit 2>/dev/null | grep -q '--> on'; then
-            pass_msg "SELinux boolean httpd_setrlimit is on"
-        else
-            fail_msg "SELinux boolean httpd_setrlimit is off; workers cannot set worker_rlimit_nofile"
-        fi
+    loaded_policy=$(sestatus 2>/dev/null | awk -F: '/Loaded policy name/ { gsub(/^[[:space:]]+/, "", $2); print $2 }')
+    if [ "$loaded_policy" = targeted ]; then
+        pass_msg "loaded SELinux policy is targeted"
+    else
+        fail_msg "loaded SELinux policy is ${loaded_policy:-unknown} (must be targeted)"
+    fi
+
+    if ! port_list=$(semanage port -l 2>/dev/null); then
+        fail_msg "unable to read SELinux port labels"
+        return
+    fi
+    if printf '%s\n' "$port_list" | grep '^http_port_t' | grep -F 'udp' | grep -qw '443'; then
+        pass_msg "UDP port 443 is labeled http_port_t for QUIC"
+    else
+        fail_msg "UDP port 443 is missing http_port_t label; run selinux/apply-nginx-policy"
+    fi
+
+    if printf '%s\n' "$port_list" | grep '^ssh_port_t' | grep -F 'tcp' | grep -qw '2356'; then
+        pass_msg "TCP port 2356 is labeled ssh_port_t"
+    else
+        fail_msg "TCP port 2356 is missing ssh_port_t label"
+    fi
+
+    if getsebool httpd_setrlimit 2>/dev/null | grep -q -- '--> on'; then
+        pass_msg "SELinux boolean httpd_setrlimit is on"
+    else
+        fail_msg "SELinux boolean httpd_setrlimit is off; workers cannot set worker_rlimit_nofile"
     fi
 }
 
@@ -307,15 +369,15 @@ check_site_socket() {
     socket_path="/run/$SITE_TAG/php-fpm.sock"
     if [ -S "$socket_path" ]; then
         pass_msg "PHP-FPM socket exists: $socket_path"
-        if command -v getfacl >/dev/null 2>&1; then
-            if getfacl -p "$socket_path" 2>/dev/null | grep -q 'user:nginx:rw-'; then
-                pass_msg "POSIX ACL grants nginx rw access on $socket_path"
-            else
-                fail_msg "POSIX ACL missing user:nginx:rw- on $socket_path"
-            fi
+        if ! command -v getfacl >/dev/null 2>&1; then
+            fail_msg "getfacl is unavailable; cannot validate $socket_path"
+        elif getfacl -p "$socket_path" 2>/dev/null | grep -q 'user:nginx:rw-'; then
+            pass_msg "POSIX ACL grants nginx rw access on $socket_path"
+        else
+            fail_msg "POSIX ACL missing user:nginx:rw- on $socket_path"
         fi
     else
-        info_msg "PHP-FPM socket not active at $socket_path (start php-fpm@$SITE_TAG.service)"
+        fail_msg "PHP-FPM socket is not active: $socket_path"
     fi
 }
 
@@ -347,6 +409,8 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
+require_root || exit 1
+
 printf '=== Baseline Deployment Preflight & Health Verification ===\n\n'
 check_nginx
 check_quic_state
@@ -358,7 +422,7 @@ check_site_socket
 
 printf '\n==========================================================\n'
 if [ "$FAILED_CHECKS" -eq 0 ]; then
-    printf 'Verification result: ALL ACTIVE CHECKS PASSED\n'
+    printf 'Verification result: ALL CHECKS PASSED\n'
     exit 0
 else
     printf 'Verification result: %d CHECK(S) FAILED\n' "$FAILED_CHECKS" >&2

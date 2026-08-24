@@ -57,6 +57,8 @@ expect_failure \
     || fail 'nginx renderer created state for a rejected dot-dot output'
 [ ! -e "$TEST_ROOT/php-dot-parent" ] \
     || fail 'PHP renderer created state for a rejected dot output'
+[ ! -e "$TEST_ROOT/php-parent" ] \
+    || fail 'PHP renderer created state for a rejected dot-dot output'
 [ -x "$REPOSITORY_ROOT/deploy/verify-deployment" ] \
     || fail 'verify-deployment is not executable'
 "$REPOSITORY_ROOT/deploy/verify-deployment" --help >/dev/null
@@ -72,6 +74,22 @@ expect_failure \
     'unknown argument: --invalid-option' \
     "$REPOSITORY_ROOT/deploy/certbot-healthcheck" \
     --invalid-option
+
+[ -x "$REPOSITORY_ROOT/deploy/install-host-tools" ] \
+    || fail 'install-host-tools is not executable'
+"$REPOSITORY_ROOT/deploy/install-host-tools" --help >/dev/null
+"$REPOSITORY_ROOT/deploy/install-host-tools" --check >/dev/null
+
+grep -Fq "geo \$wp_cache_revalidation_source {" \
+    "$REPOSITORY_ROOT/nginx/stubs/http/fastcgi-cache.conf" \
+    || fail 'WordPress cache revalidation is not source-restricted'
+grep -Fq '"1:revalidate" 1;' \
+    "$REPOSITORY_ROOT/nginx/stubs/http/fastcgi-cache.conf" \
+    || fail 'WordPress cache revalidation lacks its exact control value'
+if grep -Fq "map \$http_x_purge_key \$wp_has_purge_header" \
+    "$REPOSITORY_ROOT/nginx/stubs/http/fastcgi-cache.conf"; then
+    fail 'WordPress cache revalidation trusts arbitrary non-empty headers'
+fi
 
 
 "$REPOSITORY_ROOT/deploy/install-nginx" \

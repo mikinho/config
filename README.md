@@ -463,12 +463,14 @@ The optional WordPress cache bypasses every request carrying any `Cookie`,
 `Authorization` header, or query string, plus non-GET/HEAD methods and known
 WordPress private routes. It also honors application `Cache-Control`,
 `Expires`, `Set-Cookie`, and `Vary` response behavior. Administrative
-cache revalidation is supported via the `X-Purge-Key` request header: when
-present, nginx bypasses the existing cache, fetches fresh upstream content,
-and updates the cached response. These are conservative guards, not proof that
-a site is safe to cache: opt in only after testing every personalized,
-logged-in, commerce, consent, and parameter-driven path. The uncached include
-is the universal default.
+cache revalidation is supported only for a loopback request carrying the exact
+`X-Purge-Key: revalidate` header. nginx then bypasses the existing cache,
+fetches fresh upstream content, and updates the cached response. Applications
+must make this request directly to a loopback nginx listener and must never
+forward a client-supplied `X-Purge-Key`. These are conservative guards, not
+proof that a site is safe to cache: opt in only after testing every
+personalized, logged-in, commerce, consent, and parameter-driven path. The
+uncached include is the universal default.
 
 `includes/relativeurls.conf` remains available only for narrowly reviewed
 legacy applications. It rewrites HTML attributes in response bodies and can
@@ -615,7 +617,8 @@ openssl version
 # Required only when the post-quantum profile is selected:
 openssl list -tls1_3 -tls-groups | grep X25519MLKEM768
 deploy/install-nginx --verify-host
-deploy/verify-deployment
+sudo deploy/install-host-tools
+sudo /usr/local/bin/verify-deployment
 /usr/sbin/nginx -v
 /usr/sbin/nginx -V 2>&1
 sudo /usr/sbin/nginx -t -c /etc/nginx/nginx.conf
@@ -636,7 +639,7 @@ sudo systemctl --no-pager show certbot.timer \
     -p Unit -p TimersCalendar -p RandomizedDelayUSec -p Persistent
 sudo systemctl list-timers --no-pager | grep -Ei 'certbot|letsencrypt'
 sudo certbot renew --dry-run
-deploy/certbot-healthcheck
+sudo /usr/local/bin/certbot-healthcheck
 ```
 
 After deployment, verify the expected headers and protocol behavior against a

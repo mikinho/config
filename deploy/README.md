@@ -72,22 +72,35 @@ deploy/install-php-site --output /tmp/php-example_wp --tag example_wp
 
 ## Post-deployment verification
 
-`verify-deployment` performs a non-destructive audit of the live host state,
+Install the repository-owned host tools into their fixed, trusted production
+paths before application verification delegates to them:
+
+```sh
+deploy/install-host-tools --check
+sudo deploy/install-host-tools
+```
+
+`verify-deployment` performs a non-destructive, root-only audit of live host
+state,
 asserting Nginx version and configuration, active systemd units, OpenSSH port
 and authentication restrictions, firewalld service definitions, SELinux
 Enforcing mode and port labels, QUIC buffer limits, and per-site PHP-FPM socket
 permissions.
 
 ```sh
-# Native Certbot backend:
-deploy/verify-deployment
+# Auto-detect the installed Certbot backend (recommended):
+sudo /usr/local/bin/verify-deployment
 
-# Snap Certbot backend:
-deploy/verify-deployment --backend snap
+# Explicit override for operator diagnosis:
+sudo /usr/local/bin/verify-deployment --backend snap
 
 # With per-site PHP-FPM socket check:
-deploy/verify-deployment --site example_wp --verbose
+sudo /usr/local/bin/verify-deployment --site example_wp --verbose
 ```
+
+`certbot-healthcheck` fails closed when the live tree is missing, empty, or
+contains an invalid certificate. JSON output requires `jq`; file output is
+published atomically and refuses symbolic-link destinations.
 
 ## Profiles
 
