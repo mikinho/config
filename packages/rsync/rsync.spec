@@ -5,7 +5,7 @@ Name: rsync
 Version: 3.5.0
 # Sort below a future vendor 3.5.0-1 package while still upgrading EL9's
 # 3.2.5 package family.
-Release: 0.1.mikinho%{?dist}
+Release: 0.2.mikinho%{?dist}
 URL: https://rsync.samba.org/
 License: GPL-3.0-or-later
 Vendor: Mikinho, LLC
@@ -14,6 +14,7 @@ Source0: https://download.samba.org/pub/rsync/src/rsync-%{version}.tar.gz
 Source1: https://download.samba.org/pub/rsync/src/rsync-%{version}.tar.gz.asc
 Source2: rsync-%{version}-signing-key.asc
 Source3: rsyncd.conf
+Patch0: 0001-use-o-path-for-directory-walks.patch
 
 BuildRequires: acl
 BuildRequires: attr
@@ -122,6 +123,10 @@ grep -Fx '#!/usr/bin/python3' %{buildroot}%{_bindir}/rrsync
 %{_mandir}/man1/rrsync.1*
 
 %changelog
+* Mon Aug 24 2026 Michael Welter <me@mikinho.com> - 3.5.0-0.2.mikinho
+- Preserve search-only directory traversal in hardened path resolution.
+- Add an rrsync missing-destination regression test.
+
 * Sun Aug 23 2026 Michael Welter <me@mikinho.com> - 3.5.0-0.1.mikinho
 - Build the upstream 3.5.0 security release for CentOS Stream 9.
 - Package the hardened Python rrsync wrapper separately.

@@ -5,10 +5,10 @@ the `--confine-root` and `--drop-D` interface used by a hardened `rrsync`
 restricted account. This directory produces a temporary EL9 package pair from
 the signed upstream 3.5.0 security release:
 
-- `rsync-3.5.0-0.1.mikinho.el9.x86_64.rpm`
-- `rsync-rrsync-3.5.0-0.1.mikinho.el9.noarch.rpm`
+- `rsync-3.5.0-0.2.mikinho.el9.x86_64.rpm`
+- `rsync-rrsync-3.5.0-0.2.mikinho.el9.noarch.rpm`
 
-The `0.1` release intentionally sorts below a future vendor `3.5.0-1` build,
+The `0.2` release intentionally sorts below a future vendor `3.5.0-1` build,
 so a normal distribution package can replace this bridge without an epoch or
 manual downgrade.
 
@@ -23,14 +23,17 @@ release-signing key over HTTPS. Before executing any source it verifies:
 - the detached upstream signature over the source archive.
 
 The SRPM repeats the fingerprint and detached-signature checks during `%prep`,
-removes the bundled popt and zlib implementations, and asserts that the build
-uses EL9's patched system libraries. The RPM build runs the complete upstream
-`make check` suite. It then extracts the resulting packages and checks rsync's
-version and confinement options, rrsync's inherited-lock mode, and the
-security-contract markers used by the Vulcan deploy boundary. The published
-output includes the source, signature, signing key, source RPM, debuginfo,
-spec, build log, dependency NEVRAs, builder image identity, metadata, and a
-`SHA256SUMS` manifest.
+applies the repository-owned search-only-directory patch recorded in the
+published provenance, removes the bundled popt and zlib implementations, and
+asserts that the build uses EL9's patched system libraries. The patch preserves
+POSIX search-only traversal in rsync's hardened directory walker and adds a
+missing-destination rrsync regression test. The RPM build runs the complete
+patched upstream `make check` suite. It then extracts the resulting packages
+and checks rsync's version and confinement options, rrsync's inherited-lock
+mode, and the security-contract markers used by restricted deployment
+identities. The published output includes the source, signature, signing key,
+patch, source RPM, debuginfo, spec, build log, dependency NEVRAs, builder image
+identity, metadata, and a `SHA256SUMS` manifest.
 
 Only the `rsync` and `rsync-rrsync` packages are installed; the automatic
 debuginfo/debugsource packages are retained as audit artifacts. The binary
@@ -77,12 +80,12 @@ if rpm -q rsync-daemon; then
 fi
 
 rpm --checksig --nosignature \
-  rsync-3.5.0-0.1.mikinho.el9.x86_64.rpm \
-  rsync-rrsync-3.5.0-0.1.mikinho.el9.noarch.rpm
+  rsync-3.5.0-0.2.mikinho.el9.x86_64.rpm \
+  rsync-rrsync-3.5.0-0.2.mikinho.el9.noarch.rpm
 
 sudo dnf install -y --nogpgcheck \
-  ./rsync-3.5.0-0.1.mikinho.el9.x86_64.rpm \
-  ./rsync-rrsync-3.5.0-0.1.mikinho.el9.noarch.rpm
+  ./rsync-3.5.0-0.2.mikinho.el9.x86_64.rpm \
+  ./rsync-rrsync-3.5.0-0.2.mikinho.el9.noarch.rpm
 ```
 
 `--nogpgcheck` applies only to these exact local RPMs after verification of the

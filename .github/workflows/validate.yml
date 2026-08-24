@@ -215,9 +215,9 @@ jobs:
                 --output /tmp/rsync-output/rsync-3.5.0-el9
               cd /tmp/rsync-output/rsync-3.5.0-el9
               sha256sum --check --strict SHA256SUMS
-              test -f rsync-3.5.0-0.1.mikinho.el9.x86_64.rpm
-              test -f rsync-rrsync-3.5.0-0.1.mikinho.el9.noarch.rpm
-              test -f rsync-3.5.0-0.1.mikinho.el9.src.rpm
+              test -f rsync-3.5.0-0.2.mikinho.el9.x86_64.rpm
+              test -f rsync-rrsync-3.5.0-0.2.mikinho.el9.noarch.rpm
+              test -f rsync-3.5.0-0.2.mikinho.el9.src.rpm
             '
 
   nginx:
