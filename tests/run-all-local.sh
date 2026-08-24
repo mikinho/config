@@ -29,11 +29,13 @@ if command -v shellcheck >/dev/null 2>&1; then
     shellcheck \
         "$REPOSITORY_ROOT/deploy/install-nginx" \
         "$REPOSITORY_ROOT/deploy/install-php-site" \
+        "$REPOSITORY_ROOT/deploy/install-host-tools" \
         "$REPOSITORY_ROOT/deploy/verify-deployment" \
         "$REPOSITORY_ROOT/deploy/certbot-healthcheck" \
         "$REPOSITORY_ROOT/packages/rsync/build-el9" \
         "$REPOSITORY_ROOT/selinux/apply-nginx-policy" \
         "$REPOSITORY_ROOT/tests/deploy-renderers.sh" \
+        "$REPOSITORY_ROOT/tests/health-verifiers.sh" \
         "$REPOSITORY_ROOT/tests/nginx-runtime.sh" \
         "$REPOSITORY_ROOT/tests/rsync-packaging.sh" \
         "$REPOSITORY_ROOT/tests/run-all-local.sh"
@@ -47,6 +49,9 @@ step "Validating deployment profile assignments..."
 
 step "Running deployment renderer and path boundary tests..."
 "$REPOSITORY_ROOT/tests/deploy-renderers.sh"
+
+step "Running strict host and certificate healthcheck tests..."
+"$REPOSITORY_ROOT/tests/health-verifiers.sh"
 
 step "Running rsync packaging contract tests..."
 "$REPOSITORY_ROOT/tests/rsync-packaging.sh"

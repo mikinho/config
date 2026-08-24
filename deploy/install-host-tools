@@ -1,0 +1,90 @@
+#!/bin/sh
+
+set -eu
+
+PROGRAM_NAME=${0##*/}
+SCRIPT_DIRECTORY=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+TARGET_DIRECTORY=/usr/local/bin
+
+usage() {
+    cat <<EOF
+Usage:
+  sudo $PROGRAM_NAME
+  $PROGRAM_NAME --check
+
+Installs the reviewed host verifier and certificate healthcheck as root-owned,
+non-writable executables under $TARGET_DIRECTORY. --check validates repository
+sources without modifying the host.
+EOF
+}
+
+fail() {
+    printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2
+    exit 1
+}
+
+validate_source() {
+    source_path=$1
+    [ -f "$source_path" ] && [ ! -L "$source_path" ] && [ -x "$source_path" ] \
+        || fail "source must be a real executable file: $source_path"
+}
+
+validate_target_directory() {
+    [ -d "$TARGET_DIRECTORY" ] && [ ! -L "$TARGET_DIRECTORY" ] \
+        || fail "target must be a real directory: $TARGET_DIRECTORY"
+    target_identity=$(stat -Lc '%U:%G:%a' "$TARGET_DIRECTORY" 2>/dev/null) \
+        || fail "cannot inspect target directory: $TARGET_DIRECTORY"
+    target_owner_group=${target_identity%:*}
+    target_mode=${target_identity##*:}
+    [ "$target_owner_group" = root:root ] \
+        || fail "$TARGET_DIRECTORY must be owned by root:root"
+    [ "$target_mode" = 755 ] \
+        || fail "$TARGET_DIRECTORY must have mode 0755 (found $target_mode)"
+}
+
+install_tool() {
+    source_path=$1
+    target_path=$2
+    [ ! -L "$target_path" ] || fail "refusing symbolic-link target: $target_path"
+    if [ -e "$target_path" ]; then
+        [ -f "$target_path" ] || fail "target is not a regular file: $target_path"
+    fi
+    install -o root -g root -m 0755 "$source_path" "$target_path"
+    cmp -s "$source_path" "$target_path" \
+        || fail "installed tool differs from repository source: $target_path"
+    [ "$(stat -Lc '%U:%G:%a' "$target_path")" = root:root:755 ] \
+        || fail "installed tool has unsafe ownership or mode: $target_path"
+}
+
+mode=install
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --check)
+            [ "$mode" = install ] || fail "select exactly one mode"
+            mode=check
+            shift
+            ;;
+        --help | -h)
+            usage
+            exit 0
+            ;;
+        *) fail "unknown argument: $1" ;;
+    esac
+done
+
+validate_source "$SCRIPT_DIRECTORY/verify-deployment"
+validate_source "$SCRIPT_DIRECTORY/certbot-healthcheck"
+
+if [ "$mode" = check ]; then
+    printf 'Validated host-tool repository sources.\n'
+    exit 0
+fi
+
+[ "$(id -u)" -eq 0 ] || fail "run as root"
+command -v install >/dev/null 2>&1 || fail "install command not found"
+command -v cmp >/dev/null 2>&1 || fail "cmp command not found"
+validate_target_directory
+install_tool "$SCRIPT_DIRECTORY/verify-deployment" "$TARGET_DIRECTORY/verify-deployment"
+install_tool "$SCRIPT_DIRECTORY/certbot-healthcheck" "$TARGET_DIRECTORY/certbot-healthcheck"
+
+printf 'Installed root-owned host tools under %s.\n' "$TARGET_DIRECTORY"
