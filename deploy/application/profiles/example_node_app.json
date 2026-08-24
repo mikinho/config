@@ -1,0 +1,57 @@
+{
+  "schemaVersion": 1,
+  "standardVersion": "1",
+  "application": {
+    "tag": "example_node_app",
+    "serviceUser": "example_node_app",
+    "deployUser": "example_deploy",
+    "deployGroup": "example_deploy"
+  },
+  "paths": {
+    "applicationRoot": "/opt/example_node_app",
+    "secureRoot": "/opt/.secure/example_node_app",
+    "runtimeRoot": "/run/example_node_app",
+    "triggerRoot": "/var/lib/example_deploy",
+    "dependencyStateRoot": "/var/lib/example_node_app",
+    "dependencyCacheRoot": "/var/cache/example_node_app"
+  },
+  "transport": {
+    "sessionCommand": "example-deploy-session"
+  },
+  "services": {
+    "live": "example_node_app.service",
+    "candidate": "example_node_app-candidate@.service",
+    "finalizer": "example_deploy.service",
+    "path": "example_deploy.path",
+    "recovery": "example_deploy-recover.service"
+  },
+  "health": {
+    "route": "/~/health",
+    "deploymentTokenPointer": "/deployment/deployId",
+    "confirmations": 3,
+    "timeoutSeconds": 90
+  },
+  "metadata": {
+    "path": ".build/deploy.json",
+    "deploymentTokenPointer": "/deployId"
+  },
+  "dependencies": {
+    "adapter": "node-npm",
+    "manifests": ["package-lock.json", "package.json"],
+    "provenancePath": ".build/dependencies.json"
+  },
+  "staticContent": {
+    "releasePaths": [".build", "wwwroot"],
+    "buildValidator": "example-built-assets"
+  },
+  "limits": {
+    "memoryHighBytes": 805306368,
+    "memoryMaxBytes": 1073741824,
+    "tasksMax": 128
+  },
+  "retention": {
+    "releases": 5,
+    "auditDays": 365,
+    "assetsDays": 90
+  }
+}
