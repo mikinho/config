@@ -35,7 +35,8 @@ The output deliberately records `conformanceStatus: core-only`. It is a
 versioned extraction boundary for the shared security state machines, not yet a
 standalone deployable gold bundle. A project MUST NOT install it without the
 remaining standard finalizer, host-policy, verifier, and application adapter
-layers.
+layers. Those remaining generic milestones are tracked in
+[`ROADMAP.md`](ROADMAP.md).
 
 ## Distribution model
 
