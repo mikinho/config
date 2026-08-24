@@ -43,7 +43,7 @@ fail() {
 }
 
 # Invoked through the signal and exit trap below.
-# shellcheck disable=SC2329
+# shellcheck disable=SC2317,SC2329
 cleanup() {
     if [ -n "$OUTPUT_TMP" ] && [ -e "$OUTPUT_TMP" ]; then
         rm -f -- "$OUTPUT_TMP"
@@ -89,8 +89,9 @@ write_output() {
     case "$output_name" in
         '' | . | ..) fail "invalid output file: $OUTPUT_FILE" ;;
     esac
-    [ -d "$output_parent" ] && [ ! -L "$output_parent" ] \
-        || fail "output parent must be an existing real directory: $output_parent"
+    if [ ! -d "$output_parent" ] || [ -L "$output_parent" ]; then
+        fail "output parent must be an existing real directory: $output_parent"
+    fi
     [ ! -L "$OUTPUT_FILE" ] || fail "refusing symbolic-link output: $OUTPUT_FILE"
 
     OUTPUT_TMP=$(mktemp "$output_parent/.$output_name.XXXXXX") \
@@ -152,8 +153,9 @@ if [ "$FORMAT" = json ]; then
     command -v jq >/dev/null 2>&1 || fail "jq binary is required for JSON output"
 fi
 
-[ -d "$LIVE_DIR" ] && [ ! -L "$LIVE_DIR" ] \
-    || fail "live directory must be an existing real directory: $LIVE_DIR"
+if [ ! -d "$LIVE_DIR" ] || [ -L "$LIVE_DIR" ]; then
+    fail "live directory must be an existing real directory: $LIVE_DIR"
+fi
 
 WARN_SECONDS=$((WARN_DAYS * SECONDS_PER_DAY))
 CURRENT_EPOCH=$(date -u +%s) || fail "could not read the current UTC time"
@@ -187,8 +189,9 @@ for cert_path in "$LIVE_DIR"/*/fullchain.pem; do
     end_date_raw=${end_date_line#notAfter=}
     subject_raw=${subject_line#subject=}
     issuer_raw=${issuer_line#issuer=}
-    [ -n "$end_date_raw" ] && [ "$end_date_raw" != "$end_date_line" ] \
-        || fail "certificate has no parseable expiry: $cert_path"
+    if [ -z "$end_date_raw" ] || [ "$end_date_raw" = "$end_date_line" ]; then
+        fail "certificate has no parseable expiry: $cert_path"
+    fi
 
     expiry_epoch_value=$(expiry_epoch "$end_date_raw") \
         || fail "could not convert certificate expiry to epoch time: $cert_path"
