@@ -476,6 +476,15 @@ def write_rendered_file(root: Path, rendered: RenderedFile) -> None:
         fail(f"cannot write rendered file {rendered.relative_path}: {error}")
 
 
+def normalize_directory_modes(root: Path) -> None:
+    """Set deterministic non-writable modes on every rendered directory."""
+
+    for directory, names, _ in os.walk(root, topdown=True, followlinks=False):
+        path = Path(directory)
+        path.chmod(0o755)
+        names.sort()
+
+
 def render_bundle(profile: ApplicationProfile, output: Path, source_revision: str) -> None:
     """Publish one deterministic core bundle to a new output directory."""
 
@@ -492,7 +501,7 @@ def render_bundle(profile: ApplicationProfile, output: Path, source_revision: st
     try:
         for rendered in payload:
             write_rendered_file(staging, rendered)
-        staging.chmod(0o755)
+        normalize_directory_modes(staging)
         directory_descriptor = os.open(staging, os.O_RDONLY | os.O_DIRECTORY)
         try:
             os.fsync(directory_descriptor)
