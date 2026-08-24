@@ -222,7 +222,7 @@ function main() {
         throw new Error("usage: ./package-hash.mjs <app-dir>");
     }
 
-    console.log(`${packageHash(appDir)} production dependency state`);
+    console.log(packageHash(appDir));
 }
 
 try {

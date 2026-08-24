@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import sys
 import tempfile
@@ -39,6 +40,7 @@ CORE_TEMPLATES: Final = {
     "scripts/deploy-gateway.py": "deploy-gateway.py.in",
     "scripts/deploy-trigger.py": "deploy-trigger.py.in",
     "scripts/package-hash.mjs": "package-hash.mjs.in",
+    "scripts/post-deploy": "post-deploy.in",
     "scripts/snapshot-manifests.py": "snapshot-manifests.py.in",
 }
 
@@ -83,11 +85,48 @@ def trigger_selinux_type(deploy_user: str) -> str:
     return value
 
 
+def shell_literal(value: str) -> str:
+    """Return one POSIX-shell literal for a validated profile value."""
+
+    return shlex.quote(value)
+
+
+def shell_array(values: Sequence[str]) -> str:
+    """Render one deterministic Bash array body from validated strings."""
+
+    return "\n".join(f"    {shell_literal(value)}" for value in values)
+
+
+def candidate_unit_prefix(candidate_service: str) -> str:
+    """Return the fixed prefix of one validated template service unit."""
+
+    suffix = "@.service"
+    if not candidate_service.endswith(suffix):
+        fail("candidate service does not use the required template-unit suffix")
+    return candidate_service[: -len(suffix)]
+
+
+def allowed_candidate_roots(profile: ApplicationProfile) -> tuple[str, ...]:
+    """Return the closed set of permitted candidate top-level entries."""
+
+    relative_paths = (
+        profile.runtime.entrypoint,
+        profile.metadata.path,
+        profile.dependencies.provenance_path,
+        *profile.dependencies.manifests,
+        *profile.static_content.release_paths,
+        "node_modules",
+    )
+    return tuple(sorted({value.split("/", maxsplit=1)[0] for value in relative_paths}))
+
+
 def build_replacements(profile: ApplicationProfile) -> dict[str, str]:
     """Build the complete fixed placeholder map for generic core templates."""
 
     identity = profile.identity
     prefix = environment_prefix(identity.tag)
+    candidate_prefix = candidate_unit_prefix(profile.services.candidate)
+    health_retries = (profile.health.timeout_seconds + 1) // 2
     return {
         "@@DEPLOY_USER@@": identity.deploy_user,
         "@@DEPLOY_GROUP@@": identity.deploy_group,
@@ -101,6 +140,39 @@ def build_replacements(profile: ApplicationProfile) -> dict[str, str]:
         "@@TRIGGER_STOP_ENV@@": f"{prefix}_DEPLOY_TRIGGER_STOP_AFTER_BLOCKER",
         "@@SNAPSHOT_TEST_ENV@@": f"{prefix}_MANIFEST_SNAPSHOT_TESTING",
         "@@TRIGGER_SELINUX_TYPE@@": trigger_selinux_type(identity.deploy_user),
+        "@@APPLICATION_ROOT@@": profile.paths.application_root,
+        "@@SECURE_ROOT@@": profile.paths.secure_root,
+        "@@DEPENDENCY_STATE_ROOT@@": profile.paths.dependency_state_root,
+        "@@DEPENDENCY_CACHE_ROOT@@": profile.paths.dependency_cache_root,
+        "@@SERVICE_USER@@": identity.service_user,
+        "@@LIVE_SERVICE@@": profile.services.live,
+        "@@RUNTIME_SOCKET@@": (
+            f"{profile.paths.runtime_root}/{profile.runtime.socket_name}"
+        ),
+        "@@ENTRYPOINT@@": profile.runtime.entrypoint,
+        "@@METADATA_PATH@@": profile.metadata.path,
+        "@@METADATA_TOKEN_POINTER_LITERAL@@": shell_literal(
+            profile.metadata.deployment_token_pointer
+        ),
+        "@@DEPENDENCY_PROVENANCE_PATH@@": profile.dependencies.provenance_path,
+        "@@HEALTH_STATUS_POINTER_LITERAL@@": shell_literal(
+            profile.health.status_pointer
+        ),
+        "@@HEALTH_STATUS_VALUE@@": profile.health.status_value,
+        "@@HEALTH_TOKEN_POINTER_LITERAL@@": shell_literal(
+            profile.health.deployment_token_pointer
+        ),
+        "@@HEALTH_ROUTE_LITERAL@@": shell_literal(profile.health.route),
+        "@@RELEASE_RETENTION_COUNT@@": str(profile.retention.releases),
+        "@@AUDIT_RETENTION_DAYS@@": str(profile.retention.audit_days),
+        "@@HEALTH_RETRIES@@": str(health_retries),
+        "@@HEALTH_CONFIRMATIONS@@": str(profile.health.confirmations),
+        "@@MANIFEST_ARRAY@@": shell_array(profile.dependencies.manifests),
+        "@@STATIC_PATH_ARRAY@@": shell_array(profile.static_content.release_paths),
+        "@@ALLOWED_ROOT_ARRAY@@": shell_array(allowed_candidate_roots(profile)),
+        "@@CANDIDATE_SERVICE@@": profile.services.candidate,
+        "@@CANDIDATE_UNIT_PREFIX@@": candidate_prefix,
+        "@@CANDIDATE_RUNTIME_PREFIX@@": f"{profile.paths.runtime_root}-candidate",
     }
 
 

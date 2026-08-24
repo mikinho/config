@@ -7,6 +7,7 @@ import copy
 import hashlib
 import importlib.util
 import json
+import os
 import stat
 import subprocess
 import sys
@@ -114,6 +115,14 @@ class ProfileValidationTests(unittest.TestCase):
         source["limits"]["memoryHighBytes"] = source["limits"]["memoryMaxBytes"] + 1
         self.assert_invalid(source, "memoryHighBytes must not exceed")
 
+    def test_health_timeout_must_fit_required_confirmations(self) -> None:
+        """A profile cannot demand more confirmations than its health window permits."""
+
+        source = copy.deepcopy(self.source)
+        source["health"]["confirmations"] = 10
+        source["health"]["timeoutSeconds"] = 5
+        self.assert_invalid(source, "must allow two seconds per confirmation")
+
     def test_runtime_and_build_adapters_are_closed_sets(self) -> None:
         """Profiles cannot select unreviewed executable behavior."""
 
@@ -174,7 +183,10 @@ class CoreRendererTests(unittest.TestCase):
     """Verify deterministic, provenance-bound transaction-core rendering."""
 
     def render(
-        self, output: Path, revision: str = SOURCE_REVISION
+        self,
+        output: Path,
+        revision: str = SOURCE_REVISION,
+        profile: Path = EXAMPLE_PROFILE,
     ) -> subprocess.CompletedProcess[str]:
         """Run the public renderer against the synthetic example profile."""
 
@@ -183,7 +195,7 @@ class CoreRendererTests(unittest.TestCase):
                 sys.executable,
                 str(RENDERER_PATH),
                 "--profile",
-                str(EXAMPLE_PROFILE),
+                str(profile),
                 "--source-revision",
                 revision,
                 "--output",
@@ -239,6 +251,24 @@ class CoreRendererTests(unittest.TestCase):
                 self.assertNotIn("@@", source)
                 compile(source, str(script_path), "exec")
 
+            finalizer = first / "scripts" / "post-deploy"
+            self.assertEqual(stat.S_IMODE(finalizer.stat().st_mode), 0o755)
+            finalizer_source = finalizer.read_text(encoding="utf-8")
+            self.assertNotIn("@@", finalizer_source)
+            self.assertIn(
+                r"^(manual|[0-9a-f]{40,64})-[0-9]{1,20}-[0-9a-f]{24}$",
+                finalizer_source,
+            )
+            self.assertIn("example_node_app-candidate@.service", finalizer_source)
+            self.assertNotIn("legacy release", finalizer_source)
+            shell_check = subprocess.run(
+                ["bash", "-n", str(finalizer)],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(shell_check.returncode, 0, shell_check.stderr)
+
             node_check = subprocess.run(
                 ["node", "--check", str(first / "scripts" / "package-hash.mjs")],
                 check=False,
@@ -288,7 +318,9 @@ class CoreRendererTests(unittest.TestCase):
                     text=True,
                 )
                 self.assertEqual(completed.returncode, 0, completed.stderr)
-                return completed.stdout.split(maxsplit=1)[0]
+                digest = completed.stdout.strip()
+                self.assertRegex(digest, r"^[0-9a-f]{64}$")
+                return digest
 
             baseline = calculate_hash()
             package["devDependencies"]["test-package"] = "2.0.0"
@@ -317,6 +349,76 @@ class CoreRendererTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("source revision must contain", result.stderr)
             self.assertFalse(output.exists())
+
+    def test_finalizer_accepts_only_exact_transaction_tokens(self) -> None:
+        """Release pointers cannot widen the gateway's deployment-token grammar."""
+
+        valid_token = f"{SOURCE_REVISION}-1787530000-0123456789abcdef01234567"
+        invalid_tokens = (
+            "releases/current",
+            "manual-1-0123456789abcdef0123456Z",
+            f"{SOURCE_REVISION.upper()}-1787530000-0123456789abcdef01234567",
+            f"{SOURCE_REVISION}-1787530000-0123456789abcdef01234567/extra",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            bundle = Path(directory) / "bundle"
+            result = self.render(bundle)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            command = """
+                source "$1"
+                valid_deploy_id "$2" || exit 11
+                shift 2
+                for token in "$@"; do
+                    ! valid_deploy_id "$token" || exit 12
+                done
+            """
+            completed = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    command,
+                    "finalizer-token-test",
+                    str(bundle / "scripts" / "post-deploy"),
+                    valid_token,
+                    *invalid_tokens,
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_shell_hostile_health_route_remains_literal_data(self) -> None:
+        """A schema-valid route with shell metacharacters cannot alter the script."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            marker = root / "route-injection"
+            hostile_route = f"/'$HOME;touch$IFS{marker};"
+            source = json.loads(EXAMPLE_PROFILE.read_text(encoding="utf-8"))
+            source["health"]["route"] = hostile_route
+            profile = root / "hostile-profile.json"
+            profile.write_text(json.dumps(source), encoding="utf-8")
+            bundle = root / "bundle"
+            result = self.render(bundle, profile=profile)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            finalizer = bundle / "scripts" / "post-deploy"
+            completed = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    'source "$1"; printf "%s" "$HEALTH_ROUTE"',
+                    "finalizer-route-test",
+                    str(finalizer),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                env={"HOME": "/unexpected", "PATH": os.environ["PATH"]},
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(completed.stdout, hostile_route)
+            self.assertFalse(marker.exists())
 
 
 if __name__ == "__main__":
