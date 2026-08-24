@@ -6,6 +6,7 @@ SCRIPT_DIRECTORY=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 REPOSITORY_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIRECTORY/.." && pwd)
 BUILDER=$REPOSITORY_ROOT/packages/rsync/build-el9
 SPEC=$REPOSITORY_ROOT/packages/rsync/rsync.spec
+PATCH=$REPOSITORY_ROOT/packages/rsync/0001-use-o-path-for-directory-walks.patch
 
 fail() {
     printf 'rsync-packaging: %s\n' "$*" >&2
@@ -16,11 +17,15 @@ fail() {
 if [ ! -f "$SPEC" ] || [ -L "$SPEC" ]; then
     fail "spec is not a real file: $SPEC"
 fi
+if [ ! -f "$PATCH" ] || [ -L "$PATCH" ]; then
+    fail "patch is not a real file: $PATCH"
+fi
 
 "$BUILDER" --check
 
 grep -Fqx 'Version: 3.5.0' "$SPEC"
-grep -Fqx 'Release: 0.1.mikinho%{?dist}' "$SPEC"
+grep -Fqx 'Release: 0.2.mikinho%{?dist}' "$SPEC"
+grep -Fqx 'Patch0: 0001-use-o-path-for-directory-walks.patch' "$SPEC"
 grep -Fq -- '--with-rrsync' "$SPEC"
 grep -Fq -- '--with-included-popt=no' "$SPEC"
 grep -Fq -- '--with-included-zlib=no' "$SPEC"
@@ -28,6 +33,8 @@ grep -Fqx "grep -Fx '#define EXTERNAL_ZLIB 1' config.h" "$SPEC"
 grep -Fqx 'make check CHECK_J=%{_smp_build_ncpus}' "$SPEC"
 grep -Fqx '%{_bindir}/rrsync' "$SPEC"
 grep -Fqx '%config(noreplace) %{_sysconfdir}/rsyncd.conf' "$SPEC"
+grep -Fq 'static int directory_walk_open_flags(void)' "$PATCH"
+grep -Fq 'rrsync-search-only-ancestor_test.py' "$PATCH"
 
 if "$BUILDER" --check --output /tmp/rsync-invalid-output; then
     fail 'builder accepted multiple modes'

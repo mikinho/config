@@ -1,0 +1,111 @@
+diff --git a/syscall.c b/syscall.c
+index 5e92edc..5836396 100644
+--- a/syscall.c
++++ b/syscall.c
+@@ -77,0 +78,13 @@ extern int operator_path_resolve;	/* defined below; fwd-declared for the exclude
++/* Directory components need search permission, not directory-read permission.
++ * O_PATH preserves that POSIX distinction while still providing a stable dirfd
++ * for fstatat(), readlinkat(), and openat().  Fall back to O_RDONLY on systems
++ * without Linux's O_PATH support. */
++static int directory_walk_open_flags(void)
++{
++#ifdef O_PATH
++	return O_PATH | O_DIRECTORY;
++#else
++	return O_RDONLY | O_DIRECTORY;
++#endif
++}
++
+@@ -493 +506,2 @@ static int ona_open(const char *path, int flags, mode_t mode, char *out_abs, siz
+-		int next = openat(dfd, comp, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
++		int next = openat(dfd, comp,
++				directory_walk_open_flags() | O_NOFOLLOW | O_CLOEXEC);
+diff --git a/testsuite/rrsync-search-only-ancestor_test.py b/testsuite/rrsync-search-only-ancestor_test.py
+new file mode 100644
+index 0000000..0ae8ddc
+--- /dev/null
++++ b/testsuite/rrsync-search-only-ancestor_test.py
+@@ -0,0 +1,83 @@
++#!/usr/bin/env python3
++"""A restricted push must traverse search-only ancestors.
++
++POSIX directory traversal requires execute/search permission, not permission to
++list the directory.  rrsync's receiver-side new-destination hardening passes a
++parent-pinned ``/proc/self/fd/N/<leaf>`` path to rsync.  Rsync's secure ownership
++walker must therefore hold intermediate directories with ``O_PATH`` on Linux;
++opening them ``O_RDONLY`` incorrectly rejects a least-privilege mode such as
++``0311`` with ``EACCES`` after the destination has been created.
++"""
++
++import os
++import shlex
++import subprocess
++
++from rsyncfns import (
++    RSYNC,
++    SCRATCHDIR,
++    patched_rrsync,
++    proc_self_fd_pins,
++    rmtree,
++    rsync_argv,
++    rsync_path_arg,
++    test_fail,
++    test_skipped,
++)
++
++
++PAYLOAD = "SEARCH-ONLY-ANCESTOR-CONTENT\n"
++SEARCH_ONLY_MODE = 0o311
++RESTORE_MODE = 0o700
++
++
++if not hasattr(os, "O_PATH") or not proc_self_fd_pins():
++    test_skipped("search-only rrsync ancestor coverage requires Linux O_PATH "
++                 "and /proc/self/fd inode pins")
++
++
++base = SCRATCHDIR / "rrsync-search-only-ancestor"
++rmtree(base)
++source = base / "source"
++boundary = base / "search-only"
++restricted = boundary / "restricted"
++source.mkdir(parents=True)
++restricted.mkdir(parents=True)
++(source / "payload.txt").write_text(PAYLOAD)
++
++shim = base / "rsync-shim"
++shim.write_text("#!/bin/sh\nexec " + rsync_path_arg(RSYNC) + " \"$@\"\n")
++shim.chmod(0o755)
++rrsync = patched_rrsync(base, rsync_path=str(shim))
++
++rsh = base / "fake-rsh"
++rsh.write_text(
++    "#!/bin/sh\n"
++    "shift\n"
++    "SSH_ORIGINAL_COMMAND=\"$*\"\n"
++    "export SSH_ORIGINAL_COMMAND\n"
++    "exec %s -wo -munge -no-lock %s\n"
++    % (shlex.quote(str(rrsync)), shlex.quote(str(restricted)))
++)
++rsh.chmod(0o755)
++
++boundary.chmod(SEARCH_ONLY_MODE)
++try:
++    proc = subprocess.run(
++        rsync_argv("-a", "-e", str(rsh), f"{source}/", "dummy:candidate/"),
++        stdout=subprocess.PIPE,
++        stderr=subprocess.STDOUT,
++        text=True,
++        timeout=120,
++    )
++finally:
++    boundary.chmod(RESTORE_MODE)
++
++context = f"rc={proc.returncode}, output={proc.stdout.strip()[:500]!r}"
++landed = restricted / "candidate" / "payload.txt"
++if proc.returncode != 0:
++    test_fail(f"rrsync push through a search-only ancestor failed ({context})")
++if not landed.is_file() or landed.read_text() != PAYLOAD:
++    test_fail(f"rrsync push through a search-only ancestor lost content ({context})")
++
++print("rrsync push traverses search-only ancestors without granting directory-list access")
