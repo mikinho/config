@@ -8,6 +8,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -23,6 +24,7 @@ APPLICATION_ROOT: Final = REPOSITORY_ROOT / "deploy" / "application"
 VALIDATOR_PATH: Final = APPLICATION_ROOT / "validate_profile.py"
 PROFILE_ROOT: Final = APPLICATION_ROOT / "profiles"
 RENDERER_PATH: Final = APPLICATION_ROOT / "render_core.py"
+CONFORMANCE_PATH: Final = APPLICATION_ROOT / "verify_bundle.py"
 EXAMPLE_PROFILE: Final = PROFILE_ROOT / "example_node_app.json"
 SOURCE_REVISION: Final = "0123456789abcdef0123456789abcdef01234567"
 
@@ -217,6 +219,27 @@ class CoreRendererTests(unittest.TestCase):
             text=True,
         )
 
+    def verify(
+        self, bundle: Path, revision: str = SOURCE_REVISION
+    ) -> subprocess.CompletedProcess[str]:
+        """Run vendored-bundle conformance against the synthetic profile."""
+
+        return subprocess.run(
+            [
+                sys.executable,
+                str(CONFORMANCE_PATH),
+                "--profile",
+                str(EXAMPLE_PROFILE),
+                "--source-revision",
+                revision,
+                "--bundle",
+                str(bundle),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
     def test_core_bundle_is_reproducible_and_self_verifying(self) -> None:
         """Two renders produce identical bytes, modes, and checksum evidence."""
 
@@ -378,6 +401,41 @@ class CoreRendererTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("source revision must contain", result.stderr)
             self.assertFalse(output.exists())
+
+    def test_vendored_bundle_conformance_rejects_every_tree_drift(self) -> None:
+        """Content, mode, extra-file, alias, and revision drift all fail closed."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pristine = root / "pristine"
+            result = self.render(pristine)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            verified = self.verify(pristine)
+            self.assertEqual(verified.returncode, 0, verified.stderr)
+
+            mutations = ("content", "mode", "extra", "symlink")
+            for mutation in mutations:
+                with self.subTest(mutation=mutation):
+                    candidate = root / mutation
+                    shutil.copytree(pristine, candidate)
+                    if mutation == "content":
+                        profile = candidate / "profile.json"
+                        profile.write_bytes(profile.read_bytes() + b" ")
+                    elif mutation == "mode":
+                        (candidate / "scripts/post-deploy").chmod(0o700)
+                    elif mutation == "extra":
+                        (candidate / "unreviewed").write_text("extra\n")
+                    else:
+                        profile = candidate / "profile.json"
+                        target = root / "attacker-profile.json"
+                        target.write_bytes(profile.read_bytes())
+                        profile.unlink()
+                        profile.symlink_to(target)
+                    drift = self.verify(candidate)
+                    self.assertNotEqual(drift.returncode, 0)
+
+            wrong_revision = self.verify(pristine, "f" * 40)
+            self.assertNotEqual(wrong_revision.returncode, 0)
 
     def test_finalizer_accepts_only_exact_transaction_tokens(self) -> None:
         """Release pointers cannot widen the gateway's deployment-token grammar."""
