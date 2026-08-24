@@ -4,8 +4,11 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import importlib.util
 import json
+import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -18,6 +21,9 @@ REPOSITORY_ROOT: Final = Path(__file__).resolve().parents[1]
 APPLICATION_ROOT: Final = REPOSITORY_ROOT / "deploy" / "application"
 VALIDATOR_PATH: Final = APPLICATION_ROOT / "validate_profile.py"
 PROFILE_ROOT: Final = APPLICATION_ROOT / "profiles"
+RENDERER_PATH: Final = APPLICATION_ROOT / "render_core.py"
+EXAMPLE_PROFILE: Final = PROFILE_ROOT / "example_node_app.json"
+SOURCE_REVISION: Final = "0123456789abcdef0123456789abcdef01234567"
 
 
 def load_validator() -> ModuleType:
@@ -41,8 +47,7 @@ class ProfileValidationTests(unittest.TestCase):
     def setUp(self) -> None:
         """Load one independent valid profile for mutation tests."""
 
-        source_path = PROFILE_ROOT / "example_node_app.json"
-        self.source: dict[str, Any] = json.loads(source_path.read_text(encoding="utf-8"))
+        self.source: dict[str, Any] = json.loads(EXAMPLE_PROFILE.read_text(encoding="utf-8"))
 
     def assert_invalid(self, source: dict[str, Any], message: str) -> None:
         """Assert that one decoded profile fails with a stable message fragment."""
@@ -53,7 +58,7 @@ class ProfileValidationTests(unittest.TestCase):
     def test_public_example_profile_validates(self) -> None:
         """The synthetic public profile conforms to the complete schema."""
 
-        profile = VALIDATOR.load_profile(PROFILE_ROOT / "example_node_app.json")
+        profile = VALIDATOR.load_profile(EXAMPLE_PROFILE)
         self.assertEqual(profile.identity.tag, "example_node_app")
         self.assertRegex(profile.digest(), r"^[0-9a-f]{64}$")
 
@@ -70,6 +75,10 @@ class ProfileValidationTests(unittest.TestCase):
         source = copy.deepcopy(self.source)
         source["application"]["deployUser"] = source["application"]["serviceUser"]
         self.assert_invalid(source, "serviceUser and deployUser must be distinct")
+
+        source = copy.deepcopy(self.source)
+        source["application"]["deployGroup"] = source["application"]["serviceGroup"]
+        self.assert_invalid(source, "serviceGroup and deployGroup must be distinct")
 
     def test_traversal_and_path_aliases_are_rejected(self) -> None:
         """Trusted roots and release-relative paths must be canonical."""
@@ -136,6 +145,96 @@ class ProfileValidationTests(unittest.TestCase):
             link_path.hardlink_to(profile_path)
             with self.assertRaisesRegex(VALIDATOR.ProfileError, "one-link real regular file"):
                 VALIDATOR.load_profile(profile_path)
+
+
+class CoreRendererTests(unittest.TestCase):
+    """Verify deterministic, provenance-bound transaction-core rendering."""
+
+    def render(
+        self, output: Path, revision: str = SOURCE_REVISION
+    ) -> subprocess.CompletedProcess[str]:
+        """Run the public renderer against the synthetic example profile."""
+
+        return subprocess.run(
+            [
+                sys.executable,
+                str(RENDERER_PATH),
+                "--profile",
+                str(EXAMPLE_PROFILE),
+                "--source-revision",
+                revision,
+                "--output",
+                str(output),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+    def test_core_bundle_is_reproducible_and_self_verifying(self) -> None:
+        """Two renders produce identical bytes, modes, and checksum evidence."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = root / "first"
+            second = root / "second"
+            for output in (first, second):
+                result = self.render(output)
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+            first_paths = sorted(
+                path.relative_to(first) for path in first.rglob("*") if path.is_file()
+            )
+            second_paths = sorted(
+                path.relative_to(second) for path in second.rglob("*") if path.is_file()
+            )
+            self.assertEqual(first_paths, second_paths)
+            for relative_path in first_paths:
+                first_path = first / relative_path
+                second_path = second / relative_path
+                self.assertEqual(first_path.read_bytes(), second_path.read_bytes())
+                self.assertEqual(
+                    stat.S_IMODE(first_path.stat().st_mode),
+                    stat.S_IMODE(second_path.stat().st_mode),
+                )
+
+            manifest = json.loads((first / "STANDARD-MANIFEST.json").read_text())
+            self.assertEqual(manifest["conformanceStatus"], "core-only")
+            self.assertEqual(manifest["sourceRevision"], SOURCE_REVISION)
+            self.assertEqual(manifest["standardVersion"], "1")
+
+            checksum_lines = (first / "SHA256SUMS").read_text().splitlines()
+            self.assertGreaterEqual(len(checksum_lines), 5)
+            for line in checksum_lines:
+                expected_digest, relative_path = line.split("  ", maxsplit=1)
+                actual_digest = hashlib.sha256((first / relative_path).read_bytes()).hexdigest()
+                self.assertEqual(actual_digest, expected_digest)
+
+            for script_path in sorted((first / "scripts").glob("*.py")):
+                self.assertEqual(stat.S_IMODE(script_path.stat().st_mode), 0o755)
+                source = script_path.read_text(encoding="utf-8")
+                self.assertNotIn("@@", source)
+                compile(source, str(script_path), "exec")
+
+    def test_renderer_refuses_an_existing_output(self) -> None:
+        """A render never overlays an earlier reviewed bundle."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "existing"
+            output.mkdir()
+            result = self.render(output)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("output must not already exist", result.stderr)
+
+    def test_renderer_rejects_an_unbound_source_revision(self) -> None:
+        """Bundle provenance always names one immutable standard revision."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "invalid"
+            result = self.render(output, "main")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("source revision must contain", result.stderr)
+            self.assertFalse(output.exists())
 
 
 if __name__ == "__main__":

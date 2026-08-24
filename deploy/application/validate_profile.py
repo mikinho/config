@@ -166,6 +166,7 @@ class ApplicationIdentity:
 
     tag: str
     service_user: str
+    service_group: str
     deploy_user: str
     deploy_group: str
 
@@ -200,12 +201,17 @@ def validate_identity(profile: Mapping[str, Any]) -> ApplicationIdentity:
     """Validate the application identity section and trust separation."""
 
     value = require_mapping(profile["application"], "application")
-    keys = frozenset({"tag", "serviceUser", "deployUser", "deployGroup"})
+    keys = frozenset(
+        {"tag", "serviceUser", "serviceGroup", "deployUser", "deployGroup"}
+    )
     require_exact_keys(value, "application", keys)
     identity = ApplicationIdentity(
         tag=require_string(value["tag"], "application.tag", IDENTIFIER_PATTERN),
         service_user=require_string(
             value["serviceUser"], "application.serviceUser", IDENTIFIER_PATTERN
+        ),
+        service_group=require_string(
+            value["serviceGroup"], "application.serviceGroup", IDENTIFIER_PATTERN
         ),
         deploy_user=require_string(
             value["deployUser"], "application.deployUser", IDENTIFIER_PATTERN
@@ -216,6 +222,8 @@ def validate_identity(profile: Mapping[str, Any]) -> ApplicationIdentity:
     )
     if identity.service_user == identity.deploy_user:
         fail("application serviceUser and deployUser must be distinct")
+    if identity.service_group == identity.deploy_group:
+        fail("application serviceGroup and deployGroup must be distinct")
     return identity
 
 
@@ -387,30 +395,30 @@ def validate_profile(source: Mapping[str, Any]) -> ApplicationProfile:
     return ApplicationProfile(source=source, identity=identity)
 
 
-def read_profile_bytes(path: Path) -> bytes:
-    """Read one inode-stable, single-link regular file without following links."""
+def read_bounded_regular_file(path: Path, maximum_bytes: int, purpose: str) -> bytes:
+    """Read one bounded, inode-stable, single-link file without following links."""
 
     flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
     try:
         descriptor = os.open(path, flags)
     except OSError as error:
-        fail(f"cannot open profile as a real regular file: {path}: {error.strerror}")
+        fail(f"cannot open {purpose} as a real regular file: {path}: {error.strerror}")
     try:
         before = os.fstat(descriptor)
         if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
-            fail(f"profile must be a one-link real regular file: {path}")
-        if before.st_size <= 0 or before.st_size > MAX_PROFILE_BYTES:
-            fail(f"profile size must be between 1 and {MAX_PROFILE_BYTES} bytes: {path}")
+            fail(f"{purpose} must be a one-link real regular file: {path}")
+        if before.st_size <= 0 or before.st_size > maximum_bytes:
+            fail(f"{purpose} size must be between 1 and {maximum_bytes} bytes: {path}")
         chunks: list[bytes] = []
         remaining = before.st_size
         while remaining:
             chunk = os.read(descriptor, min(remaining, 16 * 1024))
             if not chunk:
-                fail(f"profile changed while being read: {path}")
+                fail(f"{purpose} changed while being read: {path}")
             chunks.append(chunk)
             remaining -= len(chunk)
         if os.read(descriptor, 1):
-            fail(f"profile grew while being read: {path}")
+            fail(f"{purpose} grew while being read: {path}")
         after = os.fstat(descriptor)
         identity_before = (
             before.st_dev,
@@ -425,7 +433,7 @@ def read_profile_bytes(path: Path) -> bytes:
             after.st_mtime_ns,
         )
         if identity_before != identity_after:
-            fail(f"profile changed while being read: {path}")
+            fail(f"{purpose} changed while being read: {path}")
         return b"".join(chunks)
     finally:
         os.close(descriptor)
@@ -435,7 +443,7 @@ def load_profile(path: Path) -> ApplicationProfile:
     """Read one bounded real JSON file and validate its complete profile."""
 
     try:
-        raw = read_profile_bytes(path)
+        raw = read_bounded_regular_file(path, MAX_PROFILE_BYTES, "profile")
         decoded = json.loads(raw.decode("utf-8"), object_pairs_hook=reject_duplicate_keys)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         fail(f"cannot decode profile {path}: {error}")
