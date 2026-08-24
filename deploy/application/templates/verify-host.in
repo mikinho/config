@@ -1,0 +1,499 @@
+#!/usr/bin/env bash
+# Non-mutating verification for one rendered gold deployment host.
+# The compact check chains are safe because pass() is side-effect-only and
+# always successful; single-quoted jq programs intentionally remain literal.
+# shellcheck disable=SC2015,SC2016
+
+set -euo pipefail
+
+readonly APP_DIR="@@APPLICATION_ROOT@@"
+readonly SECURE_DIR="@@SECURE_ROOT@@"
+readonly CONFIG_DIR="@@CONFIG_ROOT@@"
+readonly RUNTIME_ROOT="@@RUNTIME_ROOT@@"
+readonly TRIGGER_ROOT="@@TRIGGER_ROOT@@"
+readonly DEPENDENCY_STATE_ROOT="@@DEPENDENCY_STATE_ROOT@@"
+readonly DEPENDENCY_CACHE_ROOT="@@DEPENDENCY_CACHE_ROOT@@"
+readonly APP_USER="@@SERVICE_USER@@"
+readonly APP_GROUP="@@SERVICE_GROUP@@"
+readonly DEPLOY_USER="@@DEPLOY_USER@@"
+readonly DEPLOY_GROUP="@@DEPLOY_GROUP@@"
+readonly DEPLOY_HOME="/home/$DEPLOY_USER"
+readonly LIVE_SERVICE="@@LIVE_SERVICE@@"
+readonly FINALIZER_SERVICE="@@FINALIZER_SERVICE@@"
+readonly PATH_UNIT="@@FINALIZER_PATH@@"
+readonly RECOVERY_SERVICE="@@RECOVERY_SERVICE@@"
+readonly GATEWAY_PROGRAM="@@GATEWAY_PROGRAM@@"
+readonly SOURCE_REVISION="@@SOURCE_REVISION@@"
+readonly BUNDLE_ID="@@BUNDLE_ID@@"
+readonly PROFILE_DIGEST="@@PROFILE_DIGEST@@"
+readonly STANDARD_LINK="$SECURE_DIR/standard"
+readonly STANDARD_BUNDLE="$SECURE_DIR/bundles/$BUNDLE_ID"
+readonly SSH_POLICY=/etc/ssh/sshd_config.d/@@SSH_POLICY_NAME@@
+readonly SSH_MAINTENANCE=/etc/ssh/sshd_config.d/@@SSH_MAINTENANCE_NAME@@
+readonly RUNTIME_SOCKET="@@RUNTIME_SOCKET@@"
+readonly METADATA_PATH="@@METADATA_PATH@@"
+readonly METADATA_TOKEN_POINTER=@@METADATA_TOKEN_POINTER_LITERAL@@
+readonly DEPENDENCY_PROVENANCE_PATH="@@DEPENDENCY_PROVENANCE_PATH@@"
+readonly HEALTH_ROUTE=@@HEALTH_ROUTE_LITERAL@@
+readonly HEALTH_STATUS_POINTER=@@HEALTH_STATUS_POINTER_LITERAL@@
+readonly HEALTH_STATUS_VALUE="@@HEALTH_STATUS_VALUE@@"
+readonly HEALTH_TOKEN_POINTER=@@HEALTH_TOKEN_POINTER_LITERAL@@
+readonly SELINUX_MODULE="@@SELINUX_MODULE@@"
+readonly TRIGGER_TYPE=@@TRIGGER_SELINUX_TYPE@@
+readonly -a SYSTEMD_UNITS=(
+@@SYSTEMD_UNIT_ARRAY@@
+)
+readonly -a SECURE_SCRIPTS=(
+@@SECURE_SCRIPT_ARRAY@@
+)
+readonly -a STATIC_PATTERNS=(
+@@SELINUX_STATIC_PATTERN_ARRAY@@
+)
+readonly -a POINTER_PATTERNS=(
+@@SELINUX_POINTER_PATTERN_ARRAY@@
+)
+readonly -a RUNTIME_PATTERNS=(
+@@SELINUX_RUNTIME_PATTERN_ARRAY@@
+)
+readonly TRIGGER_PATTERN=@@SELINUX_TRIGGER_PATTERN_LITERAL@@
+readonly -a STATIC_RELEASE_PATHS=(
+@@STATIC_PATH_ARRAY@@
+)
+
+PRE_SSH=0
+FAILURES=0
+
+pass() { printf '[server-verify] PASS: %s\n' "$*"; }
+fail() { printf '[server-verify] FAIL: %s\n' "$*" >&2; ((++FAILURES)); }
+
+check_command() {
+    command -v "$1" >/dev/null 2>&1 \
+        && pass "required command available: $1" \
+        || fail "required command unavailable: $1"
+}
+
+check_stat() {
+    local path=$1 expected=$2 actual
+    if [[ ! -e "$path" && ! -L "$path" ]]; then
+        fail "missing path: $path"
+        return
+    fi
+    actual="$(stat -Lc '%U:%G:%a:%h' "$path" 2>/dev/null || true)"
+    [[ "$actual" == "$expected" ]] \
+        && pass "identity ok: $path" \
+        || fail "identity mismatch: $path ($actual, expected $expected)"
+}
+
+check_real_directory() {
+    local path=$1 expected=$2
+    if [[ -d "$path" && ! -L "$path" ]]; then
+        local actual
+        actual="$(stat -Lc '%U:%G:%a' "$path" 2>/dev/null || true)"
+        [[ "$actual" == "$expected" ]] \
+            && pass "identity ok: $path" \
+            || fail "identity mismatch: $path ($actual, expected $expected)"
+    else
+        fail "not a real directory: $path"
+    fi
+}
+
+check_real_file() {
+    local path=$1 expected=$2
+    if [[ -f "$path" && ! -L "$path" ]]; then
+        check_stat "$path" "$expected"
+    else
+        fail "not a real file: $path"
+    fi
+}
+
+check_same_file() {
+    local installed=$1 expected=$2
+    if [[ -f "$installed" && ! -L "$installed" && -f "$expected" && ! -L "$expected" ]] \
+        && cmp -s -- "$installed" "$expected"; then
+        pass "installed content matches bundle: $installed"
+    else
+        fail "installed content differs from bundle: $installed"
+    fi
+}
+
+json_pointer_filter() {
+    printf '%s\n' '
+        def pointer_path($value):
+            $value | split("/")[1:] | map(gsub("~1"; "/") | gsub("~0"; "~"));
+        getpath(pointer_path($pointer))
+    '
+}
+
+verify_bundle() {
+    [[ -L "$STANDARD_LINK" && "$(readlink "$STANDARD_LINK")" == "bundles/$BUNDLE_ID" ]] \
+        && pass "standard bundle pointer is revision-bound" \
+        || fail "standard bundle pointer is missing or unsafe"
+    check_real_directory "$STANDARD_BUNDLE" root:root:755
+    check_real_file "$STANDARD_BUNDLE/SHA256SUMS" root:root:644:1
+    [[ "$(jq -r '.profileSha256 // empty' "$STANDARD_BUNDLE/STANDARD-MANIFEST.json" 2>/dev/null)" \
+        == "$PROFILE_DIGEST" ]] \
+        && pass "archived bundle profile digest verified" \
+        || fail "archived bundle profile digest mismatch"
+
+    local unsafe
+    unsafe="$(find "$STANDARD_BUNDLE" -xdev \
+        \( -type l -o \( ! -type d ! -type f \) \
+           -o ! -user root -o ! -group root -o -perm /022 \
+           -o \( -type f ! -links 1 \) \) -print -quit 2>/dev/null || true)"
+    [[ -z "$unsafe" ]] \
+        && pass "archived bundle is root-owned, immutable, and link-safe" \
+        || fail "unsafe archived bundle entry: $unsafe"
+    if (cd "$STANDARD_BUNDLE" && sha256sum --strict --check SHA256SUMS >/dev/null); then
+        pass "archived bundle checksums verified"
+    else
+        fail "archived bundle checksum verification failed"
+    fi
+}
+
+verify_accounts_and_paths() {
+    local app_passwd deploy_passwd blocker_content=""
+    app_passwd="$(getent passwd "$APP_USER" 2>/dev/null || true)"
+    deploy_passwd="$(getent passwd "$DEPLOY_USER" 2>/dev/null || true)"
+    [[ -n "$app_passwd" ]] \
+        && [[ "$(id -gn "$APP_USER")" == "$APP_GROUP" ]] \
+        && [[ "$(id -Gn "$APP_USER")" == "$APP_GROUP" ]] \
+        && [[ "$(cut -d: -f6 <<<"$app_passwd")" == "$APP_DIR" ]] \
+        && [[ "$(cut -d: -f7 <<<"$app_passwd")" == /sbin/nologin ]] \
+        && pass "application account and primary group exist" \
+        || fail "application account or primary group is wrong"
+    [[ -n "$deploy_passwd" ]] \
+        && [[ "$(id -gn "$DEPLOY_USER")" == "$DEPLOY_GROUP" ]] \
+        && [[ "$(id -Gn "$DEPLOY_USER")" == "$DEPLOY_GROUP" ]] \
+        && [[ "$(cut -d: -f6 <<<"$deploy_passwd")" == "$DEPLOY_HOME" ]] \
+        && [[ "$(cut -d: -f7 <<<"$deploy_passwd")" == /bin/sh ]] \
+        && pass "deploy account has only its primary deploy group" \
+        || fail "deploy account group boundary is wrong"
+    id -nG nginx | tr ' ' '\n' | grep -Fqx "$APP_GROUP" \
+        && pass "nginx belongs to the application group" \
+        || fail "nginx is not a member of $APP_GROUP"
+
+    check_real_directory "$APP_DIR" root:"$APP_GROUP":751
+    check_real_directory "$APP_DIR/incoming" root:"$DEPLOY_GROUP":2770
+    check_real_directory "$APP_DIR/releases" root:"$APP_GROUP":750
+    check_real_directory "$APP_DIR/candidates" root:"$APP_GROUP":750
+    check_real_directory "$SECURE_DIR" root:root:755
+    check_real_directory "$SECURE_DIR/scripts" root:root:755
+    check_real_directory "$SECURE_DIR/state" root:root:700
+    check_real_file "$SECURE_DIR/.post-deploy.lock" root:root:600:1
+    check_real_directory "$CONFIG_DIR" root:"$APP_GROUP":750
+    check_real_file "$CONFIG_DIR/.env" root:root:600:1
+    check_real_directory "$TRIGGER_ROOT" root:root:755
+    check_real_directory "$TRIGGER_ROOT/inbox" root:"$DEPLOY_GROUP":2770
+    check_real_directory "$TRIGGER_ROOT/state" root:root:700
+    check_real_directory "$TRIGGER_ROOT/results" root:"$DEPLOY_GROUP":750
+    check_real_file "$TRIGGER_ROOT/ingress.lock" root:"$DEPLOY_GROUP":660:1
+    check_real_file "$TRIGGER_ROOT/publish.lock" root:"$DEPLOY_GROUP":660:1
+    check_real_file "$TRIGGER_ROOT/session.lock" root:"$DEPLOY_GROUP":660:1
+    check_real_directory "$DEPENDENCY_STATE_ROOT" root:"$APP_GROUP":750
+    check_real_directory "$DEPENDENCY_STATE_ROOT/home" "$APP_USER":"$APP_GROUP":700
+    check_real_directory "$DEPENDENCY_STATE_ROOT/npm-work" root:"$APP_GROUP":710
+    check_real_directory "$DEPENDENCY_CACHE_ROOT" root:"$APP_GROUP":750
+    check_real_directory "$DEPENDENCY_CACHE_ROOT/npm" "$APP_USER":"$APP_GROUP":700
+    check_real_directory "$DEPLOY_HOME" root:"$DEPLOY_GROUP":750
+    check_real_directory "$DEPLOY_HOME/.ssh" root:"$DEPLOY_GROUP":750
+    check_real_file "$DEPLOY_HOME/.ssh/authorized_keys" root:"$DEPLOY_GROUP":640:1
+    [[ "$(awk 'NF { count++ } END { print count + 0 }' \
+        "$DEPLOY_HOME/.ssh/authorized_keys")" == 1 ]] \
+        || fail "authorized_keys must contain exactly one non-empty key line"
+    ssh-keygen -lf "$DEPLOY_HOME/.ssh/authorized_keys" 2>/dev/null \
+        | awk 'END { exit NR != 1 }' \
+        && pass "deployment public key parses" \
+        || fail "deployment public key is invalid"
+    if (( PRE_SSH == 1 )); then
+        check_real_file "$TRIGGER_ROOT/blocked" root:root:600:1
+        IFS= read -r blocker_content < "$TRIGGER_ROOT/blocked" || true
+        [[ "$blocker_content" == gold-setup-v1 ]] \
+            || fail "pre-SSH setup blocker content is invalid"
+    elif [[ -e "$TRIGGER_ROOT/blocked" || -L "$TRIGGER_ROOT/blocked" ]]; then
+        fail "deployment blocker remains after setup"
+    else
+        pass "deployment blocker cleared"
+    fi
+}
+
+verify_installed_policy() {
+    local script unit
+    for script in "${SECURE_SCRIPTS[@]}"; do
+        check_real_file "$SECURE_DIR/scripts/$script" root:root:755:1
+        check_same_file "$SECURE_DIR/scripts/$script" "$STANDARD_BUNDLE/scripts/$script"
+    done
+    check_real_file "$GATEWAY_PROGRAM" root:root:755:1
+    check_same_file "$GATEWAY_PROGRAM" "$STANDARD_BUNDLE/scripts/deploy-gateway.py"
+    check_real_file /usr/local/bin/rrsync root:root:755:1
+    check_same_file /usr/local/bin/rrsync /usr/bin/rrsync
+    for unit in "${SYSTEMD_UNITS[@]}"; do
+        check_real_file "/etc/systemd/system/$unit" root:root:644:1
+        check_same_file "/etc/systemd/system/$unit" "$STANDARD_BUNDLE/systemd/$unit"
+    done
+    check_real_file "$SSH_POLICY" root:root:644:1
+    check_same_file "$SSH_POLICY" "$STANDARD_BUNDLE/ssh/deploy.conf"
+    if (( PRE_SSH == 1 )); then
+        check_same_file "$SSH_MAINTENANCE" "$STANDARD_BUNDLE/ssh/maintenance.conf"
+    fi
+}
+
+verify_rsync_contract() {
+    rpm -qf /usr/bin/rsync /usr/bin/rrsync >/dev/null 2>&1 \
+        && pass "rsync and rrsync are package-owned" \
+        || fail "rsync or rrsync is not package-owned"
+    local rsync_help rrsync_help
+    rsync_help="$(LC_ALL=C /usr/bin/rsync --help 2>&1 || true)"
+    rrsync_help="$(LC_ALL=C /usr/bin/rrsync -help 2>&1 || true)"
+    for option in --confine-root --drop-D --fsync; do
+        grep -Fq -- "$option" <<<"$rsync_help" \
+            || fail "rsync is missing receiver boundary: $option"
+    done
+    for option in -wo -munge -no-lock; do
+        grep -Fq -- "$option" <<<"$rrsync_help" \
+            || fail "rrsync is missing wrapper option: $option"
+    done
+}
+
+verify_systemd() {
+    if systemd-analyze verify "${SYSTEMD_UNITS[@]/#//etc/systemd/system/}" >/dev/null; then
+        pass "rendered systemd units verify"
+    else
+        fail "rendered systemd units fail systemd-analyze verify"
+    fi
+    for unit in "$LIVE_SERVICE" "$PATH_UNIT" "$RECOVERY_SERVICE"; do
+        systemctl is-enabled --quiet "$unit" \
+            && pass "unit enabled: $unit" \
+            || fail "unit is not enabled: $unit"
+    done
+    systemctl is-active --quiet "$PATH_UNIT" \
+        && pass "path trigger active" \
+        || fail "path trigger inactive"
+    systemctl is-active --quiet "$RECOVERY_SERVICE" \
+        && pass "recovery prerequisite active" \
+        || fail "recovery prerequisite inactive"
+    if [[ -L "$APP_DIR/current" ]]; then
+        systemctl is-active --quiet "$LIVE_SERVICE" \
+            && pass "live service active" \
+            || fail "live service inactive with a committed release"
+    fi
+    [[ "$(systemctl show "$FINALIZER_SERVICE" -p ActiveState --value)" != failed ]] \
+        && pass "finalizer is not failed" \
+        || fail "finalizer remains failed"
+}
+
+fcontext_type() {
+    semanage fcontext -l \
+        | pattern="$1" awk '$1 == ENVIRON["pattern"] { split($NF, value, ":"); print value[3]; found = 1 } END { exit !found }'
+}
+
+verify_selinux() {
+    [[ "$(getenforce)" == Enforcing ]] \
+        && pass "SELinux is Enforcing" \
+        || fail "SELinux is not Enforcing"
+    sestatus | grep -Eq '^Loaded policy name:[[:space:]]+targeted$' \
+        && pass "SELinux targeted policy loaded" \
+        || fail "SELinux targeted policy not loaded"
+    semodule -lfull | awk -v module="$SELINUX_MODULE" \
+        '$1 == module || $2 == module { found = 1 } END { exit !found }' \
+        && pass "SELinux module loaded: $SELINUX_MODULE" \
+        || fail "SELinux module missing: $SELINUX_MODULE"
+    sesearch -A -s httpd_t -t unconfined_service_t -c unix_stream_socket -p connectto \
+        | grep -q '^allow ' \
+        && pass "nginx runtime socket connect rule present" \
+        || fail "nginx runtime socket connect rule missing"
+    sesearch -A -s init_t -t "$TRIGGER_TYPE" -c dir -p watch \
+        | grep -q '^allow ' \
+        && pass "systemd trigger watch rule present" \
+        || fail "systemd trigger watch rule missing"
+    local permission
+    for permission in add_name create remove_name rename rmdir write; do
+        if sesearch -A -s init_t -t "$TRIGGER_TYPE" -c dir -p "$permission" \
+            | grep -q '^allow '; then
+            fail "systemd has forbidden trigger-directory permission: $permission"
+        fi
+    done
+    for permission in append create rename setattr unlink write; do
+        if sesearch -A -s init_t -t "$TRIGGER_TYPE" -c file -p "$permission" \
+            | grep -q '^allow '; then
+            fail "systemd has forbidden trigger-file permission: $permission"
+        fi
+    done
+    local pattern
+    for pattern in "${STATIC_PATTERNS[@]}"; do
+        [[ "$(fcontext_type "$pattern" 2>/dev/null || true)" == httpd_sys_content_t ]] \
+            || fail "static fcontext missing or wrong: $pattern"
+    done
+    for pattern in "${POINTER_PATTERNS[@]}"; do
+        [[ "$(fcontext_type "$pattern" 2>/dev/null || true)" == usr_t ]] \
+            || fail "pointer fcontext missing or wrong: $pattern"
+    done
+    [[ "$(fcontext_type "$TRIGGER_PATTERN" 2>/dev/null || true)" == "$TRIGGER_TYPE" ]] \
+        || fail "trigger fcontext missing or wrong"
+    local runtime_rule=0
+    for pattern in "${RUNTIME_PATTERNS[@]}"; do
+        [[ "$(fcontext_type "$pattern" 2>/dev/null || true)" == httpd_var_run_t ]] \
+            && runtime_rule=1
+    done
+    (( runtime_rule == 1 )) || fail "runtime fcontext missing or wrong"
+
+    local actual_type
+    actual_type="$(stat -Lc '%C' "$TRIGGER_ROOT/inbox" 2>/dev/null | cut -d: -f3)"
+    [[ "$actual_type" == "$TRIGGER_TYPE" ]] \
+        || fail "trigger inbox has wrong live label: ${actual_type:-missing}"
+    if [[ -d "$RUNTIME_ROOT" ]]; then
+        actual_type="$(stat -Lc '%C' "$RUNTIME_ROOT" 2>/dev/null | cut -d: -f3)"
+        [[ "$actual_type" == httpd_var_run_t ]] \
+            || fail "runtime directory has wrong live label: ${actual_type:-missing}"
+    fi
+    local main_pid process_type
+    main_pid="$(systemctl show "$LIVE_SERVICE" -p MainPID --value 2>/dev/null || true)"
+    if [[ "$main_pid" =~ ^[1-9][0-9]*$ ]]; then
+        process_type="$(ps -o label= -p "$main_pid" 2>/dev/null | awk -F: 'NF >= 3 { print $3 }')"
+        [[ "$process_type" == unconfined_service_t ]] \
+            || fail "live service has unexpected SELinux domain: ${process_type:-missing}"
+    fi
+    main_pid="$(systemctl show nginx.service -p MainPID --value 2>/dev/null || true)"
+    if [[ "$main_pid" =~ ^[1-9][0-9]*$ ]]; then
+        process_type="$(ps -o label= -p "$main_pid" 2>/dev/null | awk -F: 'NF >= 3 { print $3 }')"
+        [[ "$process_type" == httpd_t ]] \
+            || fail "nginx has unexpected SELinux domain: ${process_type:-missing}"
+    fi
+}
+
+verify_ssh() {
+    /usr/sbin/sshd -t \
+        && pass "OpenSSH configuration syntax valid" \
+        || { fail "OpenSSH configuration syntax invalid"; return; }
+    if (( PRE_SSH == 1 )); then
+        check_real_file "$SSH_MAINTENANCE" root:root:644:1
+        pass "maintenance deny remains armed for pre-SSH verification"
+        return
+    fi
+    [[ ! -e "$SSH_MAINTENANCE" && ! -L "$SSH_MAINTENANCE" ]] \
+        && pass "maintenance deny removed after successful setup" \
+        || fail "maintenance deny still installed"
+    local context effective
+    for context in \
+        "user=$DEPLOY_USER,host=localhost,addr=127.0.0.1" \
+        "user=$DEPLOY_USER,host=deploy-client.example,addr=203.0.113.1"; do
+        effective="$(/usr/sbin/sshd -T -C "$context")"
+        grep -Fqx "forcecommand $GATEWAY_PROGRAM" <<<"$effective" \
+            || fail "effective SSH ForceCommand is wrong for $context"
+        grep -Fqx 'authenticationmethods publickey' <<<"$effective" \
+            || fail "effective SSH authentication is not publickey-only for $context"
+        local expected
+        for expected in \
+            'pubkeyauthentication yes' \
+            'passwordauthentication no' \
+            'kbdinteractiveauthentication no' \
+            'permituserenvironment no' \
+            'permituserrc no' \
+            'permittty no' \
+            'x11forwarding no' \
+            'allowtcpforwarding no' \
+            'allowagentforwarding no' \
+            'allowstreamlocalforwarding no'; do
+            grep -Fqx "$expected" <<<"$effective" \
+                || fail "effective SSH policy is missing '$expected' for $context"
+        done
+        if grep -E '^denyusers([[:space:]].*)?$' <<<"$effective" \
+            | tr ' ' '\n' | grep -Fqx "$DEPLOY_USER"; then
+            fail "effective SSH policy still denies $DEPLOY_USER"
+        fi
+    done
+}
+
+verify_release() {
+    [[ -L "$APP_DIR/current" ]] || { pass "no committed release yet"; return; }
+    local target deploy_id release metadata_hash provenance_hash health
+    target="$(readlink "$APP_DIR/current")"
+    deploy_id="${target#releases/}"
+    [[ "$target" == "releases/$deploy_id" \
+        && "$deploy_id" =~ ^(manual|[0-9a-f]{40,64})-[0-9]{1,20}-[0-9a-f]{24}$ ]] \
+        || { fail "current release pointer is unsafe: $target"; return; }
+    release="$APP_DIR/$target"
+    check_real_directory "$release" root:"$APP_GROUP":550
+    local ownership_drift writable
+    ownership_drift="$(find "$release" -xdev \
+        \( ! -user root -o ! -group "$APP_GROUP" \) -print -quit)"
+    writable="$(find "$release" -xdev ! -type l -perm /222 -print -quit)"
+    [[ -z "$ownership_drift" ]] \
+        || fail "release contains unexpected ownership: $ownership_drift"
+    [[ -z "$writable" ]] \
+        || fail "release contains a writable entry: $writable"
+    local actual_type unexpected
+    actual_type="$(stat -c '%C' "$APP_DIR/current" 2>/dev/null | cut -d: -f3)"
+    [[ "$actual_type" == usr_t ]] \
+        || fail "current pointer has wrong SELinux label: ${actual_type:-missing}"
+    actual_type="$(stat -Lc '%C' "$release" 2>/dev/null | cut -d: -f3)"
+    [[ "$actual_type" == httpd_sys_content_t ]] \
+        || fail "release root has wrong SELinux label: ${actual_type:-missing}"
+    jq -e --arg pointer "$METADATA_TOKEN_POINTER" --arg token "$deploy_id" "$(json_pointer_filter) == \$token" \
+        "$release/$METADATA_PATH" >/dev/null \
+        && pass "release metadata matches current token" \
+        || fail "release metadata does not match current token"
+    check_real_file "$APP_DIR/committed.json" root:"$APP_GROUP":440:1
+    jq -e --arg token "$deploy_id" \
+        '.schemaVersion == 1 and .status == "committed" and .deployId == $token' \
+        "$APP_DIR/committed.json" >/dev/null \
+        && pass "committed state matches current token" \
+        || fail "committed state does not match current token"
+    metadata_hash="$($SECURE_DIR/scripts/package-hash.mjs "$release" 2>/dev/null || true)"
+    provenance_hash="$(jq -r '.packageHash // empty' "$release/$DEPENDENCY_PROVENANCE_PATH" 2>/dev/null || true)"
+    [[ "$metadata_hash" =~ ^[0-9a-f]{64}$ && "$metadata_hash" == "$provenance_hash" ]] \
+        && pass "dependency provenance matches immutable manifests" \
+        || fail "dependency provenance does not match immutable manifests"
+    local static_path
+    for static_path in "${STATIC_RELEASE_PATHS[@]}"; do
+        if [[ -d "$release/$static_path" && ! -L "$release/$static_path" ]]; then
+            unexpected="$(find "$release/$static_path" -xdev \
+                ! -context '*:httpd_sys_content_t:*' -print -quit 2>/dev/null || true)"
+            [[ -z "$unexpected" ]] \
+                || fail "static content has wrong SELinux label: $unexpected"
+        else
+            fail "static release path is missing or unsafe: $static_path"
+        fi
+    done
+    health="$(curl --fail --silent --show-error --max-time 10 --noproxy '*' \
+        --unix-socket "$RUNTIME_SOCKET" "http://localhost$HEALTH_ROUTE" 2>/dev/null || true)"
+    jq -e \
+        --arg statusPointer "$HEALTH_STATUS_POINTER" \
+        --arg statusValue "$HEALTH_STATUS_VALUE" \
+        --arg tokenPointer "$HEALTH_TOKEN_POINTER" \
+        --arg token "$deploy_id" '
+            def pointer_path($value):
+                $value | split("/")[1:] | map(gsub("~1"; "/") | gsub("~0"; "~"));
+            getpath(pointer_path($statusPointer)) == $statusValue
+            and getpath(pointer_path($tokenPointer)) == $token
+        ' <<<"$health" >/dev/null \
+        && pass "live Unix-socket health matches current token" \
+        || fail "live Unix-socket health does not match current token"
+}
+
+main() {
+    [[ "$(id -u)" -eq 0 ]] || { printf '[server-verify] ERROR: must run as root\n' >&2; exit 1; }
+    case "${1:-}" in
+        "") ;;
+        --pre-ssh) PRE_SSH=1 ;;
+        *) printf '[server-verify] ERROR: unknown argument: %s\n' "$1" >&2; exit 1 ;;
+    esac
+    local command_name
+    for command_name in cmp curl find getenforce getent jq ps rpm semanage semodule sesearch sha256sum ssh-keygen systemctl systemd-analyze; do
+        check_command "$command_name"
+    done
+    verify_bundle
+    verify_accounts_and_paths
+    verify_installed_policy
+    verify_rsync_contract
+    verify_systemd
+    verify_selinux
+    verify_ssh
+    verify_release
+    if (( FAILURES > 0 )); then
+        printf '[server-verify] ERROR: %d check(s) failed\n' "$FAILURES" >&2
+        return 1
+    fi
+    printf '[server-verify] gold deployment host checks passed\n'
+}
+
+main "$@"

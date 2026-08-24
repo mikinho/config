@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+# Install the rendered SELinux policy and file-context contract.
+
+set -euo pipefail
+
+readonly RUNTIME_DIR="@@RUNTIME_ROOT@@"
+readonly TRIGGER_DIR="@@TRIGGER_ROOT@@/inbox"
+readonly SECURE_DIR="@@SECURE_ROOT@@"
+readonly MODULE_NAME="@@SELINUX_MODULE@@"
+readonly MODULE_SOURCE="$SECURE_DIR/standard/selinux/runtime.te"
+readonly STATIC_TYPE=httpd_sys_content_t
+readonly POINTER_TYPE=usr_t
+readonly RUNTIME_TYPE=httpd_var_run_t
+readonly TRIGGER_TYPE=@@TRIGGER_SELINUX_TYPE@@
+readonly -a STATIC_PATTERNS=(
+@@SELINUX_STATIC_PATTERN_ARRAY@@
+)
+readonly -a POINTER_PATTERNS=(
+@@SELINUX_POINTER_PATTERN_ARRAY@@
+)
+readonly -a RUNTIME_PATTERNS=(
+@@SELINUX_RUNTIME_PATTERN_ARRAY@@
+)
+readonly TRIGGER_PATTERN=@@SELINUX_TRIGGER_PATTERN_LITERAL@@
+readonly -a RELABEL_PATHS=(
+@@SELINUX_RELABEL_PATH_ARRAY@@
+)
+
+POLICY_BUILD_DIR=""
+
+log() { printf '[selinux-setup] %s\n' "$*"; }
+die() { printf '[selinux-setup] ERROR: %s\n' "$*" >&2; exit 1; }
+
+cleanup() {
+    [[ -z "$POLICY_BUILD_DIR" ]] || rm -rf -- "$POLICY_BUILD_DIR"
+}
+
+trap cleanup EXIT
+
+require_platform() {
+    [[ "$(id -u)" -eq 0 ]] || die "must run as root"
+    [[ "$(getenforce)" == Enforcing ]] || die "SELinux must be Enforcing"
+    sestatus | grep -Eq '^Loaded policy name:[[:space:]]+targeted$' \
+        || die "SELinux targeted policy must be loaded"
+    local command_name
+    for command_name in checkmodule restorecon semanage semodule semodule_package; do
+        command -v "$command_name" >/dev/null 2>&1 \
+            || die "required SELinux tool is unavailable: $command_name"
+    done
+    [[ -f "$MODULE_SOURCE" && ! -L "$MODULE_SOURCE" ]] \
+        || die "missing real policy source: $MODULE_SOURCE"
+}
+
+fcontext_context() {
+    semanage fcontext -l \
+        | pattern="$1" awk '$1 == ENVIRON["pattern"] { print $NF; found = 1 } END { exit !found }'
+}
+
+context_type() {
+    awk -F: '{ print $3 }' <<<"$1"
+}
+
+ensure_fcontext() {
+    local expected_type=$1 pattern=$2 context actual_type
+    if context="$(fcontext_context "$pattern")"; then
+        actual_type="$(context_type "$context")"
+        if [[ "$actual_type" != "$expected_type" ]]; then
+            log "updating rule: $pattern ($actual_type -> $expected_type)"
+            semanage fcontext -m -t "$expected_type" "$pattern"
+        else
+            log "rule exists: $pattern"
+        fi
+        return 0
+    fi
+    log "adding rule: $pattern"
+    semanage fcontext -a -t "$expected_type" "$pattern"
+}
+
+ensure_equivalent_fcontext() {
+    local expected_type=$1
+    shift
+    local pattern context actual_type
+    for pattern in "$@"; do
+        if context="$(fcontext_context "$pattern")"; then
+            actual_type="$(context_type "$context")"
+            if [[ "$actual_type" != "$expected_type" ]]; then
+                semanage fcontext -m -t "$expected_type" "$pattern"
+            fi
+            log "runtime rule available: $pattern"
+            return 0
+        fi
+        if semanage fcontext -a -t "$expected_type" "$pattern" 2>/dev/null; then
+            log "added runtime rule: $pattern"
+            return 0
+        fi
+    done
+    die "unable to register $expected_type for equivalent runtime paths"
+}
+
+install_module() {
+    POLICY_BUILD_DIR="$(mktemp -d /tmp/application-policy.XXXXXXXX)"
+    checkmodule -M -m \
+        -o "$POLICY_BUILD_DIR/$MODULE_NAME.mod" \
+        "$MODULE_SOURCE"
+    semodule_package \
+        -o "$POLICY_BUILD_DIR/$MODULE_NAME.pp" \
+        -m "$POLICY_BUILD_DIR/$MODULE_NAME.mod"
+    semodule -i "$POLICY_BUILD_DIR/$MODULE_NAME.pp"
+    log "installed policy module: $MODULE_NAME"
+    rm -rf -- "$POLICY_BUILD_DIR"
+    POLICY_BUILD_DIR=""
+}
+
+main() {
+    require_platform
+    install_module
+
+    local pattern path
+    for pattern in "${STATIC_PATTERNS[@]}"; do
+        ensure_fcontext "$STATIC_TYPE" "$pattern"
+    done
+    for pattern in "${POINTER_PATTERNS[@]}"; do
+        ensure_fcontext "$POINTER_TYPE" "$pattern"
+    done
+    ensure_fcontext "$TRIGGER_TYPE" "$TRIGGER_PATTERN"
+    ensure_equivalent_fcontext "$RUNTIME_TYPE" "${RUNTIME_PATTERNS[@]}"
+
+    for path in "${RELABEL_PATHS[@]}"; do
+        if [[ -e "$path" || -L "$path" ]]; then
+            restorecon -RF "$path"
+        fi
+    done
+    [[ ! -d "$TRIGGER_DIR" ]] || restorecon -RF "$TRIGGER_DIR"
+    [[ ! -d "$RUNTIME_DIR" ]] || restorecon -RF "$RUNTIME_DIR"
+    log "SELinux policy and labels installed"
+}
+
+main "$@"
