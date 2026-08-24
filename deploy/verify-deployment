@@ -140,10 +140,11 @@ check_quic_state() {
     if [ -f /etc/nginx/quic_host.key ]; then
         key_mode=$(stat -c '%a' /etc/nginx/quic_host.key 2>/dev/null || stat -f '%Lp' /etc/nginx/quic_host.key 2>/dev/null || echo '')
         key_bytes=$(wc -c < /etc/nginx/quic_host.key | tr -d ' ')
-        if [ "$key_mode" = "600" ] && [ "$key_bytes" = "80" ]; then
-            pass_msg "quic_host.key present with mode 0600 and 80 bytes"
+        key_owner=$(stat -c '%U:%G' /etc/nginx/quic_host.key 2>/dev/null || stat -f '%Su:%Sg' /etc/nginx/quic_host.key 2>/dev/null || echo '')
+        if [ "$key_mode" = "600" ] && [ "$key_bytes" = "80" ] && [ "$key_owner" = "root:root" ]; then
+            pass_msg "quic_host.key present with root:root mode 0600 and 80 bytes"
         else
-            fail_msg "quic_host.key has unexpected permissions ($key_mode) or size ($key_bytes bytes)"
+            fail_msg "quic_host.key has unexpected ownership ($key_owner), permissions ($key_mode) or size ($key_bytes bytes)"
         fi
     else
         fail_msg "quic_host.key is missing: /etc/nginx/quic_host.key"
@@ -284,12 +285,22 @@ check_firewalld() {
 
     if "$cmd" --info-service=nginx >/dev/null 2>&1; then
         pass_msg "firewalld service 'nginx' (TCP 80/443, UDP 443) is defined"
+        if "$cmd" --list-services 2>/dev/null | grep -qw nginx; then
+            pass_msg "firewalld service 'nginx' is active in the current zone"
+        else
+            fail_msg "firewalld service 'nginx' is defined but not active in the current zone"
+        fi
     else
         fail_msg "firewalld service 'nginx' is missing; install firewalld/services/nginx.xml"
     fi
 
     if "$cmd" --info-service=ssh-hardened >/dev/null 2>&1; then
         pass_msg "firewalld service 'ssh-hardened' (TCP 2356) is defined"
+        if "$cmd" --list-services 2>/dev/null | grep -qw ssh-hardened; then
+            pass_msg "firewalld service 'ssh-hardened' is active in the current zone"
+        else
+            fail_msg "firewalld service 'ssh-hardened' is defined but not active in the current zone"
+        fi
     else
         fail_msg "firewalld service 'ssh-hardened' is missing; install firewalld/services/ssh-hardened.xml"
     fi
