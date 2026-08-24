@@ -86,6 +86,8 @@ maintenance responses, and failure-only static asset logging.
 `sites/sample_wp.conf.example` matches the `sample_wp` PHP-FPM pool and systemd
 instance. Replace its domains, certificate paths, and site tag, then install it
 as `sites/SITE_TAG.conf`; only the installed `*.conf` copy becomes active.
+`sites/sample_node.conf.example` provides the corresponding reference for
+Node.js reverse-proxied applications with static asset cache fallbacks.
 
 ## Validation
 
