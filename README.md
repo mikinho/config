@@ -636,6 +636,7 @@ sudo systemctl --no-pager show certbot.timer \
     -p Unit -p TimersCalendar -p RandomizedDelayUSec -p Persistent
 sudo systemctl list-timers --no-pager | grep -Ei 'certbot|letsencrypt'
 sudo certbot renew --dry-run
+deploy/certbot-healthcheck
 ```
 
 After deployment, verify the expected headers and protocol behavior against a

@@ -65,6 +65,15 @@ expect_failure \
     "$REPOSITORY_ROOT/deploy/verify-deployment" \
     --invalid-option
 
+[ -x "$REPOSITORY_ROOT/deploy/certbot-healthcheck" ] \
+    || fail 'certbot-healthcheck is not executable'
+"$REPOSITORY_ROOT/deploy/certbot-healthcheck" --help >/dev/null
+expect_failure \
+    'unknown argument: --invalid-option' \
+    "$REPOSITORY_ROOT/deploy/certbot-healthcheck" \
+    --invalid-option
+
+
 "$REPOSITORY_ROOT/deploy/install-nginx" \
     --output "$TEST_ROOT/nginx-valid" \
     --profile gzip >/dev/null
