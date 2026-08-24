@@ -52,6 +52,9 @@ python3 "$REPOSITORY_ROOT/tests/application-deployment-standard.py"
 python3 "$REPOSITORY_ROOT/deploy/application/validate_profile.py" \
     "$REPOSITORY_ROOT/deploy/application/profiles/example_node_app.json" >/dev/null
 
+step "Exercising gold application deployment transactions..."
+python3 "$REPOSITORY_ROOT/tests/application-deployment-transactions.py"
+
 step "Running deployment renderer and path boundary tests..."
 "$REPOSITORY_ROOT/tests/deploy-renderers.sh"
 
