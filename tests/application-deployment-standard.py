@@ -101,6 +101,17 @@ class ProfileValidationTests(unittest.TestCase):
         source["paths"]["secureRoot"] = "/opt/example_node_app/.secure"
         self.assert_invalid(source, "applicationRoot and paths.secureRoot")
 
+    def test_runtime_root_must_be_managed_directly_beneath_run(self) -> None:
+        """RuntimeDirectory rendering cannot escape or alias systemd's /run root."""
+
+        source = copy.deepcopy(self.source)
+        source["paths"]["runtimeRoot"] = "/var/lib/example_runtime"
+        self.assert_invalid(source, "must be one direct child of /run")
+
+        source = copy.deepcopy(self.source)
+        source["paths"]["runtimeRoot"] = "/run/nested/example_runtime"
+        self.assert_invalid(source, "must be one direct child of /run")
+
     def test_unsorted_path_sets_are_rejected(self) -> None:
         """Semantically equal profiles have one canonical path ordering."""
 
@@ -419,6 +430,98 @@ class CoreRendererTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertEqual(completed.stdout, hostile_route)
             self.assertFalse(marker.exists())
+
+    def test_host_policy_is_hardened_and_profile_bound(self) -> None:
+        """Rendered units, SSH policy, and SELinux policy preserve trust separation."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            bundle = Path(directory) / "bundle"
+            result = self.render(bundle)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            expected_paths = {
+                "selinux/runtime.te",
+                "ssh/deploy.conf",
+                "ssh/maintenance.conf",
+                "systemd/example_deploy-failure@.service",
+                "systemd/example_deploy-recover.service",
+                "systemd/example_deploy.path",
+                "systemd/example_deploy.service",
+                "systemd/example_node_app-candidate@.service",
+                "systemd/example_node_app.service",
+            }
+            manifest = json.loads((bundle / "STANDARD-MANIFEST.json").read_text())
+            manifest_paths = {entry["path"] for entry in manifest["files"]}
+            self.assertTrue(expected_paths <= manifest_paths)
+
+            live = (bundle / "systemd/example_node_app.service").read_text()
+            self.assertIn("Requires=example_deploy-recover.service", live)
+            self.assertIn("WorkingDirectory=/opt/example_node_app/current", live)
+            self.assertIn("IPAddressDeny=127.0.0.0/8 ::1/128", live)
+            self.assertIn("SocketBindDeny=any", live)
+            self.assertIn("MemoryHigh=805306368", live)
+            self.assertIn("MemoryMax=1073741824", live)
+            self.assertIn("TasksMax=128", live)
+
+            candidate = (
+                bundle / "systemd/example_node_app-candidate@.service"
+            ).read_text()
+            self.assertIn(
+                "WorkingDirectory=/opt/example_node_app/candidates/%i", candidate
+            )
+            self.assertIn("RuntimeDirectory=example_node_app-candidate-%i", candidate)
+            self.assertIn("Restart=no", candidate)
+
+            finalizer = (bundle / "systemd/example_deploy.service").read_text()
+            self.assertIn("ExecStopPost=", finalizer)
+            self.assertIn(" --recover", finalizer)
+            self.assertIn("OnFailure=example_deploy-failure@%n.service", finalizer)
+            self.assertNotIn("RestrictSUIDSGID", finalizer)
+
+            recovery = (
+                bundle / "systemd/example_deploy-recover.service"
+            ).read_text()
+            self.assertIn("Before=example_node_app.service example_deploy.path", recovery)
+            self.assertIn("--recover-pointer", recovery)
+            self.assertNotIn("ConditionPathExists", recovery)
+
+            ssh_policy = (bundle / "ssh/deploy.conf").read_text()
+            self.assertIn("Match User example_deploy", ssh_policy)
+            self.assertIn("AuthenticationMethods publickey", ssh_policy)
+            self.assertIn("ForceCommand /usr/local/bin/example-node-app-deploy-gateway", ssh_policy)
+            self.assertNotIn("PermitUserEnvironment", ssh_policy)
+
+            selinux = (bundle / "selinux/runtime.te").read_text()
+            self.assertIn("type example_deploy_trigger_t;", selinux)
+            self.assertIn(
+                "allow init_t example_deploy_trigger_t:dir { getattr search watch };",
+                selinux,
+            )
+            self.assertNotRegex(
+                selinux,
+                r"allow init_t example_deploy_trigger_t:(?:dir|file).*\b(?:add_name|create|remove_name|rename|unlink|write)\b",
+            )
+
+    def test_loopback_policy_is_an_explicit_profile_decision(self) -> None:
+        """Development loopback access changes only the reviewed network block."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = json.loads(EXAMPLE_PROFILE.read_text(encoding="utf-8"))
+            source["runtime"]["allowLoopback"] = True
+            profile = root / "loopback-profile.json"
+            profile.write_text(json.dumps(source), encoding="utf-8")
+            bundle = root / "bundle"
+            result = self.render(bundle, profile=profile)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            for relative_path in (
+                "systemd/example_node_app.service",
+                "systemd/example_node_app-candidate@.service",
+            ):
+                unit = (bundle / relative_path).read_text()
+                self.assertIn("IPAddressAllow=0.0.0.0/0 ::/0", unit)
+                self.assertIn("IPAddressDeny=any", unit)
+                self.assertNotIn("IPAddressDeny=127.0.0.0/8", unit)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,24 @@
+# Root-owned OpenSSH policy for the restricted deployment account.
+
+Match User @@DEPLOY_USER@@
+    PubkeyAuthentication yes
+    AuthorizedKeysFile .ssh/authorized_keys
+    AuthorizedKeysCommand none
+    AuthorizedPrincipalsFile none
+    AuthorizedPrincipalsCommand none
+    TrustedUserCAKeys none
+    PasswordAuthentication no
+    KbdInteractiveAuthentication no
+    AuthenticationMethods publickey
+    GSSAPIAuthentication no
+    HostbasedAuthentication no
+    PermitUserRC no
+    PermitTTY no
+    X11Forwarding no
+    AllowTcpForwarding no
+    AllowStreamLocalForwarding no
+    AllowAgentForwarding no
+    PermitTunnel no
+    ForceCommand @@GATEWAY_PROGRAM@@
+
+Match all

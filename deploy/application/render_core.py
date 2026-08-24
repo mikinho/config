@@ -64,6 +64,15 @@ class RenderedFile:
         return hashlib.sha256(self.content).hexdigest()
 
 
+@dataclass(frozen=True)
+class TemplateSpec:
+    """One trusted source template and its rendered bundle destination."""
+
+    relative_path: str
+    template_name: str
+    mode: int
+
+
 def fail(message: str) -> NoReturn:
     """Raise one deterministic renderer failure."""
 
@@ -120,6 +129,73 @@ def allowed_candidate_roots(profile: ApplicationProfile) -> tuple[str, ...]:
     return tuple(sorted({value.split("/", maxsplit=1)[0] for value in relative_paths}))
 
 
+def failure_service(profile: ApplicationProfile) -> str:
+    """Return the derived failure-observer template service name."""
+
+    return f"{profile.services.finalizer.removesuffix('.service')}-failure@.service"
+
+
+def gateway_program(profile: ApplicationProfile) -> str:
+    """Return the fixed root-owned forced-command gateway path."""
+
+    program = f"{profile.identity.tag.replace('_', '-')}-deploy-gateway"
+    return f"/usr/local/bin/{program}"
+
+
+def network_policy(profile: ApplicationProfile) -> str:
+    """Render the reviewed outbound and loopback policy for systemd units."""
+
+    if profile.runtime.allow_loopback:
+        return "IPAddressAllow=0.0.0.0/0 ::/0\nIPAddressDeny=any"
+    return (
+        "IPAddressAllow=0.0.0.0/0 ::/0 127.0.0.53/32\n"
+        "IPAddressDeny=127.0.0.0/8 ::1/128"
+    )
+
+
+def template_specs(profile: ApplicationProfile) -> tuple[TemplateSpec, ...]:
+    """Return all generic transaction and host-policy template outputs."""
+
+    specs = [
+        TemplateSpec(path, template, SCRIPT_MODE)
+        for path, template in CORE_TEMPLATES.items()
+    ]
+    specs.extend(
+        (
+            TemplateSpec(
+                f"systemd/{profile.services.live}", "live.service.in", DATA_MODE
+            ),
+            TemplateSpec(
+                f"systemd/{profile.services.candidate}",
+                "candidate@.service.in",
+                DATA_MODE,
+            ),
+            TemplateSpec(
+                f"systemd/{profile.services.finalizer}",
+                "finalizer.service.in",
+                DATA_MODE,
+            ),
+            TemplateSpec(
+                f"systemd/{profile.services.path}", "finalizer.path.in", DATA_MODE
+            ),
+            TemplateSpec(
+                f"systemd/{profile.services.recovery}",
+                "recovery.service.in",
+                DATA_MODE,
+            ),
+            TemplateSpec(
+                f"systemd/{failure_service(profile)}", "failure@.service.in", DATA_MODE
+            ),
+            TemplateSpec("ssh/deploy.conf", "ssh-deploy.conf.in", DATA_MODE),
+            TemplateSpec(
+                "ssh/maintenance.conf", "ssh-maintenance.conf.in", DATA_MODE
+            ),
+            TemplateSpec("selinux/runtime.te", "runtime.te.in", DATA_MODE),
+        )
+    )
+    return tuple(sorted(specs, key=lambda item: item.relative_path))
+
+
 def build_replacements(profile: ApplicationProfile) -> dict[str, str]:
     """Build the complete fixed placeholder map for generic core templates."""
 
@@ -173,6 +249,30 @@ def build_replacements(profile: ApplicationProfile) -> dict[str, str]:
         "@@CANDIDATE_SERVICE@@": profile.services.candidate,
         "@@CANDIDATE_UNIT_PREFIX@@": candidate_prefix,
         "@@CANDIDATE_RUNTIME_PREFIX@@": f"{profile.paths.runtime_root}-candidate",
+        "@@APPLICATION_TAG@@": identity.tag,
+        "@@CONFIG_ROOT@@": profile.paths.config_root,
+        "@@RUNTIME_ROOT@@": profile.paths.runtime_root,
+        "@@RUNTIME_DIRECTORY@@": profile.paths.runtime_root.removeprefix("/run/"),
+        "@@PID_FILE_NAME@@": profile.runtime.pid_file_name,
+        "@@SOCKET_NAME@@": profile.runtime.socket_name,
+        "@@RECOVERY_SERVICE@@": profile.services.recovery,
+        "@@FINALIZER_SERVICE@@": profile.services.finalizer,
+        "@@FINALIZER_PATH@@": profile.services.path,
+        "@@FAILURE_SERVICE_PREFIX@@": failure_service(profile).removesuffix(
+            ".service"
+        ),
+        "@@GATEWAY_PROGRAM@@": gateway_program(profile),
+        "@@NETWORK_POLICY@@": network_policy(profile),
+        "@@MEMORY_HIGH_BYTES@@": str(profile.limits.memory_high_bytes),
+        "@@MEMORY_MAX_BYTES@@": str(profile.limits.memory_max_bytes),
+        "@@TASKS_MAX@@": str(profile.limits.tasks_max),
+        "@@CANDIDATE_RUNTIME_MAX_SECONDS@@": str(
+            profile.health.timeout_seconds + 60
+        ),
+        "@@FINALIZER_TIMEOUT_STOP_SECONDS@@": str(
+            profile.health.timeout_seconds * 2 + 120
+        ),
+        "@@SELINUX_MODULE@@": f"{identity.tag.replace('-', '_')}_runtime",
     }
 
 
@@ -220,8 +320,12 @@ def build_payload(
         fail("source revision must contain 40 to 64 lowercase hexadecimal characters")
     replacements = build_replacements(profile)
     files = [
-        RenderedFile(path, render_template(template, replacements), SCRIPT_MODE)
-        for path, template in sorted(CORE_TEMPLATES.items())
+        RenderedFile(
+            spec.relative_path,
+            render_template(spec.template_name, replacements),
+            spec.mode,
+        )
+        for spec in template_specs(profile)
     ]
     files.append(RenderedFile("profile.json", profile.canonical_bytes(), DATA_MODE))
 

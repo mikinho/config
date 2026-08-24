@@ -1,0 +1,26 @@
+[Unit]
+Description=Finalize @@APPLICATION_TAG@@ deployment
+After=network-online.target
+Wants=network-online.target
+OnFailure=@@FAILURE_SERVICE_PREFIX@@%n.service
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=@@SECURE_ROOT@@/scripts/post-deploy
+ExecStopPost=@@SECURE_ROOT@@/scripts/post-deploy --recover
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=HOME=/root
+PrivateTmp=yes
+ProtectHome=yes
+NoNewPrivileges=yes
+ProtectSystem=full
+ReadWritePaths=@@APPLICATION_ROOT@@ @@SECURE_ROOT@@ @@TRIGGER_ROOT@@ @@DEPENDENCY_STATE_ROOT@@ @@DEPENDENCY_CACHE_ROOT@@
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictRealtime=yes
+LockPersonality=yes
+TimeoutStartSec=20min
+TimeoutStopSec=@@FINALIZER_TIMEOUT_STOP_SECONDS@@s
