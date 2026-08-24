@@ -11,10 +11,18 @@
   "paths": {
     "applicationRoot": "/opt/example_node_app",
     "secureRoot": "/opt/.secure/example_node_app",
+    "configRoot": "/etc/example_node_app",
     "runtimeRoot": "/run/example_node_app",
     "triggerRoot": "/var/lib/example_deploy",
     "dependencyStateRoot": "/var/lib/example_node_app",
     "dependencyCacheRoot": "/var/cache/example_node_app"
+  },
+  "runtime": {
+    "adapter": "node",
+    "entrypoint": "src/web.js",
+    "socketName": "example_node_app.sock",
+    "pidFileName": "example_node_app.pid",
+    "allowLoopback": false
   },
   "transport": {
     "sessionCommand": "example-deploy-session"
@@ -28,6 +36,8 @@
   },
   "health": {
     "route": "/~/health",
+    "statusPointer": "/status",
+    "statusValue": "healthy",
     "deploymentTokenPointer": "/deployment/deployId",
     "confirmations": 3,
     "timeoutSeconds": 90
@@ -43,7 +53,7 @@
   },
   "staticContent": {
     "releasePaths": [".build", "wwwroot"],
-    "buildValidator": "example-built-assets"
+    "buildValidator": "standard-node"
   },
   "limits": {
     "memoryHighBytes": 805306368,
@@ -52,7 +62,6 @@
   },
   "retention": {
     "releases": 5,
-    "auditDays": 365,
-    "assetsDays": 90
+    "auditDays": 365
   }
 }

@@ -216,6 +216,7 @@ minimum it identifies:
 - application tag, service user, deploy user, and deploy group;
 - application, secure, runtime, trigger, state, cache, incoming, and release
   paths;
+- the fixed Node runtime entrypoint, socket and PID names, and loopback policy;
 - session command, service units, Unix sockets, and health route;
 - deployment metadata path and token field;
 - static-content paths and SELinux label patterns;

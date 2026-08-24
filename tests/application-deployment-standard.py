@@ -60,6 +60,8 @@ class ProfileValidationTests(unittest.TestCase):
 
         profile = VALIDATOR.load_profile(EXAMPLE_PROFILE)
         self.assertEqual(profile.identity.tag, "example_node_app")
+        self.assertEqual(profile.runtime.entrypoint, "src/web.js")
+        self.assertEqual(profile.health.status_value, "healthy")
         self.assertRegex(profile.digest(), r"^[0-9a-f]{64}$")
 
     def test_unknown_fields_are_rejected(self) -> None:
@@ -111,6 +113,27 @@ class ProfileValidationTests(unittest.TestCase):
         source = copy.deepcopy(self.source)
         source["limits"]["memoryHighBytes"] = source["limits"]["memoryMaxBytes"] + 1
         self.assert_invalid(source, "memoryHighBytes must not exceed")
+
+    def test_runtime_and_build_adapters_are_closed_sets(self) -> None:
+        """Profiles cannot select unreviewed executable behavior."""
+
+        source = copy.deepcopy(self.source)
+        source["runtime"]["adapter"] = "arbitrary-command"
+        self.assert_invalid(source, "runtime.adapter is unsupported")
+
+        source = copy.deepcopy(self.source)
+        source["staticContent"]["buildValidator"] = "private-script"
+        self.assert_invalid(source, "buildValidator is unsupported")
+
+    def test_node_dependency_manifest_contract_is_exact(self) -> None:
+        """The fixed snapshot and hash helpers receive exactly their reviewed inputs."""
+
+        source = copy.deepcopy(self.source)
+        source["dependencies"]["manifests"] = [
+            "npm-shrinkwrap.json",
+            "package.json",
+        ]
+        self.assert_invalid(source, "must be package-lock.json and package.json")
 
     def test_duplicate_json_members_are_rejected(self) -> None:
         """A decoded profile has one unambiguous interpretation."""

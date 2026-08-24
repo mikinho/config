@@ -8,6 +8,7 @@
     "standardVersion",
     "application",
     "paths",
+    "runtime",
     "transport",
     "services",
     "health",
@@ -38,6 +39,7 @@
       "required": [
         "applicationRoot",
         "secureRoot",
+        "configRoot",
         "runtimeRoot",
         "triggerRoot",
         "dependencyStateRoot",
@@ -46,10 +48,23 @@
       "properties": {
         "applicationRoot": { "$ref": "#/$defs/absolutePath" },
         "secureRoot": { "$ref": "#/$defs/absolutePath" },
+        "configRoot": { "$ref": "#/$defs/absolutePath" },
         "runtimeRoot": { "$ref": "#/$defs/absolutePath" },
         "triggerRoot": { "$ref": "#/$defs/absolutePath" },
         "dependencyStateRoot": { "$ref": "#/$defs/absolutePath" },
         "dependencyCacheRoot": { "$ref": "#/$defs/absolutePath" }
+      }
+    },
+    "runtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["adapter", "entrypoint", "socketName", "pidFileName", "allowLoopback"],
+      "properties": {
+        "adapter": { "const": "node" },
+        "entrypoint": { "$ref": "#/$defs/relativePath" },
+        "socketName": { "$ref": "#/$defs/fileName" },
+        "pidFileName": { "$ref": "#/$defs/fileName" },
+        "allowLoopback": { "type": "boolean" }
       }
     },
     "transport": {
@@ -75,9 +90,18 @@
     "health": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["route", "deploymentTokenPointer", "confirmations", "timeoutSeconds"],
+      "required": [
+        "route",
+        "statusPointer",
+        "statusValue",
+        "deploymentTokenPointer",
+        "confirmations",
+        "timeoutSeconds"
+      ],
       "properties": {
         "route": { "$ref": "#/$defs/httpRoute" },
+        "statusPointer": { "$ref": "#/$defs/jsonPointer" },
+        "statusValue": { "$ref": "#/$defs/statusValue" },
         "deploymentTokenPointer": { "$ref": "#/$defs/jsonPointer" },
         "confirmations": { "type": "integer", "minimum": 1, "maximum": 10 },
         "timeoutSeconds": { "type": "integer", "minimum": 5, "maximum": 600 }
@@ -120,7 +144,7 @@
           "uniqueItems": true,
           "items": { "$ref": "#/$defs/relativePath" }
         },
-        "buildValidator": { "$ref": "#/$defs/adapterName" }
+        "buildValidator": { "const": "standard-node" }
       }
     },
     "limits": {
@@ -136,11 +160,10 @@
     "retention": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["releases", "auditDays", "assetsDays"],
+      "required": ["releases", "auditDays"],
       "properties": {
         "releases": { "type": "integer", "minimum": 2, "maximum": 100 },
-        "auditDays": { "type": "integer", "minimum": 30, "maximum": 3650 },
-        "assetsDays": { "type": "integer", "minimum": 1, "maximum": 3650 }
+        "auditDays": { "type": "integer", "minimum": 30, "maximum": 3650 }
       }
     }
   },
@@ -165,6 +188,10 @@
       "type": "string",
       "pattern": "^(?:[A-Za-z0-9._@+-]+/)*[A-Za-z0-9._@+-]+$"
     },
+    "fileName": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._+-]{1,128}$"
+    },
     "serviceUnit": {
       "type": "string",
       "pattern": "^[a-z_][a-z0-9_-]{0,62}\\.service$"
@@ -184,6 +211,10 @@
     "jsonPointer": {
       "type": "string",
       "pattern": "^(?:/(?:[^~/]|~0|~1)+)+$"
+    },
+    "statusValue": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._-]{1,64}$"
     }
   }
 }

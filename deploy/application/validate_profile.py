@@ -27,14 +27,18 @@ MIN_AUDIT_DAYS: Final = 30
 MAX_RETENTION_DAYS: Final = 3_650
 IDENTIFIER_PATTERN: Final = re.compile(r"^[a-z_][a-z0-9_-]{0,30}$")
 COMMAND_PATTERN: Final = re.compile(r"^[a-z][a-z0-9-]{2,63}$")
-ADAPTER_PATTERN: Final = COMMAND_PATTERN
 UNIT_PATTERN: Final = re.compile(r"^[a-z_][a-z0-9_-]{0,62}\.service$")
 TEMPLATE_UNIT_PATTERN: Final = re.compile(r"^[a-z_][a-z0-9_-]{0,62}@\.service$")
 PATH_UNIT_PATTERN: Final = re.compile(r"^[a-z_][a-z0-9_-]{0,62}\.path$")
 ROUTE_PATTERN: Final = re.compile(r"^/[A-Za-z0-9._~!$&'()*+,;=:@%/-]{0,255}$")
 JSON_POINTER_PATTERN: Final = re.compile(r"^(?:/(?:[^~/]|~0|~1)+)+$")
 RELATIVE_COMPONENT_PATTERN: Final = re.compile(r"^[A-Za-z0-9._@+-]+$")
+FILE_NAME_PATTERN: Final = re.compile(r"^[A-Za-z0-9._+-]{1,128}$")
+STATUS_VALUE_PATTERN: Final = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 SUPPORTED_DEPENDENCY_ADAPTERS: Final = frozenset({"node-npm"})
+SUPPORTED_RUNTIME_ADAPTERS: Final = frozenset({"node"})
+SUPPORTED_BUILD_VALIDATORS: Final = frozenset({"standard-node"})
+NODE_MANIFESTS: Final = ("package-lock.json", "package.json")
 ROOT_PATH: Final = PurePosixPath("/")
 
 TOP_LEVEL_KEYS: Final = frozenset(
@@ -43,6 +47,7 @@ TOP_LEVEL_KEYS: Final = frozenset(
         "standardVersion",
         "application",
         "paths",
+        "runtime",
         "transport",
         "services",
         "health",
@@ -172,11 +177,117 @@ class ApplicationIdentity:
 
 
 @dataclass(frozen=True)
+class ApplicationPaths:
+    """Trusted roots assigned to one application deployment."""
+
+    application_root: str
+    secure_root: str
+    config_root: str
+    runtime_root: str
+    trigger_root: str
+    dependency_state_root: str
+    dependency_cache_root: str
+
+
+@dataclass(frozen=True)
+class RuntimePolicy:
+    """Fixed Node process and network behavior."""
+
+    adapter: str
+    entrypoint: str
+    socket_name: str
+    pid_file_name: str
+    allow_loopback: bool
+
+
+@dataclass(frozen=True)
+class TransportPolicy:
+    """Restricted SSH transaction command."""
+
+    session_command: str
+
+
+@dataclass(frozen=True)
+class ServiceUnits:
+    """Systemd units rendered for one application."""
+
+    live: str
+    candidate: str
+    finalizer: str
+    path: str
+    recovery: str
+
+
+@dataclass(frozen=True)
+class HealthPolicy:
+    """Token-specific Unix-socket readiness contract."""
+
+    route: str
+    status_pointer: str
+    status_value: str
+    deployment_token_pointer: str
+    confirmations: int
+    timeout_seconds: int
+
+
+@dataclass(frozen=True)
+class MetadataPolicy:
+    """Immutable deployment metadata contract."""
+
+    path: str
+    deployment_token_pointer: str
+
+
+@dataclass(frozen=True)
+class DependencyPolicy:
+    """Bounded dependency input and provenance contract."""
+
+    adapter: str
+    manifests: tuple[str, ...]
+    provenance_path: str
+
+
+@dataclass(frozen=True)
+class StaticContentPolicy:
+    """Explicit static release paths and fixed validator."""
+
+    release_paths: tuple[str, ...]
+    build_validator: str
+
+
+@dataclass(frozen=True)
+class ResourceLimits:
+    """Numeric systemd resource limits."""
+
+    memory_high_bytes: int
+    memory_max_bytes: int
+    tasks_max: int
+
+
+@dataclass(frozen=True)
+class RetentionPolicy:
+    """Immutable release and append-only audit retention."""
+
+    releases: int
+    audit_days: int
+
+
+@dataclass(frozen=True)
 class ApplicationProfile:
     """Validated immutable representation of a gold deployment profile."""
 
     source: Mapping[str, Any]
     identity: ApplicationIdentity
+    paths: ApplicationPaths
+    runtime: RuntimePolicy
+    transport: TransportPolicy
+    services: ServiceUnits
+    health: HealthPolicy
+    metadata: MetadataPolicy
+    dependencies: DependencyPolicy
+    static_content: StaticContentPolicy
+    limits: ResourceLimits
+    retention: RetentionPolicy
 
     def canonical_bytes(self) -> bytes:
         """Return deterministic UTF-8 JSON used for bundle provenance."""
@@ -227,7 +338,7 @@ def validate_identity(profile: Mapping[str, Any]) -> ApplicationIdentity:
     return identity
 
 
-def validate_paths(profile: Mapping[str, Any]) -> None:
+def validate_paths(profile: Mapping[str, Any]) -> ApplicationPaths:
     """Validate all trusted absolute roots and reject overlapping authority."""
 
     value = require_mapping(profile["paths"], "paths")
@@ -235,6 +346,7 @@ def validate_paths(profile: Mapping[str, Any]) -> None:
         {
             "applicationRoot",
             "secureRoot",
+            "configRoot",
             "runtimeRoot",
             "triggerRoot",
             "dependencyStateRoot",
@@ -253,17 +365,57 @@ def validate_paths(profile: Mapping[str, Any]) -> None:
         for right_name, right_path in named_paths[index + 1 :]:
             if left_path in right_path.parents or right_path in left_path.parents:
                 fail(f"paths.{left_name} and paths.{right_name} must not contain each other")
+    return ApplicationPaths(
+        application_root=paths["applicationRoot"],
+        secure_root=paths["secureRoot"],
+        config_root=paths["configRoot"],
+        runtime_root=paths["runtimeRoot"],
+        trigger_root=paths["triggerRoot"],
+        dependency_state_root=paths["dependencyStateRoot"],
+        dependency_cache_root=paths["dependencyCacheRoot"],
+    )
 
 
-def validate_transport(profile: Mapping[str, Any]) -> None:
+def validate_runtime(profile: Mapping[str, Any]) -> RuntimePolicy:
+    """Validate the fixed Node runtime and loopback policy."""
+
+    value = require_mapping(profile["runtime"], "runtime")
+    keys = frozenset(
+        {"adapter", "entrypoint", "socketName", "pidFileName", "allowLoopback"}
+    )
+    require_exact_keys(value, "runtime", keys)
+    adapter = value["adapter"]
+    if adapter not in SUPPORTED_RUNTIME_ADAPTERS:
+        fail("runtime.adapter is unsupported")
+    allow_loopback = value["allowLoopback"]
+    if not isinstance(allow_loopback, bool):
+        fail("runtime.allowLoopback must be a boolean")
+    return RuntimePolicy(
+        adapter=adapter,
+        entrypoint=require_relative_path(value["entrypoint"], "runtime.entrypoint"),
+        socket_name=require_string(
+            value["socketName"], "runtime.socketName", FILE_NAME_PATTERN
+        ),
+        pid_file_name=require_string(
+            value["pidFileName"], "runtime.pidFileName", FILE_NAME_PATTERN
+        ),
+        allow_loopback=allow_loopback,
+    )
+
+
+def validate_transport(profile: Mapping[str, Any]) -> TransportPolicy:
     """Validate the single accepted forced-command session name."""
 
     value = require_mapping(profile["transport"], "transport")
     require_exact_keys(value, "transport", frozenset({"sessionCommand"}))
-    require_string(value["sessionCommand"], "transport.sessionCommand", COMMAND_PATTERN)
+    return TransportPolicy(
+        session_command=require_string(
+            value["sessionCommand"], "transport.sessionCommand", COMMAND_PATTERN
+        )
+    )
 
 
-def validate_services(profile: Mapping[str, Any]) -> None:
+def validate_services(profile: Mapping[str, Any]) -> ServiceUnits:
     """Validate all required systemd units and the isolated candidate unit."""
 
     value = require_mapping(profile["services"], "services")
@@ -278,46 +430,66 @@ def validate_services(profile: Mapping[str, Any]) -> None:
     )
     if len(units) != len(set(units)):
         fail("services must identify distinct units")
+    return ServiceUnits(*units)
 
 
-def validate_health(profile: Mapping[str, Any]) -> None:
+def validate_health(profile: Mapping[str, Any]) -> HealthPolicy:
     """Validate token-specific Unix-socket health policy."""
 
     value = require_mapping(profile["health"], "health")
     keys = frozenset(
-        {"route", "deploymentTokenPointer", "confirmations", "timeoutSeconds"}
+        {
+            "route",
+            "statusPointer",
+            "statusValue",
+            "deploymentTokenPointer",
+            "confirmations",
+            "timeoutSeconds",
+        }
     )
     require_exact_keys(value, "health", keys)
-    require_string(value["route"], "health.route", ROUTE_PATTERN)
-    require_string(
-        value["deploymentTokenPointer"],
-        "health.deploymentTokenPointer",
-        JSON_POINTER_PATTERN,
-    )
-    require_integer(value["confirmations"], "health.confirmations", 1, 10)
-    require_integer(
-        value["timeoutSeconds"],
-        "health.timeoutSeconds",
-        MIN_HEALTH_TIMEOUT_SECONDS,
-        MAX_HEALTH_TIMEOUT_SECONDS,
+    return HealthPolicy(
+        route=require_string(value["route"], "health.route", ROUTE_PATTERN),
+        status_pointer=require_string(
+            value["statusPointer"], "health.statusPointer", JSON_POINTER_PATTERN
+        ),
+        status_value=require_string(
+            value["statusValue"], "health.statusValue", STATUS_VALUE_PATTERN
+        ),
+        deployment_token_pointer=require_string(
+            value["deploymentTokenPointer"],
+            "health.deploymentTokenPointer",
+            JSON_POINTER_PATTERN,
+        ),
+        confirmations=require_integer(
+            value["confirmations"], "health.confirmations", 1, 10
+        ),
+        timeout_seconds=require_integer(
+            value["timeoutSeconds"],
+            "health.timeoutSeconds",
+            MIN_HEALTH_TIMEOUT_SECONDS,
+            MAX_HEALTH_TIMEOUT_SECONDS,
+        ),
     )
 
 
-def validate_metadata(profile: Mapping[str, Any]) -> None:
+def validate_metadata(profile: Mapping[str, Any]) -> MetadataPolicy:
     """Validate immutable deployment metadata location and token field."""
 
     value = require_mapping(profile["metadata"], "metadata")
     keys = frozenset({"path", "deploymentTokenPointer"})
     require_exact_keys(value, "metadata", keys)
-    require_relative_path(value["path"], "metadata.path")
-    require_string(
-        value["deploymentTokenPointer"],
-        "metadata.deploymentTokenPointer",
-        JSON_POINTER_PATTERN,
+    return MetadataPolicy(
+        path=require_relative_path(value["path"], "metadata.path"),
+        deployment_token_pointer=require_string(
+            value["deploymentTokenPointer"],
+            "metadata.deploymentTokenPointer",
+            JSON_POINTER_PATTERN,
+        ),
     )
 
 
-def validate_dependencies(profile: Mapping[str, Any]) -> None:
+def validate_dependencies(profile: Mapping[str, Any]) -> DependencyPolicy:
     """Validate the bounded dependency adapter and manifest inputs."""
 
     value = require_mapping(profile["dependencies"], "dependencies")
@@ -327,24 +499,35 @@ def validate_dependencies(profile: Mapping[str, Any]) -> None:
     if adapter not in SUPPORTED_DEPENDENCY_ADAPTERS:
         fail("dependencies.adapter is unsupported")
     manifests = require_unique_relative_paths(value["manifests"], "dependencies.manifests", 8)
-    if len(manifests) < 2:
-        fail("dependencies.manifests must contain at least two files")
-    require_relative_path(value["provenancePath"], "dependencies.provenancePath")
+    if manifests != NODE_MANIFESTS:
+        fail("node-npm dependencies.manifests must be package-lock.json and package.json")
+    return DependencyPolicy(
+        adapter=adapter,
+        manifests=manifests,
+        provenance_path=require_relative_path(
+            value["provenancePath"], "dependencies.provenancePath"
+        ),
+    )
 
 
-def validate_static_content(profile: Mapping[str, Any]) -> None:
+def validate_static_content(profile: Mapping[str, Any]) -> StaticContentPolicy:
     """Validate explicit static paths and the named build adapter."""
 
     value = require_mapping(profile["staticContent"], "staticContent")
     keys = frozenset({"releasePaths", "buildValidator"})
     require_exact_keys(value, "staticContent", keys)
-    require_unique_relative_paths(value["releasePaths"], "staticContent.releasePaths", 32)
-    require_string(
-        value["buildValidator"], "staticContent.buildValidator", ADAPTER_PATTERN
+    release_paths = require_unique_relative_paths(
+        value["releasePaths"], "staticContent.releasePaths", 32
+    )
+    build_validator = value["buildValidator"]
+    if build_validator not in SUPPORTED_BUILD_VALIDATORS:
+        fail("staticContent.buildValidator is unsupported")
+    return StaticContentPolicy(
+        release_paths=release_paths, build_validator=build_validator
     )
 
 
-def validate_limits(profile: Mapping[str, Any]) -> None:
+def validate_limits(profile: Mapping[str, Any]) -> ResourceLimits:
     """Validate numeric systemd resource boundaries."""
 
     value = require_mapping(profile["limits"], "limits")
@@ -358,20 +541,30 @@ def validate_limits(profile: Mapping[str, Any]) -> None:
     )
     if memory_high > memory_max:
         fail("limits.memoryHighBytes must not exceed limits.memoryMaxBytes")
-    require_integer(value["tasksMax"], "limits.tasksMax", MIN_TASKS, MAX_TASKS)
+    return ResourceLimits(
+        memory_high_bytes=memory_high,
+        memory_max_bytes=memory_max,
+        tasks_max=require_integer(
+            value["tasksMax"], "limits.tasksMax", MIN_TASKS, MAX_TASKS
+        ),
+    )
 
 
-def validate_retention(profile: Mapping[str, Any]) -> None:
-    """Validate bounded release, audit, and asset retention policy."""
+def validate_retention(profile: Mapping[str, Any]) -> RetentionPolicy:
+    """Validate bounded release and audit retention policy."""
 
     value = require_mapping(profile["retention"], "retention")
-    keys = frozenset({"releases", "auditDays", "assetsDays"})
+    keys = frozenset({"releases", "auditDays"})
     require_exact_keys(value, "retention", keys)
-    require_integer(value["releases"], "retention.releases", 2, 100)
-    require_integer(
-        value["auditDays"], "retention.auditDays", MIN_AUDIT_DAYS, MAX_RETENTION_DAYS
+    return RetentionPolicy(
+        releases=require_integer(value["releases"], "retention.releases", 2, 100),
+        audit_days=require_integer(
+            value["auditDays"],
+            "retention.auditDays",
+            MIN_AUDIT_DAYS,
+            MAX_RETENTION_DAYS,
+        ),
     )
-    require_integer(value["assetsDays"], "retention.assetsDays", 1, MAX_RETENTION_DAYS)
 
 
 def validate_profile(source: Mapping[str, Any]) -> ApplicationProfile:
@@ -382,17 +575,20 @@ def validate_profile(source: Mapping[str, Any]) -> ApplicationProfile:
         fail(f"schemaVersion must be {SCHEMA_VERSION}")
     if source["standardVersion"] != STANDARD_VERSION:
         fail(f"standardVersion must be {STANDARD_VERSION}")
-    identity = validate_identity(source)
-    validate_paths(source)
-    validate_transport(source)
-    validate_services(source)
-    validate_health(source)
-    validate_metadata(source)
-    validate_dependencies(source)
-    validate_static_content(source)
-    validate_limits(source)
-    validate_retention(source)
-    return ApplicationProfile(source=source, identity=identity)
+    return ApplicationProfile(
+        source=source,
+        identity=validate_identity(source),
+        paths=validate_paths(source),
+        runtime=validate_runtime(source),
+        transport=validate_transport(source),
+        services=validate_services(source),
+        health=validate_health(source),
+        metadata=validate_metadata(source),
+        dependencies=validate_dependencies(source),
+        static_content=validate_static_content(source),
+        limits=validate_limits(source),
+        retention=validate_retention(source),
+    )
 
 
 def read_bounded_regular_file(path: Path, maximum_bytes: int, purpose: str) -> bytes:
