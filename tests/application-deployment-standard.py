@@ -216,6 +216,65 @@ class CoreRendererTests(unittest.TestCase):
                 self.assertNotIn("@@", source)
                 compile(source, str(script_path), "exec")
 
+            node_check = subprocess.run(
+                ["node", "--check", str(first / "scripts" / "package-hash.mjs")],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(node_check.returncode, 0, node_check.stderr)
+
+    def test_dependency_hash_tracks_only_production_install_state(self) -> None:
+        """The rendered npm adapter ignores dev-only drift and detects production drift."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle = root / "bundle"
+            result = self.render(bundle)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            application = root / "application"
+            application.mkdir()
+            package = {
+                "name": "example",
+                "dependencies": {"runtime-package": "1.0.0"},
+                "devDependencies": {"test-package": "1.0.0"},
+            }
+            lock = {
+                "lockfileVersion": 3,
+                "requires": True,
+                "packages": {
+                    "": {
+                        "dependencies": {"runtime-package": "1.0.0"},
+                        "devDependencies": {"test-package": "1.0.0"},
+                    },
+                    "node_modules/runtime-package": {"version": "1.0.0"},
+                    "node_modules/test-package": {"version": "1.0.0", "dev": True},
+                },
+            }
+            package_path = application / "package.json"
+            lock_path = application / "package-lock.json"
+            package_path.write_text(json.dumps(package), encoding="utf-8")
+            lock_path.write_text(json.dumps(lock), encoding="utf-8")
+            script = bundle / "scripts" / "package-hash.mjs"
+
+            def calculate_hash() -> str:
+                completed = subprocess.run(
+                    ["node", str(script), str(application)],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                return completed.stdout.split(maxsplit=1)[0]
+
+            baseline = calculate_hash()
+            package["devDependencies"]["test-package"] = "2.0.0"
+            package_path.write_text(json.dumps(package), encoding="utf-8")
+            self.assertEqual(calculate_hash(), baseline)
+            package["dependencies"]["runtime-package"] = "2.0.0"
+            package_path.write_text(json.dumps(package), encoding="utf-8")
+            self.assertNotEqual(calculate_hash(), baseline)
+
     def test_renderer_refuses_an_existing_output(self) -> None:
         """A render never overlays an earlier reviewed bundle."""
 

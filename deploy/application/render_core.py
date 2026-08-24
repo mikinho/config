@@ -38,6 +38,7 @@ DATA_MODE: Final = 0o644
 CORE_TEMPLATES: Final = {
     "scripts/deploy-gateway.py": "deploy-gateway.py.in",
     "scripts/deploy-trigger.py": "deploy-trigger.py.in",
+    "scripts/package-hash.mjs": "package-hash.mjs.in",
     "scripts/snapshot-manifests.py": "snapshot-manifests.py.in",
 }
 
