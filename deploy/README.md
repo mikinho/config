@@ -5,6 +5,13 @@ sources and the selected feature profiles. It only ever writes a new staging
 directory — never the live `/etc/nginx` — so the rendered result can be
 reviewed and installed deliberately.
 
+Reusable application deployment policy lives under
+[`application/`](application/README.md). It defines the versioned gold standard
+for restricted transfer, immutable release activation, rollback, recovery, and
+audit boundaries. Application projects vendor rendered bundles from that
+standard; the nginx profile renderer remains the authority for their shared
+edge configuration.
+
 ## Usage
 
 ```sh
