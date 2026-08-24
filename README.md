@@ -611,6 +611,7 @@ openssl version
 # Required only when the post-quantum profile is selected:
 openssl list -tls1_3 -tls-groups | grep X25519MLKEM768
 deploy/install-nginx --verify-host
+deploy/verify-deployment
 /usr/sbin/nginx -v
 /usr/sbin/nginx -V 2>&1
 sudo /usr/sbin/nginx -t -c /etc/nginx/nginx.conf
