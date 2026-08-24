@@ -448,7 +448,7 @@ def validate_health(profile: Mapping[str, Any]) -> HealthPolicy:
         }
     )
     require_exact_keys(value, "health", keys)
-    return HealthPolicy(
+    health = HealthPolicy(
         route=require_string(value["route"], "health.route", ROUTE_PATTERN),
         status_pointer=require_string(
             value["statusPointer"], "health.statusPointer", JSON_POINTER_PATTERN
@@ -471,6 +471,9 @@ def validate_health(profile: Mapping[str, Any]) -> HealthPolicy:
             MAX_HEALTH_TIMEOUT_SECONDS,
         ),
     )
+    if health.confirmations * 2 > health.timeout_seconds:
+        fail("health.timeoutSeconds must allow two seconds per confirmation")
+    return health
 
 
 def validate_metadata(profile: Mapping[str, Any]) -> MetadataPolicy:

@@ -1,0 +1,1145 @@
+#!/usr/bin/env bash
+# Root-owned server finalizer triggered after the write-only deploy completes.
+
+set -euo pipefail
+
+readonly APP_DIR="@@APPLICATION_ROOT@@"
+readonly INCOMING_DIR="$APP_DIR/incoming"
+readonly RELEASES_DIR="$APP_DIR/releases"
+readonly CANDIDATE_POINTER_DIR="$APP_DIR/candidates"
+readonly CURRENT_LINK="$APP_DIR/current"
+readonly PREVIOUS_LINK="$APP_DIR/previous"
+readonly COMMITTED_STATE="$APP_DIR/committed.json"
+readonly SECURE_DIR="@@SECURE_ROOT@@"
+readonly SECURE_SCRIPTS_DIR="$SECURE_DIR/scripts"
+readonly STATE_DIR="$SECURE_DIR/state"
+readonly LOCK_FILE="$SECURE_DIR/.post-deploy.lock"
+readonly ACTIVATION_STATE="$STATE_DIR/activation.json"
+readonly TRIGGER_HELPER="$SECURE_SCRIPTS_DIR/deploy-trigger.py"
+readonly MANIFEST_SNAPSHOT_HELPER="$SECURE_SCRIPTS_DIR/snapshot-manifests.py"
+readonly TRIGGER_ROOT="@@TRIGGER_ROOT@@"
+readonly TRIGGER_STATE_DIR="$TRIGGER_ROOT/state"
+readonly INGRESS_LOCK="$TRIGGER_ROOT/ingress.lock"
+readonly NPM_STATE_DIR="@@DEPENDENCY_STATE_ROOT@@"
+readonly NPM_HOME_DIR="$NPM_STATE_DIR/home"
+readonly NPM_WORK_ROOT="$NPM_STATE_DIR/npm-work"
+readonly NPM_CACHE_ROOT="@@DEPENDENCY_CACHE_ROOT@@"
+readonly NPM_CACHE_DIR="$NPM_CACHE_ROOT/npm"
+readonly APP_USER="@@SERVICE_USER@@"
+readonly DEPLOY_GROUP="@@DEPLOY_GROUP@@"
+readonly COMMIT_OWNER="root:$APP_USER"
+readonly SERVICE="@@LIVE_SERVICE@@"
+readonly RUNTIME_SOCKET="@@RUNTIME_SOCKET@@"
+readonly NODE_BIN=/bin/node
+readonly NPM_BIN=/bin/npm
+readonly SYNC_BIN=/bin/sync
+readonly SELINUX_ENABLED_BIN=/usr/sbin/selinuxenabled
+readonly RESTORECON_BIN=/usr/sbin/restorecon
+readonly ENTRYPOINT="@@ENTRYPOINT@@"
+readonly METADATA_RELATIVE_PATH="@@METADATA_PATH@@"
+readonly METADATA_TOKEN_POINTER=@@METADATA_TOKEN_POINTER_LITERAL@@
+readonly DEPENDENCY_PROVENANCE_RELATIVE_PATH="@@DEPENDENCY_PROVENANCE_PATH@@"
+readonly HEALTH_STATUS_POINTER=@@HEALTH_STATUS_POINTER_LITERAL@@
+readonly HEALTH_STATUS_VALUE="@@HEALTH_STATUS_VALUE@@"
+readonly HEALTH_TOKEN_POINTER=@@HEALTH_TOKEN_POINTER_LITERAL@@
+readonly HEALTH_ROUTE=@@HEALTH_ROUTE_LITERAL@@
+readonly RELEASE_RETENTION_COUNT=@@RELEASE_RETENTION_COUNT@@
+readonly AUDIT_RETENTION_DAYS=@@AUDIT_RETENTION_DAYS@@
+readonly HEALTH_RETRIES=@@HEALTH_RETRIES@@
+readonly HEALTH_CONFIRMATIONS=@@HEALTH_CONFIRMATIONS@@
+readonly DEPLOY_INVOCATION_ID="${INVOCATION_ID:-}"
+readonly -a REQUIRED_MANIFESTS=(
+@@MANIFEST_ARRAY@@
+)
+readonly -a STATIC_PATHS=(
+@@STATIC_PATH_ARRAY@@
+)
+readonly -a ALLOWED_CANDIDATE_ROOTS=(
+@@ALLOWED_ROOT_ARRAY@@
+)
+
+SENTINEL_CLAIM=""
+DEPLOY_TOKEN=""
+CANDIDATE_DIR=""
+RELEASE_DIR=""
+PREVIOUS_TARGET=""
+PREVIOUS_DIR=""
+PREVIOUS_DEPLOY_ID=""
+PREFLIGHT_SERVICE=""
+PREFLIGHT_SOCKET=""
+PREFLIGHT_POINTER=""
+NPM_WORK_DIR=""
+CANDIDATE_DEPENDENCY_HASH=""
+DEPLOY_FINALIZED=0
+ROLLED_BACK=0
+
+log() { printf '[post-deploy] %s\n' "$*"; }
+die() { printf '[post-deploy] ERROR: %s\n' "$*" >&2; exit 1; }
+
+valid_deploy_id() {
+    [[ "$1" =~ ^(manual|[0-9a-f]{40,64})-[0-9]{1,20}-[0-9a-f]{24}$ ]]
+}
+
+durably_sync_path() {
+    local path=$1
+    "$NODE_BIN" -e '
+        const fs = require("node:fs");
+        const descriptor = fs.openSync(process.argv[1], fs.constants.O_RDONLY);
+        try {
+            fs.fsyncSync(descriptor);
+        } finally {
+            fs.closeSync(descriptor);
+        }
+    ' "$path" || die "could not durably synchronize $path"
+}
+
+directory_has_identity() {
+    local target=$1 expected_owner=$2 expected_group=$3 expected_mode=$4
+    [[ -d "$target" && ! -L "$target" ]] || return 1
+    [[ "$(stat -Lc '%U:%G:%a' "$target" 2>/dev/null)" == \
+        "$expected_owner:$expected_group:$expected_mode" ]]
+}
+
+require_post_deploy_lock() {
+    directory_has_identity "$SECURE_DIR" root root 755 \
+        || die "$SECURE_DIR must be a root:root real directory with mode 755; rerun config/server/setup"
+    [[ -f "$LOCK_FILE" && ! -L "$LOCK_FILE" ]] \
+        || die "$LOCK_FILE is missing or unsafe; rerun config/server/setup"
+    [[ "$(stat -Lc '%U:%G:%a:%h' "$LOCK_FILE" 2>/dev/null)" == root:root:600:1 ]] \
+        || die "$LOCK_FILE must be a one-link root:root mode 600 file; rerun config/server/setup"
+}
+
+require_npm_directories() {
+    directory_has_identity "$NPM_STATE_DIR" root "$APP_USER" 750 \
+        || die "$NPM_STATE_DIR must be root:$APP_USER mode 750; rerun config/server/setup"
+    directory_has_identity "$NPM_HOME_DIR" "$APP_USER" "$APP_USER" 700 \
+        || die "$NPM_HOME_DIR must be $APP_USER:$APP_USER mode 700; rerun config/server/setup"
+    directory_has_identity "$NPM_WORK_ROOT" root "$APP_USER" 710 \
+        || die "$NPM_WORK_ROOT must be root:$APP_USER mode 710; rerun config/server/setup"
+    directory_has_identity "$NPM_CACHE_ROOT" root "$APP_USER" 750 \
+        || die "$NPM_CACHE_ROOT must be root:$APP_USER mode 750; rerun config/server/setup"
+    directory_has_identity "$NPM_CACHE_DIR" "$APP_USER" "$APP_USER" 700 \
+        || die "$NPM_CACHE_DIR must be $APP_USER:$APP_USER mode 700; rerun config/server/setup"
+}
+
+npm_work_root_is_safe() {
+    directory_has_identity "$NPM_STATE_DIR" root "$APP_USER" 750 \
+        && directory_has_identity "$NPM_WORK_ROOT" root "$APP_USER" 710
+}
+
+cleanup_npm_work_dir() {
+    [[ -n "$NPM_WORK_DIR" ]] || return 0
+    [[ "$NPM_WORK_DIR" == "$NPM_WORK_ROOT"/install.* ]] \
+        || { log "WARNING: refusing unexpected npm workspace: $NPM_WORK_DIR"; return 1; }
+    npm_work_root_is_safe \
+        || { log "WARNING: refusing cleanup through an unsafe npm work root"; return 1; }
+    [[ -d "$NPM_WORK_DIR" && ! -L "$NPM_WORK_DIR" ]] \
+        || { log "WARNING: npm workspace is not a real directory: $NPM_WORK_DIR"; return 1; }
+    chown --no-dereference root:root "$NPM_WORK_DIR" \
+        || { log "WARNING: could not reclaim npm workspace: $NPM_WORK_DIR"; return 1; }
+    chmod 0700 "$NPM_WORK_DIR" \
+        || { log "WARNING: could not lock npm workspace: $NPM_WORK_DIR"; return 1; }
+    rm -rf -- "$NPM_WORK_DIR" \
+        || { log "WARNING: could not remove npm workspace: $NPM_WORK_DIR"; return 1; }
+}
+
+scavenge_stale_npm_workspaces() {
+    local stale
+    require_npm_directories
+    while IFS= read -r -d '' stale; do
+        [[ -d "$stale" && ! -L "$stale" ]] \
+            || die "unsafe stale npm workspace entry: $stale"
+        log "removing stale npm workspace: $stale"
+        chown --no-dereference root:root "$stale"
+        chmod 0700 "$stale"
+        rm -rf -- "$stale"
+    done < <(find "$NPM_WORK_ROOT" -mindepth 1 -maxdepth 1 -name 'install.*' -print0)
+}
+
+publish_failed_deploy_result() {
+    [[ "$SENTINEL_CLAIM" =~ ^deploy-trigger-[0-9]+-[0-9a-f]{24}$ ]] || return 1
+    "$TRIGGER_HELPER" fail "$SENTINEL_CLAIM"
+}
+
+cleanup() {
+    local status=$?
+    trap - EXIT
+    set +e
+
+    if [[ -n "$PREFLIGHT_SERVICE" ]]; then
+        systemctl stop "$PREFLIGHT_SERVICE" >/dev/null 2>&1 || true
+        systemctl reset-failed "$PREFLIGHT_SERVICE" >/dev/null 2>&1 || true
+    fi
+    if [[ -n "$PREFLIGHT_POINTER" && -L "$PREFLIGHT_POINTER" ]]; then
+        rm -f -- "$PREFLIGHT_POINTER"
+    fi
+
+    if (( DEPLOY_FINALIZED != 1 )) && [[ -f "$ACTIVATION_STATE" ]]; then
+        recover_incomplete_activation 1 \
+            || log "automatic activation recovery failed; durable intent retained"
+    fi
+
+    if ! cleanup_npm_work_dir; then
+        (( status == 0 )) && status=1
+    fi
+
+    if [[ -n "$SENTINEL_CLAIM" ]]; then
+        if (( DEPLOY_FINALIZED == 1 && status == 0 )); then
+            if ! "$TRIGGER_HELPER" complete "$SENTINEL_CLAIM" "$DEPLOY_INVOCATION_ID"; then
+                log "could not complete deploy result transition for $SENTINEL_CLAIM"
+                status=1
+            fi
+        else
+            log "deploy failed; retained claim $SENTINEL_CLAIM for audit under $TRIGGER_STATE_DIR"
+            if ! publish_failed_deploy_result; then
+                log "could not publish failed result for deploy token $DEPLOY_TOKEN"
+                (( status == 0 )) && status=1
+            fi
+        fi
+    fi
+    exit "$status"
+}
+
+require_root() {
+    [[ "$(id -u)" -eq 0 ]] || die "must run as root"
+}
+
+require_systemd_invocation() {
+    [[ "$DEPLOY_INVOCATION_ID" =~ ^[0-9a-f]{32}$ ]] \
+        || die "INVOCATION_ID must identify the current systemd service invocation"
+}
+
+acquire_deploy_ingress_barrier() {
+    [[ -f "$INGRESS_LOCK" && ! -L "$INGRESS_LOCK" ]] \
+        || die "missing or unsafe deploy ingress lock: $INGRESS_LOCK"
+    [[ "$(stat -Lc '%U:%G:%a:%h' "$INGRESS_LOCK" 2>/dev/null)" == \
+        "root:$DEPLOY_GROUP:660:1" ]] \
+        || die "$INGRESS_LOCK must be root:$DEPLOY_GROUP mode 660 with one link"
+    exec 8<>"$INGRESS_LOCK"
+    flock --shared 8
+}
+
+claim_deploy_sentinel() {
+    local claim_status
+    set +e
+    SENTINEL_CLAIM="$("$TRIGGER_HELPER" claim)"
+    claim_status=$?
+    set -e
+
+    case "$claim_status" in
+        0)
+            [[ "$SENTINEL_CLAIM" =~ ^deploy-trigger-[0-9]+-[0-9a-f]{24}$ ]] \
+                || die "deploy trigger helper returned an invalid claim identifier"
+            [[ -f "$TRIGGER_STATE_DIR/$SENTINEL_CLAIM/token" \
+                && ! -L "$TRIGGER_STATE_DIR/$SENTINEL_CLAIM/token" ]] \
+                || die "deploy trigger helper did not persist a real token snapshot"
+            IFS= read -r DEPLOY_TOKEN < "$TRIGGER_STATE_DIR/$SENTINEL_CLAIM/token" \
+                || die "cannot read claimed deploy token"
+            [[ "$DEPLOY_TOKEN" =~ ^(manual|[0-9a-f]{40,64})-[0-9]{1,20}-[0-9a-f]{24}$ ]] \
+                || die "claimed deploy token has an invalid format"
+            CANDIDATE_DIR="$INCOMING_DIR/$DEPLOY_TOKEN"
+            RELEASE_DIR="$RELEASES_DIR/$DEPLOY_TOKEN"
+            ;;
+        3)
+            log "no sentinel; nothing to do"
+            exit 0
+            ;;
+        *)
+            die "deploy trigger claim failed; inspect $TRIGGER_STATE_DIR for quarantined work"
+            ;;
+    esac
+}
+
+validate_runtime_config() {
+    local sync_help
+    local command_name
+    for command_name in curl find flock jq openssl rsync runuser stat systemctl systemd-escape; do
+        command -v "$command_name" >/dev/null 2>&1 \
+            || die "$command_name is required"
+    done
+    [[ -x "$NODE_BIN" ]] || die "Node.js is not executable at $NODE_BIN"
+    [[ -x "$NPM_BIN" ]] || die "npm is not executable at $NPM_BIN"
+    [[ -x "$SYNC_BIN" ]] || die "sync is not executable at $SYNC_BIN"
+    sync_help="$(LC_ALL=C "$SYNC_BIN" --help 2>&1)" \
+        || die "could not inspect $SYNC_BIN capabilities"
+    grep -q -- '--file-system' <<<"$sync_help" \
+        || die "$SYNC_BIN does not support filesystem-scoped synchronization"
+    [[ "$RELEASE_RETENTION_COUNT" =~ ^[0-9]+$ && "$RELEASE_RETENTION_COUNT" -ge 2 ]] \
+        || die "release retention must be at least 2"
+    [[ "$AUDIT_RETENTION_DAYS" =~ ^[0-9]+$ && "$AUDIT_RETENTION_DAYS" -ge 30 ]] \
+        || die "audit retention must be at least 30 days"
+    [[ "$HEALTH_RETRIES" =~ ^[0-9]+$ && "$HEALTH_RETRIES" -ge 1 ]] \
+        || die "HEALTH_RETRIES must be a positive integer"
+    [[ "$HEALTH_CONFIRMATIONS" =~ ^[0-9]+$ && "$HEALTH_CONFIRMATIONS" -ge 1 ]] \
+        || die "HEALTH_CONFIRMATIONS must be a positive integer"
+    (( HEALTH_CONFIRMATIONS <= HEALTH_RETRIES )) \
+        || die "HEALTH_CONFIRMATIONS cannot exceed HEALTH_RETRIES"
+}
+
+read_release_deploy_id() {
+    local release_dir=$1 metadata
+    metadata="$release_dir/$METADATA_RELATIVE_PATH"
+    [[ -f "$metadata" && ! -L "$metadata" ]] || return 0
+    jq -er --arg pointer "$METADATA_TOKEN_POINTER" '
+        def pointer_path($value):
+            $value | split("/")[1:] | map(gsub("~1"; "/") | gsub("~0"; "~"));
+        select(.schemaVersion == 1)
+        | getpath(pointer_path($pointer))
+        | select(type == "string" and length > 0)
+    ' "$metadata" 2>/dev/null || true
+}
+
+read_previous_release() {
+    local release_name
+    if [[ ! -e "$CURRENT_LINK" && ! -L "$CURRENT_LINK" ]]; then
+        return 0
+    fi
+    [[ -L "$CURRENT_LINK" ]] || die "$CURRENT_LINK must be a symbolic link"
+
+    PREVIOUS_TARGET="$(readlink "$CURRENT_LINK")"
+    if [[ "$PREVIOUS_TARGET" == releases/* ]]; then
+        release_name="${PREVIOUS_TARGET#releases/}"
+        if [[ "$PREVIOUS_TARGET" != "releases/$release_name" ]] || ! valid_deploy_id "$release_name"; then
+            die "$CURRENT_LINK has an unsafe target: $PREVIOUS_TARGET"
+        fi
+        PREVIOUS_DIR="$APP_DIR/$PREVIOUS_TARGET"
+    else
+        die "$CURRENT_LINK has an unsafe target: $PREVIOUS_TARGET"
+    fi
+
+    [[ -d "$PREVIOUS_DIR" && ! -L "$PREVIOUS_DIR" ]] \
+        || die "$CURRENT_LINK target is not a release directory"
+    PREVIOUS_DEPLOY_ID="$(read_release_deploy_id "$PREVIOUS_DIR")"
+    [[ "$PREVIOUS_DEPLOY_ID" == "${PREVIOUS_TARGET#releases/}" ]] \
+        || die "$CURRENT_LINK release metadata does not match its directory"
+}
+
+validate_existing_release() {
+    local deploy_id=$1 metadata unexpected
+    valid_deploy_id "$deploy_id" || die "invalid release ID: $deploy_id"
+    RELEASE_DIR="$RELEASES_DIR/$deploy_id"
+    [[ -d "$RELEASE_DIR" && ! -L "$RELEASE_DIR" ]] \
+        || die "release is not a real directory: $RELEASE_DIR"
+    metadata="$(read_release_deploy_id "$RELEASE_DIR")"
+    [[ "$metadata" == "$deploy_id" ]] || die "release metadata does not match $deploy_id"
+    [[ "$(stat -c '%U:%G:%a' "$RELEASE_DIR")" == "root:$APP_USER:550" ]] \
+        || die "release root is not immutable root:$APP_USER mode 0550"
+    unexpected="$(find "$RELEASE_DIR" -xdev \( ! -user root -o ! -group "$APP_USER" \) -print -quit)"
+    [[ -z "$unexpected" ]] || die "release contains unexpected ownership: $unexpected"
+    unexpected="$(find "$RELEASE_DIR" -xdev ! -type l -perm /222 -print -quit)"
+    [[ -z "$unexpected" ]] || die "release contains a writable entry: $unexpected"
+}
+
+validate_layout() {
+    local entry manifest name relative_path
+    [[ -d "$CANDIDATE_DIR" && ! -L "$CANDIDATE_DIR" ]] \
+        || die "missing candidate $CANDIDATE_DIR"
+    [[ "$(stat -Lc '%U:%G:%a' "$INCOMING_DIR" 2>/dev/null)" == \
+        "root:$DEPLOY_GROUP:2770" ]] \
+        || die "$INCOMING_DIR must be root:$DEPLOY_GROUP mode 2770"
+    [[ "$(stat -Lc '%U:%G:%a' "$CANDIDATE_DIR" 2>/dev/null)" == \
+        "$DEPLOY_GROUP:$DEPLOY_GROUP:2755" ]] \
+        || die "$CANDIDATE_DIR must be $DEPLOY_GROUP:$DEPLOY_GROUP mode 2755"
+    [[ "$(stat -c '%d' "$INCOMING_DIR")" == "$(stat -c '%d' "$RELEASES_DIR")" ]] \
+        || die "incoming and releases must share a filesystem for atomic promotion"
+    [[ ! -e "$RELEASE_DIR" && ! -L "$RELEASE_DIR" ]] \
+        || die "release already exists: $RELEASE_DIR"
+    while IFS= read -r -d '' entry; do
+        name="${entry##*/}"
+        if ! printf '%s\n' "${ALLOWED_CANDIDATE_ROOTS[@]}" \
+            | grep -Fqx -- "$name"; then
+            die "unexpected candidate root: $entry"
+        fi
+    done < <(find "$CANDIDATE_DIR" -mindepth 1 -maxdepth 1 -print0)
+    [[ -f "$CANDIDATE_DIR/$ENTRYPOINT" && ! -L "$CANDIDATE_DIR/$ENTRYPOINT" ]] \
+        || die "missing or symlinked runtime entrypoint: $ENTRYPOINT"
+    for manifest in "${REQUIRED_MANIFESTS[@]}"; do
+        [[ -f "$CANDIDATE_DIR/$manifest" && ! -L "$CANDIDATE_DIR/$manifest" ]] \
+            || die "missing or symlinked dependency manifest: $manifest"
+    done
+    [[ -f "$CANDIDATE_DIR/$METADATA_RELATIVE_PATH" \
+        && ! -L "$CANDIDATE_DIR/$METADATA_RELATIVE_PATH" ]] \
+        || die "missing or symlinked candidate deploy metadata"
+    for relative_path in "${STATIC_PATHS[@]}"; do
+        [[ "$relative_path" == node_modules || "$relative_path" == node_modules/* ]] \
+            && continue
+        [[ -d "$CANDIDATE_DIR/$relative_path" \
+            && ! -L "$CANDIDATE_DIR/$relative_path" ]] \
+            || die "missing or symlinked static release path: $relative_path"
+    done
+    [[ ! -e "$CANDIDATE_DIR/node_modules" && ! -L "$CANDIDATE_DIR/node_modules" ]] \
+        || die "candidate unexpectedly contains node_modules"
+    [[ -x "$SECURE_SCRIPTS_DIR/package-hash.mjs" ]] || die "missing package-hash.mjs"
+    [[ -x "$TRIGGER_HELPER" ]] || die "missing deploy-trigger.py"
+    [[ -x "$MANIFEST_SNAPSHOT_HELPER" ]] || die "missing snapshot-manifests.py"
+    jq -e \
+        --arg pointer "$METADATA_TOKEN_POINTER" \
+        --arg token "$DEPLOY_TOKEN" '
+        def pointer_path($value):
+            $value | split("/")[1:] | map(gsub("~1"; "/") | gsub("~0"; "~"));
+        .schemaVersion == 1 and getpath(pointer_path($pointer)) == $token
+    ' "$CANDIDATE_DIR/$METADATA_RELATIVE_PATH" >/dev/null \
+        || die "deploy metadata does not match sentinel $DEPLOY_TOKEN"
+}
+
+validate_static_paths() {
+    local found relative_path unexpected
+    for relative_path in "${STATIC_PATHS[@]}"; do
+        [[ -d "$CANDIDATE_DIR/$relative_path" \
+            && ! -L "$CANDIDATE_DIR/$relative_path" ]] \
+            || die "missing or symlinked static release path: $relative_path"
+        unexpected="$(find "$CANDIDATE_DIR/$relative_path" -xdev \
+            ! -type d ! -type f -print -quit)"
+        [[ -z "$unexpected" ]] \
+            || die "refusing unexpected static entry type: $unexpected"
+        found="$(find "$CANDIDATE_DIR/$relative_path" -xdev -type l -print -quit)"
+        [[ -z "$found" ]] || die "refusing symlinked static content: $found"
+    done
+}
+
+atomic_set_link() {
+    local link_path=$1 target=$2 temporary
+    temporary="${link_path}.next.$$"
+    [[ ! -e "$temporary" && ! -L "$temporary" ]] || die "temporary pointer already exists: $temporary"
+    ln -s -- "$target" "$temporary" || die "could not create temporary pointer: $temporary"
+
+    # GNU mv needs -T to replace a symlink-to-directory rather than treating it
+    # as a destination directory. BSD mv provides the equivalent -h behavior.
+    if mv -Tf -- "$temporary" "$link_path" 2>/dev/null; then
+        relabel_pointer "$link_path" \
+            || die "could not label release pointer: $link_path"
+        durably_sync_path "$(dirname "$link_path")" \
+            || die "could not synchronize pointer directory for $link_path"
+        return 0
+    fi
+    if mv -fh -- "$temporary" "$link_path" 2>/dev/null; then
+        relabel_pointer "$link_path" \
+            || die "could not label release pointer: $link_path"
+        durably_sync_path "$(dirname "$link_path")" \
+            || die "could not synchronize pointer directory for $link_path"
+        return 0
+    fi
+
+    rm -f -- "$temporary"
+    die "could not atomically update $link_path"
+}
+
+atomic_remove_link() {
+    local link_path=$1
+    if [[ -L "$link_path" ]]; then
+        rm -f -- "$link_path" || die "could not remove pointer: $link_path"
+        durably_sync_path "$(dirname "$link_path")" \
+            || die "could not synchronize pointer removal for $link_path"
+    elif [[ -e "$link_path" ]]; then
+        die "refusing to remove non-symlink pointer: $link_path"
+    fi
+}
+
+dependency_manifest_hash() {
+    local release_dir=$1
+    ( cd "$SECURE_SCRIPTS_DIR" && ./package-hash.mjs "$release_dir" )
+}
+
+valid_dependency_hash() {
+    [[ "$1" =~ ^[a-f0-9]{64}$ ]]
+}
+
+npm_cli_path() {
+    local npm_cli
+    npm_cli="$(readlink -f "$NPM_BIN")" || die "could not resolve npm CLI from $NPM_BIN"
+    [[ -f "$npm_cli" && ! -L "$npm_cli" ]] || die "npm CLI is not a real file: $npm_cli"
+    printf '%s\n' "$npm_cli"
+}
+
+dependency_install_identity() {
+    local npm_cli npm_version
+    npm_cli="$(npm_cli_path)"
+    npm_version="$("$NODE_BIN" "$npm_cli" --version)" \
+        || die "could not read npm version with $NODE_BIN"
+    # shellcheck disable=SC2016 # The template literal is evaluated by Node, not Bash.
+    "$NODE_BIN" -e '
+        const npmVersion = process.argv[1];
+        const reportHeader = process.report?.getReport()?.header ?? {};
+        const glibcVersion = reportHeader.glibcVersionRuntime;
+        if (process.platform === "linux" && !glibcVersion) {
+            throw new Error("could not identify the Linux libc runtime");
+        }
+        process.stdout.write(JSON.stringify({
+            nodeVersion: process.versions.node,
+            nodeModulesAbi: process.versions.modules,
+            platform: process.platform,
+            arch: process.arch,
+            libc: process.platform === "linux" ? `glibc-${glibcVersion}` : process.platform,
+            npmVersion,
+        }));
+    ' "$npm_version" || die "could not derive dependency install identity"
+}
+
+snapshot_dependency_manifests() {
+    require_npm_directories
+    NPM_WORK_DIR="$(mktemp -d -- "$NPM_WORK_ROOT/install.XXXXXX")"
+    [[ -d "$NPM_WORK_DIR" && ! -L "$NPM_WORK_DIR" ]] \
+        || die "mktemp did not create a real npm workspace under $NPM_WORK_ROOT"
+    "$MANIFEST_SNAPSHOT_HELPER" "$DEPLOY_TOKEN" "$NPM_WORK_DIR" \
+        || die "could not snapshot candidate dependency manifests"
+    CANDIDATE_DEPENDENCY_HASH="$(dependency_manifest_hash "$NPM_WORK_DIR")" \
+        || die "could not hash staged dependency manifests"
+    valid_dependency_hash "$CANDIDATE_DEPENDENCY_HASH" \
+        || die "staged dependency hash is invalid"
+}
+
+install_dependencies() {
+    local candidate_hash npm_cli staged_hash=$1
+    npm_cli="$(npm_cli_path)"
+    log "installing production dependencies for $DEPLOY_TOKEN"
+    [[ -d "$NPM_WORK_DIR" && ! -L "$NPM_WORK_DIR" ]] \
+        || die "dependency snapshot workspace is missing or unsafe"
+
+    chown "$APP_USER:$APP_USER" "$NPM_WORK_DIR/package.json" "$NPM_WORK_DIR/package-lock.json"
+    chown --no-dereference "$APP_USER:$APP_USER" "$NPM_WORK_DIR"
+    chmod 0700 "$NPM_WORK_DIR"
+
+    ( cd "$NPM_WORK_DIR" \
+        && runuser -u "$APP_USER" -- env \
+           HOME="$NPM_HOME_DIR" \
+           npm_config_cache="$NPM_CACHE_DIR" \
+           npm_config_update_notifier=false \
+           "$NODE_BIN" "$npm_cli" ci --omit=dev --ignore-scripts --no-audit --no-fund )
+
+    mkdir "$CANDIDATE_DIR/node_modules"
+    rsync -a --delete "$NPM_WORK_DIR/node_modules/" "$CANDIDATE_DIR/node_modules/"
+    [[ -d "$CANDIDATE_DIR/node_modules" && ! -L "$CANDIDATE_DIR/node_modules" ]] \
+        || die "dependency install did not create a real node_modules directory"
+    candidate_hash="$(dependency_manifest_hash "$CANDIDATE_DIR")" \
+        || die "could not rehash candidate dependency manifests after install"
+    [[ "$candidate_hash" == "$staged_hash" ]] \
+        || die "candidate manifests changed during dependency installation"
+    cleanup_npm_work_dir || die "could not safely remove npm workspace"
+    NPM_WORK_DIR=""
+}
+
+prepare_dependencies() {
+    local candidate_hash candidate_identity previous_hash="" provenance_hash="" provenance_identity=""
+    local provenance_file temporary
+    [[ ! -e "$CANDIDATE_DIR/node_modules" && ! -L "$CANDIDATE_DIR/node_modules" ]] \
+        || die "candidate unexpectedly contains node_modules"
+    snapshot_dependency_manifests
+    candidate_hash="$CANDIDATE_DEPENDENCY_HASH"
+    valid_dependency_hash "$candidate_hash" || die "candidate dependency snapshot hash is invalid"
+    candidate_identity="$(dependency_install_identity | jq -cS .)"
+
+    provenance_file="${PREVIOUS_DIR:+$PREVIOUS_DIR/$DEPENDENCY_PROVENANCE_RELATIVE_PATH}"
+    if [[ "$PREVIOUS_TARGET" == releases/* \
+        && -d "$PREVIOUS_DIR/node_modules" && ! -L "$PREVIOUS_DIR/node_modules" \
+        && -f "$provenance_file" && ! -L "$provenance_file" ]] \
+        && jq -e '
+            .schemaVersion == 1
+            and (.packageHash | type == "string" and test("^[a-f0-9]{64}$"))
+            and (.installIdentity | type == "object")
+        ' "$provenance_file" >/dev/null; then
+        previous_hash="$(dependency_manifest_hash "$PREVIOUS_DIR")"
+        provenance_hash="$(jq -r '.packageHash' "$provenance_file")"
+        provenance_identity="$(jq -cS '.installIdentity' "$provenance_file")"
+    fi
+    if [[ "$candidate_hash" == "$previous_hash" \
+        && "$previous_hash" == "$provenance_hash" \
+        && "$candidate_identity" == "$provenance_identity" ]]; then
+        log "reusing immutable dependencies from the current release"
+        cleanup_npm_work_dir || die "could not safely remove dependency snapshot workspace"
+        NPM_WORK_DIR=""
+        cp -a --reflink=auto "$PREVIOUS_DIR/node_modules" "$CANDIDATE_DIR/node_modules"
+        [[ -d "$CANDIDATE_DIR/node_modules" && ! -L "$CANDIDATE_DIR/node_modules" ]] \
+            || die "dependency reuse did not create a real node_modules directory"
+    else
+        install_dependencies "$candidate_hash"
+    fi
+    temporary="$CANDIDATE_DIR/$DEPENDENCY_PROVENANCE_RELATIVE_PATH.tmp"
+    jq -n \
+        --arg packageHash "$candidate_hash" \
+        --argjson installIdentity "$candidate_identity" \
+        '{schemaVersion: 1, packageHash: $packageHash, installIdentity: $installIdentity}' \
+        > "$temporary" || die "could not write dependency provenance"
+    mv -f -- "$temporary" "$CANDIDATE_DIR/$DEPENDENCY_PROVENANCE_RELATIVE_PATH" \
+        || die "could not publish dependency provenance"
+}
+
+selinux_enabled() {
+    [[ -x "$SELINUX_ENABLED_BIN" ]] \
+        || die "missing $SELINUX_ENABLED_BIN; refusing to finalize without a trustworthy SELinux state check"
+    "$SELINUX_ENABLED_BIN"
+}
+
+selinux_relabeling_required() {
+    local selinux_status
+    if selinux_enabled; then
+        return 0
+    else
+        selinux_status=$?
+    fi
+    (( selinux_status == 1 )) \
+        || die "$SELINUX_ENABLED_BIN failed with status $selinux_status"
+    return 1
+}
+
+relabel_pointer() {
+    local pointer=$1
+    selinux_relabeling_required || return 0
+    [[ -x "$RESTORECON_BIN" ]] \
+        || die "missing $RESTORECON_BIN on an SELinux-enabled host"
+    log "relabeling SELinux release pointer: $pointer"
+    "$RESTORECON_BIN" "$pointer" \
+        || die "SELinux release-pointer relabel failed: $pointer"
+}
+
+relabel() {
+    selinux_relabeling_required || return 0
+    [[ -x "$RESTORECON_BIN" ]] \
+        || die "missing $RESTORECON_BIN on an SELinux-enabled host"
+    log "relabeling SELinux contexts: $*"
+    "$RESTORECON_BIN" -R "$@" \
+        || die "SELinux relabel failed: $*"
+}
+
+durably_sync_release() {
+    local release_dir=$1
+    [[ "$release_dir" == "$RELEASES_DIR"/* && -d "$release_dir" && ! -L "$release_dir" ]] \
+        || die "refusing to synchronize an unsafe release path: $release_dir"
+    "$SYNC_BIN" -f "$release_dir" || die "could not synchronize promoted release filesystem"
+}
+
+remove_os_metadata() {
+    log "removing operating-system metadata files"
+    find "$CANDIDATE_DIR" -xdev \
+        \( -name '.DS_Store' -o -name '._*' -o -name 'ehthumbs.db' \
+           -o -name 'Thumbs.db' -o -name 'Icon?' \) \
+        -type f -delete
+    find "$CANDIDATE_DIR" -xdev \
+        \( -name '.Spotlight-V100' -o -name '.Trashes' \) \
+        -type d -prune -exec rm -rf -- {} +
+}
+
+reject_payload_entries() {
+    local found unexpected
+    unexpected="$(find "$CANDIDATE_DIR" -xdev \
+        ! -type d ! -type f ! -type l -print -quit)"
+    [[ -z "$unexpected" ]] \
+        || die "refusing unexpected payload entry type: $unexpected"
+    found="$(find "$CANDIDATE_DIR" -xdev \
+        -path "$CANDIDATE_DIR/node_modules" -prune -o \
+        -type l -print -quit)"
+    [[ -z "$found" ]] || die "refusing symlinked application payload: $found"
+}
+
+make_release_immutable() {
+    local unexpected
+    log "normalizing immutable release ownership and permissions"
+    [[ -d "$CANDIDATE_DIR/node_modules" && ! -L "$CANDIDATE_DIR/node_modules" ]] \
+        || die "candidate dependencies are not a real directory"
+    unexpected="$(find "$CANDIDATE_DIR/node_modules" \
+        ! -type d ! -type f ! -type l -print -quit)"
+    [[ -z "$unexpected" ]] \
+        || die "refusing unexpected dependency entry type: $unexpected"
+
+    chown -R root:"$APP_USER" "$CANDIDATE_DIR"
+    chmod 00550 "$CANDIDATE_DIR"
+    find "$CANDIDATE_DIR" -xdev \
+        -path "$CANDIDATE_DIR/node_modules" -prune -o \
+        -type d -exec chmod 00550 {} +
+    find "$CANDIDATE_DIR" -xdev \
+        -path "$CANDIDATE_DIR/node_modules" -prune -o \
+        -type f -exec chmod 0440 {} +
+    chmod -R u+rX,g+rX,o-rwx,a-w "$CANDIDATE_DIR/node_modules"
+    find "$CANDIDATE_DIR/node_modules" ! -type l -exec chmod a-s,a-t {} +
+    chmod -R a-w "$CANDIDATE_DIR"
+}
+
+promote_candidate() {
+    log "promoting immutable release $DEPLOY_TOKEN"
+    mv -- "$CANDIDATE_DIR" "$RELEASE_DIR"
+    CANDIDATE_DIR=""
+    relabel "$RELEASE_DIR"
+    durably_sync_release "$RELEASE_DIR" \
+        || die "promoted release was not durable; refusing activation"
+}
+
+health_matches_deploy() {
+    local socket_path=$1 deploy_id=$2
+    if [[ -n "$deploy_id" ]]; then
+        curl --fail --silent --show-error --max-time 10 \
+            --unix-socket "$socket_path" "http://localhost$HEALTH_ROUTE" \
+            | jq -e \
+                --arg statusPointer "$HEALTH_STATUS_POINTER" \
+                --arg statusValue "$HEALTH_STATUS_VALUE" \
+                --arg tokenPointer "$HEALTH_TOKEN_POINTER" \
+                --arg token "$deploy_id" '
+                def pointer_path($value):
+                    $value | split("/")[1:] | map(gsub("~1"; "/") | gsub("~0"; "~"));
+                getpath(pointer_path($statusPointer)) == $statusValue
+                and getpath(pointer_path($tokenPointer)) == $token
+            ' >/dev/null
+    else
+        curl --fail --silent --show-error --max-time 10 \
+            --unix-socket "$socket_path" "http://localhost$HEALTH_ROUTE" \
+            | jq -e \
+                --arg statusPointer "$HEALTH_STATUS_POINTER" \
+                --arg statusValue "$HEALTH_STATUS_VALUE" '
+                def pointer_path($value):
+                    $value | split("/")[1:] | map(gsub("~1"; "/") | gsub("~0"; "~"));
+                getpath(pointer_path($statusPointer)) == $statusValue
+            ' >/dev/null
+    fi
+}
+
+wait_for_health() {
+    local socket_path=$1 deploy_id=$2 attempt confirmations=0
+    for ((attempt = 1; attempt <= HEALTH_RETRIES; ++attempt)); do
+        if health_matches_deploy "$socket_path" "$deploy_id"; then
+            ((++confirmations))
+            if (( confirmations >= HEALTH_CONFIRMATIONS )); then
+                log "health acknowledged $deploy_id"
+                return 0
+            fi
+        else
+            confirmations=0
+        fi
+        sleep 2
+    done
+    return 1
+}
+
+stop_preflight_service() {
+    local status=0
+    [[ -n "$PREFLIGHT_SERVICE" ]] || return 0
+    systemctl stop "$PREFLIGHT_SERVICE" || status=$?
+    systemctl reset-failed "$PREFLIGHT_SERVICE" >/dev/null 2>&1 || true
+    if (( status == 0 )); then
+        PREFLIGHT_SERVICE=""
+        PREFLIGHT_SOCKET=""
+        if [[ -n "$PREFLIGHT_POINTER" && -L "$PREFLIGHT_POINTER" ]] \
+            && ! rm -f -- "$PREFLIGHT_POINTER"; then
+            status=1
+        fi
+        if (( status == 0 )); then
+            PREFLIGHT_POINTER=""
+        fi
+    fi
+    return "$status"
+}
+
+candidate_identity() {
+    local digest
+    digest="$(printf '%s' "$1" | openssl dgst -sha256 -r | awk '{ print $1 }')"
+    [[ "$digest" =~ ^[a-f0-9]{64}$ ]] || return 1
+    printf '%.24s\n' "$digest"
+}
+
+preflight_release() {
+    local deploy_id=$1 identity pointer_target
+    if ! identity="$(candidate_identity "$deploy_id")"; then
+        log "could not derive a safe candidate identity"
+        return 1
+    fi
+    if ! PREFLIGHT_SERVICE="$(systemd-escape --template=@@CANDIDATE_SERVICE@@ "$identity")" \
+        || [[ ! "$PREFLIGHT_SERVICE" =~ ^@@CANDIDATE_UNIT_PREFIX@@@[a-f0-9]{24}\.service$ ]]; then
+        log "could not derive a safe candidate service name"
+        PREFLIGHT_SERVICE=""
+        return 1
+    fi
+    PREFLIGHT_SOCKET="@@CANDIDATE_RUNTIME_PREFIX@@-${identity}/candidate.sock"
+    PREFLIGHT_POINTER="$CANDIDATE_POINTER_DIR/$identity"
+    pointer_target="../releases/$deploy_id"
+    [[ ! -e "$PREFLIGHT_POINTER" && ! -L "$PREFLIGHT_POINTER" ]] \
+        || { log "candidate pointer already exists: $PREFLIGHT_POINTER"; return 1; }
+    if ! ln -s -- "$pointer_target" "$PREFLIGHT_POINTER"; then
+        log "could not create candidate pointer: $PREFLIGHT_POINTER"
+        return 1
+    fi
+
+    log "starting isolated preflight $PREFLIGHT_SERVICE"
+    systemctl reset-failed "$PREFLIGHT_SERVICE" >/dev/null 2>&1 || true
+    if ! systemctl start "$PREFLIGHT_SERVICE"; then
+        stop_preflight_service || true
+        return 1
+    fi
+    if ! wait_for_health "$PREFLIGHT_SOCKET" "$deploy_id"; then
+        stop_preflight_service || true
+        return 1
+    fi
+    if ! stop_preflight_service; then
+        log "candidate preflight could not be stopped cleanly"
+        return 1
+    fi
+    log "isolated candidate preflight passed: $deploy_id"
+}
+
+persist_activation_intent() {
+    local candidate_target=$1 candidate_token=$2 rollback_target=$3 rollback_token=$4
+    local state_dir temporary="${ACTIVATION_STATE}.tmp.$$"
+    state_dir="$(dirname "$ACTIVATION_STATE")"
+    [[ -d "$state_dir" && ! -L "$state_dir" ]] || die "activation state directory is unsafe: $state_dir"
+
+    if [[ "$candidate_target" != "releases/$candidate_token" ]] || ! valid_deploy_id "$candidate_token"; then
+        die "refusing to persist an unsafe candidate activation target"
+    fi
+    if [[ -n "$rollback_target" ]]; then
+        if [[ "$rollback_target" != "releases/$rollback_token" ]] || ! valid_deploy_id "$rollback_token"; then
+            die "refusing to persist an unsafe rollback target"
+        fi
+    fi
+
+    jq -n \
+        --arg candidateTarget "$candidate_target" \
+        --arg candidateDeployId "$candidate_token" \
+        --arg rollbackTarget "$rollback_target" \
+        --arg rollbackDeployId "$rollback_token" \
+        '{
+            schemaVersion: 1,
+            phase: "prepared",
+            candidateTarget: $candidateTarget,
+            candidateDeployId: $candidateDeployId,
+            rollbackTarget: $rollbackTarget,
+            rollbackDeployId: $rollbackDeployId
+        }' > "$temporary" || die "could not write activation intent"
+    chmod 0600 "$temporary" || die "could not protect activation intent"
+    durably_sync_path "$temporary" || die "could not synchronize activation intent"
+    mv -f -- "$temporary" "$ACTIVATION_STATE" || die "could not publish activation intent"
+    durably_sync_path "$state_dir" || die "could not synchronize activation state directory"
+}
+
+mark_activation_switched() {
+    local state_dir temporary="${ACTIVATION_STATE}.tmp.$$"
+    state_dir="$(dirname "$ACTIVATION_STATE")"
+    [[ -d "$state_dir" && ! -L "$state_dir" ]] || die "activation state directory is unsafe: $state_dir"
+    [[ -f "$ACTIVATION_STATE" && ! -L "$ACTIVATION_STATE" ]] \
+        || die "activation intent disappeared before pointer switch"
+    jq '.phase = "switched"' "$ACTIVATION_STATE" > "$temporary" \
+        || die "could not update activation intent"
+    chmod 0600 "$temporary" || die "could not protect updated activation intent"
+    durably_sync_path "$temporary" || die "could not synchronize updated activation intent"
+    mv -f -- "$temporary" "$ACTIVATION_STATE" || die "could not publish updated activation intent"
+    durably_sync_path "$state_dir" || die "could not synchronize updated activation state"
+}
+
+clear_activation_intent() {
+    local state_dir
+    state_dir="$(dirname "$ACTIVATION_STATE")"
+    [[ -d "$state_dir" && ! -L "$state_dir" ]] || die "activation state directory is unsafe: $state_dir"
+    rm -f -- "$ACTIVATION_STATE" || die "could not clear activation intent"
+    durably_sync_path "$state_dir" || die "could not synchronize cleared activation state"
+}
+
+publish_committed_deploy() {
+    local deploy_id=$1 committed_at temporary="${COMMITTED_STATE}.tmp.$$"
+    valid_deploy_id "$deploy_id" || die "refusing to publish an invalid committed deploy ID"
+    committed_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    jq -n \
+        --arg deployId "$deploy_id" \
+        --arg committedAt "$committed_at" \
+        '{schemaVersion: 1, status: "committed", deployId: $deployId, committedAt: $committedAt}' \
+        > "$temporary" || die "could not write committed deployment state"
+    chown "$COMMIT_OWNER" "$temporary" || die "could not own committed deployment state"
+    chmod 0440 "$temporary" || die "could not protect committed deployment state"
+    durably_sync_path "$temporary" || die "could not synchronize committed deployment state"
+    mv -f -- "$temporary" "$COMMITTED_STATE" || die "could not publish committed deployment state"
+    relabel "$COMMITTED_STATE" || die "could not label committed deployment state"
+    durably_sync_path "$COMMITTED_STATE" || die "could not synchronize committed deployment label"
+    durably_sync_path "$APP_DIR" || die "could not synchronize committed deployment directory"
+}
+
+recover_incomplete_activation() {
+    local restart_service=${1:-0}
+    local phase candidate_target candidate_token rollback_target rollback_token
+    local current_target="" rollback_dir="" rollback_metadata="" pointer_changed=0
+
+    if [[ -L "$ACTIVATION_STATE" || ( -e "$ACTIVATION_STATE" && ! -f "$ACTIVATION_STATE" ) ]]; then
+        log "activation recovery state is not a regular file: $ACTIVATION_STATE"
+        return 1
+    fi
+    [[ -f "$ACTIVATION_STATE" ]] || return 0
+    if ! jq -e '
+        .schemaVersion == 1
+        and (.phase == "prepared" or .phase == "switched")
+        and (.candidateTarget | type == "string")
+        and (.candidateDeployId | type == "string")
+        and (.rollbackTarget | type == "string")
+        and (.rollbackDeployId | type == "string")
+    ' "$ACTIVATION_STATE" >/dev/null; then
+        log "activation recovery state is invalid: $ACTIVATION_STATE"
+        return 1
+    fi
+    IFS=$'\t' read -r phase candidate_target candidate_token rollback_target rollback_token \
+        < <(jq -r '[.phase, .candidateTarget, .candidateDeployId, .rollbackTarget, .rollbackDeployId] | @tsv' \
+            "$ACTIVATION_STATE")
+
+    if [[ "$candidate_target" != "releases/$candidate_token" ]] || ! valid_deploy_id "$candidate_token"; then
+        log "activation recovery candidate is unsafe"
+        return 1
+    fi
+    if [[ -n "$rollback_target" ]]; then
+        if [[ "$rollback_target" != "releases/$rollback_token" ]] || ! valid_deploy_id "$rollback_token"; then
+            log "activation recovery rollback target is unsafe"
+            return 1
+        fi
+        rollback_dir="$APP_DIR/$rollback_target"
+        rollback_metadata="$(read_release_deploy_id "$rollback_dir")"
+        [[ "$rollback_metadata" == "$rollback_token" ]] \
+            || { log "activation recovery rollback metadata does not match"; return 1; }
+        [[ -d "$rollback_dir" && ! -L "$rollback_dir" ]] \
+            || { log "activation recovery rollback directory is missing"; return 1; }
+    fi
+
+    if [[ -L "$CURRENT_LINK" ]]; then
+        current_target="$(readlink "$CURRENT_LINK")"
+    elif [[ -e "$CURRENT_LINK" ]]; then
+        log "activation recovery refuses a non-symlink current pointer"
+        return 1
+    fi
+
+    if [[ "$current_target" == "$candidate_target" ]]; then
+        if [[ -n "$rollback_target" ]]; then
+            log "recovering interrupted activation to $rollback_target"
+            atomic_set_link "$CURRENT_LINK" "$rollback_target"
+        else
+            log "removing interrupted first-release activation"
+            atomic_remove_link "$CURRENT_LINK"
+        fi
+        pointer_changed=1
+    elif [[ "$current_target" != "$rollback_target" ]]; then
+        log "activation recovery found unexpected current target: ${current_target:-missing}"
+        return 1
+    fi
+
+    if (( restart_service == 1 )) \
+        && { (( pointer_changed == 1 )) || [[ "$phase" == "switched" ]]; }; then
+        if [[ -n "$rollback_target" ]]; then
+            systemctl reset-failed "$SERVICE" || true
+            systemctl restart "$SERVICE" || return 1
+            wait_for_health "$RUNTIME_SOCKET" "$rollback_token" || return 1
+        else
+            systemctl stop "$SERVICE" || true
+        fi
+    fi
+    clear_activation_intent
+    log "interrupted activation recovery complete"
+}
+
+activate_release() {
+    local current_link=$1 previous_link=$2 service=$3
+    local candidate_target=$4 candidate_token=$5 rollback_target=$6 rollback_token=$7
+
+    ROLLED_BACK=0
+    persist_activation_intent "$candidate_target" "$candidate_token" "$rollback_target" "$rollback_token" \
+        || die "could not persist activation intent"
+    atomic_set_link "$current_link" "$candidate_target" \
+        || die "could not switch current release"
+    mark_activation_switched || die "could not mark the activation as switched"
+    log "restarting $service on $candidate_target"
+    if systemctl restart "$service" && wait_for_health "$RUNTIME_SOCKET" "$candidate_token"; then
+        if [[ -n "$rollback_target" ]]; then
+            atomic_set_link "$previous_link" "$rollback_target" \
+                || die "could not preserve the previous release pointer"
+        else
+            atomic_remove_link "$previous_link" \
+                || die "could not clear the previous release pointer"
+        fi
+        clear_activation_intent || die "could not commit the activation"
+        # The public deploy client only acknowledges this root-published marker.
+        # Publish it after rollback intent is durably cleared so it can never
+        # report success for an activation that cleanup may still reverse.
+        publish_committed_deploy "$candidate_token" \
+            || die "could not publish the committed deployment acknowledgement"
+        return 0
+    fi
+
+    if [[ -z "$rollback_target" ]]; then
+        log "candidate failed and no previous release exists; stopping $service"
+        atomic_remove_link "$current_link" \
+            || die "could not clear the failed first-release pointer"
+        systemctl stop "$service" || true
+        clear_activation_intent || die "could not clear the failed activation intent"
+        return 1
+    fi
+
+    log "candidate failed; rolling back $service to $rollback_target"
+    atomic_set_link "$current_link" "$rollback_target" \
+        || die "could not restore the rollback release pointer"
+    # A crashing candidate can consume the unit's start-limit budget before
+    # health retries finish. Clear that candidate failure state so it cannot
+    # prevent the preserved release from starting.
+    systemctl reset-failed "$service" || true
+    if systemctl restart "$service" && wait_for_health "$RUNTIME_SOCKET" "$rollback_token"; then
+        ROLLED_BACK=1
+        clear_activation_intent || die "could not commit the rollback"
+        log "rollback is healthy: $rollback_token"
+        return 1
+    fi
+    die "candidate and rollback release both failed health checks"
+}
+
+prune_retained_releases() {
+    local current_target previous_target release_name release_path retained=0
+    current_target="$(readlink "$CURRENT_LINK" 2>/dev/null || true)"
+    previous_target="$(readlink "$PREVIOUS_LINK" 2>/dev/null || true)"
+
+    while IFS= read -r release_name; do
+        [[ -n "$release_name" ]] || continue
+        release_path="$RELEASES_DIR/$release_name"
+        valid_deploy_id "$release_name" \
+            || { log "WARNING: refusing to prune invalid release name: $release_name"; continue; }
+        if [[ "releases/$release_name" == "$current_target" \
+            || "releases/$release_name" == "$previous_target" ]]; then
+            ((++retained))
+            continue
+        fi
+        if (( retained < RELEASE_RETENTION_COUNT )); then
+            ((++retained))
+            continue
+        fi
+        [[ -d "$release_path" && ! -L "$release_path" ]] \
+            || { log "WARNING: refusing unsafe release prune target: $release_path"; continue; }
+        [[ "$(stat -c '%U:%G:%a' "$release_path")" == "root:$APP_USER:550" ]] \
+            || { log "WARNING: refusing release with unexpected identity: $release_path"; continue; }
+        log "pruning retained release: $release_name"
+        rm -rf --one-file-system -- "$release_path" \
+            || { log "WARNING: could not prune release: $release_name"; return 1; }
+    done < <(
+        find "$RELEASES_DIR" -mindepth 1 -maxdepth 1 -xdev -type d \
+            -printf '%T@ %f\n' | sort -rn | awk '{ print $2 }'
+    )
+}
+
+prune_expired_audit_results() {
+    local results_dir="$TRIGGER_ROOT/results"
+    [[ -d "$results_dir" && ! -L "$results_dir" ]] || return 1
+    find "$results_dir" -mindepth 1 -maxdepth 1 -xdev -type f \
+        -user root -group "$DEPLOY_GROUP" -links 1 -perm 0640 \
+        -mtime +"$AUDIT_RETENTION_DAYS" -delete
+}
+
+process_signal() {
+    local candidate_target
+
+    read_previous_release
+    validate_layout
+    scavenge_stale_npm_workspaces
+    remove_os_metadata
+    reject_payload_entries
+    prepare_dependencies
+    validate_static_paths
+    make_release_immutable
+    promote_candidate
+
+    if ! preflight_release "$DEPLOY_TOKEN"; then
+        die "$SERVICE candidate $DEPLOY_TOKEN failed isolated preflight; current was not changed"
+    fi
+
+    candidate_target="releases/$DEPLOY_TOKEN"
+    if ! activate_release "$CURRENT_LINK" "$PREVIOUS_LINK" "$SERVICE" \
+        "$candidate_target" "$DEPLOY_TOKEN" "$PREVIOUS_TARGET" "$PREVIOUS_DEPLOY_ID"; then
+        if (( ROLLED_BACK == 1 )); then
+            die "$SERVICE rejected $DEPLOY_TOKEN and was rolled back safely"
+        fi
+        die "$SERVICE rejected $DEPLOY_TOKEN and no rollback release was available"
+    fi
+
+    prune_retained_releases \
+        || log "WARNING: release retention cleanup was incomplete"
+    prune_expired_audit_results \
+        || log "WARNING: audit-result retention cleanup was incomplete"
+
+    DEPLOY_FINALIZED=1
+    log "deploy finalized: $DEPLOY_TOKEN"
+}
+
+run_recovery() {
+    local completion_status restart_service=$1
+    require_root
+    require_post_deploy_lock
+    exec 9<>"$LOCK_FILE"
+    flock 9
+    acquire_deploy_ingress_barrier
+    if (( restart_service == 1 )); then
+        validate_runtime_config
+    fi
+    recover_incomplete_activation "$restart_service"
+    "$TRIGGER_HELPER" recover-pending >/dev/null \
+        || die "could not recover staged deployment results"
+    if [[ "$DEPLOY_INVOCATION_ID" =~ ^[0-9a-f]{32}$ ]]; then
+        set +e
+        "$TRIGGER_HELPER" recover-completion "$DEPLOY_INVOCATION_ID" >/dev/null
+        completion_status=$?
+        set -e
+        case "$completion_status" in
+            0) log "recovered completion evidence for systemd invocation $DEPLOY_INVOCATION_ID" ;;
+            4) ;;
+            *) die "could not recover completion evidence for systemd invocation $DEPLOY_INVOCATION_ID" ;;
+        esac
+    fi
+}
+
+run_operator_activation() {
+    local deploy_id=$1 candidate_target
+    require_root
+    validate_runtime_config
+    require_post_deploy_lock
+    exec 9<>"$LOCK_FILE"
+    flock 9
+    acquire_deploy_ingress_barrier
+    recover_incomplete_activation 1 \
+        || die "an interrupted activation could not be recovered"
+
+    DEPLOY_TOKEN=$deploy_id
+    validate_existing_release "$deploy_id"
+    durably_sync_release "$RELEASE_DIR" \
+        || die "operator-selected release is not durable"
+    read_previous_release
+    candidate_target="releases/$deploy_id"
+    trap cleanup EXIT
+
+    if ! preflight_release "$deploy_id"; then
+        die "$SERVICE release $deploy_id failed isolated operator preflight"
+    fi
+    if [[ "$PREVIOUS_TARGET" == "$candidate_target" ]]; then
+        wait_for_health "$RUNTIME_SOCKET" "$deploy_id" \
+            || die "$SERVICE is not currently serving $deploy_id"
+        publish_committed_deploy "$deploy_id" \
+            || die "could not repair the committed deployment acknowledgement"
+    elif ! activate_release "$CURRENT_LINK" "$PREVIOUS_LINK" "$SERVICE" \
+        "$candidate_target" "$deploy_id" "$PREVIOUS_TARGET" "$PREVIOUS_DEPLOY_ID"; then
+        if (( ROLLED_BACK == 1 )); then
+            die "$SERVICE rejected operator release $deploy_id and was rolled back safely"
+        fi
+        die "$SERVICE rejected operator release $deploy_id and no rollback release was available"
+    fi
+
+    DEPLOY_FINALIZED=1
+    log "operator activation committed: $deploy_id"
+}
+
+run_deploy_transaction() {
+    require_root
+    require_systemd_invocation
+    validate_runtime_config
+    require_post_deploy_lock
+    exec 9<>"$LOCK_FILE"
+    flock -n 9 || { log "another run holds the lock; skipping"; return 0; }
+    acquire_deploy_ingress_barrier
+    trap cleanup EXIT
+    recover_incomplete_activation 1 \
+        || die "an interrupted activation could not be recovered"
+    claim_deploy_sentinel
+    process_signal
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    case "${1:-}" in
+        "") [[ "$#" -eq 0 ]] || die "unexpected deployment arguments"; run_deploy_transaction ;;
+        --recover) [[ "$#" -eq 1 ]] || die "--recover takes no value"; run_recovery 1 ;;
+        --recover-pointer) [[ "$#" -eq 1 ]] || die "--recover-pointer takes no value"; run_recovery 0 ;;
+        --activate-release)
+            [[ "$#" -eq 2 ]] || die "usage: post-deploy --activate-release <deploy-id>"
+            run_operator_activation "$2"
+            ;;
+        *) die "unknown argument: $1" ;;
+    esac
+fi
