@@ -25,13 +25,15 @@ fail() {
 
 validate_source() {
     source_path=$1
-    [ -f "$source_path" ] && [ ! -L "$source_path" ] && [ -x "$source_path" ] \
-        || fail "source must be a real executable file: $source_path"
+    if [ ! -f "$source_path" ] || [ -L "$source_path" ] || [ ! -x "$source_path" ]; then
+        fail "source must be a real executable file: $source_path"
+    fi
 }
 
 validate_target_directory() {
-    [ -d "$TARGET_DIRECTORY" ] && [ ! -L "$TARGET_DIRECTORY" ] \
-        || fail "target must be a real directory: $TARGET_DIRECTORY"
+    if [ ! -d "$TARGET_DIRECTORY" ] || [ -L "$TARGET_DIRECTORY" ]; then
+        fail "target must be a real directory: $TARGET_DIRECTORY"
+    fi
     target_identity=$(stat -Lc '%U:%G:%a' "$TARGET_DIRECTORY" 2>/dev/null) \
         || fail "cannot inspect target directory: $TARGET_DIRECTORY"
     target_owner_group=${target_identity%:*}

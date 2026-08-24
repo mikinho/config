@@ -96,8 +96,9 @@ grep -Eq '^certbot_certificate_expiry_seconds\{domain="example[.]test"\} [0-9]+$
     --warn-days 1 \
     --output "$TEST_ROOT/published-report.json" \
     --format json
-[ -f "$TEST_ROOT/published-report.json" ] && [ ! -L "$TEST_ROOT/published-report.json" ] \
-    || fail "healthcheck did not atomically publish a regular output file"
+if [ ! -f "$TEST_ROOT/published-report.json" ] || [ -L "$TEST_ROOT/published-report.json" ]; then
+    fail "healthcheck did not atomically publish a regular output file"
+fi
 jq -e '.total == 1' "$TEST_ROOT/published-report.json" >/dev/null
 
 : > "$TEST_ROOT/output-victim"
