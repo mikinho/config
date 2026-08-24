@@ -1,0 +1,77 @@
+#!/bin/sh
+
+set -eu
+
+PROGRAM_NAME=${0##*/}
+SCRIPT_DIRECTORY=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+REPOSITORY_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIRECTORY/.." && pwd)
+SCRATCH_DIR=$(mktemp -d "${TMPDIR:-/tmp}/config-local-tests.XXXXXX")
+
+cleanup() {
+    if [ -d "$SCRATCH_DIR" ]; then
+        rm -rf -- "$SCRATCH_DIR"
+    fi
+}
+
+trap cleanup EXIT HUP INT TERM
+
+fail() {
+    printf '%s: [FAIL] %s\n' "$PROGRAM_NAME" "$*" >&2
+    exit 1
+}
+
+step() {
+    printf '==> %s\n' "$*"
+}
+
+step "Running ShellCheck on shell scripts..."
+if command -v shellcheck >/dev/null 2>&1; then
+    shellcheck \
+        "$REPOSITORY_ROOT/deploy/install-nginx" \
+        "$REPOSITORY_ROOT/deploy/install-php-site" \
+        "$REPOSITORY_ROOT/deploy/verify-deployment" \
+        "$REPOSITORY_ROOT/packages/rsync/build-el9" \
+        "$REPOSITORY_ROOT/selinux/apply-nginx-policy" \
+        "$REPOSITORY_ROOT/tests/deploy-renderers.sh" \
+        "$REPOSITORY_ROOT/tests/nginx-runtime.sh" \
+        "$REPOSITORY_ROOT/tests/rsync-packaging.sh" \
+        "$REPOSITORY_ROOT/tests/run-all-local.sh"
+    printf 'ShellCheck passed with 0 warnings.\n'
+else
+    printf 'Notice: shellcheck not found in PATH; skipping static shell analysis.\n'
+fi
+
+step "Validating deployment profile assignments..."
+"$REPOSITORY_ROOT/deploy/install-nginx" --check
+
+step "Running deployment renderer and path boundary tests..."
+"$REPOSITORY_ROOT/tests/deploy-renderers.sh"
+
+step "Running rsync packaging contract tests..."
+"$REPOSITORY_ROOT/tests/rsync-packaging.sh"
+
+step "Exercising full profile render..."
+"$REPOSITORY_ROOT/deploy/install-nginx" \
+    --output "$SCRATCH_DIR/nginx-full" \
+    --profile brotli \
+    --profile gzip \
+    --profile post-quantum \
+    --profile quic-bpf \
+    --profile trusted-proxy \
+    --profile websocket \
+    --profile wordpress-cache >/dev/null
+
+[ -s "$SCRATCH_DIR/nginx-full/quic_host.key" ] \
+    || fail "QUIC host key was not generated in full render"
+[ -s "$SCRATCH_DIR/nginx-full/stubs/http/post-quantum.conf" ] \
+    || fail "post-quantum stub was not installed in full render"
+
+step "Exercising PHP site render..."
+"$REPOSITORY_ROOT/deploy/install-php-site" \
+    --output "$SCRATCH_DIR/php-site" \
+    --tag example_wp >/dev/null
+
+[ -f "$SCRATCH_DIR/php-site/etc/php-fpm.d/sites/example_wp.conf" ] \
+    || fail "PHP site config missing from render"
+
+printf '\nAll local pre-commit checks and tests passed successfully.\n'
