@@ -1,0 +1,18 @@
+module @@SELINUX_MODULE@@ 1.0;
+
+require {
+    type httpd_t;
+    type init_t;
+    type unconfined_service_t;
+    attribute file_type;
+    class unix_stream_socket connectto;
+    class dir { getattr search watch };
+    class file { getattr open read watch };
+}
+
+type @@TRIGGER_SELINUX_TYPE@@;
+typeattribute @@TRIGGER_SELINUX_TYPE@@ file_type;
+
+allow httpd_t unconfined_service_t:unix_stream_socket connectto;
+allow init_t @@TRIGGER_SELINUX_TYPE@@:dir { getattr search watch };
+allow init_t @@TRIGGER_SELINUX_TYPE@@:file { getattr open read watch };

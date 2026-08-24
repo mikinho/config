@@ -1,0 +1,14 @@
+# Fail-closed guard installed while deployment policy is being reconciled.
+DenyUsers @@DEPLOY_USER@@
+
+Match User @@DEPLOY_USER@@
+    ForceCommand /bin/false
+    PermitUserRC no
+    PermitTTY no
+    X11Forwarding no
+    AllowTcpForwarding no
+    AllowStreamLocalForwarding no
+    AllowAgentForwarding no
+    PermitTunnel no
+
+Match all

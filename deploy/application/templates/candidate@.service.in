@@ -1,0 +1,51 @@
+[Unit]
+Description=Isolated preflight for @@APPLICATION_TAG@@ release %I
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=@@CONFIG_ROOT@@/.env
+WorkingDirectory=@@APPLICATION_ROOT@@/candidates/%i
+ExecStart=/bin/node ./@@ENTRYPOINT@@ --pidfile %t/@@RUNTIME_DIRECTORY@@-candidate-%i/candidate.pid --listen %t/@@RUNTIME_DIRECTORY@@-candidate-%i/candidate.sock
+User=@@SERVICE_USER@@
+Group=@@SERVICE_GROUP@@
+UMask=0077
+Restart=no
+RuntimeMaxSec=@@CANDIDATE_RUNTIME_MAX_SECONDS@@s
+TimeoutStopSec=30s
+RuntimeDirectory=@@RUNTIME_DIRECTORY@@-candidate-%i
+RuntimeDirectoryMode=0750
+
+@@NETWORK_POLICY@@
+SocketBindDeny=any
+CapabilityBoundingSet=
+SystemCallArchitectures=native
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelLogs=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadOnlyPaths=@@APPLICATION_ROOT@@/candidates/%i @@APPLICATION_ROOT@@/releases @@CONFIG_ROOT@@
+ReadWritePaths=%t/@@RUNTIME_DIRECTORY@@-candidate-%i
+MemoryDenyWriteExecute=no
+LockPersonality=yes
+RestrictRealtime=yes
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @mount
+ProtectHostname=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+TasksMax=@@TASKS_MAX@@
+MemoryHigh=@@MEMORY_HIGH_BYTES@@
+MemoryMax=@@MEMORY_MAX_BYTES@@
+CPUWeight=10
+IOWeight=10
+OOMScoreAdjust=1000

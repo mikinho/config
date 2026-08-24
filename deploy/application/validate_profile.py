@@ -360,6 +360,8 @@ def validate_paths(profile: Mapping[str, Any]) -> ApplicationPaths:
     }
     if len(paths.values()) != len(set(paths.values())):
         fail("paths must identify distinct roots")
+    if PurePosixPath(paths["runtimeRoot"]).parent != PurePosixPath("/run"):
+        fail("paths.runtimeRoot must be one direct child of /run")
     named_paths = [(name, PurePosixPath(path)) for name, path in paths.items()]
     for index, (left_name, left_path) in enumerate(named_paths):
         for right_name, right_path in named_paths[index + 1 :]:

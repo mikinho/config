@@ -1,0 +1,11 @@
+[Unit]
+Description=Watch for the @@APPLICATION_TAG@@ deployment sentinel
+Wants=@@RECOVERY_SERVICE@@
+After=@@RECOVERY_SERVICE@@
+
+[Path]
+PathExists=@@TRIGGER_ROOT@@/inbox/.deploy-done
+Unit=@@FINALIZER_SERVICE@@
+
+[Install]
+WantedBy=multi-user.target

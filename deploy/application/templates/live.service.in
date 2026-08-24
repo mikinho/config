@@ -1,0 +1,55 @@
+[Unit]
+Description=Managed Node application @@APPLICATION_TAG@@
+Requires=@@RECOVERY_SERVICE@@
+After=network-online.target @@RECOVERY_SERVICE@@
+Wants=network-online.target
+StartLimitIntervalSec=60s
+StartLimitBurst=3
+
+[Service]
+Type=simple
+EnvironmentFile=@@CONFIG_ROOT@@/.env
+WorkingDirectory=@@APPLICATION_ROOT@@/current
+ExecStart=/bin/node ./@@ENTRYPOINT@@ --pidfile @@RUNTIME_ROOT@@/@@PID_FILE_NAME@@ --listen @@RUNTIME_ROOT@@/@@SOCKET_NAME@@
+User=@@SERVICE_USER@@
+Group=@@SERVICE_GROUP@@
+UMask=0077
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+RuntimeDirectory=@@RUNTIME_DIRECTORY@@
+RuntimeDirectoryMode=0750
+
+@@NETWORK_POLICY@@
+SocketBindDeny=any
+CapabilityBoundingSet=
+SystemCallArchitectures=native
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelLogs=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadOnlyPaths=@@APPLICATION_ROOT@@/current @@APPLICATION_ROOT@@/releases @@CONFIG_ROOT@@
+ReadWritePaths=@@RUNTIME_ROOT@@
+MemoryDenyWriteExecute=no
+LockPersonality=yes
+RestrictRealtime=yes
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @mount
+ProtectHostname=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+TasksMax=@@TASKS_MAX@@
+MemoryHigh=@@MEMORY_HIGH_BYTES@@
+MemoryMax=@@MEMORY_MAX_BYTES@@
+OOMScoreAdjust=500
+
+[Install]
+WantedBy=multi-user.target
