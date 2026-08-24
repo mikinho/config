@@ -30,6 +30,7 @@ if command -v shellcheck >/dev/null 2>&1; then
         "$REPOSITORY_ROOT/deploy/install-nginx" \
         "$REPOSITORY_ROOT/deploy/install-php-site" \
         "$REPOSITORY_ROOT/deploy/verify-deployment" \
+        "$REPOSITORY_ROOT/deploy/certbot-healthcheck" \
         "$REPOSITORY_ROOT/packages/rsync/build-el9" \
         "$REPOSITORY_ROOT/selinux/apply-nginx-policy" \
         "$REPOSITORY_ROOT/tests/deploy-renderers.sh" \

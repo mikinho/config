@@ -147,6 +147,7 @@ sudo systemctl list-timers --no-pager | grep -Ei 'certbot|letsencrypt'
 sudo systemd-analyze verify php-fpm@SITE_TAG.service
 sudo systemd-analyze security nginx.service php-fpm@SITE_TAG.service
 sudo certbot renew --dry-run
+deploy/certbot-healthcheck
 ```
 
 CI runs `systemd-analyze verify` for every push on Rocky Linux 9 and CentOS

@@ -1,0 +1,182 @@
+#!/bin/sh
+
+set -eu
+
+PROGRAM_NAME=${0##*/}
+LIVE_DIR=/etc/letsencrypt/live
+OUTPUT_FILE=
+WARN_DAYS=30
+FORMAT=text
+
+usage() {
+    cat <<EOF
+Usage:
+  $PROGRAM_NAME [OPTIONS]
+
+Evaluates TLS certificate expiration and validity for Let's Encrypt certificates.
+Calculates remaining days, extracts Subject/Issuer details, and emits formatted
+reports or Prometheus-compatible metrics for monitoring agents.
+
+Options:
+  --live-dir DIR      Path to Let's Encrypt live directory (default: /etc/letsencrypt/live)
+  --output FILE       Write metrics output to FILE
+  --format FORMAT     Output format: 'text' (default), 'json', or 'prometheus'
+  --warn-days DAYS    Threshold days to warn on impending expiry (default: 30)
+  --help, -h          Show this help message
+
+Exit Status:
+  0 if all inspected certificates have >= warn-days remaining.
+  1 if any certificate is near expiry, expired, or missing.
+EOF
+}
+
+fail() {
+    printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2
+    exit 1
+}
+
+CERT_COUNT=0
+EXPIRING_COUNT=0
+OUTPUT_BUFFER=
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --live-dir)
+            [ "$#" -ge 2 ] || fail "--live-dir requires a directory"
+            LIVE_DIR=$2
+            shift 2
+            ;;
+        --output)
+            [ "$#" -ge 2 ] || fail "--output requires a file path"
+            OUTPUT_FILE=$2
+            shift 2
+            ;;
+        --format)
+            [ "$#" -ge 2 ] || fail "--format requires a format name (text, json, prometheus)"
+            FORMAT=$2
+            shift 2
+            ;;
+        --warn-days)
+            [ "$#" -ge 2 ] || fail "--warn-days requires a number"
+            WARN_DAYS=$2
+            shift 2
+            ;;
+        --help | -h)
+            usage
+            exit 0
+            ;;
+        *)
+            fail "unknown argument: $1"
+            ;;
+    esac
+done
+
+if ! command -v openssl >/dev/null 2>&1; then
+    fail "openssl binary not found in PATH"
+fi
+
+if [ ! -d "$LIVE_DIR" ]; then
+    printf 'Notice: live directory not found at %s; no certificates inspected.\n' "$LIVE_DIR"
+    exit 0
+fi
+
+WARN_SECONDS=$((WARN_DAYS * 86400))
+
+case "$FORMAT" in
+    json)
+        OUTPUT_BUFFER="{\"certificates\":["
+        ;;
+    prometheus)
+        OUTPUT_BUFFER=$(printf '# HELP certbot_certificate_expiry_seconds Time until certificate expiration in seconds\n# TYPE certbot_certificate_expiry_seconds gauge\n')
+        ;;
+    text)
+        OUTPUT_BUFFER=""
+        ;;
+    *)
+        fail "unsupported format: $FORMAT (choose text, json, or prometheus)"
+        ;;
+esac
+
+FIRST_JSON_ENTRY=1
+
+for cert_path in "$LIVE_DIR"/*/fullchain.pem; do
+    [ -f "$cert_path" ] || continue
+    CERT_COUNT=$((CERT_COUNT + 1))
+
+    domain_dir=${cert_path%/*}
+    domain_name=${domain_dir##*/}
+
+    end_date_raw=$(openssl x509 -enddate -noout -in "$cert_path" 2>/dev/null | sed 's/^notAfter=//')
+    subject_raw=$(openssl x509 -subject -noout -in "$cert_path" 2>/dev/null | sed 's/^subject=//')
+
+    is_expiring=0
+    if ! openssl x509 -checkend "$WARN_SECONDS" -noout -in "$cert_path" >/dev/null 2>&1; then
+        is_expiring=1
+        EXPIRING_COUNT=$((EXPIRING_COUNT + 1))
+    fi
+
+    # Calculate remaining seconds via openssl date comparison if python/date is available
+    remaining_days="unknown"
+    if command -v python3 >/dev/null 2>&1; then
+        remaining_days=$(python3 -c "
+import datetime, sys
+try:
+    s = sys.argv[1]
+    # Openssl date format: e.g. May 24 12:00:00 2026 GMT
+    exp = datetime.datetime.strptime(s, '%b %d %H:%M:%S %Y %Z')
+    now = datetime.datetime.utcnow()
+    diff = exp - now
+    print(diff.days)
+except Exception:
+    print('unknown')
+" "$end_date_raw" 2>/dev/null || echo "unknown")
+    fi
+
+    case "$FORMAT" in
+        text)
+            status_tag="[OK]"
+            if [ "$is_expiring" -eq 1 ]; then
+                status_tag="[EXPIRING/EXPIRED]"
+            fi
+            line=$(printf '%-18s %-30s Expiry: %-24s (%s days remaining)\n' "$status_tag" "$domain_name" "$end_date_raw" "$remaining_days")
+            OUTPUT_BUFFER="$OUTPUT_BUFFER${OUTPUT_BUFFER:+
+}$line"
+            ;;
+        json)
+            if [ "$FIRST_JSON_ENTRY" -eq 1 ]; then
+                FIRST_JSON_ENTRY=0
+            else
+                OUTPUT_BUFFER="$OUTPUT_BUFFER,"
+            fi
+            OUTPUT_BUFFER="$OUTPUT_BUFFER{\"domain\":\"$domain_name\",\"subject\":\"$subject_raw\",\"end_date\":\"$end_date_raw\",\"remaining_days\":\"$remaining_days\",\"expiring\":$([ "$is_expiring" -eq 1 ] && echo true || echo false)}"
+            ;;
+        prometheus)
+            remaining_seconds="0"
+            if [ "$remaining_days" != "unknown" ]; then
+                remaining_seconds=$((remaining_days * 86400))
+            fi
+            line=$(printf 'certbot_certificate_expiry_seconds{domain="%s"} %s\n' "$domain_name" "$remaining_seconds")
+            OUTPUT_BUFFER="$OUTPUT_BUFFER$line"
+            ;;
+    esac
+done
+
+if [ "$FORMAT" = "json" ]; then
+    OUTPUT_BUFFER="$OUTPUT_BUFFER],\"total\":$CERT_COUNT,\"expiring\":$EXPIRING_COUNT}"
+fi
+
+if [ -n "$OUTPUT_FILE" ]; then
+    output_parent=${OUTPUT_FILE%/*}
+    if [ "$output_parent" != "$OUTPUT_FILE" ] && [ -n "$output_parent" ]; then
+        mkdir -p "$output_parent"
+    fi
+    printf '%s\n' "$OUTPUT_BUFFER" > "$OUTPUT_FILE"
+else
+    printf '%s\n' "$OUTPUT_BUFFER"
+fi
+
+if [ "$EXPIRING_COUNT" -gt 0 ]; then
+    exit 1
+fi
+
+exit 0
