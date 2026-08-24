@@ -4,6 +4,7 @@
   "application": {
     "tag": "example_node_app",
     "serviceUser": "example_node_app",
+    "serviceGroup": "example_node_app",
     "deployUser": "example_deploy",
     "deployGroup": "example_deploy"
   },

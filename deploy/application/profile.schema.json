@@ -23,10 +23,11 @@
     "application": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["tag", "serviceUser", "deployUser", "deployGroup"],
+      "required": ["tag", "serviceUser", "serviceGroup", "deployUser", "deployGroup"],
       "properties": {
         "tag": { "$ref": "#/$defs/identifier" },
         "serviceUser": { "$ref": "#/$defs/identifier" },
+        "serviceGroup": { "$ref": "#/$defs/identifier" },
         "deployUser": { "$ref": "#/$defs/identifier" },
         "deployGroup": { "$ref": "#/$defs/identifier" }
       }

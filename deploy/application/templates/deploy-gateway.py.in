@@ -1,0 +1,1060 @@
+#!/usr/bin/python3 -I
+"""Serialize the restricted SSH ingress used by application deployments.
+
+The deploy account has no shell. Its SSH ForceCommand invokes this root-owned
+program, which accepts only one configured, token-bound deployment session.
+The session serializes the complete rsync/finalization transaction and creates
+a durable token-bound transfer marker before creating an isolated candidate.
+It takes the ingress barrier exclusively while writing, atomically promotes
+that marker to the watched sentinel only after the candidate is synchronized,
+and holds the barrier shared through the final result. An interrupted or failed
+rsync leaves both the marker and non-live candidate available for reviewed
+recovery; it can never partially replace the serving release.
+"""
+
+from __future__ import annotations
+
+import argparse
+from contextlib import contextmanager
+import ctypes
+from dataclasses import dataclass
+from enum import Enum
+import fcntl
+import grp
+import os
+from pathlib import Path
+import pwd
+import re
+import shlex
+import stat
+import subprocess
+import sys
+import time
+from typing import Final, Iterator, NoReturn, Optional, Sequence
+
+
+DEPLOY_USERNAME: Final = "@@DEPLOY_USER@@"
+DEPLOY_GROUPNAME: Final = "@@DEPLOY_GROUP@@"
+TRIGGER_ROOT: Final = Path("@@TRIGGER_ROOT@@")
+INBOX_NAME: Final = "inbox"
+RESULTS_NAME: Final = "results"
+LOCK_NAME: Final = "ingress.lock"
+PUBLISH_LOCK_NAME: Final = "publish.lock"
+SESSION_LOCK_NAME: Final = "session.lock"
+BLOCKER_NAME: Final = "blocked"
+BLOCKER_BYTES: Final = b"blocked\n"
+SENTINEL_NAME: Final = ".deploy-done"
+TRANSFER_MARKER_NAME: Final = ".transfer-in-progress"
+TRANSFER_PENDING_NAME: Final = ".transfer-in-progress.pending"
+RRSYNC_PATH: Final = Path("/usr/local/bin/rrsync")
+RRSYNC_ROOT: Final = Path("@@INCOMING_ROOT@@")
+SYNC_PATH: Final = Path("/usr/bin/sync")
+SESSION_COMMAND: Final = "@@SESSION_COMMAND@@"
+TEST_MODE_ENV: Final = "@@GATEWAY_TEST_ENV@@"
+
+ROOT_UID: Final = 0
+ROOT_GID: Final = 0
+TRIGGER_ROOT_MODE: Final = 0o755
+INBOX_MODE: Final = 0o2770
+RRSYNC_ROOT_MODE: Final = 0o2770
+RESULTS_MODE: Final = 0o750
+LOCK_MODE: Final = 0o660
+SENTINEL_MODE: Final = 0o660
+WAIT_TIMEOUT_SECONDS: Final = 660.0
+POLL_INTERVAL_SECONDS: Final = 0.05
+MAX_COMMAND_BYTES: Final = 8192
+MAX_TOKEN_BYTES: Final = 128
+MAX_RESULT_BYTES: Final = 16
+RESULT_MODE: Final = 0o640
+BLOCKER_MODE: Final = 0o600
+RENAME_NOREPLACE: Final = 1
+
+TOKEN_PATTERN: Final = re.compile(
+    r"^(?:manual|[0-9a-f]{40,64})-[0-9]{1,20}-[0-9a-f]{24}$"
+)
+CLAIM_PATTERN: Final = re.compile(r"^deploy-trigger-[0-9]+-[0-9a-f]{24}$")
+SUCCESS_RESULT: Final = b"success\n"
+FAILED_RESULT: Final = b"failed\n"
+RSYNC_SERVER_SHORT_OPTIONS: Final = re.compile(r"^-vOtrze\.[A-Za-z0-9]+$")
+RSYNC_SERVER_ARGUMENTS: Final = (
+    "--log-format=%i",
+    "--delete",
+    "--fsync",
+    "--super",
+    ".",
+)
+
+
+class GatewayError(Exception):
+    """A deterministic gateway validation or execution failure."""
+
+    def __init__(self, message: str, exit_code: int = 1) -> None:
+        """Initialize an error with the process status returned to SSH."""
+
+        super().__init__(message)
+        self.exit_code = exit_code
+
+
+class Operation(Enum):
+    """The command family accepted by the restricted account."""
+
+    SESSION = "session"
+
+
+@dataclass(frozen=True)
+class ParsedCommand:
+    """A validated end-to-end deploy session."""
+
+    operation: Operation
+    token: str
+    rsync_arguments: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class GatewayConfig:
+    """Fixed paths and identities required by one gateway invocation."""
+
+    trigger_root: Path
+    rrsync_path: Path
+    rrsync_root: Path
+    sync_path: Path
+    required_username: str
+    root_uid: int
+    root_gid: int
+    deploy_uid: int
+    deploy_gid: int
+    inbox_mode: int
+    rrsync_root_mode: int
+    result_uid: int
+    test_mode: bool = False
+    timeout_seconds: float = WAIT_TIMEOUT_SECONDS
+    poll_interval_seconds: float = POLL_INTERVAL_SECONDS
+
+
+@dataclass(frozen=True)
+class PublishedSentinel:
+    """The inode identity of the completion token published by this process."""
+
+    device: int
+    inode: int
+
+
+def directory_flags() -> int:
+    """Return flags for opening a real directory without following it."""
+
+    return os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+
+
+def validate_directory_metadata(
+    metadata: os.stat_result,
+    *,
+    display_path: Path,
+    expected_uid: int,
+    expected_gid: int,
+    expected_mode: int,
+) -> None:
+    """Require the reviewed identity and mode on an opened directory inode."""
+
+    actual_mode = stat.S_IMODE(metadata.st_mode)
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise GatewayError(f"expected a real directory: {display_path}")
+    if (
+        metadata.st_uid != expected_uid
+        or metadata.st_gid != expected_gid
+        or actual_mode != expected_mode
+    ):
+        raise GatewayError(
+            f"unsafe directory identity for {display_path}: "
+            f"uid={metadata.st_uid} gid={metadata.st_gid} mode={actual_mode:o}"
+        )
+
+
+def open_validated_root(config: GatewayConfig) -> int:
+    """Open and validate the fixed gateway state root."""
+
+    try:
+        root_fd = os.open(config.trigger_root, directory_flags())
+    except OSError as error:
+        raise GatewayError(
+            f"cannot safely open gateway root {config.trigger_root}: {error.strerror}"
+        ) from error
+    try:
+        validate_directory_metadata(
+            os.fstat(root_fd),
+            display_path=config.trigger_root,
+            expected_uid=config.root_uid,
+            expected_gid=config.root_gid,
+            expected_mode=TRIGGER_ROOT_MODE,
+        )
+        return root_fd
+    except BaseException:
+        os.close(root_fd)
+        raise
+
+
+def open_validated_child_directory(
+    root_fd: int,
+    config: GatewayConfig,
+    name: str,
+    *,
+    expected_mode: int,
+) -> int:
+    """Open and validate one fixed directory directly below the gateway root."""
+
+    display_path = config.trigger_root / name
+    try:
+        directory_fd = os.open(name, directory_flags(), dir_fd=root_fd)
+    except OSError as error:
+        raise GatewayError(
+            f"cannot safely open directory {display_path}: {error.strerror}"
+        ) from error
+    try:
+        validate_directory_metadata(
+            os.fstat(directory_fd),
+            display_path=display_path,
+            expected_uid=config.root_uid,
+            expected_gid=config.deploy_gid,
+            expected_mode=expected_mode,
+        )
+        return directory_fd
+    except BaseException:
+        os.close(directory_fd)
+        raise
+
+
+def validate_lock_metadata(
+    metadata: os.stat_result, config: GatewayConfig, *, display_path: Path
+) -> None:
+    """Require the reviewed identity on the opened ingress-lock inode."""
+
+    actual_mode = stat.S_IMODE(metadata.st_mode)
+    if not stat.S_ISREG(metadata.st_mode):
+        raise GatewayError(f"ingress lock is not a regular file: {display_path}")
+    if metadata.st_nlink != 1:
+        raise GatewayError(f"ingress lock must have exactly one hard link: {display_path}")
+    if (
+        metadata.st_uid != config.root_uid
+        or metadata.st_gid != config.deploy_gid
+        or actual_mode != LOCK_MODE
+    ):
+        raise GatewayError(
+            f"unsafe ingress-lock identity for {display_path}: "
+            f"uid={metadata.st_uid} gid={metadata.st_gid} mode={actual_mode:o}"
+        )
+
+
+def open_validated_lock(root_fd: int, config: GatewayConfig, lock_name: str) -> int:
+    """Open one fixed coordination lock without following its pathname."""
+
+    display_path = config.trigger_root / lock_name
+    try:
+        path_metadata = os.stat(lock_name, dir_fd=root_fd, follow_symlinks=False)
+    except OSError as error:
+        raise GatewayError(f"cannot inspect ingress lock {display_path}: {error.strerror}") from error
+    validate_lock_metadata(path_metadata, config, display_path=display_path)
+
+    flags = os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        lock_fd = os.open(lock_name, flags, dir_fd=root_fd)
+    except OSError as error:
+        raise GatewayError(f"cannot safely open ingress lock {display_path}: {error.strerror}") from error
+    try:
+        opened_metadata = os.fstat(lock_fd)
+        validate_lock_metadata(opened_metadata, config, display_path=display_path)
+        if (
+            opened_metadata.st_dev != path_metadata.st_dev
+            or opened_metadata.st_ino != path_metadata.st_ino
+        ):
+            raise GatewayError(f"ingress lock changed while opening: {display_path}")
+        return lock_fd
+    except BaseException:
+        os.close(lock_fd)
+        raise
+
+
+def require_lock_entry_matches(
+    root_fd: int, lock_fd: int, config: GatewayConfig, lock_name: str
+) -> None:
+    """Revalidate that the locked inode remains the fixed directory entry."""
+
+    display_path = config.trigger_root / lock_name
+    try:
+        path_metadata = os.stat(lock_name, dir_fd=root_fd, follow_symlinks=False)
+    except OSError as error:
+        raise GatewayError(f"cannot revalidate ingress lock {display_path}: {error.strerror}") from error
+    opened_metadata = os.fstat(lock_fd)
+    validate_lock_metadata(path_metadata, config, display_path=display_path)
+    validate_lock_metadata(opened_metadata, config, display_path=display_path)
+    if (
+        path_metadata.st_dev != opened_metadata.st_dev
+        or path_metadata.st_ino != opened_metadata.st_ino
+    ):
+        raise GatewayError(f"locked inode no longer matches {display_path}")
+
+
+@contextmanager
+def coordination_lock(
+    root_fd: int,
+    config: GatewayConfig,
+    lock_name: str,
+    operation: int,
+) -> Iterator[int]:
+    """Hold one validated coordination lock in the requested flock mode."""
+
+    lock_fd = open_validated_lock(root_fd, config, lock_name)
+    try:
+        try:
+            fcntl.flock(lock_fd, operation)
+        except OSError as error:
+            raise GatewayError(
+                f"cannot acquire deploy coordination lock {lock_name}: {error.strerror}"
+            ) from error
+        require_lock_entry_matches(root_fd, lock_fd, config, lock_name)
+        yield lock_fd
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_fd)
+
+
+def parse_original_command(command: str) -> ParsedCommand:
+    """Parse the exact token-bound rsync session supplied by sshd."""
+
+    if not command or len(command.encode("utf-8", errors="surrogatepass")) > MAX_COMMAND_BYTES:
+        raise GatewayError("SSH_ORIGINAL_COMMAND is missing or too large")
+    try:
+        arguments = shlex.split(command, posix=True)
+    except ValueError as error:
+        raise GatewayError("SSH_ORIGINAL_COMMAND has invalid quoting") from error
+
+    if len(arguments) >= 5 and arguments[0] == SESSION_COMMAND:
+        token = arguments[1]
+        rsync_arguments = tuple(arguments[2:])
+        if TOKEN_PATTERN.fullmatch(token) is None:
+            raise GatewayError("deploy token has an invalid format")
+        if valid_rsync_receiver_arguments(rsync_arguments, token):
+            return ParsedCommand(Operation.SESSION, token, rsync_arguments)
+    raise GatewayError("SSH_ORIGINAL_COMMAND is not an allowed deploy operation")
+
+
+def valid_rsync_receiver_arguments(rsync_arguments: tuple[str, ...], token: str) -> bool:
+    """Accept only the metadata-bounded receiver command emitted by deploy."""
+
+    if len(rsync_arguments) != 8 or rsync_arguments[0] != "--server":
+        return False
+    if RSYNC_SERVER_SHORT_OPTIONS.fullmatch(rsync_arguments[1]) is None:
+        return False
+    return rsync_arguments[2:-1] == RSYNC_SERVER_ARGUMENTS and rsync_arguments[-1] == f"{token}/"
+
+
+def run_restricted_rsync_child(
+    config: GatewayConfig,
+    rsync_arguments: tuple[str, ...],
+    inherited_lock_fds: tuple[int, ...],
+) -> int:
+    """Run fixed rrsync while carrying both session locks into its exec chain."""
+
+    environment = {
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": "/usr/bin:/bin",
+        "SSH_ORIGINAL_COMMAND": shlex.join(("rsync", *rsync_arguments)),
+        "TMPDIR": "/tmp",
+    }
+    if config.test_mode:
+        for name in (
+            "FAKE_RRSYNC_DELAY",
+            "FAKE_RRSYNC_EXEC_CHAIN",
+            "FAKE_RRSYNC_MARKER",
+            "FAKE_RRSYNC_STATUS",
+        ):
+            if name in os.environ:
+                environment[name] = os.environ[name]
+    for lock_fd in inherited_lock_fds:
+        os.set_inheritable(lock_fd, True)
+    try:
+        result = subprocess.run(
+            [
+                str(config.rrsync_path),
+                "-wo",
+                "-munge",
+                "-no-lock",
+                str(config.rrsync_root),
+            ],
+            check=False,
+            env=environment,
+            pass_fds=inherited_lock_fds,
+        )
+    except OSError as error:
+        raise GatewayError(f"cannot execute the restricted rsync wrapper: {error.strerror}") from error
+    return result.returncode
+
+
+def open_validated_candidate_root(config: GatewayConfig) -> int:
+    """Pin and validate the root that may contain deploy-owned candidates."""
+
+    try:
+        directory_fd = os.open(config.rrsync_root, directory_flags())
+    except OSError as error:
+        raise GatewayError(
+            f"cannot safely open candidate root {config.rrsync_root}: {error.strerror}"
+        ) from error
+    try:
+        validate_directory_metadata(
+            os.fstat(directory_fd),
+            display_path=config.rrsync_root,
+            expected_uid=config.root_uid,
+            expected_gid=config.deploy_gid,
+            expected_mode=config.rrsync_root_mode,
+        )
+        return directory_fd
+    except BaseException:
+        os.close(directory_fd)
+        raise
+
+
+def require_fresh_candidate(candidate_root_fd: int, token: str) -> None:
+    """Refuse to append to or replace a candidate from an earlier session."""
+
+    if entry_metadata(candidate_root_fd, token) is not None:
+        raise GatewayError("deploy candidate already exists")
+
+
+def validate_received_candidate(
+    candidate_root_fd: int,
+    config: GatewayConfig,
+    token: str,
+) -> None:
+    """Require rsync to leave one real deploy-owned candidate directory."""
+
+    metadata = entry_metadata(candidate_root_fd, token)
+    if metadata is None:
+        raise GatewayError("received candidate is missing")
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise GatewayError("received candidate is not a real directory")
+    if metadata.st_uid != config.deploy_uid or metadata.st_gid != config.deploy_gid:
+        raise GatewayError(
+            "received candidate has an unsafe identity: "
+            f"uid={metadata.st_uid} gid={metadata.st_gid}"
+        )
+    if stat.S_IMODE(metadata.st_mode) & 0o002:
+        raise GatewayError("received candidate must not be world-writable")
+
+
+def sync_payload_filesystem(config: GatewayConfig) -> None:
+    """Durably flush the destination filesystem before publishing completion."""
+
+    environment = {
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": "/usr/bin:/bin",
+        "TMPDIR": "/tmp",
+    }
+    if config.test_mode:
+        for name in (
+            "FAKE_PAYLOAD_SYNC_DELAY",
+            "FAKE_PAYLOAD_SYNC_MARKER",
+            "FAKE_PAYLOAD_SYNC_STATUS",
+        ):
+            if name in os.environ:
+                environment[name] = os.environ[name]
+    try:
+        result = subprocess.run(
+            [str(config.sync_path), "-f", str(config.rrsync_root)],
+            check=False,
+            env=environment,
+        )
+    except OSError as error:
+        raise GatewayError(f"cannot execute payload filesystem sync: {error.strerror}") from error
+    if result.returncode != 0:
+        raise GatewayError(
+            f"payload filesystem sync failed with status {result.returncode}"
+        )
+
+
+def entry_metadata(directory_fd: int, name: str) -> Optional[os.stat_result]:
+    """Return no-follow metadata for a child, or None when it is absent."""
+
+    try:
+        return os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise GatewayError(f"cannot inspect gateway state entry {name}: {error.strerror}") from error
+
+
+def rename_noreplace(directory_fd: int, source: str, destination: str) -> None:
+    """Rename within one directory without a check-then-overwrite race."""
+
+    if sys.platform == "linux":
+        libc = ctypes.CDLL(None, use_errno=True)
+        renameat2 = getattr(libc, "renameat2", None)
+        if renameat2 is None:
+            raise GatewayError("libc does not expose required renameat2")
+        renameat2.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        renameat2.restype = ctypes.c_int
+        result = renameat2(
+            directory_fd,
+            os.fsencode(source),
+            directory_fd,
+            os.fsencode(destination),
+            RENAME_NOREPLACE,
+        )
+        if result != 0:
+            error_number = ctypes.get_errno()
+            raise OSError(error_number, os.strerror(error_number), destination)
+        return
+
+    # Guarded repository tests also run on macOS. A hard-link/unlink sequence
+    # gives those tests equivalent no-replace semantics; production is Linux
+    # and requires the atomic renameat2 path above.
+    os.link(
+        source,
+        destination,
+        src_dir_fd=directory_fd,
+        dst_dir_fd=directory_fd,
+        follow_symlinks=False,
+    )
+    os.unlink(source, dir_fd=directory_fd)
+
+
+def matching_result_names(results_fd: int, token: str) -> list[str]:
+    """Return deterministic append-only result names for one exact token."""
+
+    prefix = f"{token}."
+    try:
+        names = os.listdir(results_fd)
+    except OSError as error:
+        raise GatewayError(f"cannot enumerate deploy results: {error.strerror}") from error
+    return sorted(
+        name
+        for name in names
+        if name.startswith(prefix) and CLAIM_PATTERN.fullmatch(name[len(prefix) :]) is not None
+    )
+
+
+def token_has_result_evidence(results_fd: int, token: str) -> bool:
+    """Return whether append-only evidence already exists for this token."""
+
+    if matching_result_names(results_fd, token):
+        return True
+    try:
+        return f"{token}.transfer-failed" in os.listdir(results_fd)
+    except OSError as error:
+        raise GatewayError(f"cannot enumerate deploy results: {error.strerror}") from error
+
+
+def write_all(file_fd: int, contents: bytes) -> None:
+    """Write every transaction-marker byte, rejecting a zero-length write."""
+
+    remaining = memoryview(contents)
+    while remaining:
+        try:
+            written = os.write(file_fd, remaining)
+        except OSError as error:
+            raise GatewayError(f"cannot write deploy transaction marker: {error.strerror}") from error
+        if written <= 0:
+            raise GatewayError("cannot write deploy transaction marker: zero-length write")
+        remaining = remaining[written:]
+
+
+def validate_transfer_marker_metadata(
+    metadata: os.stat_result,
+    config: GatewayConfig,
+) -> None:
+    """Require the exact deploy-owned transfer-marker inode contract."""
+
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        raise GatewayError("deploy transfer marker is not a single-link regular file")
+    if (
+        metadata.st_uid != config.deploy_uid
+        or metadata.st_gid != config.deploy_gid
+        or stat.S_IMODE(metadata.st_mode) != SENTINEL_MODE
+    ):
+        raise GatewayError("deploy transfer marker does not have the trusted ownership and mode")
+
+
+def read_valid_transfer_marker(
+    inbox_fd: int,
+    config: GatewayConfig,
+    token: str,
+    identity: PublishedSentinel,
+) -> None:
+    """Reopen and validate the exact durable marker created before rsync."""
+
+    path_metadata = entry_metadata(inbox_fd, TRANSFER_MARKER_NAME)
+    if path_metadata is None:
+        raise GatewayError("deploy transfer marker disappeared before publication")
+    validate_transfer_marker_metadata(path_metadata, config)
+    if path_metadata.st_dev != identity.device or path_metadata.st_ino != identity.inode:
+        raise GatewayError("deploy transfer marker was unexpectedly replaced")
+
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        marker_fd = os.open(TRANSFER_MARKER_NAME, flags, dir_fd=inbox_fd)
+    except OSError as error:
+        raise GatewayError(f"cannot safely open deploy transfer marker: {error.strerror}") from error
+    try:
+        opened_metadata = os.fstat(marker_fd)
+        validate_transfer_marker_metadata(opened_metadata, config)
+        if (
+            opened_metadata.st_dev != path_metadata.st_dev
+            or opened_metadata.st_ino != path_metadata.st_ino
+        ):
+            raise GatewayError("deploy transfer marker changed while opening")
+        contents = os.read(marker_fd, MAX_TOKEN_BYTES + 1)
+        if contents != f"{token}\n".encode("ascii"):
+            raise GatewayError("deploy transfer marker has invalid contents")
+    finally:
+        os.close(marker_fd)
+
+
+def create_transfer_marker(
+    inbox_fd: int,
+    results_fd: int,
+    config: GatewayConfig,
+    token: str,
+) -> PublishedSentinel:
+    """Create and durably publish the transaction marker before live-tree writes."""
+
+    if entry_metadata(inbox_fd, SENTINEL_NAME) is not None:
+        raise GatewayError("a deploy completion token is already pending")
+    if entry_metadata(inbox_fd, TRANSFER_MARKER_NAME) is not None:
+        raise GatewayError("an interrupted deploy transfer requires reviewed recovery")
+    if entry_metadata(inbox_fd, TRANSFER_PENDING_NAME) is not None:
+        raise GatewayError("an incomplete pre-transfer marker requires reviewed recovery")
+    if token_has_result_evidence(results_fd, token):
+        raise GatewayError("a result already exists for this deploy token")
+
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
+    marker_fd = -1
+    pending_exists = False
+    try:
+        try:
+            marker_fd = os.open(TRANSFER_PENDING_NAME, flags, SENTINEL_MODE, dir_fd=inbox_fd)
+        except OSError as error:
+            raise GatewayError(f"cannot create deploy pre-transfer marker: {error.strerror}") from error
+        pending_exists = True
+        os.fchmod(marker_fd, SENTINEL_MODE)
+        write_all(marker_fd, f"{token}\n".encode("ascii"))
+        try:
+            os.fsync(marker_fd)
+        except OSError as error:
+            raise GatewayError(f"cannot fsync deploy transfer marker: {error.strerror}") from error
+        metadata = os.fstat(marker_fd)
+        validate_transfer_marker_metadata(metadata, config)
+        try:
+            os.fsync(inbox_fd)
+        except OSError as error:
+            raise GatewayError(
+                f"cannot fsync deploy inbox after pre-transfer marker creation: {error.strerror}"
+            ) from error
+        try:
+            rename_noreplace(inbox_fd, TRANSFER_PENDING_NAME, TRANSFER_MARKER_NAME)
+        except FileExistsError as error:
+            raise GatewayError("refusing to overwrite an existing deploy transfer marker") from error
+        except OSError as error:
+            raise GatewayError(
+                f"cannot atomically publish deploy transfer marker: {error.strerror}"
+            ) from error
+        pending_exists = False
+        try:
+            os.fsync(inbox_fd)
+        except OSError as error:
+            raise GatewayError(
+                f"cannot fsync deploy inbox after transfer marker publication: {error.strerror}"
+            ) from error
+        return PublishedSentinel(metadata.st_dev, metadata.st_ino)
+    finally:
+        if marker_fd >= 0:
+            os.close(marker_fd)
+        # Any ordinary exception occurs before rsync starts, so cleanup is
+        # safe. Process/host death bypasses this block and leaves the durable
+        # marker as the intended fail-closed latch.
+        if pending_exists:
+            try:
+                os.unlink(TRANSFER_PENDING_NAME, dir_fd=inbox_fd)
+                os.fsync(inbox_fd)
+            except OSError:
+                pass
+
+
+def promote_transfer_marker(
+    inbox_fd: int,
+    results_fd: int,
+    config: GatewayConfig,
+    token: str,
+    identity: PublishedSentinel,
+) -> PublishedSentinel:
+    """Atomically promote the pre-rsync marker to the watched sentinel."""
+
+    read_valid_transfer_marker(inbox_fd, config, token, identity)
+    if entry_metadata(inbox_fd, SENTINEL_NAME) is not None:
+        raise GatewayError("a deploy completion token appeared before publication")
+    if token_has_result_evidence(results_fd, token):
+        raise GatewayError("a result appeared for this deploy token before publication")
+    try:
+        rename_noreplace(inbox_fd, TRANSFER_MARKER_NAME, SENTINEL_NAME)
+    except FileExistsError as error:
+        raise GatewayError("refusing to overwrite an existing deploy sentinel") from error
+    except OSError as error:
+        raise GatewayError(f"cannot atomically publish deploy sentinel: {error.strerror}") from error
+    try:
+        published = os.stat(SENTINEL_NAME, dir_fd=inbox_fd, follow_symlinks=False)
+    except OSError as error:
+        raise GatewayError(f"cannot inspect published deploy sentinel: {error.strerror}") from error
+    if published.st_dev != identity.device or published.st_ino != identity.inode:
+        raise GatewayError("published deploy sentinel lost its transfer-marker identity")
+    try:
+        os.fsync(inbox_fd)
+    except OSError as error:
+        raise GatewayError(f"cannot fsync deploy inbox after publication: {error.strerror}") from error
+    return identity
+
+
+def wait_for_sentinel_claim(
+    inbox_fd: int, identity: PublishedSentinel, config: GatewayConfig
+) -> None:
+    """Hold ingress until the finalizer atomically removes this sentinel."""
+
+    deadline = time.monotonic() + config.timeout_seconds
+    while True:
+        metadata = entry_metadata(inbox_fd, SENTINEL_NAME)
+        if metadata is None:
+            return
+        if metadata.st_dev != identity.device or metadata.st_ino != identity.inode:
+            raise GatewayError("pending deploy sentinel was unexpectedly replaced")
+        if time.monotonic() >= deadline:
+            raise GatewayError("timed out waiting for the deploy sentinel to be claimed")
+        time.sleep(config.poll_interval_seconds)
+
+
+def read_result(results_fd: int, result_name: str, config: GatewayConfig) -> bytes:
+    """Return one validated append-only root-owned result."""
+
+    path_metadata = entry_metadata(results_fd, result_name)
+    if path_metadata is None:
+        raise GatewayError("deploy result disappeared before it could be opened")
+    if not stat.S_ISREG(path_metadata.st_mode) or path_metadata.st_nlink != 1:
+        raise GatewayError("deploy result is not a single-link regular file")
+    if (
+        path_metadata.st_uid != config.result_uid
+        or path_metadata.st_gid != config.deploy_gid
+        or stat.S_IMODE(path_metadata.st_mode) != RESULT_MODE
+    ):
+        raise GatewayError("deploy result does not have the trusted ownership and mode")
+
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        result_fd = os.open(result_name, flags, dir_fd=results_fd)
+    except OSError as error:
+        raise GatewayError(f"cannot safely open deploy result: {error.strerror}") from error
+    try:
+        opened_metadata = os.fstat(result_fd)
+        if (
+            opened_metadata.st_dev != path_metadata.st_dev
+            or opened_metadata.st_ino != path_metadata.st_ino
+            or not stat.S_ISREG(opened_metadata.st_mode)
+            or opened_metadata.st_nlink != 1
+            or opened_metadata.st_uid != config.result_uid
+            or opened_metadata.st_gid != config.deploy_gid
+            or stat.S_IMODE(opened_metadata.st_mode) != RESULT_MODE
+        ):
+            raise GatewayError("deploy result changed while opening")
+        chunks = []  # type: list[bytes]
+        remaining = MAX_RESULT_BYTES + 1
+        while remaining > 0:
+            chunk = os.read(result_fd, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(result_fd)
+
+
+def validate_present_blocker(root_fd: int, config: GatewayConfig) -> None:
+    """Require a present unresolved-work blocker to have its fixed identity.
+
+    The gateway account can stat this root-owned marker but deliberately cannot
+    read its 0600 contents. The root finalizer and verifier validate the payload;
+    this process only needs to hold the session mutex until the marker vanishes.
+    """
+
+    path_metadata = entry_metadata(root_fd, BLOCKER_NAME)
+    if path_metadata is None:
+        return
+    if (
+        not stat.S_ISREG(path_metadata.st_mode)
+        or path_metadata.st_nlink != 1
+        or path_metadata.st_uid != config.root_uid
+        or path_metadata.st_gid != config.root_gid
+        or stat.S_IMODE(path_metadata.st_mode) != BLOCKER_MODE
+    ):
+        raise GatewayError("deploy blocker does not have the trusted ownership and mode")
+
+
+def wait_for_blocker_clear(root_fd: int, config: GatewayConfig) -> None:
+    """Keep the session mutex until root has durably removed the success latch."""
+
+    deadline = time.monotonic() + config.timeout_seconds
+    while entry_metadata(root_fd, BLOCKER_NAME) is not None:
+        validate_present_blocker(root_fd, config)
+        if time.monotonic() >= deadline:
+            raise GatewayError("timed out waiting for the successful deploy blocker to clear")
+        time.sleep(config.poll_interval_seconds)
+
+
+def wait_for_result(
+    root_fd: int, results_fd: int, token: str, config: GatewayConfig
+) -> int:
+    """Wait for and interpret the first append-only result for the exact token."""
+
+    deadline = time.monotonic() + config.timeout_seconds
+    while True:
+        result_names = matching_result_names(results_fd, token)
+        if result_names:
+            if len(result_names) != 1:
+                raise GatewayError("deploy token has multiple append-only results")
+            contents = read_result(results_fd, result_names[0], config)
+            if contents == SUCCESS_RESULT:
+                wait_for_blocker_clear(root_fd, config)
+                return 0
+            if contents == FAILED_RESULT:
+                return 1
+            raise GatewayError("deploy result has invalid contents")
+        if time.monotonic() >= deadline:
+            raise GatewayError("timed out waiting for the deploy result")
+        time.sleep(config.poll_interval_seconds)
+
+
+def promote_and_wait_for_deploy(
+    root_fd: int,
+    config: GatewayConfig,
+    token: str,
+    inbox_fd: int,
+    results_fd: int,
+    transfer_identity: PublishedSentinel,
+) -> int:
+    """Promote one completed transfer and wait for its exact root result."""
+
+    with coordination_lock(
+        root_fd,
+        config,
+        PUBLISH_LOCK_NAME,
+        fcntl.LOCK_EX,
+    ):
+        identity = promote_transfer_marker(
+            inbox_fd,
+            results_fd,
+            config,
+            token,
+            transfer_identity,
+        )
+    wait_for_sentinel_claim(inbox_fd, identity, config)
+    return wait_for_result(root_fd, results_fd, token, config)
+
+
+def run_deploy_session(config: GatewayConfig, parsed: ParsedCommand) -> int:
+    """Serialize one rsync payload and its root finalization end to end."""
+
+    root_fd = open_validated_root(config)
+    inbox_fd = -1
+    results_fd = -1
+    candidate_root_fd = -1
+    try:
+        with coordination_lock(
+            root_fd,
+            config,
+            SESSION_LOCK_NAME,
+            fcntl.LOCK_EX,
+        ) as session_fd:
+            with coordination_lock(
+                root_fd,
+                config,
+                LOCK_NAME,
+                fcntl.LOCK_EX,
+            ) as ingress_fd:
+                if entry_metadata(root_fd, BLOCKER_NAME) is not None:
+                    raise GatewayError(
+                        "cannot start rsync while prior deploy work remains unresolved"
+                    )
+                inbox_fd = open_validated_child_directory(
+                    root_fd,
+                    config,
+                    INBOX_NAME,
+                    expected_mode=config.inbox_mode,
+                )
+                results_fd = open_validated_child_directory(
+                    root_fd,
+                    config,
+                    RESULTS_NAME,
+                    expected_mode=RESULTS_MODE,
+                )
+                candidate_root_fd = open_validated_candidate_root(config)
+                require_fresh_candidate(candidate_root_fd, parsed.token)
+                if entry_metadata(inbox_fd, SENTINEL_NAME) is not None:
+                    raise GatewayError(
+                        "cannot start rsync while a deploy completion token is pending"
+                    )
+                if entry_metadata(inbox_fd, TRANSFER_MARKER_NAME) is not None:
+                    raise GatewayError(
+                        "cannot start rsync while an interrupted deploy transfer requires recovery"
+                    )
+                if entry_metadata(inbox_fd, TRANSFER_PENDING_NAME) is not None:
+                    raise GatewayError(
+                        "cannot start rsync while an incomplete pre-transfer marker requires recovery"
+                    )
+                with coordination_lock(
+                    root_fd,
+                    config,
+                    PUBLISH_LOCK_NAME,
+                    fcntl.LOCK_EX,
+                ):
+                    transfer_identity = create_transfer_marker(
+                        inbox_fd,
+                        results_fd,
+                        config,
+                        parsed.token,
+                    )
+                status = run_restricted_rsync_child(
+                    config,
+                    parsed.rsync_arguments,
+                    (session_fd, ingress_fd),
+                )
+                if status != 0:
+                    return status
+                validate_received_candidate(candidate_root_fd, config, parsed.token)
+                sync_payload_filesystem(config)
+
+            # The session mutex blocks every other writer while ingress changes
+            # from EX to SH. This makes the payload-to-finalizer handoff atomic
+            # even though flock conversion itself is not guaranteed atomic.
+            with coordination_lock(
+                root_fd,
+                config,
+                LOCK_NAME,
+                fcntl.LOCK_SH,
+            ):
+                return promote_and_wait_for_deploy(
+                    root_fd,
+                    config,
+                    parsed.token,
+                    inbox_fd,
+                    results_fd,
+                    transfer_identity,
+                )
+    finally:
+        if candidate_root_fd >= 0:
+            os.close(candidate_root_fd)
+        if results_fd >= 0:
+            os.close(results_fd)
+        if inbox_fd >= 0:
+            os.close(inbox_fd)
+        os.close(root_fd)
+
+
+def validate_effective_user(config: GatewayConfig) -> None:
+    """Require sshd to have invoked the gateway as the fixed deploy account."""
+
+    try:
+        actual_username = pwd.getpwuid(os.geteuid()).pw_name
+    except KeyError as error:
+        raise GatewayError("cannot resolve the effective gateway user") from error
+    if actual_username != config.required_username:
+        raise GatewayError(
+            f"gateway must run as {config.required_username}, not {actual_username}"
+        )
+
+
+def production_config() -> GatewayConfig:
+    """Build the immutable production path and identity contract."""
+
+    try:
+        deploy_uid = pwd.getpwnam(DEPLOY_USERNAME).pw_uid
+        deploy_gid = grp.getgrnam(DEPLOY_GROUPNAME).gr_gid
+    except KeyError as error:
+        raise GatewayError("missing deploy account or group") from error
+    return GatewayConfig(
+        trigger_root=TRIGGER_ROOT,
+        rrsync_path=RRSYNC_PATH,
+        rrsync_root=RRSYNC_ROOT,
+        sync_path=SYNC_PATH,
+        required_username=DEPLOY_USERNAME,
+        root_uid=ROOT_UID,
+        root_gid=ROOT_GID,
+        deploy_uid=deploy_uid,
+        deploy_gid=deploy_gid,
+        inbox_mode=INBOX_MODE,
+        rrsync_root_mode=RRSYNC_ROOT_MODE,
+        result_uid=ROOT_UID,
+    )
+
+
+def test_config(test_root: Path) -> GatewayConfig:
+    """Build an isolated configuration for the guarded repository tests."""
+
+    if os.environ.get(TEST_MODE_ENV) != "1":
+        raise GatewayError(f"--test-root requires {TEST_MODE_ENV}=1")
+    try:
+        username = pwd.getpwuid(os.geteuid()).pw_name
+    except KeyError as error:
+        raise GatewayError("cannot resolve the effective test user") from error
+    inbox_mode = 0o770 if sys.platform == "darwin" else INBOX_MODE
+    return GatewayConfig(
+        trigger_root=test_root,
+        rrsync_path=test_root / "rrsync",
+        rrsync_root=test_root / "app",
+        sync_path=test_root / "sync",
+        required_username=username,
+        root_uid=os.geteuid(),
+        root_gid=os.getegid(),
+        deploy_uid=os.geteuid(),
+        deploy_gid=os.getegid(),
+        inbox_mode=inbox_mode,
+        rrsync_root_mode=inbox_mode,
+        result_uid=os.geteuid(),
+        test_mode=True,
+    )
+
+
+def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    """Parse the hidden test-root override; operations come only from sshd."""
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--test-root", type=Path, help=argparse.SUPPRESS)
+    return parser.parse_args(argv)
+
+
+def fail(error: GatewayError) -> NoReturn:
+    """Report one bounded failure and terminate with its declared status."""
+
+    print(f"[deploy-gateway] ERROR: {error}", file=sys.stderr)
+    raise SystemExit(error.exit_code)
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    """Validate the SSH operation and execute it without invoking a shell."""
+
+    arguments = parse_arguments(argv)
+    try:
+        config = test_config(arguments.test_root) if arguments.test_root else production_config()
+        validate_effective_user(config)
+        parsed = parse_original_command(os.environ.get("SSH_ORIGINAL_COMMAND", ""))
+        if parsed.operation is Operation.SESSION:
+            return run_deploy_session(config, parsed)
+        raise GatewayError("validated deploy operation is incomplete")
+    except GatewayError as error:
+        fail(error)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

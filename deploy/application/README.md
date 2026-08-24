@@ -17,6 +17,26 @@ python3 deploy/application/validate_profile.py \
     deploy/application/profiles/example_node_app.json
 ```
 
+## Transaction-core renderer
+
+`render_core.py` produces the shared forced-command gateway, durable trigger
+state machine, and no-follow dependency-manifest snapshot helper. It records
+the standard revision, profile digest, generated file modes, and SHA-256
+manifest in a deterministic bundle:
+
+```sh
+python3 deploy/application/render_core.py \
+    --profile deploy/application/profiles/example_node_app.json \
+    --source-revision 0123456789abcdef0123456789abcdef01234567 \
+    --output /tmp/example-deployment-core
+```
+
+The output deliberately records `conformanceStatus: core-only`. It is a
+versioned extraction boundary for the shared security state machines, not yet a
+standalone deployable gold bundle. A project MUST NOT install it without the
+remaining standard finalizer, host-policy, verifier, and application adapter
+layers.
+
 ## Distribution model
 
 Projects vendor a rendered, immutable copy of the runtime bundle into their

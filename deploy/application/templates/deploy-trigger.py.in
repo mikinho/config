@@ -1,0 +1,3233 @@
+#!/usr/bin/python3 -I
+"""Atomically claim and validate the write-only deploy completion token.
+
+The deploy account controls the trigger directory, so shell-level sequences of
+``test``, ``stat``, and ``read`` cannot safely validate the same pathname.  This
+helper opens both trusted directories without following their final components,
+validates the opened directory inodes, and uses dirfd-relative ``rename(2)`` to
+move the incoming inode into a newly created root-only claim directory. It then
+persists a fresh root-owned snapshot of the exact bounded bytes it accepts and
+unlinks the deploy-owned inode.
+
+Invalid tokens retain only bounded root-owned evidence and metadata plus an
+``INVALID`` marker while being removed from systemd's level-triggered watched
+path. Valid claims are deleted by the finalizer through ``discard``; operators
+can explicitly ``requeue`` a failed valid claim or adjudicate bounded invalid
+evidence with ``discard-invalid``.
+"""
+
+from __future__ import annotations
+
+import argparse
+import ctypes
+import fcntl
+import grp
+import json
+import os
+from pathlib import Path
+import pwd
+import re
+import secrets
+import shutil
+import stat
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from typing import Final, Literal, NoReturn, Optional, Sequence
+
+
+DEFAULT_TRIGGER_ROOT: Final = Path("@@TRIGGER_ROOT@@")
+DEFAULT_TRIGGER_DIR: Final = DEFAULT_TRIGGER_ROOT / "inbox"
+DEFAULT_STATE_DIR: Final = DEFAULT_TRIGGER_ROOT / "state"
+DEFAULT_RESULTS_DIR: Final = DEFAULT_TRIGGER_ROOT / "results"
+DEFAULT_INGRESS_LOCK: Final = DEFAULT_TRIGGER_ROOT / "ingress.lock"
+DEFAULT_PUBLISH_LOCK: Final = DEFAULT_TRIGGER_ROOT / "publish.lock"
+DEFAULT_SESSION_LOCK: Final = DEFAULT_TRIGGER_ROOT / "session.lock"
+DEFAULT_DEPLOY_USER: Final = "@@DEPLOY_USER@@"
+DEFAULT_DEPLOY_GROUP: Final = "@@DEPLOY_GROUP@@"
+DEFAULT_RESTORECON_PATH: Final = Path("/usr/sbin/restorecon")
+SENTINEL_NAME: Final = ".deploy-done"
+TRANSFER_MARKER_NAME: Final = ".transfer-in-progress"
+PENDING_TRANSFER_MARKER_NAME: Final = ".transfer-in-progress.pending"
+COMPLETION_INTENT_NAME: Final = "completion-intent"
+PENDING_COMPLETION_INTENT_NAME: Final = ".completion-intent.pending"
+BLOCKER_NAME: Final = "blocked"
+PENDING_BLOCKER_NAME: Final = ".blocked.pending"
+BLOCKER_BYTES: Final = b"blocked\n"
+MAX_TOKEN_BYTES: Final = 128
+MAX_COMPLETION_INTENT_BYTES: Final = 320
+MAX_INVALID_METADATA_BYTES: Final = 4096
+EXPECTED_TRIGGER_ROOT_MODE: Final = 0o755
+EXPECTED_TRIGGER_MODE: Final = 0o2770
+EXPECTED_STATE_MODE: Final = 0o700
+EXPECTED_RESULTS_MODE: Final = 0o750
+ROOT_UID: Final = 0
+ROOT_GID: Final = 0
+NO_SENTINEL_EXIT: Final = 3
+NO_COMPLETION_INTENT_EXIT: Final = 4
+CLAIM_PREFIX: Final = "deploy-trigger-"
+CLAIM_PATTERN: Final = re.compile(r"^deploy-trigger-[0-9]+-[0-9a-f]{24}$")
+TOKEN_TEXT_PATTERN: Final = r"(?:manual|[0-9a-f]{40,64})-[0-9]{1,20}-[0-9a-f]{24}"
+PENDING_RESULT_PATTERN: Final = re.compile(
+    rf"^\.pending-({TOKEN_TEXT_PATTERN})\.(deploy-trigger-[0-9]+-[0-9a-f]{{24}})$"
+)
+PENDING_FAILED_RESULT_PATTERN: Final = re.compile(
+    rf"^\.pending-failed-({TOKEN_TEXT_PATTERN})\.(deploy-trigger-[0-9]+-[0-9a-f]{{24}})$"
+)
+PENDING_DISCARD_RESULT_PATTERN: Final = re.compile(
+    rf"^\.pending-discard-({TOKEN_TEXT_PATTERN})\.(deploy-trigger-[0-9]+-[0-9a-f]{{24}})$"
+)
+WRITING_RESULT_PATTERN: Final = re.compile(
+    rf"^\.writing-pending-({TOKEN_TEXT_PATTERN})\.(deploy-trigger-[0-9]+-[0-9a-f]{{24}})$"
+)
+WRITING_FAILED_RESULT_PATTERN: Final = re.compile(
+    rf"^\.writing-pending-failed-({TOKEN_TEXT_PATTERN})\.(deploy-trigger-[0-9]+-[0-9a-f]{{24}})$"
+)
+WRITING_DISCARD_RESULT_PATTERN: Final = re.compile(
+    rf"^\.writing-pending-discard-({TOKEN_TEXT_PATTERN})\.(deploy-trigger-[0-9]+-[0-9a-f]{{24}})$"
+)
+FINAL_RESULT_PATTERN: Final = re.compile(
+    rf"^({TOKEN_TEXT_PATTERN})\.(deploy-trigger-[0-9]+-[0-9a-f]{{24}})$"
+)
+FAILED_TRANSFER_RESULT_PATTERN: Final = re.compile(
+    rf"^({TOKEN_TEXT_PATTERN})\.transfer-failed$"
+)
+PENDING_FAILED_TRANSFER_RESULT_PATTERN: Final = re.compile(
+    rf"^\.pending-transfer-failed-({TOKEN_TEXT_PATTERN})$"
+)
+COMPLETION_INTENT_PATTERN: Final = re.compile(
+    rf"^([0-9a-f]{{32}}) ({TOKEN_TEXT_PATTERN}) "
+    r"(deploy-trigger-[0-9]+-[0-9a-f]{24})\n$"
+)
+CLAIM_TOKEN_NAME: Final = "token"
+INCOMING_TOKEN_NAME: Final = "incoming"
+INVALID_MARKER_NAME: Final = "INVALID"
+PENDING_INVALID_MARKER_NAME: Final = ".INVALID.pending"
+INVALID_METADATA_NAME: Final = "METADATA.json"
+INVALID_EVIDENCE_NAME: Final = "EVIDENCE"
+TOKEN_PATTERN: Final = re.compile(
+    rb"^(?:manual|[0-9a-f]{40,64})-[0-9]{1,20}-[0-9a-f]{24}$"
+)
+INVOCATION_ID_PATTERN: Final = re.compile(r"^[0-9a-f]{32}$")
+TEST_MODE_ENV: Final = "@@TRIGGER_TEST_ENV@@"
+TEST_STOP_AFTER_BLOCKER_ENV: Final = "@@TRIGGER_STOP_ENV@@"
+CLAIM_WAIT_TIMEOUT_SECONDS: Final = 660.0
+CLAIM_POLL_INTERVAL_SECONDS: Final = 0.05
+RESULT_FILE_MODE: Final = 0o640
+SUCCESS_RESULT_BYTES: Final = b"success\n"
+FAILED_RESULT_BYTES: Final = b"failed\n"
+TRANSFER_MARKER_MODE: Final = 0o660
+MAX_INVALID_MARKER_BYTES: Final = 1024
+RENAME_NOREPLACE: Final = 1
+TRIGGER_SELINUX_TYPE: Final = "@@TRIGGER_SELINUX_TYPE@@"
+
+
+class TriggerError(Exception):
+    """A deterministic deploy-trigger validation or filesystem failure."""
+
+    def __init__(self, message: str, exit_code: int = 1) -> None:
+        """Initialize an error with its command-line exit code."""
+
+        super().__init__(message)
+        self.exit_code = exit_code
+
+
+@dataclass(frozen=True)
+class TriggerConfig:
+    """Trusted paths and ownership expected by one helper invocation."""
+
+    trigger_root: Path
+    trigger_dir: Path
+    state_dir: Path
+    results_dir: Path
+    trigger_uid: int
+    trigger_gid: int
+    publisher_uid: int
+    trigger_mode: int
+    state_uid: int
+    state_gid: int
+    ingress_lock: Path
+    publish_lock: Path
+    session_lock: Path
+    restorecon_path: Optional[Path]
+
+
+@dataclass(frozen=True)
+class CompletionIntent:
+    """One durable, invocation-specific successful-finalization intent."""
+
+    invocation_id: str
+    token: str
+    claim_name: str
+
+    def encoded(self) -> bytes:
+        """Return the bounded canonical on-disk representation."""
+
+        return f"{self.invocation_id} {self.token} {self.claim_name}\n".encode("ascii")
+
+
+StagedResultKind = Literal["success", "failed", "discard"]
+
+
+@dataclass(frozen=True)
+class StagedResult:
+    """One exact recoverable result transition and its claim identity."""
+
+    kind: StagedResultKind
+    token: str
+    claim_name: str
+
+
+def directory_flags() -> int:
+    """Return Linux flags for opening a real directory without following it."""
+
+    return os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+
+
+def open_validated_directory(
+    path: Path,
+    *,
+    expected_uid: int,
+    expected_gid: int,
+    expected_mode: int,
+) -> int:
+    """Open *path* and verify identity on the opened inode, not its pathname."""
+
+    try:
+        directory_fd = os.open(path, directory_flags())
+    except OSError as error:
+        raise TriggerError(f"cannot safely open directory {path}: {error.strerror}") from error
+
+    try:
+        metadata = os.fstat(directory_fd)
+        actual_mode = stat.S_IMODE(metadata.st_mode)
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise TriggerError(f"expected a real directory: {path}")
+        if metadata.st_uid != expected_uid or metadata.st_gid != expected_gid or actual_mode != expected_mode:
+            raise TriggerError(
+                f"unsafe directory identity for {path}: "
+                f"uid={metadata.st_uid} gid={metadata.st_gid} mode={actual_mode:o}; "
+                f"expected uid={expected_uid} gid={expected_gid} mode={expected_mode:o}"
+            )
+        return directory_fd
+    except BaseException:
+        os.close(directory_fd)
+        raise
+
+
+def bounded_regular_file_read(directory_fd: int, filename: str) -> bytes:
+    """Read at most ``MAX_TOKEN_BYTES + 1`` bytes from one regular-file inode."""
+
+    try:
+        path_metadata = os.stat(filename, dir_fd=directory_fd, follow_symlinks=False)
+    except OSError as error:
+        raise TriggerError(f"cannot inspect claimed sentinel: {error.strerror}") from error
+
+    if not stat.S_ISREG(path_metadata.st_mode):
+        raise TriggerError("claimed sentinel is not a regular file")
+    if path_metadata.st_nlink != 1:
+        raise TriggerError("claimed sentinel must have exactly one hard link")
+
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        file_fd = os.open(filename, flags, dir_fd=directory_fd)
+    except OSError as error:
+        raise TriggerError(f"cannot safely open claimed sentinel: {error.strerror}") from error
+
+    try:
+        opened_metadata = os.fstat(file_fd)
+        if not stat.S_ISREG(opened_metadata.st_mode):
+            raise TriggerError("opened sentinel is not a regular file")
+        if not os.path.samestat(path_metadata, opened_metadata):
+            raise TriggerError("claimed sentinel changed while it was opened")
+        if opened_metadata.st_nlink != 1:
+            raise TriggerError("opened sentinel must have exactly one hard link")
+        chunks: list[bytes] = []
+        remaining = MAX_TOKEN_BYTES + 1
+        while remaining > 0:
+            chunk = os.read(file_fd, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(file_fd)
+
+
+def write_all(file_fd: int, contents: bytes) -> None:
+    """Write every byte to *file_fd* and fail on a zero-length write."""
+
+    view = memoryview(contents)
+    written = 0
+    while written < len(view):
+        count = os.write(file_fd, view[written:])
+        if count <= 0:
+            raise TriggerError("short write while persisting deploy-token evidence")
+        written += count
+
+
+def write_exclusive_file(directory_fd: int, filename: str, contents: bytes, mode: int = 0o600) -> None:
+    """Create, fully write, and fsync one no-follow file below a trusted dirfd."""
+
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        file_fd = os.open(filename, flags, mode, dir_fd=directory_fd)
+    except OSError as error:
+        raise TriggerError(f"cannot create root-owned deploy evidence: {error.strerror}") from error
+    try:
+        write_all(file_fd, contents)
+        os.fsync(file_fd)
+    finally:
+        os.close(file_fd)
+
+
+def fsync_directory(directory_fd: int, description: str) -> None:
+    """Durably commit directory-entry changes for an audit boundary."""
+
+    try:
+        os.fsync(directory_fd)
+    except OSError as error:
+        raise TriggerError(f"cannot fsync {description}: {error.strerror}") from error
+
+
+def rename_noreplace(
+    source_directory_fd: int,
+    source: str,
+    destination_directory_fd: int,
+    destination: str,
+) -> None:
+    """Rename between trusted directories without replacing an existing entry."""
+
+    if sys.platform == "linux":
+        libc = ctypes.CDLL(None, use_errno=True)
+        renameat2 = getattr(libc, "renameat2", None)
+        if renameat2 is None:
+            raise TriggerError("libc does not expose required renameat2")
+        renameat2.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        renameat2.restype = ctypes.c_int
+        result = renameat2(
+            source_directory_fd,
+            os.fsencode(source),
+            destination_directory_fd,
+            os.fsencode(destination),
+            RENAME_NOREPLACE,
+        )
+        if result != 0:
+            error_number = ctypes.get_errno()
+            raise OSError(error_number, os.strerror(error_number), destination)
+        return
+    os.link(
+        source,
+        destination,
+        src_dir_fd=source_directory_fd,
+        dst_dir_fd=destination_directory_fd,
+        follow_symlinks=False,
+    )
+    os.unlink(source, dir_fd=source_directory_fd)
+
+
+def child_metadata(directory_fd: int, filename: str, description: str) -> Optional[os.stat_result]:
+    """Return no-follow metadata for one trusted-directory child when present."""
+
+    try:
+        return os.stat(filename, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise TriggerError(f"cannot inspect {description}: {error.strerror}") from error
+
+
+def validate_owned_regular_metadata(
+    metadata: os.stat_result,
+    *,
+    expected_uid: int,
+    expected_gid: int,
+    expected_mode: int,
+    description: str,
+    allowed_links: tuple[int, ...] = (1,),
+) -> None:
+    """Require one regular inode to have the reviewed ownership and link state."""
+
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != expected_uid
+        or metadata.st_gid != expected_gid
+        or stat.S_IMODE(metadata.st_mode) != expected_mode
+        or metadata.st_nlink not in allowed_links
+    ):
+        raise TriggerError(f"{description} has an unsafe identity")
+
+
+def read_exact_owned_file(
+    directory_fd: int,
+    filename: str,
+    expected_contents: bytes,
+    *,
+    expected_uid: int,
+    expected_gid: int,
+    expected_mode: int,
+    description: str,
+    allowed_links: tuple[int, ...] = (1,),
+) -> None:
+    """Validate and read one exact bounded file below a trusted directory."""
+
+    path_metadata = child_metadata(directory_fd, filename, description)
+    if path_metadata is None:
+        raise TriggerError(f"{description} is missing")
+    validate_owned_regular_metadata(
+        path_metadata,
+        expected_uid=expected_uid,
+        expected_gid=expected_gid,
+        expected_mode=expected_mode,
+        description=description,
+        allowed_links=allowed_links,
+    )
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        file_fd = os.open(filename, flags, dir_fd=directory_fd)
+    except OSError as error:
+        raise TriggerError(f"cannot safely open {description}: {error.strerror}") from error
+    try:
+        opened = os.fstat(file_fd)
+        validate_owned_regular_metadata(
+            opened,
+            expected_uid=expected_uid,
+            expected_gid=expected_gid,
+            expected_mode=expected_mode,
+            description=description,
+            allowed_links=allowed_links,
+        )
+        if not os.path.samestat(path_metadata, opened):
+            raise TriggerError(f"{description} changed while opening")
+        contents = os.read(file_fd, len(expected_contents) + 1)
+        if contents != expected_contents or os.read(file_fd, 1):
+            raise TriggerError(f"{description} has invalid contents")
+    finally:
+        os.close(file_fd)
+
+
+def read_bounded_owned_file(
+    directory_fd: int,
+    filename: str,
+    maximum_bytes: int,
+    *,
+    expected_uid: int,
+    expected_gid: int,
+    expected_mode: int,
+    description: str,
+    allowed_links: tuple[int, ...] = (1,),
+) -> bytes:
+    """Return bounded bytes from one validated file below a trusted directory."""
+
+    path_metadata = child_metadata(directory_fd, filename, description)
+    if path_metadata is None:
+        raise TriggerError(f"{description} is missing")
+    validate_owned_regular_metadata(
+        path_metadata,
+        expected_uid=expected_uid,
+        expected_gid=expected_gid,
+        expected_mode=expected_mode,
+        description=description,
+        allowed_links=allowed_links,
+    )
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        file_fd = os.open(filename, flags, dir_fd=directory_fd)
+    except OSError as error:
+        raise TriggerError(f"cannot safely open {description}: {error.strerror}") from error
+    try:
+        opened = os.fstat(file_fd)
+        validate_owned_regular_metadata(
+            opened,
+            expected_uid=expected_uid,
+            expected_gid=expected_gid,
+            expected_mode=expected_mode,
+            description=description,
+            allowed_links=allowed_links,
+        )
+        if not os.path.samestat(path_metadata, opened):
+            raise TriggerError(f"{description} changed while opening")
+        contents = os.read(file_fd, maximum_bytes + 1)
+        if len(contents) > maximum_bytes or os.read(file_fd, 1):
+            raise TriggerError(f"{description} exceeds its bounded representation")
+        return contents
+    finally:
+        os.close(file_fd)
+
+
+def remove_unpublished_owned_file(
+    directory_fd: int,
+    filename: str,
+    *,
+    expected_uid: int,
+    expected_gid: int,
+    expected_mode: int,
+    description: str,
+    directory_description: str,
+) -> bool:
+    """Safely remove one private, single-link interrupted-write artifact."""
+
+    metadata = child_metadata(directory_fd, filename, description)
+    if metadata is None:
+        return False
+    validate_owned_regular_metadata(
+        metadata,
+        expected_uid=expected_uid,
+        expected_gid=expected_gid,
+        expected_mode=expected_mode,
+        description=description,
+    )
+    try:
+        os.unlink(filename, dir_fd=directory_fd)
+    except OSError as error:
+        raise TriggerError(f"cannot remove {description}: {error.strerror}") from error
+    fsync_directory(directory_fd, directory_description)
+    return True
+
+
+def persist_unpublished_owned_file(
+    directory_fd: int,
+    filename: str,
+    contents: bytes,
+    *,
+    expected_uid: int,
+    expected_gid: int,
+    expected_mode: int,
+    description: str,
+    directory_description: str,
+) -> None:
+    """Fully persist one private file before any canonical-name publication."""
+
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        file_fd = os.open(filename, flags, expected_mode, dir_fd=directory_fd)
+    except OSError as error:
+        raise TriggerError(f"cannot create {description}: {error.strerror}") from error
+    completed = False
+    try:
+        os.fchown(file_fd, expected_uid, expected_gid)
+        os.fchmod(file_fd, expected_mode)
+        write_all(file_fd, contents)
+        os.fsync(file_fd)
+        completed = True
+    except OSError as error:
+        raise TriggerError(f"cannot persist {description}: {error.strerror}") from error
+    finally:
+        os.close(file_fd)
+        if not completed:
+            try:
+                os.unlink(filename, dir_fd=directory_fd)
+            except OSError:
+                pass
+    fsync_directory(directory_fd, directory_description)
+
+
+def ensure_unpublished_owned_file(
+    directory_fd: int,
+    filename: str,
+    contents: bytes,
+    *,
+    expected_uid: int,
+    expected_gid: int,
+    expected_mode: int,
+    description: str,
+    directory_description: str,
+) -> None:
+    """Recover or create one exact private file suitable for atomic promotion."""
+
+    if child_metadata(directory_fd, filename, description) is not None:
+        try:
+            read_exact_owned_file(
+                directory_fd,
+                filename,
+                contents,
+                expected_uid=expected_uid,
+                expected_gid=expected_gid,
+                expected_mode=expected_mode,
+                description=description,
+            )
+            return
+        except TriggerError:
+            remove_unpublished_owned_file(
+                directory_fd,
+                filename,
+                expected_uid=expected_uid,
+                expected_gid=expected_gid,
+                expected_mode=expected_mode,
+                description=description,
+                directory_description=directory_description,
+            )
+    persist_unpublished_owned_file(
+        directory_fd,
+        filename,
+        contents,
+        expected_uid=expected_uid,
+        expected_gid=expected_gid,
+        expected_mode=expected_mode,
+        description=description,
+        directory_description=directory_description,
+    )
+    read_exact_owned_file(
+        directory_fd,
+        filename,
+        contents,
+        expected_uid=expected_uid,
+        expected_gid=expected_gid,
+        expected_mode=expected_mode,
+        description=description,
+    )
+
+
+def validate_token_bytes(contents: bytes) -> None:
+    """Validate the bounded sentinel bytes without logging attacker input."""
+
+    if not contents or len(contents) > MAX_TOKEN_BYTES:
+        raise TriggerError(f"sentinel size must be 1-{MAX_TOKEN_BYTES} bytes")
+    token = contents[:-1] if contents.endswith(b"\n") else contents
+    if TOKEN_PATTERN.fullmatch(token) is None:
+        raise TriggerError("sentinel token has an invalid format")
+
+
+def validate_completion_fields(invocation_id: str, token: str, claim_name: str) -> None:
+    """Require the canonical fields bound by one completion intent."""
+
+    if INVOCATION_ID_PATTERN.fullmatch(invocation_id) is None:
+        raise TriggerError("systemd invocation identifier has an invalid format")
+    try:
+        token_bytes = token.encode("ascii")
+    except UnicodeEncodeError as error:
+        raise TriggerError("completion token is not ASCII") from error
+    if TOKEN_PATTERN.fullmatch(token_bytes) is None:
+        raise TriggerError("completion token has an invalid format")
+    if CLAIM_PATTERN.fullmatch(claim_name) is None:
+        raise TriggerError("completion claim identifier has an invalid format")
+
+
+def open_validated_trigger_root(config: TriggerConfig) -> int:
+    """Open the root-controlled coordination directory."""
+
+    return open_validated_directory(
+        config.trigger_root,
+        expected_uid=config.state_uid,
+        expected_gid=config.state_gid,
+        expected_mode=EXPECTED_TRIGGER_ROOT_MODE,
+    )
+
+
+def open_validated_trigger_for_cleanup(config: TriggerConfig) -> int:
+    """Open the trigger directory in either its armed or setup-locked mode."""
+
+    try:
+        trigger_fd = os.open(config.trigger_dir, directory_flags())
+    except OSError as error:
+        raise TriggerError(
+            f"cannot safely open directory {config.trigger_dir}: {error.strerror}"
+        ) from error
+    try:
+        metadata = os.fstat(trigger_fd)
+        actual_mode = stat.S_IMODE(metadata.st_mode)
+        accepted_modes = {config.trigger_mode, config.trigger_mode & ~0o020}
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != config.trigger_uid
+            or metadata.st_gid != config.trigger_gid
+            or actual_mode not in accepted_modes
+        ):
+            raise TriggerError(
+                f"unsafe directory identity for {config.trigger_dir}: "
+                f"uid={metadata.st_uid} gid={metadata.st_gid} mode={actual_mode:o}"
+            )
+        return trigger_fd
+    except BaseException:
+        os.close(trigger_fd)
+        raise
+
+
+def read_completion_intent_file(
+    root_fd: int,
+    filename: str,
+    config: TriggerConfig,
+) -> Optional[CompletionIntent]:
+    """Read and validate one fixed completion-intent entry when present."""
+
+    try:
+        path_metadata = os.stat(filename, dir_fd=root_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise TriggerError(f"cannot inspect completion intent {filename}: {error.strerror}") from error
+    if (
+        not stat.S_ISREG(path_metadata.st_mode)
+        or path_metadata.st_uid != config.state_uid
+        or path_metadata.st_gid != config.state_gid
+        or stat.S_IMODE(path_metadata.st_mode) != 0o600
+        or path_metadata.st_nlink != 1
+    ):
+        raise TriggerError(f"completion intent has an unsafe identity: {filename}")
+
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        intent_fd = os.open(filename, flags, dir_fd=root_fd)
+    except OSError as error:
+        raise TriggerError(f"cannot safely open completion intent {filename}: {error.strerror}") from error
+    try:
+        opened_metadata = os.fstat(intent_fd)
+        if not os.path.samestat(path_metadata, opened_metadata):
+            raise TriggerError(f"completion intent changed while opening: {filename}")
+        contents = os.read(intent_fd, MAX_COMPLETION_INTENT_BYTES + 1)
+        if len(contents) > MAX_COMPLETION_INTENT_BYTES or os.read(intent_fd, 1):
+            raise TriggerError(f"completion intent is too large: {filename}")
+    finally:
+        os.close(intent_fd)
+
+    try:
+        text = contents.decode("ascii")
+    except UnicodeDecodeError as error:
+        raise TriggerError(f"completion intent is not ASCII: {filename}") from error
+    match = COMPLETION_INTENT_PATTERN.fullmatch(text)
+    if match is None:
+        raise TriggerError(f"completion intent has invalid contents: {filename}")
+    invocation_id, token, claim_name = match.groups()
+    validate_completion_fields(invocation_id, token, claim_name)
+    return CompletionIntent(invocation_id, token, claim_name)
+
+
+def remove_unpublished_completion_intent(
+    root_fd: int,
+    config: TriggerConfig,
+) -> None:
+    """Remove only the fixed, root-owned unpublished intent after validation."""
+
+    try:
+        metadata = os.stat(
+            PENDING_COMPLETION_INTENT_NAME,
+            dir_fd=root_fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise TriggerError(f"cannot inspect unpublished completion intent: {error.strerror}") from error
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != config.state_uid
+        or metadata.st_gid != config.state_gid
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or metadata.st_nlink != 1
+    ):
+        raise TriggerError("refusing to remove an unsafe unpublished completion intent")
+    try:
+        os.unlink(PENDING_COMPLETION_INTENT_NAME, dir_fd=root_fd)
+        fsync_directory(root_fd, "deploy coordination root")
+    except OSError as error:
+        raise TriggerError(f"cannot remove unpublished completion intent: {error.strerror}") from error
+
+
+def promote_completion_intent(root_fd: int, config: TriggerConfig) -> None:
+    """Atomically publish the fully written fixed completion intent."""
+
+    # A prior published record is replaceable only when it still has the exact
+    # trusted shape. The root-controlled directory prevents deploy-user races.
+    read_completion_intent_file(root_fd, COMPLETION_INTENT_NAME, config)
+    try:
+        os.rename(
+            PENDING_COMPLETION_INTENT_NAME,
+            COMPLETION_INTENT_NAME,
+            src_dir_fd=root_fd,
+            dst_dir_fd=root_fd,
+        )
+        fsync_directory(root_fd, "deploy coordination root")
+    except OSError as error:
+        raise TriggerError(f"cannot publish completion intent: {error.strerror}") from error
+
+
+def write_completion_intent(config: TriggerConfig, intent: CompletionIntent) -> None:
+    """Durably publish an idempotent invocation-specific completion intent."""
+
+    validate_completion_fields(intent.invocation_id, intent.token, intent.claim_name)
+    contents = intent.encoded()
+    if len(contents) > MAX_COMPLETION_INTENT_BYTES:
+        raise TriggerError("completion intent exceeds its bounded representation")
+
+    root_fd = open_validated_trigger_root(config)
+    try:
+        # Validate any old published record before permitting atomic replacement.
+        read_completion_intent_file(root_fd, COMPLETION_INTENT_NAME, config)
+        try:
+            pending = read_completion_intent_file(
+                root_fd,
+                PENDING_COMPLETION_INTENT_NAME,
+                config,
+            )
+        except TriggerError:
+            # The pending name is unpublished. An interrupted short write can be
+            # safely removed while the retained claim remains authoritative.
+            remove_unpublished_completion_intent(root_fd, config)
+            pending = None
+        if pending is not None:
+            if pending != intent:
+                raise TriggerError("a different unpublished completion intent requires recovery")
+            promote_completion_intent(root_fd, config)
+            return
+
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
+        try:
+            intent_fd = os.open(PENDING_COMPLETION_INTENT_NAME, flags, 0o600, dir_fd=root_fd)
+        except OSError as error:
+            raise TriggerError(f"cannot create unpublished completion intent: {error.strerror}") from error
+        created = True
+        try:
+            os.fchown(intent_fd, config.state_uid, config.state_gid)
+            os.fchmod(intent_fd, 0o600)
+            write_all(intent_fd, contents)
+            os.fsync(intent_fd)
+            created = False
+        except OSError as error:
+            raise TriggerError(f"cannot persist completion intent: {error.strerror}") from error
+        finally:
+            os.close(intent_fd)
+            if created:
+                try:
+                    os.unlink(PENDING_COMPLETION_INTENT_NAME, dir_fd=root_fd)
+                except OSError:
+                    pass
+        fsync_directory(root_fd, "deploy coordination root")
+        persisted = read_completion_intent_file(
+            root_fd,
+            PENDING_COMPLETION_INTENT_NAME,
+            config,
+        )
+        if persisted != intent:
+            raise TriggerError("persisted completion intent does not match the requested transition")
+        promote_completion_intent(root_fd, config)
+    finally:
+        os.close(root_fd)
+
+
+def completion_intent_for_invocation(
+    config: TriggerConfig,
+    invocation_id: str,
+) -> CompletionIntent:
+    """Return the trusted intent for one systemd invocation, recovering publish."""
+
+    if INVOCATION_ID_PATTERN.fullmatch(invocation_id) is None:
+        raise TriggerError("systemd invocation identifier has an invalid format")
+    root_fd = open_validated_trigger_root(config)
+    try:
+        try:
+            pending = read_completion_intent_file(
+                root_fd,
+                PENDING_COMPLETION_INTENT_NAME,
+                config,
+            )
+        except TriggerError:
+            remove_unpublished_completion_intent(root_fd, config)
+            pending = None
+        if pending is not None:
+            if pending.invocation_id != invocation_id:
+                raise TriggerError("another invocation has an unpublished completion intent")
+            promote_completion_intent(root_fd, config)
+        intent = read_completion_intent_file(root_fd, COMPLETION_INTENT_NAME, config)
+        if intent is None or intent.invocation_id != invocation_id:
+            raise TriggerError(
+                "no completion intent matches the failed systemd invocation",
+                NO_COMPLETION_INTENT_EXIT,
+            )
+        return intent
+    finally:
+        os.close(root_fd)
+
+
+def read_valid_blocker(root_fd: int, config: TriggerConfig) -> bool:
+    """Validate the fixed fail-closed blocker, returning whether it exists."""
+
+    try:
+        path_metadata = os.stat(BLOCKER_NAME, dir_fd=root_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        raise TriggerError(f"cannot inspect deploy blocker: {error.strerror}") from error
+    if (
+        not stat.S_ISREG(path_metadata.st_mode)
+        or path_metadata.st_uid != config.state_uid
+        or path_metadata.st_gid != config.state_gid
+        or stat.S_IMODE(path_metadata.st_mode) != 0o600
+        or path_metadata.st_nlink != 1
+    ):
+        raise TriggerError("deploy blocker has an unsafe identity")
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        blocker_fd = os.open(BLOCKER_NAME, flags, dir_fd=root_fd)
+    except OSError as error:
+        raise TriggerError(f"cannot safely open deploy blocker: {error.strerror}") from error
+    try:
+        opened = os.fstat(blocker_fd)
+        if not os.path.samestat(path_metadata, opened):
+            raise TriggerError("deploy blocker changed while opening")
+        contents = os.read(blocker_fd, len(BLOCKER_BYTES) + 1)
+        if contents != BLOCKER_BYTES or os.read(blocker_fd, 1):
+            raise TriggerError("deploy blocker has invalid contents")
+    finally:
+        os.close(blocker_fd)
+    return True
+
+
+def ensure_deploy_blocker(config: TriggerConfig) -> bool:
+    """Durably publish or repair the generic unresolved-work blocker."""
+
+    root_fd = open_validated_trigger_root(config)
+    try:
+        blocker_metadata = child_metadata(root_fd, BLOCKER_NAME, "deploy blocker")
+        blocker_was_present = blocker_metadata is not None
+        if blocker_metadata is not None:
+            try:
+                if read_valid_blocker(root_fd, config):
+                    remove_unpublished_owned_file(
+                        root_fd,
+                        PENDING_BLOCKER_NAME,
+                        expected_uid=config.state_uid,
+                        expected_gid=config.state_gid,
+                        expected_mode=0o600,
+                        description="unpublished deploy blocker",
+                        directory_description="deploy coordination root",
+                    )
+                    return False
+            except TriggerError:
+                # The canonical name can be left empty or short only by an
+                # interrupted older writer. Keep it continuously present while
+                # preparing the exact replacement so ingress remains blocked.
+                validate_owned_regular_metadata(
+                    blocker_metadata,
+                    expected_uid=config.state_uid,
+                    expected_gid=config.state_gid,
+                    expected_mode=0o600,
+                    description="interrupted deploy blocker",
+                )
+
+        ensure_unpublished_owned_file(
+            root_fd,
+            PENDING_BLOCKER_NAME,
+            BLOCKER_BYTES,
+            expected_uid=config.state_uid,
+            expected_gid=config.state_gid,
+            expected_mode=0o600,
+            description="unpublished deploy blocker",
+            directory_description="deploy coordination root",
+        )
+        if blocker_was_present:
+            try:
+                os.replace(
+                    PENDING_BLOCKER_NAME,
+                    BLOCKER_NAME,
+                    src_dir_fd=root_fd,
+                    dst_dir_fd=root_fd,
+                )
+            except OSError as error:
+                raise TriggerError(f"cannot repair deploy blocker: {error.strerror}") from error
+        else:
+            try:
+                rename_noreplace(root_fd, PENDING_BLOCKER_NAME, root_fd, BLOCKER_NAME)
+            except FileExistsError:
+                if not read_valid_blocker(root_fd, config):
+                    raise TriggerError("deploy blocker appeared without valid contents")
+                remove_unpublished_owned_file(
+                    root_fd,
+                    PENDING_BLOCKER_NAME,
+                    expected_uid=config.state_uid,
+                    expected_gid=config.state_gid,
+                    expected_mode=0o600,
+                    description="unpublished deploy blocker",
+                    directory_description="deploy coordination root",
+                )
+                return False
+            except OSError as error:
+                raise TriggerError(f"cannot publish deploy blocker: {error.strerror}") from error
+        fsync_directory(root_fd, "deploy coordination root")
+        if not read_valid_blocker(root_fd, config):
+            raise TriggerError("deploy blocker disappeared after publication")
+        return not blocker_was_present
+    finally:
+        os.close(root_fd)
+
+
+def remove_deploy_blocker(config: TriggerConfig) -> None:
+    """Remove the blocker only after every unresolved deploy surface is empty."""
+
+    root_fd = open_validated_trigger_root(config)
+    state_fd = open_validated_directory(
+        config.state_dir,
+        expected_uid=config.state_uid,
+        expected_gid=config.state_gid,
+        expected_mode=EXPECTED_STATE_MODE,
+    )
+    trigger_fd = open_validated_trigger_for_cleanup(config)
+    results_fd = -1
+    try:
+        if os.listdir(state_fd):
+            return
+        try:
+            os.stat(SENTINEL_NAME, dir_fd=trigger_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            raise TriggerError(f"cannot inspect deploy sentinel before unblocking: {error.strerror}") from error
+        else:
+            return
+        try:
+            os.stat(TRANSFER_MARKER_NAME, dir_fd=trigger_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            raise TriggerError(
+                f"cannot inspect deploy transfer marker before unblocking: {error.strerror}"
+            ) from error
+        else:
+            return
+        if not read_valid_blocker(root_fd, config):
+            return
+        results_fd = open_validated_results_directory(config)
+        require_settled_deploy_results(results_fd, config)
+        try:
+            os.unlink(BLOCKER_NAME, dir_fd=root_fd)
+            fsync_directory(root_fd, "deploy coordination root")
+        except OSError as error:
+            raise TriggerError(f"cannot remove deploy blocker: {error.strerror}") from error
+    finally:
+        if results_fd >= 0:
+            os.close(results_fd)
+        os.close(trigger_fd)
+        os.close(state_fd)
+        os.close(root_fd)
+
+
+def new_claim_name() -> str:
+    """Return a collision-resistant root-state filename."""
+
+    return f"{CLAIM_PREFIX}{time.time_ns()}-{secrets.token_hex(12)}"
+
+
+def create_claim_directory(state_fd: int, config: TriggerConfig) -> tuple[str, int]:
+    """Create and open a unique root-only claim directory below trusted state."""
+
+    for _attempt in range(10):
+        claim_name = new_claim_name()
+        try:
+            os.mkdir(claim_name, EXPECTED_STATE_MODE, dir_fd=state_fd)
+        except FileExistsError:
+            continue
+        except OSError as error:
+            raise TriggerError(f"cannot create deploy claim directory: {error.strerror}") from error
+        try:
+            claim_fd = os.open(claim_name, directory_flags(), dir_fd=state_fd)
+            metadata = os.fstat(claim_fd)
+            actual_mode = stat.S_IMODE(metadata.st_mode)
+            if (
+                not stat.S_ISDIR(metadata.st_mode)
+                or metadata.st_uid != config.state_uid
+                or metadata.st_gid != config.state_gid
+                or actual_mode != EXPECTED_STATE_MODE
+            ):
+                os.close(claim_fd)
+                raise TriggerError(f"new deploy claim directory has an unsafe identity: {claim_name}")
+            return claim_name, claim_fd
+        except BaseException:
+            try:
+                os.rmdir(claim_name, dir_fd=state_fd)
+            except OSError:
+                pass
+            raise
+    raise TriggerError("could not allocate a unique deploy claim directory")
+
+
+def remove_empty_claim_directory(state_fd: int, claim_name: str, claim_fd: int) -> None:
+    """Close and remove a claim directory that never received a token."""
+
+    os.close(claim_fd)
+    try:
+        os.rmdir(claim_name, dir_fd=state_fd)
+        fsync_directory(state_fd, "deploy-trigger state directory")
+    except OSError as error:
+        raise TriggerError(f"could not remove empty deploy claim directory: {error.strerror}") from error
+
+
+def file_type_name(metadata: os.stat_result) -> str:
+    """Return a stable name for the observed incoming inode type."""
+
+    mode = metadata.st_mode
+    if stat.S_ISREG(mode):
+        return "regular"
+    if stat.S_ISDIR(mode):
+        return "directory"
+    if stat.S_ISLNK(mode):
+        return "symlink"
+    if stat.S_ISFIFO(mode):
+        return "fifo"
+    if stat.S_ISSOCK(mode):
+        return "socket"
+    if stat.S_ISCHR(mode):
+        return "character-device"
+    if stat.S_ISBLK(mode):
+        return "block-device"
+    return "unknown"
+
+
+def bounded_invalid_evidence(claim_fd: int, metadata: os.stat_result) -> bytes:
+    """Read at most the bounded audit sample from an invalid regular inode."""
+
+    if not stat.S_ISREG(metadata.st_mode):
+        return b""
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        file_fd = os.open(INCOMING_TOKEN_NAME, flags, dir_fd=claim_fd)
+    except OSError:
+        return b""
+    try:
+        opened = os.fstat(file_fd)
+        if not stat.S_ISREG(opened.st_mode) or not os.path.samestat(metadata, opened):
+            return b""
+        chunks: list[bytes] = []
+        remaining = MAX_TOKEN_BYTES + 1
+        while remaining > 0:
+            chunk = os.read(file_fd, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(file_fd)
+
+
+def remove_invalid_incoming(
+    claim_fd: int,
+    claim_path: Path,
+    metadata: os.stat_result,
+    owner_uid: int,
+    owner_gid: int,
+) -> bool:
+    """Remove an invalid inode without following links; lock directories first."""
+
+    try:
+        if stat.S_ISDIR(metadata.st_mode):
+            directory_fd = os.open(INCOMING_TOKEN_NAME, directory_flags(), dir_fd=claim_fd)
+            try:
+                opened = os.fstat(directory_fd)
+                if not os.path.samestat(metadata, opened):
+                    return False
+                os.fchown(directory_fd, owner_uid, owner_gid)
+                os.fchmod(directory_fd, 0 if os.geteuid() == ROOT_UID else 0o700)
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+            if not shutil.rmtree.avoids_symlink_attacks:
+                return False
+            shutil.rmtree(claim_path / INCOMING_TOKEN_NAME)
+        else:
+            os.unlink(INCOMING_TOKEN_NAME, dir_fd=claim_fd)
+    except OSError:
+        return False
+    return True
+
+
+def publish_invalid_marker(
+    claim_fd: int,
+    marker_contents: bytes,
+    config: TriggerConfig,
+) -> None:
+    """Publish a fully persisted invalid marker without exposing partial bytes."""
+
+    if not marker_contents or len(marker_contents) > MAX_INVALID_MARKER_BYTES:
+        raise TriggerError("invalid-claim marker exceeds its bounded representation")
+    if child_metadata(claim_fd, INVALID_MARKER_NAME, "invalid-claim marker") is not None:
+        read_exact_owned_file(
+            claim_fd,
+            INVALID_MARKER_NAME,
+            marker_contents,
+            expected_uid=config.state_uid,
+            expected_gid=config.state_gid,
+            expected_mode=0o600,
+            description="invalid-claim marker",
+        )
+        return
+    ensure_unpublished_owned_file(
+        claim_fd,
+        PENDING_INVALID_MARKER_NAME,
+        marker_contents,
+        expected_uid=config.state_uid,
+        expected_gid=config.state_gid,
+        expected_mode=0o600,
+        description="unpublished invalid-claim marker",
+        directory_description="invalid deploy claim",
+    )
+    try:
+        rename_noreplace(
+            claim_fd,
+            PENDING_INVALID_MARKER_NAME,
+            claim_fd,
+            INVALID_MARKER_NAME,
+        )
+    except FileExistsError:
+        read_exact_owned_file(
+            claim_fd,
+            INVALID_MARKER_NAME,
+            marker_contents,
+            expected_uid=config.state_uid,
+            expected_gid=config.state_gid,
+            expected_mode=0o600,
+            description="invalid-claim marker",
+        )
+        remove_unpublished_owned_file(
+            claim_fd,
+            PENDING_INVALID_MARKER_NAME,
+            expected_uid=config.state_uid,
+            expected_gid=config.state_gid,
+            expected_mode=0o600,
+            description="unpublished invalid-claim marker",
+            directory_description="invalid deploy claim",
+        )
+    except OSError as error:
+        raise TriggerError(f"cannot publish invalid-claim marker: {error.strerror}") from error
+    fsync_directory(claim_fd, "invalid deploy claim")
+    read_exact_owned_file(
+        claim_fd,
+        INVALID_MARKER_NAME,
+        marker_contents,
+        expected_uid=config.state_uid,
+        expected_gid=config.state_gid,
+        expected_mode=0o600,
+        description="invalid-claim marker",
+    )
+
+
+def quarantine_claim(
+    claim_fd: int,
+    claim_name: str,
+    reason: str,
+    config: TriggerConfig,
+) -> TriggerError:
+    """Persist bounded root-owned invalid evidence and remove attacker inodes."""
+
+    try:
+        metadata = os.stat(INCOMING_TOKEN_NAME, dir_fd=claim_fd, follow_symlinks=False)
+        evidence = bounded_invalid_evidence(claim_fd, metadata)
+        metadata_record = {
+            "evidence_bytes": len(evidence),
+            "gid": metadata.st_gid,
+            "mode": f"{stat.S_IMODE(metadata.st_mode):04o}",
+            "nlink": metadata.st_nlink,
+            "observed_size": metadata.st_size,
+            "reason": reason,
+            "type": file_type_name(metadata),
+            "uid": metadata.st_uid,
+        }
+        if evidence:
+            write_exclusive_file(claim_fd, INVALID_EVIDENCE_NAME, evidence)
+        write_exclusive_file(
+            claim_fd,
+            INVALID_METADATA_NAME,
+            (json.dumps(metadata_record, sort_keys=True) + "\n").encode("utf-8"),
+        )
+        # The evidence prefix must be durable before the untrusted inode is
+        # removed. Recovery can restart while ``incoming`` remains, or finish
+        # marker publication from this prefix after the removal is durable.
+        fsync_directory(claim_fd, "invalid deploy claim evidence")
+        removed = remove_invalid_incoming(
+            claim_fd,
+            config.state_dir / claim_name,
+            metadata,
+            config.state_uid,
+            config.state_gid,
+        )
+        marker_reason = reason if removed else f"{reason}; unsafe incoming inode retained for manual review"
+        publish_invalid_marker(
+            claim_fd,
+            f"{marker_reason}\n".encode("utf-8", errors="replace"),
+            config,
+        )
+        fsync_directory(claim_fd, "invalid deploy claim")
+    except (OSError, TriggerError) as error:
+        return TriggerError(
+            f"{reason}; claim retained as {config.state_dir / claim_name}; "
+            f"could not persist bounded invalid evidence: {error}"
+        )
+    return TriggerError(f"{reason}; sentinel quarantined as {config.state_dir / claim_name}")
+
+
+def recover_partial_quarantine(
+    claim_fd: int,
+    claim_name: str,
+    entries: set[str],
+    config: TriggerConfig,
+) -> NoReturn:
+    """Finish or restart a quarantine interrupted before marker publication."""
+
+    allowed = {
+        INCOMING_TOKEN_NAME,
+        INVALID_EVIDENCE_NAME,
+        INVALID_METADATA_NAME,
+        PENDING_INVALID_MARKER_NAME,
+    }
+    if not entries or not entries.issubset(allowed):
+        raise TriggerError("partial deploy claim contains unexpected entries")
+
+    if INCOMING_TOKEN_NAME in entries:
+        for filename, description in (
+            (INVALID_EVIDENCE_NAME, "partial invalid-claim evidence"),
+            (INVALID_METADATA_NAME, "partial invalid-claim metadata"),
+            (PENDING_INVALID_MARKER_NAME, "unpublished invalid-claim marker"),
+        ):
+            remove_unpublished_owned_file(
+                claim_fd,
+                filename,
+                expected_uid=config.state_uid,
+                expected_gid=config.state_gid,
+                expected_mode=0o600,
+                description=description,
+                directory_description="partial invalid deploy claim",
+            )
+        try:
+            contents = bounded_regular_file_read(claim_fd, INCOMING_TOKEN_NAME)
+            validate_token_bytes(contents)
+        except TriggerError as error:
+            reason = str(error)
+        else:
+            # The presence of root-owned quarantine artifacts is itself the
+            # durable decision boundary; never reclassify that inode as valid.
+            reason = "interrupted invalid-token quarantine"
+        raise quarantine_claim(claim_fd, claim_name, reason, config)
+
+    metadata_contents = read_bounded_owned_file(
+        claim_fd,
+        INVALID_METADATA_NAME,
+        MAX_INVALID_METADATA_BYTES,
+        expected_uid=config.state_uid,
+        expected_gid=config.state_gid,
+        expected_mode=0o600,
+        description="invalid-claim metadata",
+    )
+    try:
+        metadata_record = json.loads(metadata_contents)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise TriggerError("invalid-claim metadata is not recoverable JSON") from error
+    if not isinstance(metadata_record, dict) or not isinstance(metadata_record.get("reason"), str):
+        raise TriggerError("invalid-claim metadata lacks its quarantine reason")
+    if INVALID_EVIDENCE_NAME in entries:
+        read_bounded_owned_file(
+            claim_fd,
+            INVALID_EVIDENCE_NAME,
+            MAX_TOKEN_BYTES + 1,
+            expected_uid=config.state_uid,
+            expected_gid=config.state_gid,
+            expected_mode=0o600,
+            description="invalid-claim evidence",
+        )
+    remove_unpublished_owned_file(
+        claim_fd,
+        PENDING_INVALID_MARKER_NAME,
+        expected_uid=config.state_uid,
+        expected_gid=config.state_gid,
+        expected_mode=0o600,
+        description="unpublished invalid-claim marker",
+        directory_description="partial invalid deploy claim",
+    )
+    marker_reason = f"{metadata_record['reason']}; recovered interrupted quarantine\n"
+    publish_invalid_marker(claim_fd, marker_reason.encode("utf-8", errors="replace"), config)
+    raise TriggerError(
+        f"{metadata_record['reason']}; sentinel quarantined as {config.state_dir / claim_name}"
+    )
+
+
+def _claim_sentinel(config: TriggerConfig) -> str:
+    """Atomically move, bounded-read, and validate the current sentinel."""
+
+    trigger_fd = open_validated_directory(
+        config.trigger_dir,
+        expected_uid=config.trigger_uid,
+        expected_gid=config.trigger_gid,
+        expected_mode=config.trigger_mode,
+    )
+    state_fd = open_validated_directory(
+        config.state_dir,
+        expected_uid=config.state_uid,
+        expected_gid=config.state_gid,
+        expected_mode=EXPECTED_STATE_MODE,
+    )
+    try:
+        if os.fstat(trigger_fd).st_dev != os.fstat(state_fd).st_dev:
+            raise TriggerError(
+                f"trigger and state directories must share one filesystem: "
+                f"{config.trigger_dir} and {config.state_dir}"
+            )
+        try:
+            os.stat(SENTINEL_NAME, dir_fd=trigger_fd, follow_symlinks=False)
+        except FileNotFoundError as error:
+            raise TriggerError("no deploy sentinel; nothing to do", NO_SENTINEL_EXIT) from error
+        except OSError as error:
+            raise TriggerError(f"cannot inspect deploy sentinel: {error.strerror}") from error
+
+        blocker_created = ensure_deploy_blocker(config)
+        if (
+            os.environ.get(TEST_MODE_ENV) == "1"
+            and os.environ.get(TEST_STOP_AFTER_BLOCKER_ENV) == "1"
+        ):
+            raise TriggerError("injected stop after deploy blocker publication")
+        claim_name, claim_fd = create_claim_directory(state_fd, config)
+        fsync_directory(state_fd, "deploy-trigger state directory")
+        try:
+            os.rename(SENTINEL_NAME, INCOMING_TOKEN_NAME, src_dir_fd=trigger_fd, dst_dir_fd=claim_fd)
+        except FileNotFoundError as error:
+            remove_empty_claim_directory(state_fd, claim_name, claim_fd)
+            if blocker_created:
+                remove_deploy_blocker(config)
+            raise TriggerError("no deploy sentinel; nothing to do", NO_SENTINEL_EXIT) from error
+        except OSError as error:
+            remove_empty_claim_directory(state_fd, claim_name, claim_fd)
+            raise TriggerError(f"cannot atomically claim deploy sentinel: {error.strerror}") from error
+
+        fsync_directory(trigger_fd, "deploy-trigger inbox")
+        fsync_directory(claim_fd, "new deploy claim")
+        fsync_directory(state_fd, "deploy-trigger state directory")
+
+        try:
+            contents = bounded_regular_file_read(claim_fd, INCOMING_TOKEN_NAME)
+            validate_token_bytes(contents)
+        except TriggerError as error:
+            raise quarantine_claim(claim_fd, claim_name, str(error), config) from error
+        try:
+            write_exclusive_file(claim_fd, CLAIM_TOKEN_NAME, contents)
+            os.unlink(INCOMING_TOKEN_NAME, dir_fd=claim_fd)
+            fsync_directory(claim_fd, "validated deploy claim")
+            fsync_directory(state_fd, "deploy-trigger state directory")
+        except OSError as error:
+            raise TriggerError(
+                f"cannot finalize immutable deploy-token snapshot; recover claim {claim_name}: "
+                f"{error.strerror}"
+            ) from error
+        finally:
+            os.close(claim_fd)
+        return claim_name
+    finally:
+        os.close(state_fd)
+        os.close(trigger_fd)
+
+
+def claim_sentinel(config: TriggerConfig) -> str:
+    """Claim one sentinel while excluding every root/deploy publisher."""
+
+    publish_fd = open_validated_coordination_lock(config, config.publish_lock, "publish lock")
+    try:
+        fcntl.flock(publish_fd, fcntl.LOCK_EX)
+        return _claim_sentinel(config)
+    finally:
+        os.close(publish_fd)
+
+
+def read_valid_claim_token_from_directory(claim_fd: int, config: TriggerConfig) -> bytes:
+    """Return the normalized token from one trusted root-owned claim file."""
+
+    try:
+        token_metadata = os.stat(CLAIM_TOKEN_NAME, dir_fd=claim_fd, follow_symlinks=False)
+    except OSError as error:
+        raise TriggerError(f"cannot inspect claimed token: {error.strerror}") from error
+    if (
+        not stat.S_ISREG(token_metadata.st_mode)
+        or token_metadata.st_uid != config.state_uid
+        or token_metadata.st_gid != config.state_gid
+        or stat.S_IMODE(token_metadata.st_mode) != 0o600
+        or token_metadata.st_nlink != 1
+    ):
+        raise TriggerError("claimed token has an unsafe identity")
+    contents = bounded_regular_file_read(claim_fd, CLAIM_TOKEN_NAME)
+    validate_token_bytes(contents)
+    return contents[:-1] if contents.endswith(b"\n") else contents
+
+
+def recover_partial_claim(config: TriggerConfig, claim_name: str) -> str:
+    """Normalize one interrupted claim transition while deployment is quiesced."""
+
+    if CLAIM_PATTERN.fullmatch(claim_name) is None:
+        raise TriggerError("invalid deploy claim identifier")
+    state_fd = open_validated_directory(
+        config.state_dir,
+        expected_uid=config.state_uid,
+        expected_gid=config.state_gid,
+        expected_mode=EXPECTED_STATE_MODE,
+    )
+    claim_fd = -1
+    try:
+        try:
+            claim_fd = os.open(claim_name, directory_flags(), dir_fd=state_fd)
+        except FileNotFoundError:
+            fsync_directory(state_fd, "deploy-trigger state directory")
+            return "missing"
+        except OSError as error:
+            raise TriggerError(f"cannot safely open partial deploy claim: {error.strerror}") from error
+        metadata = os.fstat(claim_fd)
+        if (
+            metadata.st_uid != config.state_uid
+            or metadata.st_gid != config.state_gid
+            or stat.S_IMODE(metadata.st_mode) != EXPECTED_STATE_MODE
+        ):
+            raise TriggerError("partial deploy claim has an unsafe identity")
+
+        entries = set(os.listdir(claim_fd))
+        if entries.intersection(
+            {
+                INVALID_EVIDENCE_NAME,
+                INVALID_METADATA_NAME,
+                PENDING_INVALID_MARKER_NAME,
+            }
+        ):
+            recover_partial_quarantine(claim_fd, claim_name, entries, config)
+        if not entries:
+            os.close(claim_fd)
+            claim_fd = -1
+            try:
+                os.rmdir(claim_name, dir_fd=state_fd)
+            except FileNotFoundError:
+                pass
+            except OSError as error:
+                raise TriggerError(f"cannot remove empty partial deploy claim: {error.strerror}") from error
+            fsync_directory(state_fd, "deploy-trigger state directory")
+            return "removed"
+
+        if entries == {CLAIM_TOKEN_NAME}:
+            read_valid_claim_token_from_directory(claim_fd, config)
+            return "valid"
+
+        if entries == {INCOMING_TOKEN_NAME}:
+            try:
+                contents = bounded_regular_file_read(claim_fd, INCOMING_TOKEN_NAME)
+                validate_token_bytes(contents)
+            except TriggerError as error:
+                raise quarantine_claim(claim_fd, claim_name, str(error), config) from error
+            try:
+                write_exclusive_file(claim_fd, CLAIM_TOKEN_NAME, contents)
+                os.unlink(INCOMING_TOKEN_NAME, dir_fd=claim_fd)
+                fsync_directory(claim_fd, "recovered deploy claim")
+                fsync_directory(state_fd, "deploy-trigger state directory")
+                return "valid"
+            except OSError as error:
+                raise TriggerError(
+                    f"cannot recover partial deploy claim {claim_name}: {error.strerror}"
+                ) from error
+
+        if entries == {INCOMING_TOKEN_NAME, CLAIM_TOKEN_NAME}:
+            try:
+                read_valid_claim_token_from_directory(claim_fd, config)
+            except TriggerError:
+                # ``incoming`` remains authoritative until its immutable root
+                # snapshot is fully written. A short/empty root-owned token is
+                # therefore an unpublished artifact that can be recreated.
+                contents = bounded_regular_file_read(claim_fd, INCOMING_TOKEN_NAME)
+                validate_token_bytes(contents)
+                remove_unpublished_owned_file(
+                    claim_fd,
+                    CLAIM_TOKEN_NAME,
+                    expected_uid=config.state_uid,
+                    expected_gid=config.state_gid,
+                    expected_mode=0o600,
+                    description="interrupted claimed-token snapshot",
+                    directory_description="partial deploy claim",
+                )
+                write_exclusive_file(claim_fd, CLAIM_TOKEN_NAME, contents)
+                read_valid_claim_token_from_directory(claim_fd, config)
+            try:
+                incoming = os.stat(INCOMING_TOKEN_NAME, dir_fd=claim_fd, follow_symlinks=False)
+                if not stat.S_ISREG(incoming.st_mode) or incoming.st_nlink != 1:
+                    raise TriggerError("retained incoming token has an unsafe identity")
+                os.unlink(INCOMING_TOKEN_NAME, dir_fd=claim_fd)
+                fsync_directory(claim_fd, "recovered deploy claim")
+                fsync_directory(state_fd, "deploy-trigger state directory")
+                return "valid"
+            except OSError as error:
+                raise TriggerError(f"cannot remove recovered incoming token: {error.strerror}") from error
+
+        raise TriggerError("partial deploy claim contains unexpected entries")
+    finally:
+        if claim_fd >= 0:
+            os.close(claim_fd)
+        os.close(state_fd)
+
+
+def discard_claim(config: TriggerConfig, claim_name: str) -> None:
+    """Idempotently delete one helper-generated valid claim from root-only state.
+
+    An otherwise valid empty claim is the durable intermediate state left when
+    a previous invocation removed ``token`` but stopped before removing the
+    claim directory. Accepting only that empty, root-owned directory makes the
+    cleanup transition safely retryable without weakening entry validation.
+    """
+
+    if CLAIM_PATTERN.fullmatch(claim_name) is None:
+        raise TriggerError("invalid deploy claim identifier")
+    state_fd = open_validated_directory(
+        config.state_dir,
+        expected_uid=config.state_uid,
+        expected_gid=config.state_gid,
+        expected_mode=EXPECTED_STATE_MODE,
+    )
+    try:
+        try:
+            claim_fd = os.open(claim_name, directory_flags(), dir_fd=state_fd)
+        except FileNotFoundError:
+            fsync_directory(state_fd, "deploy-trigger state directory")
+            return
+        except OSError as error:
+            raise TriggerError(f"cannot safely open deploy claim: {error.strerror}") from error
+        try:
+            metadata = os.fstat(claim_fd)
+            if (
+                metadata.st_uid != config.state_uid
+                or metadata.st_gid != config.state_gid
+                or stat.S_IMODE(metadata.st_mode) != EXPECTED_STATE_MODE
+            ):
+                raise TriggerError("refusing to discard a deploy claim with an unsafe identity")
+            try:
+                os.stat(INVALID_MARKER_NAME, dir_fd=claim_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise TriggerError("refusing to discard a quarantined deploy claim")
+            entries = set(os.listdir(claim_fd))
+            if not entries:
+                fsync_directory(claim_fd, "empty deploy claim")
+            elif entries != {CLAIM_TOKEN_NAME}:
+                raise TriggerError("refusing to discard a deploy claim with unexpected entries")
+            else:
+                read_valid_claim_token_from_directory(claim_fd, config)
+                try:
+                    os.unlink(CLAIM_TOKEN_NAME, dir_fd=claim_fd)
+                    fsync_directory(claim_fd, "emptied deploy claim")
+                except OSError as error:
+                    raise TriggerError(f"cannot discard claimed token: {error.strerror}") from error
+        finally:
+            os.close(claim_fd)
+        try:
+            os.rmdir(claim_name, dir_fd=state_fd)
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            raise TriggerError(f"cannot discard deploy claim directory: {error.strerror}") from error
+        fsync_directory(state_fd, "deploy-trigger state directory")
+    finally:
+        os.close(state_fd)
+
+
+def discard_invalid_claim(config: TriggerConfig, claim_name: str) -> None:
+    """Idempotently delete one operator-reviewed bounded invalid claim.
+
+    The intact evidence set is first validated and atomically renamed to a
+    root-only tombstone. That durable rename is the adjudication boundary, so a
+    retry can finish removing a partially deleted tombstone without accepting
+    an original claim that has lost its required audit marker or metadata.
+    """
+
+    if CLAIM_PATTERN.fullmatch(claim_name) is None:
+        raise TriggerError("invalid deploy claim identifier")
+    state_fd = open_validated_directory(
+        config.state_dir,
+        expected_uid=config.state_uid,
+        expected_gid=config.state_gid,
+        expected_mode=EXPECTED_STATE_MODE,
+    )
+    tombstone_name = f".discarded-{claim_name}"
+    required = {INVALID_MARKER_NAME, INVALID_METADATA_NAME}
+    allowed = required | {INVALID_EVIDENCE_NAME}
+    try:
+        try:
+            claim_fd = os.open(claim_name, directory_flags(), dir_fd=state_fd)
+        except FileNotFoundError:
+            claim_fd = -1
+        except OSError as error:
+            raise TriggerError(f"cannot safely open invalid deploy claim: {error.strerror}") from error
+
+        if claim_fd >= 0:
+            try:
+                try:
+                    os.stat(tombstone_name, dir_fd=state_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    pass
+                except OSError as error:
+                    raise TriggerError(
+                        f"cannot inspect invalid-claim tombstone: {error.strerror}"
+                    ) from error
+                else:
+                    raise TriggerError("invalid claim and its tombstone both exist")
+                metadata = os.fstat(claim_fd)
+                if (
+                    metadata.st_uid != config.state_uid
+                    or metadata.st_gid != config.state_gid
+                    or stat.S_IMODE(metadata.st_mode) != EXPECTED_STATE_MODE
+                ):
+                    raise TriggerError("refusing to adjudicate a deploy claim with an unsafe identity")
+                entries = set(os.listdir(claim_fd))
+                if not required.issubset(entries) or not entries.issubset(allowed):
+                    raise TriggerError("invalid claim contains unexpected or retained incoming entries")
+                for filename in sorted(entries):
+                    file_metadata = os.stat(filename, dir_fd=claim_fd, follow_symlinks=False)
+                    if (
+                        not stat.S_ISREG(file_metadata.st_mode)
+                        or file_metadata.st_uid != config.state_uid
+                        or file_metadata.st_gid != config.state_gid
+                        or stat.S_IMODE(file_metadata.st_mode) != 0o600
+                        or file_metadata.st_nlink != 1
+                    ):
+                        raise TriggerError(f"invalid claim evidence has an unsafe identity: {filename}")
+            finally:
+                os.close(claim_fd)
+            try:
+                os.rename(claim_name, tombstone_name, src_dir_fd=state_fd, dst_dir_fd=state_fd)
+                fsync_directory(state_fd, "deploy-trigger state directory")
+            except OSError as error:
+                raise TriggerError(f"cannot tombstone invalid deploy claim: {error.strerror}") from error
+
+        try:
+            tombstone_fd = os.open(tombstone_name, directory_flags(), dir_fd=state_fd)
+        except FileNotFoundError:
+            fsync_directory(state_fd, "deploy-trigger state directory")
+            tombstone_fd = -1
+        except OSError as error:
+            raise TriggerError(f"cannot safely open invalid-claim tombstone: {error.strerror}") from error
+        if tombstone_fd >= 0:
+            try:
+                metadata = os.fstat(tombstone_fd)
+                if (
+                    metadata.st_uid != config.state_uid
+                    or metadata.st_gid != config.state_gid
+                    or stat.S_IMODE(metadata.st_mode) != EXPECTED_STATE_MODE
+                ):
+                    raise TriggerError("invalid-claim tombstone has an unsafe identity")
+                entries = set(os.listdir(tombstone_fd))
+                if not entries.issubset(allowed):
+                    raise TriggerError("invalid-claim tombstone contains unexpected entries")
+                for filename in sorted(entries):
+                    file_metadata = os.stat(filename, dir_fd=tombstone_fd, follow_symlinks=False)
+                    if (
+                        not stat.S_ISREG(file_metadata.st_mode)
+                        or file_metadata.st_uid != config.state_uid
+                        or file_metadata.st_gid != config.state_gid
+                        or stat.S_IMODE(file_metadata.st_mode) != 0o600
+                        or file_metadata.st_nlink != 1
+                    ):
+                        raise TriggerError(f"invalid claim evidence has an unsafe identity: {filename}")
+                    os.unlink(filename, dir_fd=tombstone_fd)
+                    fsync_directory(tombstone_fd, "partially removed invalid-claim tombstone")
+            finally:
+                os.close(tombstone_fd)
+            try:
+                os.rmdir(tombstone_name, dir_fd=state_fd)
+            except FileNotFoundError:
+                pass
+            except OSError as error:
+                raise TriggerError(f"cannot remove invalid-claim tombstone: {error.strerror}") from error
+            fsync_directory(state_fd, "deploy-trigger state directory")
+    finally:
+        os.close(state_fd)
+    remove_deploy_blocker(config)
+
+
+def read_valid_claim_token(config: TriggerConfig, claim_name: str) -> bytes:
+    """Return the normalized token from one untouched valid claim."""
+
+    if CLAIM_PATTERN.fullmatch(claim_name) is None:
+        raise TriggerError("invalid deploy claim identifier")
+    state_fd = open_validated_directory(
+        config.state_dir,
+        expected_uid=config.state_uid,
+        expected_gid=config.state_gid,
+        expected_mode=EXPECTED_STATE_MODE,
+    )
+    try:
+        try:
+            claim_fd = os.open(claim_name, directory_flags(), dir_fd=state_fd)
+        except OSError as error:
+            raise TriggerError(f"cannot safely open deploy claim: {error.strerror}") from error
+        try:
+            metadata = os.fstat(claim_fd)
+            if (
+                metadata.st_uid != config.state_uid
+                or metadata.st_gid != config.state_gid
+                or stat.S_IMODE(metadata.st_mode) != EXPECTED_STATE_MODE
+            ):
+                raise TriggerError("valid deploy claim has an unsafe identity")
+            if set(os.listdir(claim_fd)) != {CLAIM_TOKEN_NAME}:
+                raise TriggerError("valid deploy claim contains unexpected entries")
+            return read_valid_claim_token_from_directory(claim_fd, config)
+        finally:
+            os.close(claim_fd)
+    finally:
+        os.close(state_fd)
+
+
+def open_validated_results_directory(config: TriggerConfig) -> int:
+    """Open the append-only result directory with its reviewed identity."""
+
+    return open_validated_directory(
+        config.results_dir,
+        expected_uid=config.state_uid,
+        expected_gid=config.trigger_gid,
+        expected_mode=EXPECTED_RESULTS_MODE,
+    )
+
+
+def read_valid_result(
+    results_fd: int,
+    filename: str,
+    config: TriggerConfig,
+    expected_contents: tuple[bytes, ...],
+    description: str,
+    allowed_link_counts: tuple[int, ...] = (1,),
+) -> None:
+    """Require one trusted immutable result with exact allowed contents."""
+
+    try:
+        path_metadata = os.stat(filename, dir_fd=results_fd, follow_symlinks=False)
+    except OSError as error:
+        raise TriggerError(f"cannot inspect {description}: {error.strerror}") from error
+    if (
+        not stat.S_ISREG(path_metadata.st_mode)
+        or path_metadata.st_uid != config.state_uid
+        or path_metadata.st_gid != config.trigger_gid
+        or stat.S_IMODE(path_metadata.st_mode) != RESULT_FILE_MODE
+        or path_metadata.st_nlink not in allowed_link_counts
+    ):
+        raise TriggerError(f"{description} has an unsafe identity")
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        result_fd = os.open(filename, flags, dir_fd=results_fd)
+    except OSError as error:
+        raise TriggerError(f"cannot safely open {description}: {error.strerror}") from error
+    try:
+        opened_metadata = os.fstat(result_fd)
+        if (
+            not os.path.samestat(path_metadata, opened_metadata)
+            or not stat.S_ISREG(opened_metadata.st_mode)
+            or opened_metadata.st_uid != config.state_uid
+            or opened_metadata.st_gid != config.trigger_gid
+            or stat.S_IMODE(opened_metadata.st_mode) != RESULT_FILE_MODE
+            or opened_metadata.st_nlink not in allowed_link_counts
+        ):
+            raise TriggerError(f"{description} changed while opening")
+        maximum = max(len(value) for value in expected_contents)
+        contents = os.read(result_fd, maximum + 1)
+        if contents not in expected_contents or os.read(result_fd, 1):
+            raise TriggerError(f"{description} has invalid contents")
+    finally:
+        os.close(result_fd)
+
+
+def read_valid_success_result(
+    results_fd: int,
+    filename: str,
+    config: TriggerConfig,
+    allowed_link_counts: tuple[int, ...] = (1,),
+) -> None:
+    """Require one trusted, immutable success result."""
+
+    read_valid_result(
+        results_fd,
+        filename,
+        config,
+        (SUCCESS_RESULT_BYTES,),
+        "deploy success result",
+        allowed_link_counts,
+    )
+
+
+def require_settled_deploy_results(
+    results_fd: int,
+    config: TriggerConfig,
+    ignored_names: frozenset[str] = frozenset(),
+) -> None:
+    """Reject pending or malformed evidence before clearing a global blocker."""
+
+    for name in sorted(os.listdir(results_fd)):
+        if name in ignored_names:
+            continue
+        if FINAL_RESULT_PATTERN.fullmatch(name) is not None:
+            read_valid_result(
+                results_fd,
+                name,
+                config,
+                (SUCCESS_RESULT_BYTES, FAILED_RESULT_BYTES),
+                "final deploy result",
+            )
+            continue
+        if FAILED_TRANSFER_RESULT_PATTERN.fullmatch(name) is not None:
+            read_valid_result(
+                results_fd,
+                name,
+                config,
+                (FAILED_RESULT_BYTES,),
+                "failed transfer result",
+            )
+            continue
+        raise TriggerError(f"unresolved deploy result prevents unblocking: {name}")
+
+
+def result_writing_name(pending_name: str) -> str:
+    """Return the private write name paired with one canonical pending result."""
+
+    if not pending_name.startswith(".pending-"):
+        raise TriggerError("pending deploy result has an invalid private-write name")
+    return f".writing-{pending_name[1:]}"
+
+
+def create_pending_result(
+    results_fd: int,
+    pending_name: str,
+    config: TriggerConfig,
+    contents: bytes,
+    description: str,
+) -> None:
+    """Write privately, then no-replace publish one recoverable pending result."""
+
+    writing_name = result_writing_name(pending_name)
+    if child_metadata(results_fd, pending_name, description) is not None:
+        try:
+            read_valid_result(
+                results_fd,
+                pending_name,
+                config,
+                (contents,),
+                description,
+                (1, 2),
+            )
+            remove_unpublished_owned_file(
+                results_fd,
+                writing_name,
+                expected_uid=config.state_uid,
+                expected_gid=config.trigger_gid,
+                expected_mode=RESULT_FILE_MODE,
+                description=f"private {description}",
+                directory_description="deploy result directory",
+            )
+            return
+        except TriggerError:
+            # Callers reach this function only while their retained claim,
+            # completion intent, or transfer marker still authorizes staging.
+            # A single-link malformed pending name is therefore an interrupted
+            # older writer, not append-only terminal evidence.
+            remove_unpublished_owned_file(
+                results_fd,
+                pending_name,
+                expected_uid=config.state_uid,
+                expected_gid=config.trigger_gid,
+                expected_mode=RESULT_FILE_MODE,
+                description=description,
+                directory_description="deploy result directory",
+            )
+    ensure_unpublished_owned_file(
+        results_fd,
+        writing_name,
+        contents,
+        expected_uid=config.state_uid,
+        expected_gid=config.trigger_gid,
+        expected_mode=RESULT_FILE_MODE,
+        description=f"private {description}",
+        directory_description="deploy result directory",
+    )
+    try:
+        rename_noreplace(results_fd, writing_name, results_fd, pending_name)
+    except FileExistsError:
+        read_valid_result(
+            results_fd,
+            pending_name,
+            config,
+            (contents,),
+            description,
+            (1, 2),
+        )
+        remove_unpublished_owned_file(
+            results_fd,
+            writing_name,
+            expected_uid=config.state_uid,
+            expected_gid=config.trigger_gid,
+            expected_mode=RESULT_FILE_MODE,
+            description=f"private {description}",
+            directory_description="deploy result directory",
+        )
+        return
+    except OSError as error:
+        raise TriggerError(f"cannot publish {description}: {error.strerror}") from error
+    fsync_directory(results_fd, "deploy result directory")
+    read_valid_result(
+        results_fd,
+        pending_name,
+        config,
+        (contents,),
+        description,
+    )
+
+
+def create_pending_failed_transfer_result(
+    results_fd: int,
+    pending_name: str,
+    config: TriggerConfig,
+) -> None:
+    """Durably stage explicit failed-transfer evidence before unlatching ingress."""
+
+    create_pending_result(
+        results_fd,
+        pending_name,
+        config,
+        FAILED_RESULT_BYTES,
+        "staged failed-transfer result",
+    )
+
+
+def create_pending_success_result(
+    results_fd: int,
+    pending_name: str,
+    config: TriggerConfig,
+) -> None:
+    """Durably stage one exclusive success result before claim deletion."""
+
+    create_pending_result(
+        results_fd,
+        pending_name,
+        config,
+        SUCCESS_RESULT_BYTES,
+        "staged deploy result",
+    )
+
+
+def create_pending_failed_result(
+    results_fd: int,
+    pending_name: str,
+    config: TriggerConfig,
+) -> None:
+    """Durably stage one exclusive operator-cancelled failure result."""
+
+    create_pending_result(
+        results_fd,
+        pending_name,
+        config,
+        FAILED_RESULT_BYTES,
+        "staged failed deploy result",
+    )
+
+
+def promote_pending_result(results_fd: int, pending_name: str, final_name: str) -> None:
+    """Expose a staged result without ever replacing append-only evidence."""
+
+    pending_metadata, final_metadata = validate_pending_result_publication(
+        results_fd,
+        pending_name,
+        final_name,
+    )
+    if final_metadata is not None:
+        try:
+            os.unlink(pending_name, dir_fd=results_fd)
+        except OSError as error:
+            raise TriggerError(f"cannot remove staged deploy result link: {error.strerror}") from error
+        fsync_directory(results_fd, "deploy result directory")
+        return
+    try:
+        rename_noreplace(results_fd, pending_name, results_fd, final_name)
+    except FileExistsError:
+        # The macOS test fallback publishes by link-then-unlink. Recover that
+        # narrow state if another process died after creating the final link.
+        recovered_pending, recovered_final = validate_pending_result_publication(
+            results_fd,
+            pending_name,
+            final_name,
+        )
+        if recovered_final is None:
+            raise TriggerError("refusing to overwrite an append-only deploy result")
+        pending_metadata = recovered_pending
+        try:
+            os.unlink(pending_name, dir_fd=results_fd)
+        except OSError as error:
+            raise TriggerError(
+                f"cannot remove staged deploy result link: {error.strerror}"
+            ) from error
+    except OSError as error:
+        raise TriggerError(f"cannot publish staged deploy result: {error.strerror}") from error
+    fsync_directory(results_fd, "deploy result directory")
+    try:
+        final_metadata = os.stat(final_name, dir_fd=results_fd, follow_symlinks=False)
+    except OSError as error:
+        raise TriggerError(f"cannot inspect final deploy result: {error.strerror}") from error
+    if not os.path.samestat(pending_metadata, final_metadata) or final_metadata.st_nlink != 1:
+        raise TriggerError("published deploy result has an unsafe identity")
+
+
+def validate_pending_result_publication(
+    results_fd: int,
+    pending_name: str,
+    final_name: str,
+) -> tuple[os.stat_result, Optional[os.stat_result]]:
+    """Validate either a staged-only result or its interrupted publication."""
+
+    try:
+        pending_metadata = os.stat(pending_name, dir_fd=results_fd, follow_symlinks=False)
+    except OSError as error:
+        raise TriggerError(f"cannot inspect staged deploy result: {error.strerror}") from error
+    if not stat.S_ISREG(pending_metadata.st_mode) or pending_metadata.st_nlink not in {1, 2}:
+        raise TriggerError("staged deploy result has an unsafe link state")
+    try:
+        final_metadata = os.stat(final_name, dir_fd=results_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        final_metadata = None
+    except OSError as error:
+        raise TriggerError(f"cannot inspect final deploy result: {error.strerror}") from error
+    if final_metadata is None:
+        if pending_metadata.st_nlink != 1:
+            raise TriggerError("staged deploy result has an unsafe link state")
+        return pending_metadata, None
+    if (
+        not stat.S_ISREG(final_metadata.st_mode)
+        or not os.path.samestat(pending_metadata, final_metadata)
+        or pending_metadata.st_nlink != 2
+        or final_metadata.st_nlink != 2
+    ):
+        raise TriggerError("refusing to replace conflicting append-only deploy result evidence")
+    return pending_metadata, final_metadata
+
+
+def publish_failed_claim_result(config: TriggerConfig, claim_name: str) -> None:
+    """Stage and publish one failed result while retaining its retryable claim."""
+
+    token = read_valid_claim_token(config, claim_name).decode("ascii")
+    pending_name = f".pending-failed-{token}.{claim_name}"
+    final_name = f"{token}.{claim_name}"
+    results_fd = open_validated_results_directory(config)
+    try:
+        for conflicting_name in (
+            f".pending-{token}.{claim_name}",
+            f".pending-discard-{token}.{claim_name}",
+            result_writing_name(f".pending-{token}.{claim_name}"),
+            result_writing_name(f".pending-discard-{token}.{claim_name}"),
+        ):
+            try:
+                os.stat(conflicting_name, dir_fd=results_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            except OSError as error:
+                raise TriggerError(
+                    f"cannot inspect competing staged deploy result: {error.strerror}"
+                ) from error
+            raise TriggerError("deploy claim already has a different staged terminal transition")
+        try:
+            os.stat(pending_name, dir_fd=results_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pending_exists = False
+        except OSError as error:
+            raise TriggerError(f"cannot inspect staged failed deploy result: {error.strerror}") from error
+        else:
+            pending_exists = True
+        try:
+            os.stat(final_name, dir_fd=results_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            final_exists = False
+        except OSError as error:
+            raise TriggerError(f"cannot inspect failed deploy result: {error.strerror}") from error
+        else:
+            final_exists = True
+
+        if pending_exists:
+            if final_exists:
+                read_valid_result(
+                    results_fd,
+                    pending_name,
+                    config,
+                    (FAILED_RESULT_BYTES,),
+                    "staged failed deploy result",
+                    (2,),
+                )
+                read_valid_result(
+                    results_fd,
+                    final_name,
+                    config,
+                    (FAILED_RESULT_BYTES,),
+                    "failed deploy result",
+                    (2,),
+                )
+            else:
+                create_pending_failed_result(results_fd, pending_name, config)
+            validate_pending_result_publication(results_fd, pending_name, final_name)
+            promote_pending_result(results_fd, pending_name, final_name)
+        elif final_exists:
+            read_valid_result(
+                results_fd,
+                final_name,
+                config,
+                (FAILED_RESULT_BYTES,),
+                "failed deploy result",
+            )
+            return
+        else:
+            create_pending_failed_result(results_fd, pending_name, config)
+            validate_pending_result_publication(results_fd, pending_name, final_name)
+            promote_pending_result(results_fd, pending_name, final_name)
+        read_valid_result(
+            results_fd,
+            final_name,
+            config,
+            (FAILED_RESULT_BYTES,),
+            "failed deploy result",
+        )
+    finally:
+        os.close(results_fd)
+
+
+def complete_claim(config: TriggerConfig, claim_name: str, invocation_id: str) -> None:
+    """Record completion intent, discard its claim, and expose success."""
+
+    token = read_valid_claim_token(config, claim_name).decode("ascii")
+    pending_name = f".pending-{token}.{claim_name}"
+    final_name = f"{token}.{claim_name}"
+    results_fd = open_validated_results_directory(config)
+    try:
+        for conflicting_name in (
+            f".pending-failed-{token}.{claim_name}",
+            f".pending-discard-{token}.{claim_name}",
+            result_writing_name(f".pending-failed-{token}.{claim_name}"),
+            result_writing_name(f".pending-discard-{token}.{claim_name}"),
+            final_name,
+        ):
+            try:
+                os.stat(conflicting_name, dir_fd=results_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            except OSError as error:
+                raise TriggerError(
+                    f"cannot inspect competing deploy result: {error.strerror}"
+                ) from error
+            raise TriggerError("refusing to replace conflicting append-only deploy result evidence")
+        write_completion_intent(
+            config,
+            CompletionIntent(invocation_id, token, claim_name),
+        )
+        create_pending_success_result(results_fd, pending_name, config)
+        validate_pending_result_publication(results_fd, pending_name, final_name)
+        discard_claim(config, claim_name)
+        promote_pending_result(results_fd, pending_name, final_name)
+        remove_deploy_blocker(config)
+    finally:
+        os.close(results_fd)
+
+
+def discard_claim_with_terminal_result(config: TriggerConfig, claim_name: str) -> None:
+    """Cancel one valid claim only after binding durable terminal evidence."""
+
+    if CLAIM_PATTERN.fullmatch(claim_name) is None:
+        raise TriggerError("invalid deploy claim identifier")
+    claim_state = recover_partial_claim(config, claim_name)
+    results_fd = open_validated_results_directory(config)
+    try:
+        pending_matches: list[tuple[str, str, tuple[bytes, ...]]] = []
+        final_matches: list[tuple[str, str]] = []
+        for name in os.listdir(results_fd):
+            pending_match = PENDING_RESULT_PATTERN.fullmatch(name)
+            if pending_match is not None and pending_match.group(2) == claim_name:
+                pending_matches.append((name, pending_match.group(1), (SUCCESS_RESULT_BYTES,)))
+                continue
+            pending_match = PENDING_FAILED_RESULT_PATTERN.fullmatch(name)
+            if pending_match is not None and pending_match.group(2) == claim_name:
+                pending_matches.append((name, pending_match.group(1), (FAILED_RESULT_BYTES,)))
+                continue
+            pending_match = PENDING_DISCARD_RESULT_PATTERN.fullmatch(name)
+            if pending_match is not None and pending_match.group(2) == claim_name:
+                pending_matches.append((name, pending_match.group(1), (FAILED_RESULT_BYTES,)))
+                continue
+            final_match = FINAL_RESULT_PATTERN.fullmatch(name)
+            if final_match is not None and final_match.group(2) == claim_name:
+                final_matches.append((name, final_match.group(1)))
+        if len(pending_matches) > 1 or len(final_matches) > 1:
+            raise TriggerError("deploy claim has multiple terminal result candidates")
+        if pending_matches and final_matches and pending_matches[0][1] != final_matches[0][1]:
+            raise TriggerError("deploy claim has mismatched staged and final result tokens")
+
+        token: Optional[str] = None
+        if claim_state == "valid":
+            token = read_valid_claim_token(config, claim_name).decode("ascii")
+        elif claim_state not in {"missing", "removed"}:
+            raise TriggerError(f"unsupported recovered claim state: {claim_state}")
+
+        if pending_matches:
+            evidence_name, evidence_token, expected_contents = pending_matches[0]
+            if token is not None and evidence_token != token:
+                raise TriggerError("terminal result token does not match its deploy claim")
+            token = evidence_token
+            if claim_state == "valid":
+                create_pending_result(
+                    results_fd,
+                    evidence_name,
+                    config,
+                    expected_contents[0],
+                    "deploy claim terminal result",
+                )
+            else:
+                read_valid_result(
+                    results_fd,
+                    evidence_name,
+                    config,
+                    expected_contents,
+                    "deploy claim terminal result",
+                    (1, 2),
+                )
+        elif final_matches:
+            evidence_name, evidence_token = final_matches[0]
+            if token is not None and evidence_token != token:
+                raise TriggerError("terminal result token does not match its deploy claim")
+            token = evidence_token
+            read_valid_result(
+                results_fd,
+                evidence_name,
+                config,
+                (SUCCESS_RESULT_BYTES, FAILED_RESULT_BYTES),
+                "deploy claim terminal result",
+            )
+        if token is None:
+            raise TriggerError("cannot discard a missing deploy claim without terminal result evidence")
+
+        pending_name = (
+            pending_matches[0][0]
+            if pending_matches
+            else f".pending-discard-{token}.{claim_name}"
+        )
+        final_name = f"{token}.{claim_name}"
+        allowed_writing_name = result_writing_name(pending_name)
+        for competing_writing_name in (
+            result_writing_name(f".pending-{token}.{claim_name}"),
+            result_writing_name(f".pending-failed-{token}.{claim_name}"),
+            result_writing_name(f".pending-discard-{token}.{claim_name}"),
+        ):
+            if competing_writing_name == allowed_writing_name:
+                continue
+            if child_metadata(
+                results_fd,
+                competing_writing_name,
+                "competing private deploy result",
+            ) is not None:
+                raise TriggerError("deploy claim has a different private terminal transition")
+        if not pending_matches and not final_matches:
+            create_pending_failed_result(results_fd, pending_name, config)
+            pending_matches = [(pending_name, token, (FAILED_RESULT_BYTES,))]
+        if pending_matches:
+            if final_matches:
+                read_valid_result(
+                    results_fd,
+                    final_name,
+                    config,
+                    pending_matches[0][2],
+                    "deploy claim terminal result",
+                    (2,),
+                )
+            validate_pending_result_publication(results_fd, pending_name, final_name)
+        discard_claim(config, claim_name)
+        if pending_matches:
+            promote_pending_result(results_fd, pending_name, final_name)
+        read_valid_result(
+            results_fd,
+            final_name,
+            config,
+            (SUCCESS_RESULT_BYTES, FAILED_RESULT_BYTES),
+            "deploy claim terminal result",
+        )
+        remove_deploy_blocker(config)
+    finally:
+        os.close(results_fd)
+
+
+def resolve_pending_claim(config: TriggerConfig, token: str, claim_name: str) -> None:
+    """Finish deletion of the claim associated with a trusted pending result."""
+
+    state_fd = open_validated_directory(
+        config.state_dir,
+        expected_uid=config.state_uid,
+        expected_gid=config.state_gid,
+        expected_mode=EXPECTED_STATE_MODE,
+    )
+    try:
+        try:
+            claim_fd = os.open(claim_name, directory_flags(), dir_fd=state_fd)
+        except FileNotFoundError:
+            return
+        except OSError as error:
+            raise TriggerError(f"cannot inspect pending-result claim: {error.strerror}") from error
+        try:
+            metadata = os.fstat(claim_fd)
+            if (
+                metadata.st_uid != config.state_uid
+                or metadata.st_gid != config.state_gid
+                or stat.S_IMODE(metadata.st_mode) != EXPECTED_STATE_MODE
+            ):
+                raise TriggerError("pending-result claim has an unsafe identity")
+            entries = set(os.listdir(claim_fd))
+            if not entries:
+                os.close(claim_fd)
+                claim_fd = -1
+                os.rmdir(claim_name, dir_fd=state_fd)
+                fsync_directory(state_fd, "deploy-trigger state directory")
+                return
+            if entries != {CLAIM_TOKEN_NAME}:
+                raise TriggerError("pending-result claim contains unexpected entries")
+            normalized = read_valid_claim_token_from_directory(claim_fd, config)
+            if normalized.decode("ascii") != token:
+                raise TriggerError("pending result does not match its retained claim")
+        finally:
+            if claim_fd >= 0:
+                os.close(claim_fd)
+    finally:
+        os.close(state_fd)
+    discard_claim(config, claim_name)
+
+
+def staged_result_from_name(filename: str, *, private: bool) -> Optional[StagedResult]:
+    """Parse one exact canonical or private staged-result filename."""
+
+    patterns: tuple[tuple[StagedResultKind, re.Pattern[str]], ...]
+    if private:
+        patterns = (
+            ("success", WRITING_RESULT_PATTERN),
+            ("failed", WRITING_FAILED_RESULT_PATTERN),
+            ("discard", WRITING_DISCARD_RESULT_PATTERN),
+        )
+    else:
+        patterns = (
+            ("success", PENDING_RESULT_PATTERN),
+            ("failed", PENDING_FAILED_RESULT_PATTERN),
+            ("discard", PENDING_DISCARD_RESULT_PATTERN),
+        )
+    for kind, pattern in patterns:
+        match = pattern.fullmatch(filename)
+        if match is not None:
+            token, claim_name = match.groups()
+            return StagedResult(kind, token, claim_name)
+    return None
+
+
+def canonical_pending_name(staged: StagedResult) -> str:
+    """Return the canonical pending filename for one staged transition."""
+
+    prefix = {
+        "success": ".pending-",
+        "failed": ".pending-failed-",
+        "discard": ".pending-discard-",
+    }[staged.kind]
+    return f"{prefix}{staged.token}.{staged.claim_name}"
+
+
+def staged_result_contents(staged: StagedResult) -> bytes:
+    """Return the only payload allowed for one staged transition kind."""
+
+    return SUCCESS_RESULT_BYTES if staged.kind == "success" else FAILED_RESULT_BYTES
+
+
+def require_staged_success_intent(config: TriggerConfig, staged: StagedResult) -> None:
+    """Require durable completion intent bound to one staged success."""
+
+    root_fd = open_validated_trigger_root(config)
+    try:
+        pending = read_completion_intent_file(
+            root_fd,
+            PENDING_COMPLETION_INTENT_NAME,
+            config,
+        )
+        published = read_completion_intent_file(root_fd, COMPLETION_INTENT_NAME, config)
+        if pending is not None:
+            if published is not None and published != pending:
+                raise TriggerError("staged success has conflicting completion intents")
+            if pending.token != staged.token or pending.claim_name != staged.claim_name:
+                raise TriggerError("unpublished completion intent does not match staged success")
+            promote_completion_intent(root_fd, config)
+            published = pending
+        if (
+            published is None
+            or published.token != staged.token
+            or published.claim_name != staged.claim_name
+        ):
+            raise TriggerError("staged success lacks its matching completion intent")
+    finally:
+        os.close(root_fd)
+
+
+def validate_staged_claim(
+    config: TriggerConfig,
+    staged: StagedResult,
+    *,
+    require_present: bool,
+) -> None:
+    """Bind one staged transition to its retained claim when required."""
+
+    claim_state = recover_partial_claim(config, staged.claim_name)
+    if claim_state == "valid":
+        token = read_valid_claim_token(config, staged.claim_name).decode("ascii")
+        if token != staged.token:
+            raise TriggerError("staged result does not match its retained claim")
+        return
+    if require_present or claim_state not in {"missing", "removed"}:
+        raise TriggerError("staged result lacks its required retained claim")
+
+
+def prepare_staged_result_recovery(config: TriggerConfig) -> Optional[StagedResult]:
+    """Repair one authorized private write and classify staged reboot recovery."""
+
+    results_fd = open_validated_results_directory(config)
+    try:
+        private_candidates = [
+            staged
+            for name in sorted(os.listdir(results_fd))
+            if (staged := staged_result_from_name(name, private=True)) is not None
+        ]
+        if len(private_candidates) > 1:
+            raise TriggerError("multiple private deploy-result writes require operator review")
+        if private_candidates:
+            staged = private_candidates[0]
+            validate_staged_claim(config, staged, require_present=True)
+            if staged.kind == "success":
+                require_staged_success_intent(config, staged)
+            create_pending_result(
+                results_fd,
+                canonical_pending_name(staged),
+                config,
+                staged_result_contents(staged),
+                f"staged {staged.kind} deploy result",
+            )
+
+        candidates = [
+            staged
+            for name in sorted(os.listdir(results_fd))
+            if (staged := staged_result_from_name(name, private=False)) is not None
+        ]
+        if len(candidates) > 1:
+            raise TriggerError("multiple staged deploy results require operator review")
+        if not candidates:
+            return None
+        staged = candidates[0]
+        read_valid_result(
+            results_fd,
+            canonical_pending_name(staged),
+            config,
+            (staged_result_contents(staged),),
+            f"staged {staged.kind} deploy result",
+            (1, 2),
+        )
+        validate_staged_claim(
+            config,
+            staged,
+            require_present=staged.kind == "failed",
+        )
+        if staged.kind == "success":
+            require_staged_success_intent(config, staged)
+        return staged
+    finally:
+        os.close(results_fd)
+
+
+def recover_pending_results(config: TriggerConfig) -> int:
+    """Complete trusted success or operator-discard transitions after staging."""
+
+    results_fd = open_validated_results_directory(config)
+    recovered = 0
+    try:
+        candidates: list[tuple[str, str, str, tuple[bytes, ...]]] = []
+        seen_claims: set[str] = set()
+        for pending_name in sorted(os.listdir(results_fd)):
+            failed_match = PENDING_FAILED_RESULT_PATTERN.fullmatch(pending_name)
+            if failed_match is not None:
+                raise TriggerError(
+                    "staged failed finalization must be recovered with "
+                    f"fail {failed_match.group(2)}"
+                )
+            match = PENDING_RESULT_PATTERN.fullmatch(pending_name)
+            expected_contents = (SUCCESS_RESULT_BYTES,)
+            if match is None:
+                match = PENDING_DISCARD_RESULT_PATTERN.fullmatch(pending_name)
+                expected_contents = (FAILED_RESULT_BYTES,)
+            if match is None:
+                continue
+            token, claim_name = match.groups()
+            if claim_name in seen_claims:
+                raise TriggerError("deploy claim has multiple staged terminal transitions")
+            seen_claims.add(claim_name)
+            candidates.append((pending_name, token, claim_name, expected_contents))
+
+        for pending_name, token, claim_name, expected_contents in candidates:
+            try:
+                read_valid_result(
+                    results_fd,
+                    pending_name,
+                    config,
+                    expected_contents,
+                    "staged deploy result",
+                    (1, 2),
+                )
+            except TriggerError:
+                claim_state = recover_partial_claim(config, claim_name)
+                if claim_state != "valid":
+                    raise
+                retained_token = read_valid_claim_token(config, claim_name).decode("ascii")
+                if retained_token != token:
+                    raise TriggerError("partial pending result does not match its retained claim")
+                create_pending_result(
+                    results_fd,
+                    pending_name,
+                    config,
+                    expected_contents[0],
+                    "staged deploy result",
+                )
+            validate_pending_result_publication(
+                results_fd,
+                pending_name,
+                f"{token}.{claim_name}",
+            )
+
+        for pending_name, token, claim_name, _expected_contents in candidates:
+            resolve_pending_claim(config, token, claim_name)
+            promote_pending_result(
+                results_fd,
+                pending_name,
+                f"{token}.{claim_name}",
+            )
+            recovered += 1
+    finally:
+        os.close(results_fd)
+    remove_deploy_blocker(config)
+    return recovered
+
+
+def recover_completed_invocation(config: TriggerConfig, invocation_id: str) -> CompletionIntent:
+    """Finish success publication for one failed-but-completed systemd run."""
+
+    intent = completion_intent_for_invocation(config, invocation_id)
+    claim_state = recover_partial_claim(config, intent.claim_name)
+    if claim_state == "valid":
+        token = read_valid_claim_token(config, intent.claim_name).decode("ascii")
+        if token != intent.token:
+            raise TriggerError("completion intent does not match its retained claim")
+        complete_claim(config, intent.claim_name, invocation_id)
+    elif claim_state not in {"missing", "removed"}:
+        raise TriggerError(f"unsupported recovered claim state: {claim_state}")
+
+    pending_name = f".pending-{intent.token}.{intent.claim_name}"
+    final_name = f"{intent.token}.{intent.claim_name}"
+    results_fd = open_validated_results_directory(config)
+    try:
+        try:
+            final_metadata = os.stat(final_name, dir_fd=results_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            final_metadata = None
+        except OSError as error:
+            raise TriggerError(f"cannot inspect completed deploy result: {error.strerror}") from error
+        try:
+            pending_metadata = os.stat(pending_name, dir_fd=results_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pending_metadata = None
+        except OSError as error:
+            raise TriggerError(f"cannot inspect staged deploy result: {error.strerror}") from error
+
+        if pending_metadata is not None:
+            read_valid_success_result(
+                results_fd,
+                pending_name,
+                config,
+                (2,) if final_metadata is not None else (1,),
+            )
+            if final_metadata is not None:
+                read_valid_success_result(results_fd, final_name, config, (2,))
+            validate_pending_result_publication(results_fd, pending_name, final_name)
+            resolve_pending_claim(config, intent.token, intent.claim_name)
+            promote_pending_result(results_fd, pending_name, final_name)
+        elif final_metadata is None:
+            raise TriggerError("completed invocation has no recoverable success result")
+        read_valid_success_result(results_fd, final_name, config)
+    finally:
+        os.close(results_fd)
+    remove_deploy_blocker(config)
+    return intent
+
+
+def open_validated_coordination_lock(
+    config: TriggerConfig,
+    lock_path: Path,
+    description: str,
+) -> int:
+    """Open and validate one fixed cross-process coordination lock."""
+
+    flags = os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        lock_fd = os.open(lock_path, flags)
+    except OSError as error:
+        raise TriggerError(f"cannot safely open deploy {description}: {error.strerror}") from error
+    metadata = os.fstat(lock_fd)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != config.state_uid
+        or metadata.st_gid != config.trigger_gid
+        or stat.S_IMODE(metadata.st_mode) != 0o660
+        or metadata.st_nlink != 1
+    ):
+        os.close(lock_fd)
+        raise TriggerError(f"deploy {description} has an unsafe identity")
+    return lock_fd
+
+
+def read_valid_transfer_marker(trigger_fd: int, config: TriggerConfig) -> str:
+    """Read the exact deploy-owned marker left before a live-tree transfer."""
+
+    try:
+        path_metadata = os.stat(
+            TRANSFER_MARKER_NAME,
+            dir_fd=trigger_fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError as error:
+        raise TriggerError("no interrupted deploy transfer; nothing to recover") from error
+    except OSError as error:
+        raise TriggerError(f"cannot inspect interrupted deploy transfer: {error.strerror}") from error
+    if (
+        not stat.S_ISREG(path_metadata.st_mode)
+        or path_metadata.st_nlink != 1
+        or path_metadata.st_uid != config.publisher_uid
+        or path_metadata.st_gid != config.trigger_gid
+        or stat.S_IMODE(path_metadata.st_mode) != TRANSFER_MARKER_MODE
+    ):
+        raise TriggerError("interrupted deploy transfer marker has an unsafe identity")
+
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        marker_fd = os.open(TRANSFER_MARKER_NAME, flags, dir_fd=trigger_fd)
+    except OSError as error:
+        raise TriggerError(f"cannot safely open interrupted deploy transfer: {error.strerror}") from error
+    try:
+        opened_metadata = os.fstat(marker_fd)
+        if not os.path.samestat(path_metadata, opened_metadata):
+            raise TriggerError("interrupted deploy transfer marker changed while opening")
+        if (
+            not stat.S_ISREG(opened_metadata.st_mode)
+            or opened_metadata.st_nlink != 1
+            or opened_metadata.st_uid != config.publisher_uid
+            or opened_metadata.st_gid != config.trigger_gid
+            or stat.S_IMODE(opened_metadata.st_mode) != TRANSFER_MARKER_MODE
+        ):
+            raise TriggerError("opened deploy transfer marker has an unsafe identity")
+        contents = os.read(marker_fd, MAX_TOKEN_BYTES + 1)
+    finally:
+        os.close(marker_fd)
+    if not contents.endswith(b"\n") or TOKEN_PATTERN.fullmatch(contents[:-1]) is None:
+        raise TriggerError("interrupted deploy transfer marker has invalid contents")
+    return contents[:-1].decode("ascii")
+
+
+def discard_unpublished_transfer_marker(trigger_fd: int, config: TriggerConfig) -> bool:
+    """Discard a gateway private marker before any payload write can begin."""
+
+    if child_metadata(trigger_fd, TRANSFER_MARKER_NAME, "deploy transfer marker") is not None:
+        return False
+    if child_metadata(
+        trigger_fd,
+        PENDING_TRANSFER_MARKER_NAME,
+        "unpublished deploy transfer marker",
+    ) is None:
+        return False
+    remove_unpublished_owned_file(
+        trigger_fd,
+        PENDING_TRANSFER_MARKER_NAME,
+        expected_uid=config.publisher_uid,
+        expected_gid=config.trigger_gid,
+        expected_mode=TRANSFER_MARKER_MODE,
+        description="unpublished deploy transfer marker",
+        directory_description="deploy-trigger inbox",
+    )
+    return True
+
+
+def abort_interrupted_transfer(config: TriggerConfig) -> str:
+    """Record explicit failure evidence and unlatch one interrupted transfer."""
+
+    session_fd = open_validated_coordination_lock(config, config.session_lock, "session lock")
+    ingress_fd = open_validated_coordination_lock(config, config.ingress_lock, "ingress lock")
+    publish_fd = open_validated_coordination_lock(config, config.publish_lock, "publish lock")
+    try:
+        fcntl.flock(session_fd, fcntl.LOCK_EX)
+        fcntl.flock(ingress_fd, fcntl.LOCK_EX)
+        fcntl.flock(publish_fd, fcntl.LOCK_EX)
+        root_fd = open_validated_trigger_root(config)
+        trigger_fd = open_validated_trigger_for_cleanup(config)
+        state_fd = open_validated_directory(
+            config.state_dir,
+            expected_uid=config.state_uid,
+            expected_gid=config.state_gid,
+            expected_mode=EXPECTED_STATE_MODE,
+        )
+        results_fd = open_validated_results_directory(config)
+        try:
+            if os.fstat(trigger_fd).st_dev != os.fstat(state_fd).st_dev:
+                raise TriggerError("trigger and state directories must share one filesystem")
+            if os.listdir(state_fd):
+                raise TriggerError("cannot abort an interrupted transfer while deploy claims remain")
+            try:
+                os.stat(BLOCKER_NAME, dir_fd=root_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise TriggerError("cannot abort an interrupted transfer while the deploy blocker remains")
+            try:
+                os.stat(SENTINEL_NAME, dir_fd=trigger_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise TriggerError("cannot abort an interrupted transfer while a sentinel exists")
+
+            canonical_marker = child_metadata(
+                trigger_fd,
+                TRANSFER_MARKER_NAME,
+                "interrupted deploy transfer marker",
+            )
+            private_marker = child_metadata(
+                trigger_fd,
+                PENDING_TRANSFER_MARKER_NAME,
+                "unpublished deploy transfer marker",
+            )
+            if canonical_marker is not None and private_marker is not None:
+                raise TriggerError("canonical and unpublished deploy transfer markers both exist")
+            if canonical_marker is None and private_marker is not None:
+                require_settled_deploy_results(results_fd, config)
+                discard_unpublished_transfer_marker(trigger_fd, config)
+                return "pre-promotion"
+
+            token = read_valid_transfer_marker(trigger_fd, config)
+            pending_name = f".pending-transfer-failed-{token}"
+            writing_name = result_writing_name(pending_name)
+            final_name = f"{token}.transfer-failed"
+            names = set(os.listdir(results_fd))
+            related_names = {
+                name
+                for name in names
+                if name.startswith(f"{token}.") or name.startswith(f".pending-{token}.")
+            }
+            related_names.update(name for name in names if name == pending_name)
+            related_names.update(name for name in names if name == writing_name)
+            if not related_names.issubset({writing_name, pending_name, final_name}):
+                raise TriggerError("interrupted transfer token has conflicting deploy result evidence")
+            require_settled_deploy_results(
+                results_fd,
+                config,
+                frozenset({writing_name, pending_name, final_name}),
+            )
+            if pending_name in names:
+                if final_name in names:
+                    read_valid_result(
+                        results_fd,
+                        pending_name,
+                        config,
+                        (FAILED_RESULT_BYTES,),
+                        "staged failed-transfer result",
+                        (2,),
+                    )
+                    read_valid_result(
+                        results_fd,
+                        final_name,
+                        config,
+                        (FAILED_RESULT_BYTES,),
+                        "failed transfer result",
+                        (2,),
+                    )
+                else:
+                    create_pending_failed_transfer_result(results_fd, pending_name, config)
+                validate_pending_result_publication(results_fd, pending_name, final_name)
+                promote_pending_result(results_fd, pending_name, final_name)
+            elif final_name in names:
+                read_valid_result(
+                    results_fd,
+                    final_name,
+                    config,
+                    (FAILED_RESULT_BYTES,),
+                    "failed transfer result",
+                )
+            else:
+                create_pending_failed_transfer_result(results_fd, pending_name, config)
+                validate_pending_result_publication(results_fd, pending_name, final_name)
+                promote_pending_result(results_fd, pending_name, final_name)
+                read_valid_result(
+                    results_fd,
+                    final_name,
+                    config,
+                    (FAILED_RESULT_BYTES,),
+                    "failed transfer result",
+                )
+            try:
+                os.unlink(TRANSFER_MARKER_NAME, dir_fd=trigger_fd)
+            except OSError as error:
+                raise TriggerError(
+                    f"cannot clear aborted deploy transfer marker: {error.strerror}"
+                ) from error
+            fsync_directory(trigger_fd, "deploy-trigger inbox")
+            return token
+        finally:
+            os.close(results_fd)
+            os.close(state_fd)
+            os.close(trigger_fd)
+            os.close(root_fd)
+    finally:
+        os.close(publish_fd)
+        os.close(ingress_fd)
+        os.close(session_fd)
+
+
+def wait_for_requeued_sentinel_claim(
+    trigger_fd: int,
+    expected_device: int,
+    expected_inode: int,
+) -> None:
+    """Hold the shared barrier until the finalizer claims this retry token."""
+
+    deadline = time.monotonic() + CLAIM_WAIT_TIMEOUT_SECONDS
+    while True:
+        try:
+            metadata = os.stat(SENTINEL_NAME, dir_fd=trigger_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        except OSError as error:
+            raise TriggerError(f"cannot inspect requeued deploy sentinel: {error.strerror}") from error
+        if metadata.st_dev != expected_device or metadata.st_ino != expected_inode:
+            raise TriggerError("requeued deploy sentinel was unexpectedly replaced")
+        if time.monotonic() >= deadline:
+            raise TriggerError("timed out waiting for the requeued deploy sentinel to be claimed")
+        time.sleep(CLAIM_POLL_INTERVAL_SECONDS)
+
+
+def relabel_requeued_sentinel(
+    trigger_fd: int,
+    config: TriggerConfig,
+    expected: os.stat_result,
+) -> None:
+    """Apply and verify the inbox SELinux type before releasing publication."""
+
+    if config.restorecon_path is None:
+        return
+    sentinel_path = config.trigger_dir / SENTINEL_NAME
+    try:
+        result = subprocess.run(
+            [str(config.restorecon_path), "-F", str(sentinel_path)],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError as error:
+        raise TriggerError(f"cannot execute restorecon for requeued deploy sentinel: {error.strerror}") from error
+    if result.returncode != 0:
+        raise TriggerError("restorecon rejected the requeued deploy sentinel")
+
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        sentinel_fd = os.open(SENTINEL_NAME, flags, dir_fd=trigger_fd)
+    except OSError as error:
+        raise TriggerError(f"cannot open relabeled deploy sentinel: {error.strerror}") from error
+    try:
+        opened = os.fstat(sentinel_fd)
+        if not os.path.samestat(expected, opened):
+            raise TriggerError("requeued deploy sentinel changed while relabeling")
+        try:
+            raw_context = os.getxattr(sentinel_fd, "security.selinux")
+        except OSError as error:
+            raise TriggerError(
+                f"cannot read requeued deploy sentinel SELinux context: {error.strerror}"
+            ) from error
+        try:
+            context_fields = raw_context.rstrip(b"\0").decode("ascii").split(":")
+        except UnicodeDecodeError as error:
+            raise TriggerError("requeued deploy sentinel has a non-ASCII SELinux context") from error
+        if len(context_fields) < 4 or context_fields[2] != TRIGGER_SELINUX_TYPE:
+            raise TriggerError(
+                "requeued deploy sentinel did not receive the required SELinux type"
+            )
+        os.fsync(sentinel_fd)
+    finally:
+        os.close(sentinel_fd)
+
+
+def requeue_claim(config: TriggerConfig, claim_name: str) -> None:
+    """Restore a valid claim while maintaining the shared barrier handoff."""
+
+    if CLAIM_PATTERN.fullmatch(claim_name) is None:
+        raise TriggerError("invalid deploy claim identifier")
+    session_fd = open_validated_coordination_lock(config, config.session_lock, "session lock")
+    ingress_fd = open_validated_coordination_lock(config, config.ingress_lock, "ingress lock")
+    publish_fd = open_validated_coordination_lock(config, config.publish_lock, "publish lock")
+    try:
+        fcntl.flock(session_fd, fcntl.LOCK_EX)
+        fcntl.flock(ingress_fd, fcntl.LOCK_SH)
+        trigger_fd = open_validated_directory(
+            config.trigger_dir,
+            expected_uid=config.trigger_uid,
+            expected_gid=config.trigger_gid,
+            expected_mode=config.trigger_mode,
+        )
+        state_fd = open_validated_directory(
+            config.state_dir,
+            expected_uid=config.state_uid,
+            expected_gid=config.state_gid,
+            expected_mode=EXPECTED_STATE_MODE,
+        )
+        try:
+            if os.fstat(trigger_fd).st_dev != os.fstat(state_fd).st_dev:
+                raise TriggerError("trigger and state directories must share one filesystem")
+            try:
+                os.stat(SENTINEL_NAME, dir_fd=trigger_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise TriggerError("cannot requeue while another deploy sentinel exists")
+            claim_fd = os.open(claim_name, directory_flags(), dir_fd=state_fd)
+            try:
+                try:
+                    os.stat(INVALID_MARKER_NAME, dir_fd=claim_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    pass
+                else:
+                    raise TriggerError("cannot requeue an invalid quarantined claim")
+                read_valid_claim_token_from_directory(claim_fd, config)
+                source_metadata = os.stat(
+                    CLAIM_TOKEN_NAME,
+                    dir_fd=claim_fd,
+                    follow_symlinks=False,
+                )
+                fcntl.flock(publish_fd, fcntl.LOCK_EX)
+                try:
+                    try:
+                        os.stat(SENTINEL_NAME, dir_fd=trigger_fd, follow_symlinks=False)
+                    except FileNotFoundError:
+                        pass
+                    else:
+                        raise TriggerError("cannot requeue while another deploy sentinel exists")
+                    try:
+                        rename_noreplace(
+                            claim_fd,
+                            CLAIM_TOKEN_NAME,
+                            trigger_fd,
+                            SENTINEL_NAME,
+                        )
+                    except FileExistsError as error:
+                        raise TriggerError("cannot overwrite another deploy sentinel") from error
+                    except OSError as error:
+                        raise TriggerError(
+                            f"cannot publish requeued deploy sentinel: {error.strerror}"
+                        ) from error
+                    try:
+                        relabel_requeued_sentinel(trigger_fd, config, source_metadata)
+                    except TriggerError as relabel_error:
+                        try:
+                            rename_noreplace(
+                                trigger_fd,
+                                SENTINEL_NAME,
+                                claim_fd,
+                                CLAIM_TOKEN_NAME,
+                            )
+                            fsync_directory(claim_fd, "restored requeued deploy claim")
+                            fsync_directory(trigger_fd, "deploy-trigger inbox")
+                        except OSError as rollback_error:
+                            raise TriggerError(
+                                "could not restore the deploy claim after SELinux relabeling failed: "
+                                f"{rollback_error.strerror}"
+                            ) from relabel_error
+                        raise
+                    fsync_directory(claim_fd, "emptied requeued deploy claim")
+                    fsync_directory(trigger_fd, "deploy-trigger inbox")
+                    fsync_directory(state_fd, "deploy-trigger state directory")
+                    published = os.stat(SENTINEL_NAME, dir_fd=trigger_fd, follow_symlinks=False)
+                    if not os.path.samestat(source_metadata, published):
+                        raise TriggerError("requeued deploy sentinel lost its claim-token identity")
+                finally:
+                    fcntl.flock(publish_fd, fcntl.LOCK_UN)
+                wait_for_requeued_sentinel_claim(
+                    trigger_fd,
+                    published.st_dev,
+                    published.st_ino,
+                )
+            finally:
+                os.close(claim_fd)
+        finally:
+            os.close(state_fd)
+            os.close(trigger_fd)
+    finally:
+        os.close(publish_fd)
+        os.close(ingress_fd)
+        os.close(session_fd)
+    discard_claim(config, claim_name)
+    remove_deploy_blocker(config)
+
+
+def production_config() -> TriggerConfig:
+    """Build the production configuration from the reviewed fixed paths."""
+
+    if os.geteuid() != ROOT_UID:
+        raise TriggerError("must run as root")
+    try:
+        publisher_uid = pwd.getpwnam(DEFAULT_DEPLOY_USER).pw_uid
+        deploy_gid = grp.getgrnam(DEFAULT_DEPLOY_GROUP).gr_gid
+    except KeyError as error:
+        raise TriggerError(f"missing deploy account or group: {DEFAULT_DEPLOY_GROUP}") from error
+    return TriggerConfig(
+        trigger_root=DEFAULT_TRIGGER_ROOT,
+        trigger_dir=DEFAULT_TRIGGER_DIR,
+        state_dir=DEFAULT_STATE_DIR,
+        results_dir=DEFAULT_RESULTS_DIR,
+        trigger_uid=ROOT_UID,
+        trigger_gid=deploy_gid,
+        publisher_uid=publisher_uid,
+        trigger_mode=EXPECTED_TRIGGER_MODE,
+        state_uid=ROOT_UID,
+        state_gid=ROOT_GID,
+        ingress_lock=DEFAULT_INGRESS_LOCK,
+        publish_lock=DEFAULT_PUBLISH_LOCK,
+        session_lock=DEFAULT_SESSION_LOCK,
+        restorecon_path=DEFAULT_RESTORECON_PATH,
+    )
+
+
+def test_config(test_root: Path) -> TriggerConfig:
+    """Build an isolated non-root configuration for the repository test suite."""
+
+    if os.environ.get(TEST_MODE_ENV) != "1":
+        raise TriggerError(f"--test-root requires {TEST_MODE_ENV}=1")
+    # Darwin does not preserve the setgid bit on these user-owned temporary
+    # directories. Production always requires 02770; only the guarded test
+    # harness accepts Darwin's equivalent 0770 access bits.
+    trigger_mode = 0o770 if sys.platform == "darwin" else EXPECTED_TRIGGER_MODE
+    return TriggerConfig(
+        trigger_root=test_root,
+        trigger_dir=test_root / "trigger",
+        state_dir=test_root / "state",
+        results_dir=test_root / "results",
+        trigger_uid=os.geteuid(),
+        trigger_gid=os.getegid(),
+        publisher_uid=os.geteuid(),
+        trigger_mode=trigger_mode,
+        state_uid=os.geteuid(),
+        state_gid=os.getegid(),
+        ingress_lock=test_root / "ingress.lock",
+        publish_lock=test_root / "publish.lock",
+        session_lock=test_root / "session.lock",
+        restorecon_path=None,
+    )
+
+
+def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    """Parse the small claim/discard command-line interface."""
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--test-root",
+        type=Path,
+        help=argparse.SUPPRESS,
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers.add_parser("claim", help="atomically claim and validate the current sentinel")
+    discard_parser = subparsers.add_parser("discard", help="delete a completed valid claim")
+    discard_parser.add_argument("claim_name")
+    complete_parser = subparsers.add_parser(
+        "complete",
+        help="durably transition a successful claim into an append-only result",
+    )
+    complete_parser.add_argument("claim_name")
+    complete_parser.add_argument("invocation_id")
+    fail_parser = subparsers.add_parser(
+        "fail",
+        help="publish terminal failure evidence while retaining a retryable claim",
+    )
+    fail_parser.add_argument("claim_name")
+    recover_claim_parser = subparsers.add_parser(
+        "recover-claim",
+        help="normalize one claim transition interrupted before finalization",
+    )
+    recover_claim_parser.add_argument("claim_name")
+    subparsers.add_parser(
+        "recover-staged",
+        help="repair one authorized private result write and classify recovery",
+    )
+    subparsers.add_parser(
+        "recover-pending",
+        help="finish trusted success transitions interrupted after staging",
+    )
+    subparsers.add_parser(
+        "abort-transfer",
+        help="record failure and clear one operator-reviewed interrupted transfer",
+    )
+    recover_completion_parser = subparsers.add_parser(
+        "recover-completion",
+        help="finish success publication for one completed systemd invocation",
+    )
+    recover_completion_parser.add_argument("invocation_id")
+    requeue_parser = subparsers.add_parser("requeue", help="retry one retained valid claim")
+    requeue_parser.add_argument("claim_name")
+    invalid_parser = subparsers.add_parser(
+        "discard-invalid",
+        help="delete one operator-reviewed bounded invalid claim",
+    )
+    invalid_parser.add_argument("claim_name")
+    return parser.parse_args(argv)
+
+
+def fail(error: TriggerError) -> NoReturn:
+    """Report one deterministic error and terminate with its declared status."""
+
+    print(f"[deploy-trigger] ERROR: {error}", file=sys.stderr)
+    raise SystemExit(error.exit_code)
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    """Run the requested helper action."""
+
+    arguments = parse_arguments(argv)
+    try:
+        config = test_config(arguments.test_root) if arguments.test_root else production_config()
+        if arguments.command == "claim":
+            print(claim_sentinel(config))
+            return 0
+        if arguments.command == "discard":
+            discard_claim_with_terminal_result(config, arguments.claim_name)
+            return 0
+        if arguments.command == "complete":
+            complete_claim(config, arguments.claim_name, arguments.invocation_id)
+            return 0
+        if arguments.command == "fail":
+            publish_failed_claim_result(config, arguments.claim_name)
+            return 0
+        if arguments.command == "recover-claim":
+            print(recover_partial_claim(config, arguments.claim_name))
+            return 0
+        if arguments.command == "recover-staged":
+            staged = prepare_staged_result_recovery(config)
+            if staged is None:
+                print("none")
+            else:
+                print(f"{staged.kind} {staged.token} {staged.claim_name}")
+            return 0
+        if arguments.command == "recover-pending":
+            print(recover_pending_results(config))
+            return 0
+        if arguments.command == "abort-transfer":
+            print(abort_interrupted_transfer(config))
+            return 0
+        if arguments.command == "recover-completion":
+            intent = recover_completed_invocation(config, arguments.invocation_id)
+            print(f"{intent.token} {intent.claim_name}")
+            return 0
+        if arguments.command == "requeue":
+            requeue_claim(config, arguments.claim_name)
+            return 0
+        if arguments.command == "discard-invalid":
+            discard_invalid_claim(config, arguments.claim_name)
+            return 0
+        raise TriggerError(f"unsupported command: {arguments.command}")
+    except TriggerError as error:
+        fail(error)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

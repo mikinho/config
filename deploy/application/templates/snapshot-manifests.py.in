@@ -1,0 +1,581 @@
+#!/usr/bin/python3 -I
+"""Safely snapshot deploy manifests into one root-owned npm workspace.
+
+The application directory is writable by the deploy group, so pathname-level
+shell copies cannot guarantee that a checked manifest is the inode ultimately
+read.  This helper opens every trusted directory without following its final
+component, validates the opened directory identities, and performs all child
+operations relative to those directory descriptors.
+
+Both source manifests are fully validated and read before either destination
+is created.  Destinations are exclusive, read-only files below a root-only
+workspace, and any file created by a failed invocation is removed before the
+helper returns an error.
+"""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+import grp
+import os
+from pathlib import Path
+import pwd
+import re
+import stat
+import sys
+from typing import Final, NoReturn, Optional, Sequence
+
+
+DEFAULT_INCOMING_ROOT: Final = Path("@@INCOMING_ROOT@@")
+DEFAULT_WORK_ROOT: Final = Path("@@SNAPSHOT_WORK_ROOT@@")
+DEFAULT_DEPLOY_USER: Final = "@@DEPLOY_USER@@"
+DEFAULT_DEPLOY_GROUP: Final = "@@DEPLOY_GROUP@@"
+DEFAULT_APP_GROUP: Final = "@@SERVICE_GROUP@@"
+EXPECTED_INCOMING_ROOT_MODE: Final = 0o2770
+EXPECTED_CANDIDATE_MODE: Final = 0o2755
+EXPECTED_WORK_ROOT_MODE: Final = 0o710
+EXPECTED_WORKSPACE_MODE: Final = 0o700
+DESTINATION_FILE_MODE: Final = 0o400
+ROOT_UID: Final = 0
+ROOT_GID: Final = 0
+PACKAGE_JSON_MAX_BYTES: Final = 1 * 1024 * 1024
+PACKAGE_LOCK_JSON_MAX_BYTES: Final = 8 * 1024 * 1024
+READ_CHUNK_BYTES: Final = 64 * 1024
+WORKSPACE_PATTERN: Final = re.compile(r"^install\.[A-Za-z0-9]{6}$")
+DEPLOY_TOKEN_PATTERN: Final = re.compile(
+    r"^(?:manual|[0-9a-f]{40,64})-[0-9]{1,20}-[0-9a-f]{24}$"
+)
+TEST_MODE_ENV: Final = "@@SNAPSHOT_TEST_ENV@@"
+
+
+class SnapshotError(Exception):
+    """A deterministic manifest snapshot validation or filesystem failure."""
+
+
+@dataclass(frozen=True)
+class ManifestSpec:
+    """One fixed manifest filename and its maximum accepted byte length."""
+
+    filename: str
+    maximum_bytes: int
+
+
+@dataclass(frozen=True)
+class SnapshotConfig:
+    """Trusted paths and directory identities for one helper invocation."""
+
+    app_dir: Path
+    app_parent: Path
+    app_name: str
+    app_parent_uid: int
+    app_parent_gid: int
+    app_parent_mode: int
+    work_root: Path
+    app_uid: int
+    app_gid: int
+    app_modes: tuple[int, ...]
+    work_uid: int
+    work_gid: int
+    workspace_uid: int
+    workspace_gid: int
+
+
+@dataclass(frozen=True)
+class ManifestContents:
+    """Validated bytes associated with one fixed manifest specification."""
+
+    spec: ManifestSpec
+    contents: bytes
+
+
+MANIFESTS: Final = (
+    ManifestSpec("package.json", PACKAGE_JSON_MAX_BYTES),
+    ManifestSpec("package-lock.json", PACKAGE_LOCK_JSON_MAX_BYTES),
+)
+
+
+def directory_flags() -> int:
+    """Return flags for opening a real directory without following it."""
+
+    return os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+
+
+def source_file_flags() -> int:
+    """Return nonblocking flags that safely open a possible regular file."""
+
+    return os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+
+
+def destination_file_flags() -> int:
+    """Return exclusive flags for creating one destination regular file."""
+
+    return os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
+
+
+def open_validated_directory(
+    path: Path,
+    *,
+    expected_uid: int,
+    expected_gid: int,
+    expected_mode: int,
+) -> int:
+    """Open *path* and validate identity on the opened directory inode."""
+
+    try:
+        directory_fd = os.open(path, directory_flags())
+    except OSError as error:
+        raise SnapshotError(f"cannot safely open directory {path}: {error.strerror}") from error
+
+    try:
+        validate_directory_identity(
+            directory_fd,
+            display_path=path,
+            expected_uid=expected_uid,
+            expected_gid=expected_gid,
+            expected_mode=expected_mode,
+        )
+        return directory_fd
+    except BaseException:
+        os.close(directory_fd)
+        raise
+
+
+def open_validated_app_directory(config: SnapshotConfig) -> int:
+    """Open one token-bound candidate below its pinned incoming parent."""
+
+    parent_fd = open_validated_directory(
+        config.app_parent,
+        expected_uid=config.app_parent_uid,
+        expected_gid=config.app_parent_gid,
+        expected_mode=config.app_parent_mode,
+    )
+    try:
+        try:
+            directory_fd = os.open(
+                config.app_name,
+                directory_flags(),
+                dir_fd=parent_fd,
+            )
+        except OSError as error:
+            raise SnapshotError(
+                f"cannot safely open candidate {config.app_dir}: {error.strerror}"
+            ) from error
+    finally:
+        os.close(parent_fd)
+    try:
+        metadata = os.fstat(directory_fd)
+        actual_mode = stat.S_IMODE(metadata.st_mode)
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != config.app_uid
+            or metadata.st_gid != config.app_gid
+            or actual_mode not in config.app_modes
+        ):
+            expected = ", ".join(f"{mode:o}" for mode in config.app_modes)
+            raise SnapshotError(
+                f"unsafe directory identity for {config.app_dir}: "
+                f"uid={metadata.st_uid} gid={metadata.st_gid} mode={actual_mode:o}; "
+                f"expected uid={config.app_uid} gid={config.app_gid} mode in {expected}"
+            )
+        return directory_fd
+    except BaseException:
+        os.close(directory_fd)
+        raise
+
+
+def open_validated_child_directory(
+    parent_fd: int,
+    child_name: str,
+    *,
+    display_path: Path,
+    expected_uid: int,
+    expected_gid: int,
+    expected_mode: int,
+) -> int:
+    """Open and validate one direct child below an already trusted directory."""
+
+    try:
+        directory_fd = os.open(child_name, directory_flags(), dir_fd=parent_fd)
+    except OSError as error:
+        raise SnapshotError(f"cannot safely open workspace {display_path}: {error.strerror}") from error
+
+    try:
+        validate_directory_identity(
+            directory_fd,
+            display_path=display_path,
+            expected_uid=expected_uid,
+            expected_gid=expected_gid,
+            expected_mode=expected_mode,
+        )
+        return directory_fd
+    except BaseException:
+        os.close(directory_fd)
+        raise
+
+
+def validate_directory_identity(
+    directory_fd: int,
+    *,
+    display_path: Path,
+    expected_uid: int,
+    expected_gid: int,
+    expected_mode: int,
+) -> None:
+    """Require exact ownership and access mode on an opened directory inode."""
+
+    metadata = os.fstat(directory_fd)
+    actual_mode = stat.S_IMODE(metadata.st_mode)
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise SnapshotError(f"expected a real directory: {display_path}")
+    if metadata.st_uid != expected_uid or metadata.st_gid != expected_gid or actual_mode != expected_mode:
+        raise SnapshotError(
+            f"unsafe directory identity for {display_path}: "
+            f"uid={metadata.st_uid} gid={metadata.st_gid} mode={actual_mode:o}; "
+            f"expected uid={expected_uid} gid={expected_gid} mode={expected_mode:o}"
+        )
+
+
+def normalize_workspace_name(workspace: str, work_root: Path) -> str:
+    """Return a validated direct-child workspace basename."""
+
+    candidate = Path(workspace)
+    if candidate.is_absolute():
+        if candidate.parent != work_root:
+            raise SnapshotError(f"workspace must be a direct child of {work_root}")
+        workspace_name = candidate.name
+    else:
+        if len(candidate.parts) != 1:
+            raise SnapshotError(f"workspace must be a direct child of {work_root}")
+        workspace_name = candidate.name
+
+    if WORKSPACE_PATTERN.fullmatch(workspace_name) is None:
+        raise SnapshotError("workspace name must match install.XXXXXX")
+    return workspace_name
+
+
+def validate_manifest_metadata(metadata: os.stat_result, spec: ManifestSpec) -> None:
+    """Require one bounded, singly linked regular-file inode."""
+
+    if not stat.S_ISREG(metadata.st_mode):
+        raise SnapshotError(f"source manifest is not a regular file: {spec.filename}")
+    if metadata.st_nlink != 1:
+        raise SnapshotError(f"source manifest must have exactly one hard link: {spec.filename}")
+    if metadata.st_size <= 0 or metadata.st_size > spec.maximum_bytes:
+        raise SnapshotError(
+            f"source manifest size must be 1-{spec.maximum_bytes} bytes: {spec.filename}"
+        )
+
+
+def same_inode(left: os.stat_result, right: os.stat_result) -> bool:
+    """Return whether two metadata records identify the same filesystem inode."""
+
+    return left.st_dev == right.st_dev and left.st_ino == right.st_ino
+
+
+def same_file_snapshot(left: os.stat_result, right: os.stat_result) -> bool:
+    """Return whether an opened source remained unchanged while it was read."""
+
+    return (
+        same_inode(left, right)
+        and left.st_mode == right.st_mode
+        and left.st_nlink == right.st_nlink
+        and left.st_size == right.st_size
+        and left.st_mtime_ns == right.st_mtime_ns
+        and left.st_ctime_ns == right.st_ctime_ns
+    )
+
+
+def read_bounded_file(file_fd: int, spec: ManifestSpec) -> bytes:
+    """Read no more than one byte beyond a manifest's declared size cap."""
+
+    chunks: list[bytes] = []
+    remaining = spec.maximum_bytes + 1
+    while remaining > 0:
+        chunk = os.read(file_fd, min(READ_CHUNK_BYTES, remaining))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    contents = b"".join(chunks)
+    if not contents or len(contents) > spec.maximum_bytes:
+        raise SnapshotError(
+            f"source manifest size must be 1-{spec.maximum_bytes} bytes: {spec.filename}"
+        )
+    return contents
+
+
+def read_validated_manifest(app_fd: int, spec: ManifestSpec) -> ManifestContents:
+    """Open and read one manifest without trusting its pathname metadata alone."""
+
+    try:
+        path_metadata = os.stat(spec.filename, dir_fd=app_fd, follow_symlinks=False)
+    except OSError as error:
+        raise SnapshotError(f"cannot inspect source manifest {spec.filename}: {error.strerror}") from error
+    validate_manifest_metadata(path_metadata, spec)
+
+    try:
+        file_fd = os.open(spec.filename, source_file_flags(), dir_fd=app_fd)
+    except OSError as error:
+        raise SnapshotError(f"cannot safely open source manifest {spec.filename}: {error.strerror}") from error
+
+    try:
+        opened_metadata = os.fstat(file_fd)
+        validate_manifest_metadata(opened_metadata, spec)
+        if not same_inode(path_metadata, opened_metadata):
+            raise SnapshotError(f"source manifest changed while opening: {spec.filename}")
+        contents = read_bounded_file(file_fd, spec)
+        final_metadata = os.fstat(file_fd)
+        validate_manifest_metadata(final_metadata, spec)
+        if not same_file_snapshot(opened_metadata, final_metadata):
+            raise SnapshotError(f"source manifest changed while reading: {spec.filename}")
+        if len(contents) != final_metadata.st_size:
+            raise SnapshotError(f"source manifest changed while reading: {spec.filename}")
+        return ManifestContents(spec=spec, contents=contents)
+    finally:
+        os.close(file_fd)
+
+
+def require_absent_destination(workspace_fd: int, filename: str) -> None:
+    """Reject every pre-existing destination object without following it."""
+
+    try:
+        os.stat(filename, dir_fd=workspace_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise SnapshotError(f"cannot inspect destination {filename}: {error.strerror}") from error
+    raise SnapshotError(f"refusing unsafe existing destination: {filename}")
+
+
+def write_all(file_fd: int, contents: bytes) -> None:
+    """Write every byte, including after a short ``write(2)`` result."""
+
+    view = memoryview(contents)
+    offset = 0
+    while offset < len(view):
+        written = os.write(file_fd, view[offset:])
+        if written <= 0:
+            raise SnapshotError("destination write made no forward progress")
+        offset += written
+
+
+def create_snapshot_file(workspace_fd: int, manifest: ManifestContents) -> None:
+    """Create, write, and durably sync one exclusive destination file."""
+
+    try:
+        file_fd = os.open(
+            manifest.spec.filename,
+            destination_file_flags(),
+            DESTINATION_FILE_MODE,
+            dir_fd=workspace_fd,
+        )
+    except OSError as error:
+        raise SnapshotError(
+            f"cannot exclusively create destination {manifest.spec.filename}: {error.strerror}"
+        ) from error
+
+    try:
+        try:
+            os.fchmod(file_fd, DESTINATION_FILE_MODE)
+            write_all(file_fd, manifest.contents)
+            os.fsync(file_fd)
+        finally:
+            os.close(file_fd)
+    except BaseException as error:
+        try:
+            os.unlink(manifest.spec.filename, dir_fd=workspace_fd)
+            os.fsync(workspace_fd)
+        except OSError as cleanup_error:
+            raise SnapshotError(
+                f"cannot remove failed destination {manifest.spec.filename}: {cleanup_error.strerror}"
+            ) from error
+        if isinstance(error, OSError):
+            raise SnapshotError(
+                f"cannot write destination {manifest.spec.filename}: {error.strerror}"
+            ) from error
+        raise
+
+
+def rollback_created_files(workspace_fd: int, filenames: Sequence[str]) -> None:
+    """Remove only destination names created by the current invocation."""
+
+    failures: list[str] = []
+    for filename in reversed(filenames):
+        try:
+            os.unlink(filename, dir_fd=workspace_fd)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            failures.append(filename)
+    try:
+        os.fsync(workspace_fd)
+    except OSError:
+        failures.append("workspace directory sync")
+    if failures:
+        raise SnapshotError(f"cannot completely roll back failed snapshot: {', '.join(failures)}")
+
+
+def snapshot_manifests(config: SnapshotConfig, workspace: str) -> None:
+    """Validate both manifests and copy them into one trusted workspace."""
+
+    workspace_name = normalize_workspace_name(workspace, config.work_root)
+    app_fd = open_validated_app_directory(config)
+    try:
+        work_fd = open_validated_directory(
+            config.work_root,
+            expected_uid=config.work_uid,
+            expected_gid=config.work_gid,
+            expected_mode=EXPECTED_WORK_ROOT_MODE,
+        )
+        try:
+            workspace_path = config.work_root / workspace_name
+            workspace_fd = open_validated_child_directory(
+                work_fd,
+                workspace_name,
+                display_path=workspace_path,
+                expected_uid=config.workspace_uid,
+                expected_gid=config.workspace_gid,
+                expected_mode=EXPECTED_WORKSPACE_MODE,
+            )
+            try:
+                manifests = [read_validated_manifest(app_fd, spec) for spec in MANIFESTS]
+                for manifest in manifests:
+                    require_absent_destination(workspace_fd, manifest.spec.filename)
+
+                created: list[str] = []
+                try:
+                    for manifest in manifests:
+                        create_snapshot_file(workspace_fd, manifest)
+                        created.append(manifest.spec.filename)
+                    os.fsync(workspace_fd)
+                except BaseException as error:
+                    try:
+                        rollback_created_files(workspace_fd, created)
+                    except SnapshotError as rollback_error:
+                        raise rollback_error from error
+                    if isinstance(error, OSError):
+                        raise SnapshotError(f"cannot sync manifest snapshot: {error.strerror}") from error
+                    raise
+            finally:
+                os.close(workspace_fd)
+        finally:
+            os.close(work_fd)
+    finally:
+        os.close(app_fd)
+
+
+def resolve_group_id(group_name: str) -> int:
+    """Resolve one required production group or report a deterministic error."""
+
+    try:
+        return grp.getgrnam(group_name).gr_gid
+    except KeyError as error:
+        raise SnapshotError(f"missing required group: {group_name}") from error
+
+
+def resolve_user_id(username: str) -> int:
+    """Resolve one required production account or report a deterministic error."""
+
+    try:
+        return pwd.getpwnam(username).pw_uid
+    except KeyError as error:
+        raise SnapshotError(f"missing required user: {username}") from error
+
+
+def normalize_deploy_token(deploy_token: str) -> str:
+    """Return one canonical deploy token accepted by the SSH gateway."""
+
+    if DEPLOY_TOKEN_PATTERN.fullmatch(deploy_token) is None:
+        raise SnapshotError("deploy token has an invalid format")
+    return deploy_token
+
+
+def production_config(deploy_token: str) -> SnapshotConfig:
+    """Build the production configuration from fixed reviewed paths."""
+
+    if os.geteuid() != ROOT_UID:
+        raise SnapshotError("must run as root")
+    candidate_name = normalize_deploy_token(deploy_token)
+    deploy_gid = resolve_group_id(DEFAULT_DEPLOY_GROUP)
+    return SnapshotConfig(
+        app_dir=DEFAULT_INCOMING_ROOT / candidate_name,
+        app_parent=DEFAULT_INCOMING_ROOT,
+        app_name=candidate_name,
+        app_parent_uid=ROOT_UID,
+        app_parent_gid=deploy_gid,
+        app_parent_mode=EXPECTED_INCOMING_ROOT_MODE,
+        work_root=DEFAULT_WORK_ROOT,
+        app_uid=resolve_user_id(DEFAULT_DEPLOY_USER),
+        app_gid=deploy_gid,
+        app_modes=(EXPECTED_CANDIDATE_MODE,),
+        work_uid=ROOT_UID,
+        work_gid=resolve_group_id(DEFAULT_APP_GROUP),
+        workspace_uid=ROOT_UID,
+        workspace_gid=ROOT_GID,
+    )
+
+
+def test_config(test_root: Path, deploy_token: str) -> SnapshotConfig:
+    """Build an isolated non-root configuration for behavioral tests."""
+
+    if os.environ.get(TEST_MODE_ENV) != "1":
+        raise SnapshotError(f"--test-root requires {TEST_MODE_ENV}=1")
+    candidate_name = normalize_deploy_token(deploy_token)
+    # Darwin strips setgid from this user-owned candidate directory. The
+    # guarded harness checks equivalent access bits; production always
+    # requires the complete 02755 mode.
+    app_modes = (0o755,) if sys.platform == "darwin" else (EXPECTED_CANDIDATE_MODE,)
+    return SnapshotConfig(
+        app_dir=test_root / candidate_name,
+        app_parent=test_root,
+        app_name=candidate_name,
+        app_parent_uid=os.geteuid(),
+        app_parent_gid=os.getegid(),
+        app_parent_mode=0o700,
+        work_root=test_root / "npm-work",
+        app_uid=os.geteuid(),
+        app_gid=os.getegid(),
+        app_modes=app_modes,
+        work_uid=os.geteuid(),
+        work_gid=os.getegid(),
+        workspace_uid=os.geteuid(),
+        workspace_gid=os.getegid(),
+    )
+
+
+def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    """Parse one candidate token, workspace, and guarded test override."""
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--test-root", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("deploy_token", help="exact token naming the incoming candidate")
+    parser.add_argument("workspace", help="install workspace basename or fixed-root path")
+    return parser.parse_args(argv)
+
+
+def fail(error: SnapshotError) -> NoReturn:
+    """Report one deterministic error and terminate unsuccessfully."""
+
+    print(f"[snapshot-manifests] ERROR: {error}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    """Validate configuration and snapshot both npm manifests."""
+
+    arguments = parse_arguments(argv)
+    try:
+        config = (
+            test_config(arguments.test_root, arguments.deploy_token)
+            if arguments.test_root
+            else production_config(arguments.deploy_token)
+        )
+        snapshot_manifests(config, arguments.workspace)
+        return 0
+    except SnapshotError as error:
+        fail(error)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
