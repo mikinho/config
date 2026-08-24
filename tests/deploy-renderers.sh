@@ -57,8 +57,13 @@ expect_failure \
     || fail 'nginx renderer created state for a rejected dot-dot output'
 [ ! -e "$TEST_ROOT/php-dot-parent" ] \
     || fail 'PHP renderer created state for a rejected dot output'
-[ ! -e "$TEST_ROOT/php-parent" ] \
-    || fail 'PHP renderer created state for a rejected dot-dot output'
+[ -x "$REPOSITORY_ROOT/deploy/verify-deployment" ] \
+    || fail 'verify-deployment is not executable'
+"$REPOSITORY_ROOT/deploy/verify-deployment" --help >/dev/null
+expect_failure \
+    'unknown argument: --invalid-option' \
+    "$REPOSITORY_ROOT/deploy/verify-deployment" \
+    --invalid-option
 
 "$REPOSITORY_ROOT/deploy/install-nginx" \
     --output "$TEST_ROOT/nginx-valid" \

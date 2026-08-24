@@ -70,6 +70,25 @@ provisioning steps around it.
 deploy/install-php-site --output /tmp/php-example_wp --tag example_wp
 ```
 
+## Post-deployment verification
+
+`verify-deployment` performs a non-destructive audit of the live host state,
+asserting Nginx version and configuration, active systemd units, OpenSSH port
+and authentication restrictions, firewalld service definitions, SELinux
+Enforcing mode and port labels, QUIC buffer limits, and per-site PHP-FPM socket
+permissions.
+
+```sh
+# Native Certbot backend:
+deploy/verify-deployment
+
+# Snap Certbot backend:
+deploy/verify-deployment --backend snap
+
+# With per-site PHP-FPM socket check:
+deploy/verify-deployment --site example_wp --verbose
+```
+
 ## Profiles
 
 Profiles are line-per-stub manifests in `profiles/`. The profile table and
