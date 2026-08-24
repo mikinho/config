@@ -47,6 +47,11 @@ fi
 step "Validating deployment profile assignments..."
 "$REPOSITORY_ROOT/deploy/install-nginx" --check
 
+step "Validating gold application deployment profiles..."
+python3 "$REPOSITORY_ROOT/tests/application-deployment-standard.py"
+python3 "$REPOSITORY_ROOT/deploy/application/validate_profile.py" \
+    "$REPOSITORY_ROOT/deploy/application/profiles/example_node_app.json" >/dev/null
+
 step "Running deployment renderer and path boundary tests..."
 "$REPOSITORY_ROOT/tests/deploy-renderers.sh"
 

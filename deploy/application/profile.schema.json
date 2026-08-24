@@ -1,0 +1,188 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Gold application deployment profile",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "standardVersion",
+    "application",
+    "paths",
+    "transport",
+    "services",
+    "health",
+    "metadata",
+    "dependencies",
+    "staticContent",
+    "limits",
+    "retention"
+  ],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "standardVersion": { "const": "1" },
+    "application": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tag", "serviceUser", "deployUser", "deployGroup"],
+      "properties": {
+        "tag": { "$ref": "#/$defs/identifier" },
+        "serviceUser": { "$ref": "#/$defs/identifier" },
+        "deployUser": { "$ref": "#/$defs/identifier" },
+        "deployGroup": { "$ref": "#/$defs/identifier" }
+      }
+    },
+    "paths": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "applicationRoot",
+        "secureRoot",
+        "runtimeRoot",
+        "triggerRoot",
+        "dependencyStateRoot",
+        "dependencyCacheRoot"
+      ],
+      "properties": {
+        "applicationRoot": { "$ref": "#/$defs/absolutePath" },
+        "secureRoot": { "$ref": "#/$defs/absolutePath" },
+        "runtimeRoot": { "$ref": "#/$defs/absolutePath" },
+        "triggerRoot": { "$ref": "#/$defs/absolutePath" },
+        "dependencyStateRoot": { "$ref": "#/$defs/absolutePath" },
+        "dependencyCacheRoot": { "$ref": "#/$defs/absolutePath" }
+      }
+    },
+    "transport": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sessionCommand"],
+      "properties": {
+        "sessionCommand": { "$ref": "#/$defs/commandName" }
+      }
+    },
+    "services": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["live", "candidate", "finalizer", "path", "recovery"],
+      "properties": {
+        "live": { "$ref": "#/$defs/serviceUnit" },
+        "candidate": { "$ref": "#/$defs/templateServiceUnit" },
+        "finalizer": { "$ref": "#/$defs/serviceUnit" },
+        "path": { "$ref": "#/$defs/pathUnit" },
+        "recovery": { "$ref": "#/$defs/serviceUnit" }
+      }
+    },
+    "health": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["route", "deploymentTokenPointer", "confirmations", "timeoutSeconds"],
+      "properties": {
+        "route": { "$ref": "#/$defs/httpRoute" },
+        "deploymentTokenPointer": { "$ref": "#/$defs/jsonPointer" },
+        "confirmations": { "type": "integer", "minimum": 1, "maximum": 10 },
+        "timeoutSeconds": { "type": "integer", "minimum": 5, "maximum": 600 }
+      }
+    },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "deploymentTokenPointer"],
+      "properties": {
+        "path": { "$ref": "#/$defs/relativePath" },
+        "deploymentTokenPointer": { "$ref": "#/$defs/jsonPointer" }
+      }
+    },
+    "dependencies": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["adapter", "manifests", "provenancePath"],
+      "properties": {
+        "adapter": { "enum": ["node-npm"] },
+        "manifests": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 8,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/relativePath" }
+        },
+        "provenancePath": { "$ref": "#/$defs/relativePath" }
+      }
+    },
+    "staticContent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["releasePaths", "buildValidator"],
+      "properties": {
+        "releasePaths": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 32,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/relativePath" }
+        },
+        "buildValidator": { "$ref": "#/$defs/adapterName" }
+      }
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["memoryHighBytes", "memoryMaxBytes", "tasksMax"],
+      "properties": {
+        "memoryHighBytes": { "type": "integer", "minimum": 67108864 },
+        "memoryMaxBytes": { "type": "integer", "minimum": 67108864 },
+        "tasksMax": { "type": "integer", "minimum": 16, "maximum": 65535 }
+      }
+    },
+    "retention": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["releases", "auditDays", "assetsDays"],
+      "properties": {
+        "releases": { "type": "integer", "minimum": 2, "maximum": 100 },
+        "auditDays": { "type": "integer", "minimum": 30, "maximum": 3650 },
+        "assetsDays": { "type": "integer", "minimum": 1, "maximum": 3650 }
+      }
+    }
+  },
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "pattern": "^[a-z_][a-z0-9_-]{0,30}$"
+    },
+    "commandName": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]{2,63}$"
+    },
+    "adapterName": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]{2,63}$"
+    },
+    "absolutePath": {
+      "type": "string",
+      "pattern": "^/(?:[A-Za-z0-9._-]+/)*[A-Za-z0-9._-]+$"
+    },
+    "relativePath": {
+      "type": "string",
+      "pattern": "^(?:[A-Za-z0-9._@+-]+/)*[A-Za-z0-9._@+-]+$"
+    },
+    "serviceUnit": {
+      "type": "string",
+      "pattern": "^[a-z_][a-z0-9_-]{0,62}\\.service$"
+    },
+    "templateServiceUnit": {
+      "type": "string",
+      "pattern": "^[a-z_][a-z0-9_-]{0,62}@\\.service$"
+    },
+    "pathUnit": {
+      "type": "string",
+      "pattern": "^[a-z_][a-z0-9_-]{0,62}\\.path$"
+    },
+    "httpRoute": {
+      "type": "string",
+      "pattern": "^/[A-Za-z0-9._~!$&'()*+,;=:@%/-]{0,255}$"
+    },
+    "jsonPointer": {
+      "type": "string",
+      "pattern": "^(?:/(?:[^~/]|~0|~1)+)+$"
+    }
+  }
+}
