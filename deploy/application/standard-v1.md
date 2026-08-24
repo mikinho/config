@@ -161,9 +161,19 @@ guarantees.
 ## 7. Host policy boundary
 
 The installed deployment surface MUST be rooted in directories that are owned
-by root and not writable by deploy or application accounts. Setup MUST install
-scripts, SSH policy, systemd units, SELinux policy, and nginx configuration by
-atomic replacement from a reviewed archive.
+by root and not writable by deploy or application accounts. Generic setup MUST
+install scripts, SSH policy, systemd units, and SELinux policy by atomic
+replacement from a reviewed archive.
+
+Private nginx site configuration is an adopter-owned adapter. It MUST remain in
+the private application repository and MUST NOT be rendered into this public
+standard. The adapter owns domains, certificates, trusted proxy ranges, and
+other site-specific data; it MUST target the profile's live Unix socket, use the
+shared nginx transport policy selected for that host, validate the fully
+assembled nginx candidate before installation, and pass `nginx -t` before
+reload. Generic setup and verification MAY validate nginx account membership,
+service state, SELinux process domain, and direct socket reachability without
+learning private site data.
 
 The standard requires:
 
@@ -176,7 +186,8 @@ The standard requires:
   dependency trees;
 - systemd hardening, resource bounds, a private runtime directory, and a
   generation-specific readiness check;
-- an nginx configuration test before reload; and
+- an adopter-owned nginx candidate test before site installation or reload;
+  and
 - effective OpenSSH policy verification for representative local and remote
   connection contexts before the maintenance guard is removed.
 
@@ -219,7 +230,8 @@ minimum it identifies:
 - the fixed Node runtime entrypoint, socket and PID names, and loopback policy;
 - session command, service units, Unix sockets, and health route;
 - deployment metadata path and token field;
-- static-content paths and SELinux label patterns;
+- static-content paths from which the renderer derives exact SELinux label
+  patterns;
 - dependency adapter and runtime provenance adapter;
 - candidate build validator;
 - service resource limits and startup timeout; and

@@ -17,11 +17,13 @@ python3 deploy/application/validate_profile.py \
     deploy/application/profiles/example_node_app.json
 ```
 
-## Transaction-core renderer
+## Candidate gold-bundle renderer
 
-`render_core.py` produces the shared forced-command gateway, durable trigger
-state machine, no-follow dependency-manifest snapshot helper, and canonical
-production-dependency hash adapter. It records the standard revision, profile
+`render_core.py` produces the complete generic host bundle: the forced-command
+gateway, durable trigger state machine, immutable release finalizer, isolated
+candidate preflight, activation and rollback recovery, dependency helpers,
+hardened systemd and OpenSSH policy, derived SELinux policy, fail-closed setup,
+and non-mutating live verifier. It records the standard revision, profile
 digest, generated file modes, and SHA-256 manifest in a deterministic bundle:
 
 ```sh
@@ -31,19 +33,36 @@ python3 deploy/application/render_core.py \
     --output /tmp/example-deployment-core
 ```
 
-The output deliberately records `conformanceStatus: core-only`. It is a
-versioned extraction boundary for the shared security state machines, not yet a
-standalone deployable gold bundle. A project MUST NOT install it without the
-remaining standard finalizer, host-policy, verifier, and application adapter
-layers. Those remaining generic milestones are tracked in
-[`ROADMAP.md`](ROADMAP.md).
+The output deliberately records `conformanceStatus: core-only` until the
+remaining real-host and private-adapter release gates in
+[`ROADMAP.md`](ROADMAP.md) pass. That status is a release-maturity boundary, not
+permission to install the bundle. Private projects MUST NOT vendor or install a
+rendered bundle while this repository still emits `core-only`.
+
+## Exact bundle conformance
+
+`verify_bundle.py` independently rerenders a pinned profile and standard source
+revision, then compares the vendored tree byte-for-byte. It rejects missing or
+extra entries, content or mode drift, symbolic links, hard links, special files,
+and an incorrect source revision:
+
+```sh
+python3 deploy/application/verify_bundle.py \
+    --profile deploy/application/profiles/example_node_app.json \
+    --source-revision 0123456789abcdef0123456789abcdef01234567 \
+    --bundle /tmp/example-deployment-core
+```
+
+Conformance proves only that a bundle is the exact deterministic output for its
+inputs. It does not override the manifest's `conformanceStatus` or the release
+gates.
 
 ## Distribution model
 
-Projects vendor a rendered, immutable copy of the runtime bundle into their
-repository. Hosts install that reviewed copy into a root-owned secure tree.
-Live deployments never execute code from this repository over the network and
-never depend on a mutable shared checkout.
+After version 1 is released, projects vendor a rendered, immutable copy of the
+runtime bundle into their repository. Hosts install that reviewed copy into a
+root-owned secure tree. Live deployments never execute code from this
+repository over the network and never depend on a mutable shared checkout.
 
 The standard owns:
 
@@ -55,9 +74,12 @@ The standard owns:
 - root-owned systemd, OpenSSH, SELinux, and verification contracts; and
 - audit retention and operator recovery semantics.
 
-Each private project profile supplies only application identity and approved variation
-points such as the health probe, build validator, static-content label rules,
-dependency adapter, service limits, and retention policy.
+Each private project profile supplies only application identity and approved
+variation points such as the health probe, build validator, static-content
+paths, dependency adapter, service limits, and retention policy. Private nginx
+site configuration remains in the adopting project: domains, certificates,
+trusted proxy ranges, and other site data are prohibited from this public
+standard repository.
 
 ## Adoption rule
 
