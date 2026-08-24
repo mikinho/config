@@ -20,9 +20,9 @@ python3 deploy/application/validate_profile.py \
 ## Transaction-core renderer
 
 `render_core.py` produces the shared forced-command gateway, durable trigger
-state machine, and no-follow dependency-manifest snapshot helper. It records
-the standard revision, profile digest, generated file modes, and SHA-256
-manifest in a deterministic bundle:
+state machine, no-follow dependency-manifest snapshot helper, and canonical
+production-dependency hash adapter. It records the standard revision, profile
+digest, generated file modes, and SHA-256 manifest in a deterministic bundle:
 
 ```sh
 python3 deploy/application/render_core.py \

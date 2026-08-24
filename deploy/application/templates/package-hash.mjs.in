@@ -1,0 +1,233 @@
+#!/usr/bin/env node
+import { createHash } from "node:crypto";
+import { closeSync, constants, fstatSync, openSync, readSync } from "node:fs";
+import path from "node:path";
+import process from "node:process";
+
+const HASH_ALGORITHM = "sha256";
+const PACKAGE_JSON_MAX_BYTES = 1 * 1024 * 1024;
+const PACKAGE_LOCK_JSON_MAX_BYTES = 8 * 1024 * 1024;
+const SUPPORTED_LOCKFILE_VERSIONS = new Set([2, 3]);
+const ROOT_INSTALL_FIELDS = [
+    "dependencies",
+    "optionalDependencies",
+    "peerDependencies",
+    "peerDependenciesMeta",
+    "bundleDependencies",
+    "bundledDependencies",
+    "overrides",
+    "workspaces",
+    "os",
+    "cpu",
+    "libc",
+    "engines",
+    "devEngines",
+    "packageManager",
+];
+const LOCKFILE_INSTALL_FIELDS = ["lockfileVersion", "requires"];
+
+/**
+ * Recursively sorts object keys so equivalent JSON produces identical hashes.
+ *
+ * @param {unknown} value - JSON-compatible value to canonicalize.
+ * @returns {unknown} Canonicalized value.
+ */
+function stable(value) {
+    if (Array.isArray(value)) {
+        return value.map(stable);
+    }
+    if (isRecord(value)) {
+        return Object.fromEntries(
+            Object.keys(value)
+                .sort()
+                .map((key) => [key, stable(value[key])]),
+        );
+    }
+    return value;
+}
+
+/**
+ * Determines whether a value is a non-array object.
+ *
+ * @param {unknown} value - Candidate value.
+ * @returns {boolean} Whether the value is a record.
+ */
+function isRecord(value) {
+    return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+/**
+ * Reads one bounded, single-link regular file without following symlinks.
+ *
+ * @param {string} filePath - File to read.
+ * @param {string} label - Human-readable file label.
+ * @param {number} maxBytes - Maximum accepted file size.
+ * @returns {string} UTF-8 file contents.
+ */
+function readBoundedRegularFile(filePath, label, maxBytes) {
+    const flags = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK | (constants.O_CLOEXEC ?? 0);
+    let fileDescriptor;
+    try {
+        fileDescriptor = openSync(filePath, flags);
+    } catch (err) {
+        const code = typeof err?.code === "string" ? err.code : "UNKNOWN";
+        throw new Error(`could not safely open ${label} (${code})`, { cause: err });
+    }
+    try {
+        const metadata = fstatSync(fileDescriptor, { bigint: true });
+        if (!metadata.isFile() || metadata.nlink !== 1n) {
+            throw new Error(`${label} must be a single-link regular file`);
+        }
+        if (metadata.size > BigInt(maxBytes)) {
+            throw new Error(`${label} exceeds the ${maxBytes}-byte limit`);
+        }
+        const buffer = Buffer.allocUnsafe(maxBytes + 1);
+        let offset = 0;
+        while (offset <= maxBytes) {
+            const bytesRead = readSync(fileDescriptor, buffer, offset, maxBytes + 1 - offset, null);
+            if (bytesRead === 0) {
+                break;
+            }
+            offset += bytesRead;
+        }
+        if (offset > maxBytes) {
+            throw new Error(`${label} exceeds the ${maxBytes}-byte limit`);
+        }
+        const after = fstatSync(fileDescriptor, { bigint: true });
+        const identityFields = ["dev", "ino", "size", "mtimeNs", "ctimeNs"];
+        if (identityFields.some((field) => metadata[field] !== after[field])) {
+            throw new Error(`${label} changed while being read`);
+        }
+        return buffer.subarray(0, offset).toString("utf8");
+    } finally {
+        closeSync(fileDescriptor);
+    }
+}
+
+/**
+ * Reads and validates a bounded, no-follow JSON object.
+ *
+ * @param {string} filePath - JSON file to read.
+ * @param {string} label - Human-readable file label.
+ * @param {number} maxBytes - Maximum accepted file size.
+ * @returns {Record<string, unknown>} Parsed JSON object.
+ */
+function readJsonObject(filePath, label, maxBytes) {
+    let source;
+    try {
+        source = readBoundedRegularFile(filePath, label, maxBytes);
+    } catch (err) {
+        if (err instanceof Error) {
+            throw err;
+        }
+        throw new Error(`could not safely read ${label}`, { cause: err });
+    }
+
+    let value;
+    try {
+        value = JSON.parse(source);
+    } catch {
+        throw new Error(`${label} is not valid JSON`);
+    }
+    if (!isRecord(value)) {
+        throw new Error(`${label} must contain a JSON object`);
+    }
+    return value;
+}
+
+/**
+ * Selects root package fields that can affect `npm ci --omit=dev`.
+ * Application identity, scripts, and devDependencies are deliberately absent.
+ *
+ * @param {Record<string, unknown>} pkg - Root package descriptor.
+ * @returns {Record<string, unknown>} Production-install-relevant fields.
+ */
+function selectRootInstallFields(pkg) {
+    const relevant = {};
+    for (const field of ROOT_INSTALL_FIELDS) {
+        if (pkg[field] !== undefined) {
+            relevant[field] = pkg[field];
+        }
+    }
+    return relevant;
+}
+
+/**
+ * Builds the production-only view of a package-lock v2/v3 packages map.
+ * npm marks packages that are exclusively reachable through devDependencies
+ * with `dev: true`; those packages are not materialized by `--omit=dev`.
+ *
+ * @param {Record<string, unknown>} lock - Parsed package lock.
+ * @returns {Record<string, unknown>} Canonical hash input for the lockfile.
+ */
+function selectProductionLock(lock) {
+    const lockfileVersion = lock.lockfileVersion;
+    if (!SUPPORTED_LOCKFILE_VERSIONS.has(lockfileVersion)) {
+        throw new Error(`unsupported package-lock.json lockfileVersion: ${String(lockfileVersion)}`);
+    }
+    if (!isRecord(lock.packages)) {
+        throw new Error("package-lock.json packages must be an object");
+    }
+    if (!isRecord(lock.packages[""])) {
+        throw new Error('package-lock.json packages must contain the root entry ""');
+    }
+
+    const productionPackages = {};
+    for (const [location, descriptor] of Object.entries(lock.packages)) {
+        if (!isRecord(descriptor)) {
+            throw new Error(`package-lock.json package entry ${JSON.stringify(location)} must be an object`);
+        }
+        if (location === "") {
+            productionPackages[location] = selectRootInstallFields(descriptor);
+        } else if (descriptor.dev !== true) {
+            productionPackages[location] = descriptor;
+        }
+    }
+
+    const relevantLock = { packages: productionPackages };
+    for (const field of LOCKFILE_INSTALL_FIELDS) {
+        if (lock[field] !== undefined) {
+            relevantLock[field] = lock[field];
+        }
+    }
+    return relevantLock;
+}
+
+/**
+ * Hashes only state that can affect the server's production npm install.
+ *
+ * @param {string} appDir - Application directory containing package manifests.
+ * @returns {string} Lowercase hexadecimal SHA-256 digest.
+ */
+function packageHash(appDir) {
+    const pkg = readJsonObject(path.join(appDir, "package.json"), "package.json", PACKAGE_JSON_MAX_BYTES);
+    const lock = readJsonObject(
+        path.join(appDir, "package-lock.json"),
+        "package-lock.json",
+        PACKAGE_LOCK_JSON_MAX_BYTES,
+    );
+    const productionState = {
+        package: selectRootInstallFields(pkg),
+        lock: selectProductionLock(lock),
+    };
+
+    return createHash(HASH_ALGORITHM)
+        .update(JSON.stringify(stable(productionState)))
+        .digest("hex");
+}
+
+function main() {
+    const appDir = process.argv[2];
+    if (!appDir || process.argv.length !== 3) {
+        throw new Error("usage: ./package-hash.mjs <app-dir>");
+    }
+
+    console.log(`${packageHash(appDir)} production dependency state`);
+}
+
+try {
+    main();
+} catch (err) {
+    console.error(`[package-hash] ERROR: ${err.message ?? err}`);
+    process.exitCode = 1;
+}
