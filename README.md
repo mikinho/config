@@ -232,6 +232,7 @@ unselected stubs cannot silently survive inside a render.
 | `gzip` | gzip response compression. |
 | `brotli` | Paired Brotli module-loader and HTTP compression stubs. |
 | `websocket` | WebSocket connection-upgrade map. |
+| `nodejs-proxy` | Node.js reverse-proxy and WebSocket connection mapping. |
 | `wordpress-cache` | Opt-in WordPress FastCGI page-cache zone and conservative bypass maps. Ordinary WordPress routing needs no profile. |
 | `trusted-proxy` | Client address restoration; deployment-local trusted CIDRs are still required. |
 | `post-quantum` | Hybrid `X25519MLKEM768` TLS key exchange for compatible OpenSSL 3.5.1+ builds. |

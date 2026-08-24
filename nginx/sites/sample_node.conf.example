@@ -1,0 +1,98 @@
+# nginx/sites/sample_node.conf.example
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+# Copy this file to sites/sample_node.conf after replacing the example domains,
+# certificate paths, and sample_node site tag. Keep the primary domain first:
+# includes/redir.conf redirects every other listed name to $server_name.
+#
+# Requires the baseline deployment profile and the nodejs-proxy profile.
+# The Node.js application service must provide its Unix socket at
+# /run/sample_node/sample_node.sock.
+#
+
+server {
+    server_name example.com www.example.com;
+
+    include includes/http.conf;
+}
+
+upstream sample_node_upstream {
+    server unix:/run/sample_node/sample_node.sock;
+    keepalive 32;
+}
+
+# Application-owned static caching policy; referenced by
+# includes/cache-control-fallback.conf.
+map $uri $static_cache_control {
+    "~*[._-][a-f0-9]{8,}\.[a-z0-9]+$" "public, max-age=31536000, immutable";
+    "~*\.(?:css|js|woff2?|ttf|eot)$"     "public, max-age=86400, stale-while-revalidate=604800";
+    "~*\.(?:png|jpe?g|gif|svg|webp|ico)$" "public, max-age=604800, stale-while-revalidate=604800";
+    default                               "public, max-age=3600";
+}
+
+include includes/cache-control-fallback.conf;
+
+server {
+    set $site_tag sample_node;
+
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    # The default HTTPS server owns reuseport for these shared UDP sockets.
+    listen 443 quic;
+    listen [::]:443 quic;
+
+    server_name example.com www.example.com;
+
+    access_log /var/log/nginx/sample_node.access.log main buffer=32k flush=5s;
+    error_log /var/log/nginx/sample_node.error.log warn;
+
+    ssl_certificate /etc/letsencrypt/live/example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/example.com/privkey.pem;
+
+    include includes/http3.conf;
+    include includes/redir.conf;
+
+    root /var/www/sample_node/wwwroot;
+
+    # For immutable release directories with a current symlink pointer:
+    # disable_symlinks on from=/var/www/sample_node/current;
+
+    include includes/secure.conf;
+    include includes/block-cgi.conf;
+    include includes/block-php.conf;
+    include includes/block-project-files.conf;
+    include includes/block-wordpress-probes.conf;
+
+    include includes/proxy-common.conf;
+
+    error_page 502 503 504 /maintenance.html;
+
+    location = /maintenance.html {
+        internal;
+        root /var/www/sample_node/wwwroot;
+    }
+
+    # Static assets: served directly by nginx with fallback cache control.
+    location ~* ^/(css|js|img|fonts|static)/ {
+        add_header Cache-Control $cache_control_fallback;
+        access_log off;
+
+        try_files $uri @app;
+    }
+
+    # Reverse proxy to Node.js application.
+    location @app {
+        limit_conn conn_general 20;
+        limit_req zone=req_general burst=30 nodelay;
+
+        proxy_pass http://sample_node_upstream;
+    }
+
+    location / {
+        limit_conn conn_general 20;
+        limit_req zone=req_general burst=30 nodelay;
+
+        try_files $uri @app;
+    }
+}
