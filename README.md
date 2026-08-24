@@ -462,10 +462,13 @@ that class.
 The optional WordPress cache bypasses every request carrying any `Cookie`,
 `Authorization` header, or query string, plus non-GET/HEAD methods and known
 WordPress private routes. It also honors application `Cache-Control`,
-`Expires`, `Set-Cookie`, and `Vary` response behavior. These are conservative
-guards, not proof that a site is safe to cache: opt in only after testing every
-personalized, logged-in, commerce, consent, and parameter-driven path. The
-uncached include is the universal default.
+`Expires`, `Set-Cookie`, and `Vary` response behavior. Administrative
+cache revalidation is supported via the `X-Purge-Key` request header: when
+present, nginx bypasses the existing cache, fetches fresh upstream content,
+and updates the cached response. These are conservative guards, not proof that
+a site is safe to cache: opt in only after testing every personalized,
+logged-in, commerce, consent, and parameter-driven path. The uncached include
+is the universal default.
 
 `includes/relativeurls.conf` remains available only for narrowly reviewed
 legacy applications. It rewrites HTML attributes in response bodies and can
