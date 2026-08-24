@@ -68,24 +68,6 @@ def fail(message: str) -> NoReturn:
     raise RenderError(message)
 
 
-def profile_section(profile: ApplicationProfile, name: str) -> Mapping[str, object]:
-    """Return one already-validated object from the canonical profile."""
-
-    value = profile.source[name]
-    if not isinstance(value, dict):
-        fail(f"validated profile section changed type: {name}")
-    return value
-
-
-def string_value(section: Mapping[str, object], name: str) -> str:
-    """Return one already-validated string member."""
-
-    value = section[name]
-    if not isinstance(value, str):
-        fail(f"validated profile field changed type: {name}")
-    return value
-
-
 def environment_prefix(tag: str) -> str:
     """Return a shell-safe uppercase prefix derived from an application tag."""
 
@@ -104,20 +86,16 @@ def trigger_selinux_type(deploy_user: str) -> str:
 def build_replacements(profile: ApplicationProfile) -> dict[str, str]:
     """Build the complete fixed placeholder map for generic core templates."""
 
-    paths = profile_section(profile, "paths")
-    transport = profile_section(profile, "transport")
     identity = profile.identity
     prefix = environment_prefix(identity.tag)
-    application_root = string_value(paths, "applicationRoot")
-    dependency_state_root = string_value(paths, "dependencyStateRoot")
     return {
         "@@DEPLOY_USER@@": identity.deploy_user,
         "@@DEPLOY_GROUP@@": identity.deploy_group,
         "@@SERVICE_GROUP@@": identity.service_group,
-        "@@TRIGGER_ROOT@@": string_value(paths, "triggerRoot"),
-        "@@INCOMING_ROOT@@": f"{application_root}/incoming",
-        "@@SNAPSHOT_WORK_ROOT@@": f"{dependency_state_root}/npm-work",
-        "@@SESSION_COMMAND@@": string_value(transport, "sessionCommand"),
+        "@@TRIGGER_ROOT@@": profile.paths.trigger_root,
+        "@@INCOMING_ROOT@@": f"{profile.paths.application_root}/incoming",
+        "@@SNAPSHOT_WORK_ROOT@@": f"{profile.paths.dependency_state_root}/npm-work",
+        "@@SESSION_COMMAND@@": profile.transport.session_command,
         "@@GATEWAY_TEST_ENV@@": f"{prefix}_DEPLOY_GATEWAY_TESTING",
         "@@TRIGGER_TEST_ENV@@": f"{prefix}_DEPLOY_TRIGGER_TESTING",
         "@@TRIGGER_STOP_ENV@@": f"{prefix}_DEPLOY_TRIGGER_STOP_AFTER_BLOCKER",
