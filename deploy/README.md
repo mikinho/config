@@ -145,7 +145,7 @@ Selection rationale, so the host's choices stay written down:
 - `wordpress-cache` — the cache zone is available only to audited sites that
   explicitly include `wordpress-cache-by-tag.conf`; ordinary WordPress sites
   use the uncached `wordpress-by-tag.conf` and need no cache profile.
-- `websocket` — the vulcan_web site proxies through
+- `websocket` — websocket-enabled applications proxy through
   `includes/proxy-websocket.conf`, which requires the profile's
   `$connection_upgrade` map. The map degrades to an empty `Connection` header
   for ordinary requests, so the application's upstream keepalive pool is
