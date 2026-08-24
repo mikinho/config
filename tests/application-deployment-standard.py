@@ -248,6 +248,7 @@ class CoreRendererTests(unittest.TestCase):
             self.assertEqual(manifest["conformanceStatus"], "core-only")
             self.assertEqual(manifest["sourceRevision"], SOURCE_REVISION)
             self.assertEqual(manifest["standardVersion"], "1")
+            self.assertEqual(stat.S_IMODE(first.stat().st_mode), 0o755)
 
             checksum_lines = (first / "SHA256SUMS").read_text().splitlines()
             self.assertGreaterEqual(len(checksum_lines), 5)
@@ -279,6 +280,23 @@ class CoreRendererTests(unittest.TestCase):
                 text=True,
             )
             self.assertEqual(shell_check.returncode, 0, shell_check.stderr)
+
+            for relative_path in (
+                "setup",
+                "scripts/selinux-setup",
+                "scripts/verify-host",
+            ):
+                script = first / relative_path
+                self.assertEqual(stat.S_IMODE(script.stat().st_mode), 0o755)
+                source = script.read_text(encoding="utf-8")
+                self.assertNotIn("@@", source)
+                shell_check = subprocess.run(
+                    ["bash", "-n", str(script)],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(shell_check.returncode, 0, shell_check.stderr)
 
             node_check = subprocess.run(
                 ["node", "--check", str(first / "scripts" / "package-hash.mjs")],
@@ -522,6 +540,68 @@ class CoreRendererTests(unittest.TestCase):
                 self.assertIn("IPAddressAllow=0.0.0.0/0 ::/0", unit)
                 self.assertIn("IPAddressDeny=any", unit)
                 self.assertNotIn("IPAddressDeny=127.0.0.0/8", unit)
+
+    def test_installer_is_fail_closed_and_verifier_is_non_mutating(self) -> None:
+        """Setup arms ingress denial first and only the verifier performs reads."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            bundle = Path(directory) / "bundle"
+            result = self.render(bundle)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            setup = (bundle / "setup").read_text()
+            main = setup[setup.index("main() {") :]
+            ordered_calls = (
+                "require_platform",
+                "verify_source_bundle",
+                "quiesce_services",
+                "ensure_accounts",
+                "ensure_directories",
+                "install_deploy_key",
+                "verify_rsync_source",
+                "archive_bundle",
+                "install_policy",
+                "flock --unlock 8",
+                "arm_services",
+                "finish_setup",
+            )
+            positions = [main.index(call) for call in ordered_calls]
+            self.assertEqual(positions, sorted(positions))
+            self.assertIn("trap failure_guard ERR EXIT", setup)
+            self.assertIn("setup failed; deployment SSH remains denied", setup)
+            self.assertIn('"$SECURE_DIR/scripts/verify-host" --pre-ssh', setup)
+            self.assertIn('rm -f -- "$SSH_MAINTENANCE"', setup)
+
+            verifier = (bundle / "scripts/verify-host").read_text()
+            self.assertNotRegex(
+                verifier,
+                r"\bsystemctl\s+(?:start|stop|restart|reload|enable|disable|daemon-reload)\b",
+            )
+            self.assertNotRegex(
+                verifier,
+                r"(?m)^\s*(?:chown|chmod|install|mv|rm)\s",
+            )
+            self.assertIn("live Unix-socket health matches current token", verifier)
+            self.assertIn("systemd has forbidden trigger-file permission", verifier)
+            self.assertIn("effective SSH ForceCommand is wrong", verifier)
+
+    def test_distinct_service_group_is_rendered_consistently(self) -> None:
+        """Runtime ownership never assumes that the user and group names match."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = json.loads(EXAMPLE_PROFILE.read_text(encoding="utf-8"))
+            source["application"]["serviceGroup"] = "example_runtime"
+            profile = root / "distinct-group-profile.json"
+            profile.write_text(json.dumps(source), encoding="utf-8")
+            bundle = root / "bundle"
+            result = self.render(bundle, profile=profile)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            finalizer = (bundle / "scripts/post-deploy").read_text()
+            self.assertIn('readonly APP_GROUP="example_runtime"', finalizer)
+            self.assertIn('readonly COMMIT_OWNER="root:$APP_GROUP"', finalizer)
+            self.assertIn('chown -R root:"$APP_GROUP"', finalizer)
+            setup = (bundle / "setup").read_text()
+            self.assertIn('readonly APP_GROUP="example_runtime"', setup)
 
 
 if __name__ == "__main__":

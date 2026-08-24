@@ -26,8 +26,9 @@ readonly NPM_WORK_ROOT="$NPM_STATE_DIR/npm-work"
 readonly NPM_CACHE_ROOT="@@DEPENDENCY_CACHE_ROOT@@"
 readonly NPM_CACHE_DIR="$NPM_CACHE_ROOT/npm"
 readonly APP_USER="@@SERVICE_USER@@"
+readonly APP_GROUP="@@SERVICE_GROUP@@"
 readonly DEPLOY_GROUP="@@DEPLOY_GROUP@@"
-readonly COMMIT_OWNER="root:$APP_USER"
+readonly COMMIT_OWNER="root:$APP_GROUP"
 readonly SERVICE="@@LIVE_SERVICE@@"
 readonly RUNTIME_SOCKET="@@RUNTIME_SOCKET@@"
 readonly NODE_BIN=/bin/node
@@ -110,21 +111,21 @@ require_post_deploy_lock() {
 }
 
 require_npm_directories() {
-    directory_has_identity "$NPM_STATE_DIR" root "$APP_USER" 750 \
-        || die "$NPM_STATE_DIR must be root:$APP_USER mode 750; rerun config/server/setup"
-    directory_has_identity "$NPM_HOME_DIR" "$APP_USER" "$APP_USER" 700 \
-        || die "$NPM_HOME_DIR must be $APP_USER:$APP_USER mode 700; rerun config/server/setup"
-    directory_has_identity "$NPM_WORK_ROOT" root "$APP_USER" 710 \
-        || die "$NPM_WORK_ROOT must be root:$APP_USER mode 710; rerun config/server/setup"
-    directory_has_identity "$NPM_CACHE_ROOT" root "$APP_USER" 750 \
-        || die "$NPM_CACHE_ROOT must be root:$APP_USER mode 750; rerun config/server/setup"
-    directory_has_identity "$NPM_CACHE_DIR" "$APP_USER" "$APP_USER" 700 \
-        || die "$NPM_CACHE_DIR must be $APP_USER:$APP_USER mode 700; rerun config/server/setup"
+    directory_has_identity "$NPM_STATE_DIR" root "$APP_GROUP" 750 \
+        || die "$NPM_STATE_DIR must be root:$APP_GROUP mode 750; rerun config/server/setup"
+    directory_has_identity "$NPM_HOME_DIR" "$APP_USER" "$APP_GROUP" 700 \
+        || die "$NPM_HOME_DIR must be $APP_USER:$APP_GROUP mode 700; rerun config/server/setup"
+    directory_has_identity "$NPM_WORK_ROOT" root "$APP_GROUP" 710 \
+        || die "$NPM_WORK_ROOT must be root:$APP_GROUP mode 710; rerun config/server/setup"
+    directory_has_identity "$NPM_CACHE_ROOT" root "$APP_GROUP" 750 \
+        || die "$NPM_CACHE_ROOT must be root:$APP_GROUP mode 750; rerun config/server/setup"
+    directory_has_identity "$NPM_CACHE_DIR" "$APP_USER" "$APP_GROUP" 700 \
+        || die "$NPM_CACHE_DIR must be $APP_USER:$APP_GROUP mode 700; rerun config/server/setup"
 }
 
 npm_work_root_is_safe() {
-    directory_has_identity "$NPM_STATE_DIR" root "$APP_USER" 750 \
-        && directory_has_identity "$NPM_WORK_ROOT" root "$APP_USER" 710
+    directory_has_identity "$NPM_STATE_DIR" root "$APP_GROUP" 750 \
+        && directory_has_identity "$NPM_WORK_ROOT" root "$APP_GROUP" 710
 }
 
 cleanup_npm_work_dir() {
@@ -322,9 +323,9 @@ validate_existing_release() {
         || die "release is not a real directory: $RELEASE_DIR"
     metadata="$(read_release_deploy_id "$RELEASE_DIR")"
     [[ "$metadata" == "$deploy_id" ]] || die "release metadata does not match $deploy_id"
-    [[ "$(stat -c '%U:%G:%a' "$RELEASE_DIR")" == "root:$APP_USER:550" ]] \
-        || die "release root is not immutable root:$APP_USER mode 0550"
-    unexpected="$(find "$RELEASE_DIR" -xdev \( ! -user root -o ! -group "$APP_USER" \) -print -quit)"
+    [[ "$(stat -c '%U:%G:%a' "$RELEASE_DIR")" == "root:$APP_GROUP:550" ]] \
+        || die "release root is not immutable root:$APP_GROUP mode 0550"
+    unexpected="$(find "$RELEASE_DIR" -xdev \( ! -user root -o ! -group "$APP_GROUP" \) -print -quit)"
     [[ -z "$unexpected" ]] || die "release contains unexpected ownership: $unexpected"
     unexpected="$(find "$RELEASE_DIR" -xdev ! -type l -perm /222 -print -quit)"
     [[ -z "$unexpected" ]] || die "release contains a writable entry: $unexpected"
@@ -495,8 +496,8 @@ install_dependencies() {
     [[ -d "$NPM_WORK_DIR" && ! -L "$NPM_WORK_DIR" ]] \
         || die "dependency snapshot workspace is missing or unsafe"
 
-    chown "$APP_USER:$APP_USER" "$NPM_WORK_DIR/package.json" "$NPM_WORK_DIR/package-lock.json"
-    chown --no-dereference "$APP_USER:$APP_USER" "$NPM_WORK_DIR"
+    chown "$APP_USER:$APP_GROUP" "$NPM_WORK_DIR/package.json" "$NPM_WORK_DIR/package-lock.json"
+    chown --no-dereference "$APP_USER:$APP_GROUP" "$NPM_WORK_DIR"
     chmod 0700 "$NPM_WORK_DIR"
 
     ( cd "$NPM_WORK_DIR" \
@@ -640,7 +641,7 @@ make_release_immutable() {
     [[ -z "$unexpected" ]] \
         || die "refusing unexpected dependency entry type: $unexpected"
 
-    chown -R root:"$APP_USER" "$CANDIDATE_DIR"
+    chown -R root:"$APP_GROUP" "$CANDIDATE_DIR"
     chmod 00550 "$CANDIDATE_DIR"
     find "$CANDIDATE_DIR" -xdev \
         -path "$CANDIDATE_DIR/node_modules" -prune -o \
@@ -997,7 +998,7 @@ prune_retained_releases() {
         fi
         [[ -d "$release_path" && ! -L "$release_path" ]] \
             || { log "WARNING: refusing unsafe release prune target: $release_path"; continue; }
-        [[ "$(stat -c '%U:%G:%a' "$release_path")" == "root:$APP_USER:550" ]] \
+        [[ "$(stat -c '%U:%G:%a' "$release_path")" == "root:$APP_GROUP:550" ]] \
             || { log "WARNING: refusing release with unexpected identity: $release_path"; continue; }
         log "pruning retained release: $release_name"
         rm -rf --one-file-system -- "$release_path" \

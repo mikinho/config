@@ -153,6 +153,46 @@ def network_policy(profile: ApplicationProfile) -> str:
     )
 
 
+def selinux_static_patterns(profile: ApplicationProfile) -> tuple[str, ...]:
+    """Return exact fcontext regexes for nginx traversal and static content."""
+
+    root = re.escape(profile.paths.application_root)
+    patterns = {
+        root,
+        f"{root}/releases",
+        f"{root}/releases/[^/]+",
+    }
+    patterns.update(
+        f"{root}/releases/[^/]+/{re.escape(path)}(/.*)?"
+        for path in profile.static_content.release_paths
+    )
+    return tuple(sorted(patterns))
+
+
+def selinux_pointer_patterns(profile: ApplicationProfile) -> tuple[str, ...]:
+    """Return fcontext regexes kept on the ordinary systemd-traversable type."""
+
+    root = re.escape(profile.paths.application_root)
+    return (
+        f"{root}/candidates(/.*)?",
+        f"{root}/current",
+        f"{root}/previous",
+    )
+
+
+def selinux_relabel_paths(profile: ApplicationProfile) -> tuple[str, ...]:
+    """Return bounded application paths that may need label reconciliation."""
+
+    root = profile.paths.application_root
+    return (
+        root,
+        f"{root}/candidates",
+        f"{root}/current",
+        f"{root}/previous",
+        f"{root}/releases",
+    )
+
+
 def template_specs(profile: ApplicationProfile) -> tuple[TemplateSpec, ...]:
     """Return all generic transaction and host-policy template outputs."""
 
@@ -191,12 +231,46 @@ def template_specs(profile: ApplicationProfile) -> tuple[TemplateSpec, ...]:
                 "ssh/maintenance.conf", "ssh-maintenance.conf.in", DATA_MODE
             ),
             TemplateSpec("selinux/runtime.te", "runtime.te.in", DATA_MODE),
+            TemplateSpec(
+                "scripts/selinux-setup", "selinux-setup.in", SCRIPT_MODE
+            ),
+            TemplateSpec("scripts/verify-host", "verify-host.in", SCRIPT_MODE),
+            TemplateSpec("setup", "setup.in", SCRIPT_MODE),
         )
     )
     return tuple(sorted(specs, key=lambda item: item.relative_path))
 
 
-def build_replacements(profile: ApplicationProfile) -> dict[str, str]:
+def systemd_units(profile: ApplicationProfile) -> tuple[str, ...]:
+    """Return all rendered unit filenames in deterministic order."""
+
+    return tuple(
+        sorted(
+            (
+                profile.services.live,
+                profile.services.candidate,
+                profile.services.finalizer,
+                profile.services.path,
+                profile.services.recovery,
+                failure_service(profile),
+            )
+        )
+    )
+
+
+def secure_scripts() -> tuple[str, ...]:
+    """Return all root-owned runtime scripts installed from a bundle."""
+
+    names = {
+        Path(path).name for path in CORE_TEMPLATES if path.startswith("scripts/")
+    }
+    names.update(("selinux-setup", "verify-host"))
+    return tuple(sorted(names))
+
+
+def build_replacements(
+    profile: ApplicationProfile, source_revision: str
+) -> dict[str, str]:
     """Build the complete fixed placeholder map for generic core templates."""
 
     identity = profile.identity
@@ -261,6 +335,7 @@ def build_replacements(profile: ApplicationProfile) -> dict[str, str]:
         "@@FAILURE_SERVICE_PREFIX@@": failure_service(profile).removesuffix(
             ".service"
         ),
+        "@@FAILURE_SERVICE@@": failure_service(profile),
         "@@GATEWAY_PROGRAM@@": gateway_program(profile),
         "@@NETWORK_POLICY@@": network_policy(profile),
         "@@MEMORY_HIGH_BYTES@@": str(profile.limits.memory_high_bytes),
@@ -273,6 +348,31 @@ def build_replacements(profile: ApplicationProfile) -> dict[str, str]:
             profile.health.timeout_seconds * 2 + 120
         ),
         "@@SELINUX_MODULE@@": f"{identity.tag.replace('-', '_')}_runtime",
+        "@@SELINUX_STATIC_PATTERN_ARRAY@@": shell_array(
+            selinux_static_patterns(profile)
+        ),
+        "@@SELINUX_POINTER_PATTERN_ARRAY@@": shell_array(
+            selinux_pointer_patterns(profile)
+        ),
+        "@@SELINUX_RUNTIME_PATTERN_ARRAY@@": shell_array(
+            (
+                f"{re.escape(profile.paths.runtime_root)}(/.*)?",
+                f"{re.escape('/var' + profile.paths.runtime_root)}(/.*)?",
+            )
+        ),
+        "@@SELINUX_TRIGGER_PATTERN_LITERAL@@": shell_literal(
+            f"{re.escape(profile.paths.trigger_root)}/inbox(/.*)?"
+        ),
+        "@@SELINUX_RELABEL_PATH_ARRAY@@": shell_array(
+            selinux_relabel_paths(profile)
+        ),
+        "@@SOURCE_REVISION@@": source_revision,
+        "@@BUNDLE_ID@@": f"{source_revision}-{profile.digest()}",
+        "@@PROFILE_DIGEST@@": profile.digest(),
+        "@@SSH_POLICY_NAME@@": f"40-{identity.tag}-deploy.conf",
+        "@@SSH_MAINTENANCE_NAME@@": f"00-{identity.tag}-deploy-maintenance.conf",
+        "@@SYSTEMD_UNIT_ARRAY@@": shell_array(systemd_units(profile)),
+        "@@SECURE_SCRIPT_ARRAY@@": shell_array(secure_scripts()),
     }
 
 
@@ -318,7 +418,7 @@ def build_payload(
 
     if SOURCE_REVISION_PATTERN.fullmatch(source_revision) is None:
         fail("source revision must contain 40 to 64 lowercase hexadecimal characters")
-    replacements = build_replacements(profile)
+    replacements = build_replacements(profile, source_revision)
     files = [
         RenderedFile(
             spec.relative_path,
@@ -392,6 +492,7 @@ def render_bundle(profile: ApplicationProfile, output: Path, source_revision: st
     try:
         for rendered in payload:
             write_rendered_file(staging, rendered)
+        staging.chmod(0o755)
         directory_descriptor = os.open(staging, os.O_RDONLY | os.O_DIRECTORY)
         try:
             os.fsync(directory_descriptor)

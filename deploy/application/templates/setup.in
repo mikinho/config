@@ -1,0 +1,385 @@
+#!/usr/bin/env bash
+# Fail-closed installer for one rendered gold deployment bundle.
+
+set -Eeuo pipefail
+
+readonly APP_DIR="@@APPLICATION_ROOT@@"
+readonly SECURE_DIR="@@SECURE_ROOT@@"
+readonly CONFIG_DIR="@@CONFIG_ROOT@@"
+readonly TRIGGER_ROOT="@@TRIGGER_ROOT@@"
+readonly DEPENDENCY_STATE_ROOT="@@DEPENDENCY_STATE_ROOT@@"
+readonly DEPENDENCY_CACHE_ROOT="@@DEPENDENCY_CACHE_ROOT@@"
+readonly APP_USER="@@SERVICE_USER@@"
+readonly APP_GROUP="@@SERVICE_GROUP@@"
+readonly DEPLOY_USER="@@DEPLOY_USER@@"
+readonly DEPLOY_GROUP="@@DEPLOY_GROUP@@"
+readonly DEPLOY_HOME="/home/$DEPLOY_USER"
+readonly LIVE_SERVICE="@@LIVE_SERVICE@@"
+readonly FINALIZER_SERVICE="@@FINALIZER_SERVICE@@"
+readonly PATH_UNIT="@@FINALIZER_PATH@@"
+readonly RECOVERY_SERVICE="@@RECOVERY_SERVICE@@"
+readonly GATEWAY_PROGRAM="@@GATEWAY_PROGRAM@@"
+readonly SOURCE_REVISION="@@SOURCE_REVISION@@"
+readonly BUNDLE_ID="@@BUNDLE_ID@@"
+readonly PROFILE_DIGEST="@@PROFILE_DIGEST@@"
+readonly SSH_POLICY=/etc/ssh/sshd_config.d/@@SSH_POLICY_NAME@@
+readonly SSH_MAINTENANCE=/etc/ssh/sshd_config.d/@@SSH_MAINTENANCE_NAME@@
+readonly SETUP_BLOCKER_CONTENT="gold-setup-v1"
+readonly -a SYSTEMD_UNITS=(
+@@SYSTEMD_UNIT_ARRAY@@
+)
+readonly -a SECURE_SCRIPTS=(
+@@SECURE_SCRIPT_ARRAY@@
+)
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+readonly SCRIPT_DIR
+readonly BUNDLE_ROOT="$SCRIPT_DIR"
+readonly BUNDLES_DIR="$SECURE_DIR/bundles"
+readonly STANDARD_BUNDLE="$BUNDLES_DIR/$BUNDLE_ID"
+readonly STANDARD_LINK="$SECURE_DIR/standard"
+
+QUIESCE_STARTED=0
+SETUP_OWNS_BLOCKER=0
+ARCHIVE_STAGING=""
+NGINX_RESTART_REQUIRED=0
+
+log() { printf '[server-setup] %s\n' "$*"; }
+die() { printf '[server-setup] ERROR: %s\n' "$*" >&2; exit 1; }
+
+atomic_install() {
+    local source=$1 target=$2 mode=$3 owner=$4 group=$5
+    local parent replacement
+    parent="$(dirname "$target")"
+    [[ -d "$parent" && ! -L "$parent" ]] || die "unsafe install parent: $parent"
+    replacement="$parent/.${target##*/}.replacement.$$"
+    [[ ! -e "$replacement" && ! -L "$replacement" ]] \
+        || die "replacement path already exists: $replacement"
+    install -o "$owner" -g "$group" -m "$mode" -T -- "$source" "$replacement"
+    restorecon "$replacement" >/dev/null 2>&1 || true
+    mv -Tf -- "$replacement" "$target"
+}
+
+ensure_file() {
+    local path=$1 mode=$2 owner=$3 group=$4
+    if [[ -e "$path" || -L "$path" ]]; then
+        [[ -f "$path" && ! -L "$path" ]] || die "unsafe existing file: $path"
+        [[ "$(stat -Lc '%h' "$path")" == 1 ]] || die "hard-linked control file: $path"
+    else
+        install -o "$owner" -g "$group" -m "$mode" /dev/null "$path"
+    fi
+    chown "$owner:$group" "$path"
+    chmod "$mode" "$path"
+}
+
+arm_maintenance_deny() {
+    install -d -o root -g root -m 0755 /etc/ssh/sshd_config.d
+    atomic_install \
+        "$BUNDLE_ROOT/ssh/maintenance.conf" \
+        "$SSH_MAINTENANCE" 0644 root root
+    /usr/sbin/sshd -t || die "maintenance SSH policy is invalid"
+    systemctl reload sshd
+    log "deployment SSH ingress disabled for setup"
+}
+
+ensure_setup_blocker() {
+    local blocker="$TRIGGER_ROOT/blocked" content=""
+    if [[ -e "$blocker" || -L "$blocker" ]]; then
+        [[ -f "$blocker" && ! -L "$blocker" \
+            && "$(stat -Lc '%U:%G:%a:%h' "$blocker")" == root:root:600:1 ]] \
+            || die "existing deployment blocker is unsafe: $blocker"
+        IFS= read -r content < "$blocker" || true
+        [[ "$content" == "$SETUP_BLOCKER_CONTENT" ]] \
+            || die "an operator deployment blocker already exists: $blocker"
+        SETUP_OWNS_BLOCKER=1
+        return
+    fi
+    umask 077
+    printf '%s\n' "$SETUP_BLOCKER_CONTENT" > "$TRIGGER_ROOT/.blocked.setup.$$"
+    chown root:root "$TRIGGER_ROOT/.blocked.setup.$$"
+    chmod 0600 "$TRIGGER_ROOT/.blocked.setup.$$"
+    mv -Tf -- "$TRIGGER_ROOT/.blocked.setup.$$" "$blocker"
+    SETUP_OWNS_BLOCKER=1
+}
+
+failure_guard() {
+    local status=$? blocker temporary
+    trap - ERR EXIT
+    set +e
+    if (( QUIESCE_STARTED == 1 )); then
+        systemctl stop "$PATH_UNIT" >/dev/null 2>&1
+        if [[ -d "$TRIGGER_ROOT" && ! -L "$TRIGGER_ROOT" ]]; then
+            blocker="$TRIGGER_ROOT/blocked"
+            if [[ ! -e "$blocker" && ! -L "$blocker" ]]; then
+                temporary="$TRIGGER_ROOT/.blocked.failure.$$"
+                printf '%s\n' "$SETUP_BLOCKER_CONTENT" > "$temporary" 2>/dev/null
+                chown root:root "$temporary" >/dev/null 2>&1
+                chmod 0600 "$temporary" >/dev/null 2>&1
+                mv -Tf -- "$temporary" "$blocker" >/dev/null 2>&1
+            fi
+        fi
+        install -d -o root -g root -m 0755 /etc/ssh/sshd_config.d >/dev/null 2>&1
+        install -o root -g root -m 0644 -T \
+            "$BUNDLE_ROOT/ssh/maintenance.conf" "$SSH_MAINTENANCE" >/dev/null 2>&1
+        /usr/sbin/sshd -t >/dev/null 2>&1 \
+            && systemctl reload sshd >/dev/null 2>&1
+        if [[ -L "$APP_DIR/current" ]] \
+            && ! systemctl is-active --quiet "$LIVE_SERVICE"; then
+            systemctl reset-failed "$LIVE_SERVICE" >/dev/null 2>&1
+            systemctl start "$LIVE_SERVICE" >/dev/null 2>&1
+        fi
+        log "setup failed; deployment SSH remains denied and the path trigger is stopped"
+    fi
+    [[ -z "$ARCHIVE_STAGING" ]] || rm -rf -- "$ARCHIVE_STAGING"
+    exit "$status"
+}
+
+trap failure_guard ERR EXIT
+
+require_platform() {
+    [[ "$(id -u)" -eq 0 ]] || die "must run as root"
+    [[ -f /etc/os-release ]] || die "cannot identify the operating system"
+    # shellcheck disable=SC1091
+    source /etc/os-release
+    [[ " ${ID_LIKE:-} $ID " =~ (rhel|fedora|centos) ]] \
+        || die "a RHEL-family host is required"
+    [[ "${VERSION_ID%%.*}" == 9 ]] || die "major operating-system version 9 is required"
+    [[ "$(getenforce)" == Enforcing ]] || die "SELinux must be Enforcing"
+    sestatus | grep -Eq '^Loaded policy name:[[:space:]]+targeted$' \
+        || die "SELinux targeted policy must be loaded"
+    local command_name
+    for command_name in \
+        chown cmp cp find flock getent groupadd install jq mv passwd pgrep \
+        restorecon rpm sha256sum ssh-keygen systemctl useradd usermod; do
+        command -v "$command_name" >/dev/null 2>&1 \
+            || die "required command unavailable: $command_name"
+    done
+}
+
+verify_source_bundle() {
+    [[ -d "$BUNDLE_ROOT" && ! -L "$BUNDLE_ROOT" ]] \
+        || die "bundle root must be a real directory"
+    [[ "$(stat -Lc '%U:%G:%a' "$BUNDLE_ROOT")" == root:root:755 ]] \
+        || die "bundle root must be root:root mode 0755"
+    local unsafe
+    unsafe="$(find "$BUNDLE_ROOT" -xdev \
+        \( -type l -o \( ! -type d ! -type f \) \
+           -o ! -user root -o ! -group root -o -perm /022 \
+           -o \( -type f ! -links 1 \) \) -print -quit)"
+    [[ -z "$unsafe" ]] || die "unsafe bundle entry: $unsafe"
+    [[ "$(jq -r '.sourceRevision // empty' "$BUNDLE_ROOT/STANDARD-MANIFEST.json")" \
+        == "$SOURCE_REVISION" ]] || die "bundle source revision does not match renderer"
+    [[ "$(jq -r '.profileSha256 // empty' "$BUNDLE_ROOT/STANDARD-MANIFEST.json")" \
+        == "$PROFILE_DIGEST" ]] || die "bundle profile digest does not match renderer"
+    (cd "$BUNDLE_ROOT" && sha256sum --strict --check SHA256SUMS >/dev/null) \
+        || die "bundle checksum verification failed"
+    log "authenticated rendered bundle $SOURCE_REVISION"
+}
+
+quiesce_services() {
+    QUIESCE_STARTED=1
+    arm_maintenance_deny
+    systemctl stop "$PATH_UNIT" >/dev/null 2>&1 || true
+    systemctl stop "$FINALIZER_SERVICE" >/dev/null 2>&1 || true
+    if getent passwd "$DEPLOY_USER" >/dev/null \
+        && pgrep -u "$DEPLOY_USER" >/dev/null 2>&1; then
+        die "deployment-account processes remain after SSH ingress was disabled"
+    fi
+}
+
+ensure_accounts() {
+    local passwd_entry current_home current_shell current_groups
+    getent group "$APP_GROUP" >/dev/null || groupadd --system "$APP_GROUP"
+    getent group "$DEPLOY_GROUP" >/dev/null || groupadd --system "$DEPLOY_GROUP"
+    if getent passwd "$APP_USER" >/dev/null; then
+        passwd_entry="$(getent passwd "$APP_USER")"
+        current_home="$(cut -d: -f6 <<<"$passwd_entry")"
+        current_shell="$(cut -d: -f7 <<<"$passwd_entry")"
+        current_groups="$(id -Gn "$APP_USER")"
+        if [[ "$(id -gn "$APP_USER")" != "$APP_GROUP" \
+            || "$current_groups" != "$APP_GROUP" \
+            || "$current_home" != "$APP_DIR" \
+            || "$current_shell" != /sbin/nologin ]]; then
+            if systemctl is-active --quiet "$LIVE_SERVICE"; then
+                systemctl stop "$LIVE_SERVICE"
+            fi
+            usermod -g "$APP_GROUP" -G '' -d "$APP_DIR" -s /sbin/nologin "$APP_USER"
+        fi
+    else
+        useradd --system --gid "$APP_GROUP" --home-dir "$APP_DIR" \
+            --shell /sbin/nologin --no-create-home "$APP_USER"
+    fi
+    if getent passwd "$DEPLOY_USER" >/dev/null; then
+        passwd_entry="$(getent passwd "$DEPLOY_USER")"
+        current_home="$(cut -d: -f6 <<<"$passwd_entry")"
+        current_shell="$(cut -d: -f7 <<<"$passwd_entry")"
+        current_groups="$(id -Gn "$DEPLOY_USER")"
+        if [[ "$(id -gn "$DEPLOY_USER")" != "$DEPLOY_GROUP" \
+            || "$current_groups" != "$DEPLOY_GROUP" \
+            || "$current_home" != "$DEPLOY_HOME" \
+            || "$current_shell" != /bin/sh ]]; then
+            usermod -g "$DEPLOY_GROUP" -G '' -d "$DEPLOY_HOME" -s /bin/sh "$DEPLOY_USER"
+        fi
+    else
+        useradd --gid "$DEPLOY_GROUP" --home-dir "$DEPLOY_HOME" \
+            --shell /bin/sh --create-home "$DEPLOY_USER"
+    fi
+    passwd -l "$APP_USER" >/dev/null 2>&1 || true
+    passwd -l "$DEPLOY_USER" >/dev/null 2>&1 || true
+    id nginx >/dev/null 2>&1 || die "nginx account is required"
+    if ! id -nG nginx | tr ' ' '\n' | grep -Fqx "$APP_GROUP"; then
+        usermod -a -G "$APP_GROUP" nginx
+        NGINX_RESTART_REQUIRED=1
+    fi
+}
+
+ensure_directories() {
+    install -d -o root -g "$APP_GROUP" -m 0751 "$APP_DIR"
+    install -d -o root -g "$DEPLOY_GROUP" -m 2770 "$APP_DIR/incoming"
+    install -d -o root -g "$APP_GROUP" -m 0750 "$APP_DIR/releases" "$APP_DIR/candidates"
+    install -d -o root -g root -m 0755 "$SECURE_DIR" "$SECURE_DIR/scripts" "$BUNDLES_DIR"
+    install -d -o root -g root -m 0700 "$SECURE_DIR/state"
+    ensure_file "$SECURE_DIR/.post-deploy.lock" 0600 root root
+    install -d -o root -g "$APP_GROUP" -m 0750 "$CONFIG_DIR"
+    [[ -f "$CONFIG_DIR/.env" && ! -L "$CONFIG_DIR/.env" ]] \
+        || die "create the root-owned environment file before setup: $CONFIG_DIR/.env"
+    [[ "$(stat -Lc '%U:%G:%a:%h' "$CONFIG_DIR/.env")" == root:root:600:1 ]] \
+        || die "$CONFIG_DIR/.env must be a one-link root:root mode 0600 file"
+
+    install -d -o root -g root -m 0755 "$TRIGGER_ROOT"
+    install -d -o root -g "$DEPLOY_GROUP" -m 2770 "$TRIGGER_ROOT/inbox"
+    install -d -o root -g root -m 0700 "$TRIGGER_ROOT/state"
+    install -d -o root -g "$DEPLOY_GROUP" -m 0750 "$TRIGGER_ROOT/results"
+    ensure_file "$TRIGGER_ROOT/ingress.lock" 0660 root "$DEPLOY_GROUP"
+    ensure_file "$TRIGGER_ROOT/publish.lock" 0660 root "$DEPLOY_GROUP"
+    ensure_file "$TRIGGER_ROOT/session.lock" 0660 root "$DEPLOY_GROUP"
+    ensure_setup_blocker
+
+    install -d -o root -g "$APP_GROUP" -m 0750 "$DEPENDENCY_STATE_ROOT"
+    install -d -o "$APP_USER" -g "$APP_GROUP" -m 0700 "$DEPENDENCY_STATE_ROOT/home"
+    install -d -o root -g "$APP_GROUP" -m 0710 "$DEPENDENCY_STATE_ROOT/npm-work"
+    install -d -o root -g "$APP_GROUP" -m 0750 "$DEPENDENCY_CACHE_ROOT"
+    install -d -o "$APP_USER" -g "$APP_GROUP" -m 0700 "$DEPENDENCY_CACHE_ROOT/npm"
+
+    install -d -o root -g "$DEPLOY_GROUP" -m 0750 "$DEPLOY_HOME" "$DEPLOY_HOME/.ssh"
+}
+
+install_deploy_key() {
+    local key_file=${SSH_PUBLIC_KEY_FILE:-}
+    [[ -n "$key_file" ]] || die "set SSH_PUBLIC_KEY_FILE to the reviewed public key"
+    [[ -f "$key_file" && ! -L "$key_file" \
+        && "$(stat -Lc '%h' "$key_file")" == 1 ]] \
+        || die "SSH_PUBLIC_KEY_FILE must be a one-link real file"
+    [[ "$(awk 'NF { count++ } END { print count + 0 }' "$key_file")" == 1 ]] \
+        || die "SSH_PUBLIC_KEY_FILE must contain exactly one non-empty key line"
+    grep -Eq '^ssh-ed25519[[:space:]][A-Za-z0-9+/]+={0,3}([[:space:]].*)?$' "$key_file" \
+        || die "only one OpenSSH ed25519 public key is accepted"
+    ssh-keygen -lf "$key_file" || die "could not inspect the deployment key"
+    atomic_install "$key_file" "$DEPLOY_HOME/.ssh/authorized_keys" 0640 root "$DEPLOY_GROUP"
+}
+
+verify_rsync_source() {
+    [[ -x /usr/bin/rsync && -f /usr/bin/rrsync && ! -L /usr/bin/rrsync ]] \
+        || die "install the reviewed rsync and rsync-rrsync packages"
+    rpm -qf /usr/bin/rsync /usr/bin/rrsync >/dev/null \
+        || die "rsync executables must be package-owned"
+    local rsync_help rrsync_help option
+    rsync_help="$(LC_ALL=C /usr/bin/rsync --help 2>&1)"
+    rrsync_help="$(LC_ALL=C /usr/bin/rrsync -help 2>&1)"
+    for option in --confine-root --drop-D --fsync; do
+        grep -Fq -- "$option" <<<"$rsync_help" || die "rsync is missing $option"
+    done
+    for option in -wo -munge -no-lock; do
+        grep -Fq -- "$option" <<<"$rrsync_help" || die "rrsync is missing $option"
+    done
+}
+
+archive_bundle() {
+    if [[ -e "$STANDARD_BUNDLE" || -L "$STANDARD_BUNDLE" ]]; then
+        [[ -d "$STANDARD_BUNDLE" && ! -L "$STANDARD_BUNDLE" ]] \
+            || die "existing standard revision is unsafe: $STANDARD_BUNDLE"
+        (cd "$STANDARD_BUNDLE" && sha256sum --strict --check SHA256SUMS >/dev/null) \
+            || die "existing standard revision failed checksum verification"
+        cmp -s "$BUNDLE_ROOT/SHA256SUMS" "$STANDARD_BUNDLE/SHA256SUMS" \
+            || die "source revision already exists with different rendered content"
+    else
+        ARCHIVE_STAGING="$BUNDLES_DIR/.${BUNDLE_ID}.staging.$$"
+        [[ ! -e "$ARCHIVE_STAGING" && ! -L "$ARCHIVE_STAGING" ]] \
+            || die "bundle archive staging path already exists"
+        install -d -o root -g root -m 0755 "$ARCHIVE_STAGING"
+        cp -a -- "$BUNDLE_ROOT/." "$ARCHIVE_STAGING/"
+        chown -R root:root "$ARCHIVE_STAGING"
+        mv -T -- "$ARCHIVE_STAGING" "$STANDARD_BUNDLE"
+        ARCHIVE_STAGING=""
+    fi
+    local temporary="$SECURE_DIR/.standard.next.$$"
+    ln -s "bundles/$BUNDLE_ID" "$temporary"
+    mv -Tf -- "$temporary" "$STANDARD_LINK"
+}
+
+install_policy() {
+    local script unit
+    for script in "${SECURE_SCRIPTS[@]}"; do
+        atomic_install "$STANDARD_BUNDLE/scripts/$script" \
+            "$SECURE_DIR/scripts/$script" 0755 root root
+    done
+    atomic_install "$STANDARD_BUNDLE/scripts/deploy-gateway.py" \
+        "$GATEWAY_PROGRAM" 0755 root root
+    atomic_install /usr/bin/rrsync /usr/local/bin/rrsync 0755 root root
+    for unit in "${SYSTEMD_UNITS[@]}"; do
+        atomic_install "$STANDARD_BUNDLE/systemd/$unit" \
+            "/etc/systemd/system/$unit" 0644 root root
+    done
+    atomic_install "$STANDARD_BUNDLE/ssh/deploy.conf" "$SSH_POLICY" 0644 root root
+    systemctl daemon-reload
+    "$SECURE_DIR/scripts/selinux-setup"
+}
+
+arm_services() {
+    systemctl enable "$LIVE_SERVICE" "$PATH_UNIT" "$RECOVERY_SERVICE"
+    systemctl reset-failed "$FINALIZER_SERVICE" "$LIVE_SERVICE" || true
+    systemctl restart "$RECOVERY_SERVICE"
+    if (( NGINX_RESTART_REQUIRED == 1 )); then
+        /usr/sbin/nginx -t -c /etc/nginx/nginx.conf
+        systemctl restart nginx.service
+    fi
+    if [[ -L "$APP_DIR/current" ]]; then
+        systemctl restart "$LIVE_SERVICE"
+    fi
+    systemctl start "$PATH_UNIT"
+}
+
+finish_setup() {
+    "$SECURE_DIR/scripts/verify-host" --pre-ssh
+    if (( SETUP_OWNS_BLOCKER == 1 )); then
+        rm -f -- "$TRIGGER_ROOT/blocked"
+        SETUP_OWNS_BLOCKER=0
+    fi
+    rm -f -- "$SSH_MAINTENANCE"
+    /usr/sbin/sshd -t
+    systemctl reload sshd
+    "$SECURE_DIR/scripts/verify-host"
+    QUIESCE_STARTED=0
+    trap - ERR EXIT
+    log "gold deployment setup and verification completed"
+}
+
+main() {
+    require_platform
+    verify_source_bundle
+    quiesce_services
+    ensure_accounts
+    ensure_directories
+    exec 8<>"$TRIGGER_ROOT/ingress.lock"
+    flock --exclusive 8
+    install_deploy_key
+    verify_rsync_source
+    archive_bundle
+    install_policy
+    flock --unlock 8
+    exec 8>&-
+    arm_services
+    finish_setup
+}
+
+main "$@"
