@@ -32,8 +32,10 @@ if command -v shellcheck >/dev/null 2>&1; then
         "$REPOSITORY_ROOT/deploy/install-host-tools" \
         "$REPOSITORY_ROOT/deploy/verify-deployment" \
         "$REPOSITORY_ROOT/deploy/certbot-healthcheck" \
+        "$REPOSITORY_ROOT/certbot/install" \
         "$REPOSITORY_ROOT/packages/rsync/build-el9" \
         "$REPOSITORY_ROOT/selinux/apply-nginx-policy" \
+        "$REPOSITORY_ROOT/tests/certbot-installer.sh" \
         "$REPOSITORY_ROOT/tests/deploy-renderers.sh" \
         "$REPOSITORY_ROOT/tests/health-verifiers.sh" \
         "$REPOSITORY_ROOT/tests/nginx-runtime.sh" \
@@ -57,6 +59,9 @@ python3 "$REPOSITORY_ROOT/tests/application-deployment-transactions.py"
 
 step "Running deployment renderer and path boundary tests..."
 "$REPOSITORY_ROOT/tests/deploy-renderers.sh"
+
+step "Running Certbot installer routing tests..."
+"$REPOSITORY_ROOT/tests/certbot-installer.sh"
 
 step "Running strict host and certificate healthcheck tests..."
 "$REPOSITORY_ROOT/tests/health-verifiers.sh"

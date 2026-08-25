@@ -1,0 +1,543 @@
+#!/bin/sh
+
+set -eu
+
+PROGRAM_NAME=${0##*/}
+SCRIPT_DIRECTORY=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+REPOSITORY_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIRECTORY/.." && pwd)
+SYSTEMD_SOURCE=$REPOSITORY_ROOT/systemd/system
+HEALTHCHECK_SOURCE=$REPOSITORY_ROOT/deploy/certbot-healthcheck
+
+SYSTEMD_TARGET=/etc/systemd/system
+LOCAL_BIN_TARGET=/usr/local/bin
+ACME_WEBROOT=/var/www/letsencrypt
+DEFAULT_OS_RELEASE=/etc/os-release
+EPEL_RELEASE_BASE_URL=https://dl.fedoraproject.org/pub/epel
+
+MODE=install
+BACKEND=native
+OS_RELEASE_FILE=$DEFAULT_OS_RELEASE
+OS_RELEASE_OVERRIDDEN=no
+OS_ID=
+OS_NAME=
+OS_VERSION_MAJOR=
+OS_ARCHITECTURE=
+OS_LABEL=
+
+usage() {
+    cat <<EOF
+Usage:
+  $PROGRAM_NAME [--backend native|snap]
+  $PROGRAM_NAME --plan [--backend native|snap] [--os-release FILE]
+  $PROGRAM_NAME --check
+
+Installs Certbot and the repository-owned renewal integration on a supported
+RHEL-family host. The native EPEL package is the default; select --backend snap
+to use the official Certbot Snap. --plan detects the host and prints the
+installation actions without modifying it. --os-release is accepted only with
+--plan and is intended for reviewing a specific supported base OS.
+EOF
+}
+
+fail() {
+    printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2
+    exit 1
+}
+
+print_command() {
+    printf '+'
+    for command_argument do
+        printf ' %s' "$command_argument"
+    done
+    printf '\n'
+}
+
+run_command() {
+    if [ "$MODE" = plan ]; then
+        print_command "$@"
+    else
+        "$@"
+    fi
+}
+
+read_os_release_value() {
+    release_key=$1
+
+    awk -F= -v requested_key="$release_key" '
+        $1 == requested_key {
+            sub(/^[^=]*=/, "")
+            print
+            exit
+        }
+    ' "$OS_RELEASE_FILE"
+}
+
+strip_os_release_quotes() {
+    release_value=$1
+
+    case "$release_value" in
+        \"*\")
+            release_value=${release_value#\"}
+            release_value=${release_value%\"}
+            ;;
+        \'*\')
+            release_value=${release_value#\'}
+            release_value=${release_value%\'}
+            ;;
+    esac
+
+    printf '%s\n' "$release_value"
+}
+
+detect_architecture() {
+    detected_architecture=$(uname -m)
+    case "$detected_architecture" in
+        x86_64 | amd64) OS_ARCHITECTURE=x86_64 ;;
+        aarch64 | arm64) OS_ARCHITECTURE=aarch64 ;;
+        *) fail "unsupported host architecture: $detected_architecture" ;;
+    esac
+}
+
+detect_supported_os() {
+    [ -f "$OS_RELEASE_FILE" ] && [ ! -L "$OS_RELEASE_FILE" ] \
+        || fail "OS release metadata must be a regular file: $OS_RELEASE_FILE"
+
+    OS_ID=$(strip_os_release_quotes "$(read_os_release_value ID)")
+    OS_NAME=$(strip_os_release_quotes "$(read_os_release_value PRETTY_NAME)")
+    release_version=$(strip_os_release_quotes "$(read_os_release_value VERSION_ID)")
+    OS_VERSION_MAJOR=${release_version%%.*}
+
+    case "$OS_VERSION_MAJOR" in
+        9 | 10) ;;
+        *) fail "unsupported OS version in $OS_RELEASE_FILE: ${release_version:-missing VERSION_ID}" ;;
+    esac
+
+    case "$OS_ID" in
+        rhel)
+            OS_LABEL="Red Hat Enterprise Linux $OS_VERSION_MAJOR"
+            ;;
+        rocky)
+            OS_LABEL="Rocky Linux $OS_VERSION_MAJOR"
+            ;;
+        centos)
+            case "$OS_NAME" in
+                *CentOS*Stream*) ;;
+                *) fail "CentOS Stream is required; detected: ${OS_NAME:-unknown CentOS variant}" ;;
+            esac
+            OS_LABEL="CentOS Stream $OS_VERSION_MAJOR"
+            ;;
+        *) fail "unsupported base OS: ${OS_ID:-missing ID}" ;;
+    esac
+
+    detect_architecture
+}
+
+validate_regular_source() {
+    source_path=$1
+    [ -f "$source_path" ] && [ ! -L "$source_path" ] \
+        || fail "repository source must be a regular file: $source_path"
+}
+
+validate_executable_source() {
+    source_path=$1
+    validate_regular_source "$source_path"
+    [ -x "$source_path" ] \
+        || fail "repository source must be executable: $source_path"
+}
+
+validate_repository_sources() {
+    validate_executable_source "$HEALTHCHECK_SOURCE"
+    validate_regular_source "$SYSTEMD_SOURCE/certbot.service"
+    validate_regular_source "$SYSTEMD_SOURCE/certbot.timer"
+    validate_regular_source "$SYSTEMD_SOURCE/certbot.timer.d/10-snap-runner.conf"
+    validate_regular_source "$SYSTEMD_SOURCE/snap.certbot.renew.service.d/10-nginx.conf"
+}
+
+validate_backend() {
+    case "$BACKEND" in
+        native | snap) ;;
+        *) fail "unsupported Certbot backend: $BACKEND" ;;
+    esac
+}
+
+validate_install_host() {
+    [ "$(id -u)" -eq 0 ] || fail "run as root or use --plan"
+
+    for required_command in \
+        cmp \
+        dnf \
+        getent \
+        install \
+        readlink \
+        rpm \
+        stat \
+        systemctl \
+        systemd-analyze
+    do
+        command -v "$required_command" >/dev/null 2>&1 \
+            || fail "required command not found: $required_command"
+    done
+
+    [ -d "$SYSTEMD_TARGET" ] && [ ! -L "$SYSTEMD_TARGET" ] \
+        || fail "systemd target must be a real directory: $SYSTEMD_TARGET"
+    [ -d "$LOCAL_BIN_TARGET" ] && [ ! -L "$LOCAL_BIN_TARGET" ] \
+        || fail "local binary target must be a real directory: $LOCAL_BIN_TARGET"
+    [ "$(stat -Lc '%U:%G:%a' "$LOCAL_BIN_TARGET")" = root:root:755 ] \
+        || fail "$LOCAL_BIN_TARGET must be owned by root:root with mode 0755"
+    if [ -e "$ACME_WEBROOT" ] || [ -L "$ACME_WEBROOT" ]; then
+        [ -d "$ACME_WEBROOT" ] && [ ! -L "$ACME_WEBROOT" ] \
+            || fail "ACME webroot must be a real directory: $ACME_WEBROOT"
+    fi
+    getent group nginx >/dev/null 2>&1 \
+        || fail "nginx group is missing; install the nginx baseline first"
+    [ -x /usr/sbin/nginx ] \
+        || fail "nginx service binary is missing: /usr/sbin/nginx"
+
+    case "$BACKEND" in
+        native)
+            if command -v snap >/dev/null 2>&1 && snap list certbot >/dev/null 2>&1; then
+                fail "the Certbot Snap is installed; remove it before selecting the native backend"
+            fi
+            case $(readlink -f /usr/local/bin/certbot 2>/dev/null || true) in
+                /snap/*)
+                    fail "the Certbot Snap command remains under /usr/local/bin; remove it before selecting the native backend"
+                    ;;
+            esac
+            validate_install_target "$LOCAL_BIN_TARGET/certbot-healthcheck"
+            validate_install_target "$SYSTEMD_TARGET/certbot.timer"
+            validate_install_target "$SYSTEMD_TARGET/certbot.service"
+            validate_repository_removal \
+                "$SYSTEMD_SOURCE/certbot.timer.d/10-snap-runner.conf" \
+                "$SYSTEMD_TARGET/certbot.timer.d/10-snap-runner.conf"
+            validate_repository_removal \
+                "$SYSTEMD_SOURCE/snap.certbot.renew.service.d/10-nginx.conf" \
+                "$SYSTEMD_TARGET/snap.certbot.renew.service.d/10-nginx.conf"
+            ;;
+        snap)
+            if rpm -q certbot >/dev/null 2>&1; then
+                fail "the native Certbot package is installed; remove it before selecting the Snap backend"
+            fi
+            if [ -e /snap ] || [ -L /snap ]; then
+                [ -L /snap ] && [ "$(readlink /snap)" = /var/lib/snapd/snap ] \
+                    || fail "/snap exists but is not the expected /var/lib/snapd/snap link"
+            fi
+            if [ -e "$LOCAL_BIN_TARGET/certbot" ] || [ -L "$LOCAL_BIN_TARGET/certbot" ]; then
+                [ -L "$LOCAL_BIN_TARGET/certbot" ] \
+                    && [ "$(readlink "$LOCAL_BIN_TARGET/certbot")" = /snap/bin/certbot ] \
+                    || fail "$LOCAL_BIN_TARGET/certbot exists and is not the expected Certbot Snap link"
+            fi
+            validate_install_target "$LOCAL_BIN_TARGET/certbot-healthcheck"
+            validate_install_target "$SYSTEMD_TARGET/certbot.timer"
+            validate_install_target \
+                "$SYSTEMD_TARGET/certbot.timer.d/10-snap-runner.conf"
+            validate_install_target \
+                "$SYSTEMD_TARGET/snap.certbot.renew.service.d/10-nginx.conf"
+            validate_optional_directory "$SYSTEMD_TARGET/certbot.timer.d"
+            validate_optional_directory \
+                "$SYSTEMD_TARGET/snap.certbot.renew.service.d"
+            validate_repository_removal \
+                "$SYSTEMD_SOURCE/certbot.service" \
+                "$SYSTEMD_TARGET/certbot.service"
+            ;;
+    esac
+}
+
+install_epel_repository() {
+    run_command dnf install --assumeyes ca-certificates dnf-plugins-core
+
+    case "$OS_ID" in
+        rhel)
+            if [ "$MODE" = install ]; then
+                command -v subscription-manager >/dev/null 2>&1 \
+                    || fail "subscription-manager is required to enable CodeReady Builder on RHEL"
+            fi
+            run_command subscription-manager repos --enable \
+                "codeready-builder-for-rhel-$OS_VERSION_MAJOR-$OS_ARCHITECTURE-rpms"
+            ;;
+        rocky | centos)
+            run_command dnf config-manager --set-enabled crb
+            ;;
+    esac
+
+    run_command dnf install --assumeyes \
+        "$EPEL_RELEASE_BASE_URL/epel-release-latest-$OS_VERSION_MAJOR.noarch.rpm"
+}
+
+stop_unit_if_present() {
+    unit_name=$1
+    if [ "$MODE" = plan ]; then
+        print_command systemctl stop "$unit_name"
+    elif systemctl cat "$unit_name" >/dev/null 2>&1; then
+        systemctl stop "$unit_name"
+    fi
+}
+
+disable_unit_if_present() {
+    unit_name=$1
+    if [ "$MODE" = plan ]; then
+        print_command systemctl disable --now "$unit_name"
+    elif systemctl cat "$unit_name" >/dev/null 2>&1; then
+        systemctl disable --now "$unit_name"
+    fi
+}
+
+remove_repository_file() {
+    removal_source=$1
+    removal_target=$2
+
+    if [ "$MODE" = plan ]; then
+        print_command rm -f -- "$removal_target"
+        return
+    fi
+
+    if [ -e "$removal_target" ] || [ -L "$removal_target" ]; then
+        [ -f "$removal_target" ] && [ ! -L "$removal_target" ] \
+            || fail "refusing non-regular backend file: $removal_target"
+        cmp -s "$removal_source" "$removal_target" \
+            || fail "refusing to remove locally modified backend file: $removal_target"
+        rm -f -- "$removal_target"
+    fi
+}
+
+validate_repository_removal() {
+    removal_source=$1
+    removal_target=$2
+
+    if [ -e "$removal_target" ] || [ -L "$removal_target" ]; then
+        [ -f "$removal_target" ] && [ ! -L "$removal_target" ] \
+            || fail "refusing non-regular backend file: $removal_target"
+        cmp -s "$removal_source" "$removal_target" \
+            || fail "refusing to remove locally modified backend file: $removal_target"
+    fi
+}
+
+validate_optional_directory() {
+    target_directory=$1
+    if [ -e "$target_directory" ] || [ -L "$target_directory" ]; then
+        [ -d "$target_directory" ] && [ ! -L "$target_directory" ] \
+            || fail "installation target must be a real directory: $target_directory"
+    fi
+}
+
+validate_install_target() {
+    target_path=$1
+    if [ -e "$target_path" ] || [ -L "$target_path" ]; then
+        [ -f "$target_path" ] && [ ! -L "$target_path" ] \
+            || fail "installation target must be a regular file: $target_path"
+    fi
+}
+
+install_file() {
+    source_path=$1
+    target_path=$2
+    target_mode=$3
+
+    if [ "$MODE" = install ]; then
+        validate_install_target "$target_path"
+    fi
+    run_command install -D -o root -g root -m "$target_mode" "$source_path" "$target_path"
+}
+
+install_common_assets() {
+    run_command install -d -o root -g nginx -m 0750 "$ACME_WEBROOT"
+    install_file \
+        "$HEALTHCHECK_SOURCE" \
+        "$LOCAL_BIN_TARGET/certbot-healthcheck" \
+        0755
+    install_file \
+        "$SYSTEMD_SOURCE/certbot.timer" \
+        "$SYSTEMD_TARGET/certbot.timer" \
+        0644
+}
+
+restore_system_labels() {
+    shift_count=$#
+    [ "$shift_count" -gt 0 ] || return
+
+    if [ "$MODE" = plan ]; then
+        print_command restorecon -RF "$@"
+    elif command -v restorecon >/dev/null 2>&1; then
+        restorecon -RF "$@"
+    fi
+}
+
+install_native_backend() {
+    stop_unit_if_present certbot.timer
+    install_epel_repository
+    run_command dnf install --assumeyes certbot
+
+    if [ "$MODE" = install ]; then
+        [ -x /bin/certbot ] \
+            || fail "native Certbot package did not provide /bin/certbot"
+        case $(readlink -f /bin/certbot) in
+            /snap/*) fail "/bin/certbot resolves to the Snap launcher" ;;
+        esac
+    fi
+
+    disable_unit_if_present certbot-renew.timer
+    remove_repository_file \
+        "$SYSTEMD_SOURCE/certbot.timer.d/10-snap-runner.conf" \
+        "$SYSTEMD_TARGET/certbot.timer.d/10-snap-runner.conf"
+    remove_repository_file \
+        "$SYSTEMD_SOURCE/snap.certbot.renew.service.d/10-nginx.conf" \
+        "$SYSTEMD_TARGET/snap.certbot.renew.service.d/10-nginx.conf"
+
+    install_common_assets
+    install_file \
+        "$SYSTEMD_SOURCE/certbot.service" \
+        "$SYSTEMD_TARGET/certbot.service" \
+        0644
+    restore_system_labels \
+        "$SYSTEMD_TARGET/certbot.service" \
+        "$SYSTEMD_TARGET/certbot.timer" \
+        "$ACME_WEBROOT" \
+        "$LOCAL_BIN_TARGET/certbot-healthcheck"
+
+    run_command systemctl daemon-reload
+    run_command systemd-analyze --man=no verify certbot.service certbot.timer
+    run_command systemctl enable --now certbot.timer
+    run_command /bin/certbot --version
+}
+
+ensure_classic_snap_link() {
+    if [ "$MODE" = plan ]; then
+        print_command ln -s /var/lib/snapd/snap /snap
+    elif [ ! -e /snap ] && [ ! -L /snap ]; then
+        ln -s /var/lib/snapd/snap /snap
+    fi
+}
+
+ensure_snap_certbot_command() {
+    snap_command_target=$LOCAL_BIN_TARGET/certbot
+
+    if [ "$MODE" = plan ]; then
+        print_command ln -s /snap/bin/certbot "$snap_command_target"
+        return
+    fi
+
+    if [ -e "$snap_command_target" ] || [ -L "$snap_command_target" ]; then
+        [ -L "$snap_command_target" ] \
+            && [ "$(readlink "$snap_command_target")" = /snap/bin/certbot ] \
+            || fail "$snap_command_target exists and is not the expected Certbot Snap link"
+    else
+        ln -s /snap/bin/certbot "$snap_command_target"
+    fi
+}
+
+install_snap_backend() {
+    stop_unit_if_present certbot.timer
+    install_epel_repository
+    run_command dnf install --assumeyes snapd
+    run_command systemctl enable --now snapd.socket
+    ensure_classic_snap_link
+
+    if [ "$MODE" = plan ]; then
+        print_command snap install --classic certbot
+    elif snap list certbot >/dev/null 2>&1; then
+        snap refresh certbot
+    else
+        snap install --classic certbot
+    fi
+    ensure_snap_certbot_command
+
+    if [ "$MODE" = install ]; then
+        systemctl cat snap.certbot.renew.service >/dev/null 2>&1 \
+            || fail "Certbot Snap did not generate snap.certbot.renew.service"
+    fi
+
+    run_command snap stop --disable certbot.renew
+
+    disable_unit_if_present certbot-renew.timer
+    disable_unit_if_present snap.certbot.renew.timer
+    remove_repository_file \
+        "$SYSTEMD_SOURCE/certbot.service" \
+        "$SYSTEMD_TARGET/certbot.service"
+
+    install_common_assets
+    install_file \
+        "$SYSTEMD_SOURCE/certbot.timer.d/10-snap-runner.conf" \
+        "$SYSTEMD_TARGET/certbot.timer.d/10-snap-runner.conf" \
+        0644
+    install_file \
+        "$SYSTEMD_SOURCE/snap.certbot.renew.service.d/10-nginx.conf" \
+        "$SYSTEMD_TARGET/snap.certbot.renew.service.d/10-nginx.conf" \
+        0644
+    restore_system_labels \
+        "$SYSTEMD_TARGET/certbot.timer" \
+        "$SYSTEMD_TARGET/certbot.timer.d" \
+        "$SYSTEMD_TARGET/snap.certbot.renew.service.d" \
+        "$ACME_WEBROOT" \
+        "$LOCAL_BIN_TARGET/certbot-healthcheck"
+
+    run_command systemctl daemon-reload
+    run_command systemd-analyze --man=no verify \
+        certbot.timer \
+        snap.certbot.renew.service
+    run_command systemctl enable --now certbot.timer
+    run_command "$LOCAL_BIN_TARGET/certbot" --version
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --backend)
+            [ "$#" -ge 2 ] || fail "--backend requires a value"
+            BACKEND=$2
+            shift 2
+            ;;
+        --check)
+            [ "$MODE" = install ] || fail "select exactly one mode"
+            MODE=check
+            shift
+            ;;
+        --plan)
+            [ "$MODE" = install ] || fail "select exactly one mode"
+            MODE=plan
+            shift
+            ;;
+        --os-release)
+            [ "$#" -ge 2 ] || fail "--os-release requires a file"
+            OS_RELEASE_FILE=$2
+            OS_RELEASE_OVERRIDDEN=yes
+            shift 2
+            ;;
+        --help | -h)
+            usage
+            exit 0
+            ;;
+        *) fail "unknown argument: $1" ;;
+    esac
+done
+
+validate_backend
+validate_repository_sources
+
+if [ "$MODE" = check ]; then
+    [ "$OS_RELEASE_OVERRIDDEN" = no ] \
+        || fail "--os-release is accepted only with --plan"
+    printf 'Validated Certbot installer sources and native/snap backend assets.\n'
+    exit 0
+fi
+
+if [ "$OS_RELEASE_OVERRIDDEN" = yes ] && [ "$MODE" != plan ]; then
+    fail "--os-release is accepted only with --plan"
+fi
+
+detect_supported_os
+printf 'Certbot installation target: %s (%s), backend: %s\n' \
+    "$OS_LABEL" "$OS_ARCHITECTURE" "$BACKEND"
+
+if [ "$MODE" = install ]; then
+    validate_install_host
+fi
+
+case "$BACKEND" in
+    native) install_native_backend ;;
+    snap) install_snap_backend ;;
+esac
+
+if [ "$MODE" = plan ]; then
+    printf 'Plan complete; no host changes were made.\n'
+else
+    printf 'Installed the %s Certbot backend and enabled the repository renewal timer.\n' \
+        "$BACKEND"
+fi
