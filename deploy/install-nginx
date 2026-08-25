@@ -75,6 +75,23 @@ version_at_least() {
     return 0
 }
 
+parse_nginx_version() {
+    parse_version_raw=$1
+    parse_version_candidate=
+
+    case "$parse_version_raw" in
+        'nginx version: '*/*)
+            parse_version_candidate=$(printf '%s\n' "$parse_version_raw" \
+                | sed 's|^.*/||; s|[^0-9.].*$||')
+            ;;
+    esac
+
+    if printf '%s\n' "$parse_version_candidate" \
+        | grep -Eq '^[0-9]+([.][0-9]+){0,2}$'; then
+        printf '%s\n' "$parse_version_candidate"
+    fi
+}
+
 # Rendering can happen on a build machine, so the floor is enforced against
 # the host that will actually load the tree, not at render time.
 verify_host_nginx() {
@@ -83,7 +100,7 @@ verify_host_nginx() {
 
     host_version_raw=$("$NGINX_BINARY" -v 2>&1) \
         || fail "unable to read the nginx version from $NGINX_BINARY"
-    host_version=$(printf '%s' "$host_version_raw" | sed 's|^.*nginx/||; s|[^0-9.].*$||')
+    host_version=$(parse_nginx_version "$host_version_raw")
     [ -n "$host_version" ] || fail "unable to parse an nginx version from: $host_version_raw"
 
     version_at_least "$host_version" "$NGINX_VERSION_FLOOR" \

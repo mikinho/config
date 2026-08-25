@@ -167,4 +167,36 @@ printf '%s\\n' \"\$RESOLVED_BACKEND\"
 [ "$backend_result" = 'snap native' ] \
     || fail "Certbot backend auto-detection returned: $backend_result"
 
+for nginx_verifier in \
+    "$REPOSITORY_ROOT/deploy/install-nginx" \
+    "$HOST_VERIFIER"
+do
+    nginx_parser=$(extract_function parse_nginx_version "$nginx_verifier")
+    stock_version=$(sh -c "
+$nginx_parser
+parse_nginx_version 'nginx version: nginx/1.29.3'
+")
+    getpagespeed_version=$(sh -c "
+$nginx_parser
+parse_nginx_version 'nginx version: nginx-mod by GetPageSpeed.com/1.30.4'
+")
+    invalid_version=$(sh -c "
+$nginx_parser
+parse_nginx_version 'nginx version: nginx-mod by GetPageSpeed.com/not-a-version'
+")
+    unrelated_version=$(sh -c "
+$nginx_parser
+parse_nginx_version 'not an nginx banner/1.30.4'
+")
+
+    [ "$stock_version" = 1.29.3 ] \
+        || fail "stock nginx version was parsed as: $stock_version"
+    [ "$getpagespeed_version" = 1.30.4 ] \
+        || fail "GetPageSpeed nginx version was parsed as: $getpagespeed_version"
+    [ -z "$invalid_version" ] \
+        || fail "invalid nginx version was accepted as: $invalid_version"
+    [ -z "$unrelated_version" ] \
+        || fail "unrelated nginx banner was accepted as: $unrelated_version"
+done
+
 printf 'Validated strict host and certificate healthcheck behavior.\n'
