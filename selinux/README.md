@@ -146,10 +146,12 @@ sudo semodule -i nginx_quic_bpf.pp
 ```
 
 Remove it with `semodule -r nginx_quic_bpf` when the profile is removed. The
-module targets the CAP_BPF capability path used by RHEL 9 era kernels; if the
-target kernel or nginx build still produces a denial, extend the module only
-with the specific audited permission. CI builds the module on Rocky Linux 9
-and CentOS Stream 10 so a syntax error cannot reach a host.
+module grants the BPF permissions plus the audited `net_admin`, `sys_admin`,
+and `perfmon` capabilities used by RHEL 9.4 when creating nginx's QUIC
+reuseport socket map and loading its selector program. If another target
+kernel or nginx build still produces a denial, extend the module only with the
+specific audited permission. CI builds the module on Rocky Linux 9 and CentOS
+Stream 10 so a syntax error cannot reach a host.
 
 ## Investigating denials
 
