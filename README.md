@@ -178,6 +178,8 @@ TCP 443 so clients always have an HTTP/2 or HTTP/1.1 fallback.
 - `php-fpm/` contains the optional per-site PHP-FPM pool, main configuration,
   provisioning contract, and validation guidance.
 - `logrotate/` contains the nginx file-log rotation policy.
+- `certbot/` contains the supported-OS installer and first-certificate
+  workflow for the native EPEL and official Snap Certbot backends.
 - `deploy/` contains the profile installer and its profile manifests.
 - `selinux/` contains the SELinux file-context and policy-module assets that
   enforcing-mode deployments need beyond the distribution policy.
@@ -195,6 +197,19 @@ TCP 443 so clients always have an HTTP/2 or HTTP/1.1 fallback.
 Each component directory carries its own README covering that component's
 installation and validation; this document remains authoritative for the
 platform baseline and the cross-component contracts.
+
+Install Certbot only after the nginx baseline is present. The component
+installer detects supported RHEL, Rocky Linux, and CentOS Stream releases,
+shows a non-mutating plan, installs the selected payload, and activates the
+repository-owned single-scheduler renewal contract:
+
+```sh
+certbot/install --plan
+sudo certbot/install
+```
+
+See [`certbot/README.md`](certbot/README.md) for the optional Snap backend,
+initial webroot certificate request, backend switching, and validation.
 
 Deploy the selected contents of `nginx/` to `/etc/nginx/`, preserving this
 directory structure. The installer must populate both stub levels with the

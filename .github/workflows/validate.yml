@@ -409,6 +409,10 @@ jobs:
             --volume "$PWD:/workspace:ro" \
             "${{ matrix.image }}" \
             /bin/bash -euxo pipefail -c '
+              /workspace/certbot/install --plan |
+                grep --fixed-strings "backend: native"
+              /workspace/certbot/install --plan --backend snap |
+                grep --fixed-strings "backend: snap"
               dnf install --assumeyes logrotate shadow-utils systemd
               install -D -m 0755 /usr/bin/true /usr/sbin/nginx
               install -D -m 0755 /usr/bin/true /sbin/php-fpm

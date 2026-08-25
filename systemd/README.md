@@ -29,6 +29,12 @@ do not leave a distribution or Snap Certbot timer active alongside it.
 When switching backends, stop `certbot.timer` before changing files. Reinstalling
 the base timer does not remove anything under `certbot.timer.d/`.
 
+For supported RHEL, Rocky Linux, and CentOS Stream hosts, prefer the
+[`certbot/install`](../certbot/README.md) component installer. It handles EPEL,
+the selected native or Snap payload, these unit files, the ACME webroot, and
+the single-scheduler transition. The commands below remain the manual unit
+installation reference.
+
 ### Native Certbot backend
 
 Use this backend only when `/bin/certbot` is a native executable rather than a
