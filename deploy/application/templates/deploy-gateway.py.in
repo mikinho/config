@@ -57,6 +57,7 @@ ROOT_GID: Final = 0
 TRIGGER_ROOT_MODE: Final = 0o755
 INBOX_MODE: Final = 0o2770
 RRSYNC_ROOT_MODE: Final = 0o2770
+CANDIDATE_MODE: Final = 0o2755
 RESULTS_MODE: Final = 0o750
 LOCK_MODE: Final = 0o660
 SENTINEL_MODE: Final = 0o660
@@ -125,6 +126,7 @@ class GatewayConfig:
     deploy_gid: int
     inbox_mode: int
     rrsync_root_mode: int
+    candidate_mode: int
     result_uid: int
     test_mode: bool = False
     timeout_seconds: float = WAIT_TIMEOUT_SECONDS
@@ -365,6 +367,7 @@ def run_restricted_rsync_child(
     if config.test_mode:
         for name in (
             "FAKE_RRSYNC_DELAY",
+            "FAKE_RRSYNC_CANDIDATE_MODE",
             "FAKE_RRSYNC_EXEC_CHAIN",
             "FAKE_RRSYNC_MARKER",
             "FAKE_RRSYNC_STATUS",
@@ -421,12 +424,19 @@ def require_fresh_candidate(candidate_root_fd: int, token: str) -> None:
         raise GatewayError("deploy candidate already exists")
 
 
-def validate_received_candidate(
+def normalize_received_candidate(
     candidate_root_fd: int,
     config: GatewayConfig,
     token: str,
 ) -> None:
-    """Require rsync to leave one real deploy-owned candidate directory."""
+    """Pin and normalize one safe deploy-owned candidate directory.
+
+    Rsync 3.5 can clear the setgid bit inherited from the incoming root even
+    when the client disables permission preservation. Accept only that exact
+    ``0755`` receiver outcome or the already-correct ``02755`` mode, restore
+    the reviewed mode through the pinned inode, and durably verify it before
+    publishing the completion token.
+    """
 
     metadata = entry_metadata(candidate_root_fd, token)
     if metadata is None:
@@ -438,8 +448,42 @@ def validate_received_candidate(
             "received candidate has an unsafe identity: "
             f"uid={metadata.st_uid} gid={metadata.st_gid}"
         )
-    if stat.S_IMODE(metadata.st_mode) & 0o002:
-        raise GatewayError("received candidate must not be world-writable")
+    actual_mode = stat.S_IMODE(metadata.st_mode)
+    if actual_mode not in (0o755, config.candidate_mode):
+        raise GatewayError(f"received candidate has an unsafe mode: {actual_mode:o}")
+
+    candidate_fd = -1
+    try:
+        candidate_fd = os.open(token, directory_flags(), dir_fd=candidate_root_fd)
+        pinned = os.fstat(candidate_fd)
+        if pinned.st_dev != metadata.st_dev or pinned.st_ino != metadata.st_ino:
+            raise GatewayError("received candidate changed while it was being pinned")
+        if (
+            not stat.S_ISDIR(pinned.st_mode)
+            or pinned.st_uid != config.deploy_uid
+            or pinned.st_gid != config.deploy_gid
+            or stat.S_IMODE(pinned.st_mode) != actual_mode
+        ):
+            raise GatewayError("received candidate identity changed after it was pinned")
+        if actual_mode == 0o755:
+            os.fchmod(candidate_fd, config.candidate_mode)
+            os.fsync(candidate_fd)
+        normalized = os.fstat(candidate_fd)
+        if (
+            normalized.st_dev != metadata.st_dev
+            or normalized.st_ino != metadata.st_ino
+            or normalized.st_uid != config.deploy_uid
+            or normalized.st_gid != config.deploy_gid
+            or stat.S_IMODE(normalized.st_mode) != config.candidate_mode
+        ):
+            raise GatewayError("received candidate mode normalization failed")
+    except OSError as error:
+        raise GatewayError(
+            f"cannot safely normalize received candidate: {error.strerror}"
+        ) from error
+    finally:
+        if candidate_fd >= 0:
+            os.close(candidate_fd)
 
 
 def sync_payload_filesystem(config: GatewayConfig) -> None:
@@ -932,7 +976,7 @@ def run_deploy_session(config: GatewayConfig, parsed: ParsedCommand) -> int:
                 )
                 if status != 0:
                     return status
-                validate_received_candidate(candidate_root_fd, config, parsed.token)
+                normalize_received_candidate(candidate_root_fd, config, parsed.token)
                 sync_payload_filesystem(config)
 
             # The session mutex blocks every other writer while ingress changes
@@ -995,6 +1039,7 @@ def production_config() -> GatewayConfig:
         deploy_gid=deploy_gid,
         inbox_mode=INBOX_MODE,
         rrsync_root_mode=RRSYNC_ROOT_MODE,
+        candidate_mode=CANDIDATE_MODE,
         result_uid=ROOT_UID,
     )
 
@@ -1021,6 +1066,7 @@ def test_config(test_root: Path) -> GatewayConfig:
         deploy_gid=os.getegid(),
         inbox_mode=inbox_mode,
         rrsync_root_mode=inbox_mode,
+        candidate_mode=0o755 if sys.platform == "darwin" else CANDIDATE_MODE,
         result_uid=os.geteuid(),
         test_mode=True,
     )
