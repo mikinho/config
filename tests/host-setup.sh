@@ -87,6 +87,9 @@ done
 
 write_os_release "$TEST_ROOT/rocky-9" rocky 'Rocky Linux 9.7' 9.7
 write_os_release "$TEST_ROOT/centos-stream-10" centos 'CentOS Stream 10' 10
+mkdir -p "$TEST_ROOT/etc" "$TEST_ROOT/usr/lib"
+cp "$TEST_ROOT/rocky-9" "$TEST_ROOT/usr/lib/os-release"
+ln -s ../usr/lib/os-release "$TEST_ROOT/etc/os-release"
 
 for platform_installer in \
     "$FAIL2BAN_INSTALL" \
@@ -94,7 +97,7 @@ for platform_installer in \
     "$SELINUX_INSTALL" \
     "$SSH_INSTALL"
 do
-    "$platform_installer" --plan --os-release "$TEST_ROOT/rocky-9" \
+    "$platform_installer" --plan --os-release "$TEST_ROOT/etc/os-release" \
         > "$TEST_ROOT/$(basename "${platform_installer%/*}")-rocky.plan"
 done
 assert_contains "$TEST_ROOT/fail2ban-rocky.plan" \
@@ -196,7 +199,7 @@ assert_not_contains "$TEST_ROOT/nginx.plan" 'zones/public.xml'
     --ssh-phase prepare \
     --authorized-key-ready \
     --ignore-ip 192.0.2.0/24 \
-    --os-release "$TEST_ROOT/rocky-9" \
+    --os-release "$TEST_ROOT/etc/os-release" \
     > "$TEST_ROOT/host-direct.plan"
 assert_contains "$TEST_ROOT/host-direct.plan" \
     'Host setup: profile=edge-direct, topology=direct, ssh-phase=prepare'

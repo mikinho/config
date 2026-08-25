@@ -149,12 +149,31 @@ expect_failure \
     --check \
     --os-release "$TEST_ROOT/rocky-9"
 
-ln -s "$TEST_ROOT/rocky-9" "$TEST_ROOT/symlink-release"
+mkdir -p "$TEST_ROOT/etc" "$TEST_ROOT/usr/lib"
+cp "$TEST_ROOT/rocky-9" "$TEST_ROOT/usr/lib/os-release"
+ln -s ../usr/lib/os-release "$TEST_ROOT/etc/os-release"
+"$CERTBOT_INSTALLER" \
+    --plan \
+    --os-release "$TEST_ROOT/etc/os-release" \
+    > "$TEST_ROOT/symlink-release.plan"
+assert_plan_contains \
+    "$TEST_ROOT/symlink-release.plan" \
+    'Certbot installation target: Rocky Linux 9'
+
+ln -s missing-release "$TEST_ROOT/broken-release"
 expect_failure \
     'OS release metadata must be a regular file' \
     "$CERTBOT_INSTALLER" \
     --plan \
-    --os-release "$TEST_ROOT/symlink-release"
+    --os-release "$TEST_ROOT/broken-release"
+
+mkdir "$TEST_ROOT/release-directory"
+ln -s release-directory "$TEST_ROOT/directory-release"
+expect_failure \
+    'OS release metadata must be a regular file' \
+    "$CERTBOT_INSTALLER" \
+    --plan \
+    --os-release "$TEST_ROOT/directory-release"
 
 fixture_root=$TEST_ROOT/repository
 mkdir -p "$fixture_root"
