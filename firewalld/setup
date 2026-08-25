@@ -1,0 +1,246 @@
+#!/bin/sh
+
+set -eu
+
+PROGRAM_NAME=${0##*/}
+SCRIPT_DIRECTORY=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+SERVICE_SOURCE_DIRECTORY=$SCRIPT_DIRECTORY/services
+SERVICE_TARGET_DIRECTORY=/etc/firewalld/services
+
+MODE=apply
+ZONE=public
+SELECTED_SERVICES=
+SCRATCH_DIRECTORY=
+ROLLBACK_REQUIRED=no
+NGINX_WAS_ENABLED=no
+SSH_WAS_ENABLED=no
+
+usage() {
+    cat <<EOF
+Usage:
+  $PROGRAM_NAME --check
+  $PROGRAM_NAME --plan --service nginx|ssh-hardened [--service ...] [--zone NAME]
+  sudo $PROGRAM_NAME --service nginx|ssh-hardened [--service ...] [--zone NAME]
+
+Installs selected repository firewalld service definitions and enables them in
+the selected existing zone. It never installs firewalld/zones/public.xml and
+never removes an existing service or raw port allowance.
+EOF
+}
+
+fail() {
+    printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2
+    exit 1
+}
+
+service_selected() {
+    selection_candidate=$1
+    printf '%s\n' "$SELECTED_SERVICES" | grep -qx "$selection_candidate"
+}
+
+add_service() {
+    requested_service=$1
+    case "$requested_service" in
+        nginx | ssh-hardened) ;;
+        *) fail "unsupported firewalld service: $requested_service" ;;
+    esac
+    if ! service_selected "$requested_service"; then
+        SELECTED_SERVICES=$SELECTED_SERVICES${SELECTED_SERVICES:+"
+"}$requested_service
+    fi
+}
+
+validate_zone() {
+    case "$ZONE" in
+        '' | -* | *[!A-Za-z0-9_-]*) fail "invalid firewalld zone: $ZONE" ;;
+    esac
+}
+
+validate_sources() {
+    for supported_service in nginx ssh-hardened; do
+        supported_source=$SERVICE_SOURCE_DIRECTORY/$supported_service.xml
+        [ -f "$supported_source" ] && [ ! -L "$supported_source" ] \
+            || fail "service source must be a regular file: $supported_source"
+    done
+}
+
+print_plan() {
+    printf '%s\n' "$SELECTED_SERVICES" | while IFS= read -r planned_service; do
+        [ -n "$planned_service" ] || continue
+        printf '+ install -D -o root -g root -m 0644 %s/%s.xml %s/%s.xml\n' \
+            "$SERVICE_SOURCE_DIRECTORY" "$planned_service" \
+            "$SERVICE_TARGET_DIRECTORY" "$planned_service"
+    done
+    printf '+ firewall-cmd --check-config\n'
+    printf '+ firewall-cmd --reload\n'
+    printf '%s\n' "$SELECTED_SERVICES" | while IFS= read -r planned_service; do
+        [ -n "$planned_service" ] || continue
+        printf '+ firewall-cmd --permanent --zone=%s --add-service=%s\n' \
+            "$ZONE" "$planned_service"
+    done
+    printf '+ firewall-cmd --reload\n'
+}
+
+validate_live_host() {
+    [ "$(id -u)" -eq 0 ] || fail "run as root or use --plan"
+    for firewall_command in firewall-cmd install; do
+        command -v "$firewall_command" >/dev/null 2>&1 \
+            || fail "required command not found: $firewall_command"
+    done
+    firewall-cmd --state >/dev/null 2>&1 || fail "firewalld is not running"
+    firewall-cmd --get-zones | tr ' ' '\n' | grep -qx "$ZONE" \
+        || fail "firewalld zone does not exist: $ZONE"
+    [ -d "$SERVICE_TARGET_DIRECTORY" ] && [ ! -L "$SERVICE_TARGET_DIRECTORY" ] \
+        || fail "firewalld service target must be a real directory"
+    printf '%s\n' "$SELECTED_SERVICES" | while IFS= read -r live_service; do
+        [ -n "$live_service" ] || continue
+        live_target=$SERVICE_TARGET_DIRECTORY/$live_service.xml
+        if [ -e "$live_target" ] || [ -L "$live_target" ]; then
+            [ -f "$live_target" ] && [ ! -L "$live_target" ] \
+                || fail "firewalld target must be a regular file: $live_target"
+        fi
+    done
+}
+
+backup_service() {
+    backup_service_name=$1
+    backup_target=$SERVICE_TARGET_DIRECTORY/$backup_service_name.xml
+    if [ -f "$backup_target" ]; then
+        cp "$backup_target" "$SCRATCH_DIRECTORY/$backup_service_name.xml"
+        : > "$SCRATCH_DIRECTORY/$backup_service_name.present"
+    fi
+}
+
+restore_service() {
+    restore_service_name=$1
+    restore_target=$SERVICE_TARGET_DIRECTORY/$restore_service_name.xml
+    if [ -f "$SCRATCH_DIRECTORY/$restore_service_name.present" ]; then
+        install -D -o root -g root -m 0644 \
+            "$SCRATCH_DIRECTORY/$restore_service_name.xml" "$restore_target"
+    else
+        rm -f -- "$restore_target"
+    fi
+}
+
+rollback_firewall() {
+    [ -n "$SCRATCH_DIRECTORY" ] && [ -d "$SCRATCH_DIRECTORY" ] || return
+    if service_selected nginx; then
+        [ "$NGINX_WAS_ENABLED" = yes ] \
+            || firewall-cmd --permanent --zone="$ZONE" --remove-service=nginx \
+                >/dev/null 2>&1 || true
+        restore_service nginx
+    fi
+    if service_selected ssh-hardened; then
+        [ "$SSH_WAS_ENABLED" = yes ] \
+            || firewall-cmd --permanent --zone="$ZONE" \
+                --remove-service=ssh-hardened >/dev/null 2>&1 || true
+        restore_service ssh-hardened
+    fi
+    firewall-cmd --reload >/dev/null 2>&1 || true
+    ROLLBACK_REQUIRED=no
+}
+
+cleanup() {
+    if [ "$ROLLBACK_REQUIRED" = yes ]; then
+        rollback_firewall
+    fi
+    if [ -n "$SCRATCH_DIRECTORY" ] && [ -d "$SCRATCH_DIRECTORY" ]; then
+        rm -rf -- "$SCRATCH_DIRECTORY"
+    fi
+}
+
+trap cleanup EXIT HUP INT TERM
+
+apply_services() {
+    validate_live_host
+    SCRATCH_DIRECTORY=$(mktemp -d "${TMPDIR:-/tmp}/config-firewalld-setup.XXXXXX")
+    if service_selected nginx; then
+        backup_service nginx
+        if firewall-cmd --permanent --zone="$ZONE" --query-service=nginx \
+            >/dev/null 2>&1; then
+            NGINX_WAS_ENABLED=yes
+        fi
+    fi
+    if service_selected ssh-hardened; then
+        backup_service ssh-hardened
+        if firewall-cmd --permanent --zone="$ZONE" --query-service=ssh-hardened \
+            >/dev/null 2>&1; then
+            SSH_WAS_ENABLED=yes
+        fi
+    fi
+    ROLLBACK_REQUIRED=yes
+
+    printf '%s\n' "$SELECTED_SERVICES" | while IFS= read -r apply_service; do
+        [ -n "$apply_service" ] || continue
+        install -D -o root -g root -m 0644 \
+            "$SERVICE_SOURCE_DIRECTORY/$apply_service.xml" \
+            "$SERVICE_TARGET_DIRECTORY/$apply_service.xml"
+    done
+    if ! firewall-cmd --check-config; then
+        rollback_firewall
+        fail "firewalld rejected the installed service definitions; previous state restored"
+    fi
+    firewall-cmd --reload
+    printf '%s\n' "$SELECTED_SERVICES" | while IFS= read -r apply_service; do
+        [ -n "$apply_service" ] || continue
+        firewall-cmd --permanent --zone="$ZONE" --add-service="$apply_service"
+    done
+    firewall-cmd --reload
+    printf '%s\n' "$SELECTED_SERVICES" | while IFS= read -r apply_service; do
+        [ -n "$apply_service" ] || continue
+        firewall-cmd --zone="$ZONE" --query-service="$apply_service" >/dev/null \
+            || fail "firewalld service is not active after reload: $apply_service"
+    done
+    ROLLBACK_REQUIRED=no
+    printf 'Enabled repository firewalld services in zone %s: %s\n' \
+        "$ZONE" "$(printf '%s' "$SELECTED_SERVICES" | tr '\n' ' ')"
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --check)
+            [ "$MODE" = apply ] || fail "select exactly one mode"
+            MODE=check
+            shift
+            ;;
+        --plan)
+            [ "$MODE" = apply ] || fail "select exactly one mode"
+            MODE=plan
+            shift
+            ;;
+        --service)
+            [ "$#" -ge 2 ] || fail "--service requires a name"
+            add_service "$2"
+            shift 2
+            ;;
+        --zone)
+            [ "$#" -ge 2 ] || fail "--zone requires a name"
+            ZONE=$2
+            shift 2
+            ;;
+        --help | -h)
+            usage
+            exit 0
+            ;;
+        *) fail "unknown argument: $1" ;;
+    esac
+done
+
+validate_sources
+validate_zone
+if [ "$MODE" = check ]; then
+    [ -z "$SELECTED_SERVICES" ] || fail "--check does not accept --service"
+    printf 'Validated firewalld service sources; reference zone remains opt-in.\n'
+    exit 0
+fi
+[ -n "$SELECTED_SERVICES" ] || fail "at least one --service is required"
+
+case "$MODE" in
+    plan)
+        printf 'firewalld setup: zone=%s, services=%s\n' \
+            "$ZONE" "$(printf '%s' "$SELECTED_SERVICES" | tr '\n' ' ')"
+        print_plan
+        printf 'Plan complete; no host changes were made.\n'
+        ;;
+    apply) apply_services ;;
+esac

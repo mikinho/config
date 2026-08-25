@@ -22,7 +22,7 @@ bantime.maxtime = 1w
 # own jail.d drop-in on RHEL-family hosts; do not override banaction here.
 
 [sshd]
-enabled = true
+enabled = false
 backend = systemd
 # Ban where sshd actually listens; the default action scopes bans to the
 # jail's ports. Matches ssh/sshd_config.d/40-baseline-port.conf — change the
@@ -30,20 +30,20 @@ backend = systemd
 port = 2356
 
 [nginx-http-auth]
-enabled = true
+enabled = false
 logpath = /var/log/nginx/*error.log
 
 # The nginx baseline logs limit_req and limit_conn events at warn, which this
 # stock filter matches. Bursts from legitimate clients are expected, so ban
 # only sustained abuse.
 [nginx-limit-req]
-enabled = true
+enabled = false
 logpath = /var/log/nginx/*error.log
 maxretry = 10
 
 # Requests answered 444 come from the default HTTP server for host names this
 # deployment does not serve. Legitimate site traffic never produces them.
 [nginx-444]
-enabled = true
+enabled = false
 logpath = /var/log/nginx/access.log
 maxretry = 3

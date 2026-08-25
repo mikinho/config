@@ -34,7 +34,44 @@ below therefore asserts exactly one effective port.
 ## Installation — lockout-safe order
 
 Keep the working session open until the final step, and confirm out-of-band
-console access exists before starting. Install and prepare:
+console access exists before starting. The standard two-phase workflow makes
+the transition explicit. `--authorized-key-ready` records that a non-root
+administrator already has a working authorized key; it is a required guard,
+not an automated key installer:
+
+```sh
+ssh/install --plan
+sudo ssh/install
+
+ssh/setup --plan --phase prepare --authorized-key-ready
+sudo ssh/setup --phase prepare --authorized-key-ready
+```
+
+Prepare installs the key-only baseline, labels and opens TCP 2356, and adds a
+temporary early `Port 22` drop-in. It validates that sshd will listen on
+exactly 22 and 2356 before reloading. From a **new terminal**, prove the new
+path:
+
+```sh
+ssh -p 2356 HOST
+ssh -p 2356 -o PreferredAuthentications=password,keyboard-interactive -o PubkeyAuthentication=no HOST   # must be refused
+ssh -p 2356 root@HOST                                                                                   # must be refused
+```
+
+Run finalize from that new port-2356 session. It refuses any other SSH
+session unless `--console-confirmed` explicitly records out-of-band console
+access:
+
+```sh
+ssh/setup --plan --phase finalize
+sudo ssh/setup --phase finalize
+```
+
+Finalize removes the transition file, requires exactly port 2356, reloads
+sshd, and only then removes the built-in `ssh` service and raw TCP 22
+allowance from the selected firewalld zone. Existing sessions remain open.
+
+The equivalent manual prepare sequence is:
 
 ```sh
 install -m 0644 ssh/sshd_config.d/*.conf /etc/ssh/sshd_config.d/
@@ -56,17 +93,8 @@ daemon cannot bind 2356 under enforcing mode. If the rule already exists,
 `semanage port -a` fails — use `-m` instead. Reload does not drop
 established sessions.
 
-From a **new terminal**, confirm key-based login on the new port and that
-the old paths are closed:
-
-```sh
-ssh -p 2356 HOST
-ssh -p 2356 -o PreferredAuthentications=password,keyboard-interactive -o PubkeyAuthentication=no HOST   # must be refused
-ssh -p 2356 root@HOST                                                                                   # must be refused
-```
-
-Only after the new session works, close port 22 (the built-in `ssh` service,
-distinct from `ssh-hardened`):
+Only after the new session works, close port 22 in a manual cutover (the
+built-in `ssh` service is distinct from `ssh-hardened`):
 
 ```sh
 firewall-cmd --permanent --remove-service=ssh
@@ -87,7 +115,7 @@ test "$(sshd -T | grep -c '^port ')" = 1
 `sshd_config` of Rocky Linux 9 and CentOS Stream 10 and asserts exactly
 those effective values.
 
-The `fail2ban/` sshd jail declares this port so bans apply where sshd
-actually listens; change the port in both places together. The port is
+`fail2ban/setup --ssh-phase prepare` watches both 22 and 2356 during the
+transition; rerun it with `--ssh-phase final` after finalization. The port is
 obscurity, not security — the authentication policy is the control, and the
 port only quiets scanner log noise.

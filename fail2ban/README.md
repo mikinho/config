@@ -12,30 +12,55 @@ itself. Fronted deployments need enforcement at the edge (provider API or an
 nginx-level deny), which is out of scope for this shared policy. The `sshd`
 jail is unaffected and appropriate everywhere.
 
-## Installation
+## Installation and setup
 
-fail2ban ships in EPEL on RHEL-family hosts:
+`install` detects RHEL, Rocky Linux, or CentOS Stream major version 9 or 10,
+enables the matching EPEL/CRB repositories, and installs `fail2ban`,
+`fail2ban-firewalld`, `fail2ban-selinux`, and the Python runtime used for exact
+CIDR validation. It deliberately leaves the service inactive until a
+deployment topology and administrative CIDR have been selected:
 
 ```sh
-dnf install epel-release
-dnf install fail2ban fail2ban-firewalld fail2ban-selinux
+fail2ban/install --plan
+sudo fail2ban/install
 ```
 
 `fail2ban-firewalld` selects the firewalld ban action through its own
 `jail.d` drop-in, and `fail2ban-selinux` provides the enforcing-mode policy.
-Install the shared files, then enable the service:
+Apply the repository policy with `setup`, repeating `--ignore-ip` for every
+trusted administrative network:
 
 ```sh
-install -m 0644 fail2ban/jail.local /etc/fail2ban/jail.local
-install -m 0644 fail2ban/filter.d/nginx-444.conf /etc/fail2ban/filter.d/nginx-444.conf
-systemctl enable --now fail2ban.service
+# Direct client connections; SSH is still transitioning from 22 to 2356.
+fail2ban/setup --plan \
+    --topology direct \
+    --ssh-phase prepare \
+    --ignore-ip 192.0.2.0/24
+sudo fail2ban/setup \
+    --topology direct \
+    --ssh-phase prepare \
+    --ignore-ip 192.0.2.0/24
+
+# After SSH finalization:
+sudo fail2ban/setup \
+    --topology direct \
+    --ssh-phase final \
+    --ignore-ip 192.0.2.0/24
 ```
 
-Deployment-specific settings — administrative `ignoreip` ranges, per-host
-jail toggles — belong in a local `/etc/fail2ban/jail.d/*.local` drop-in, the
-same pattern as `nginx/trusted-proxies/`. Never commit them here. Confirm an
-administrative range is in `ignoreip` before enabling the `sshd` jail on a
-remote host; a typo in an aggressive jail can lock the operator out.
+Use `--topology proxied` on a CDN or load-balancer origin. That mode enables
+only `sshd`; all nginx jails remain disabled. The shared `jail.local` also
+keeps every jail disabled so copying a file cannot accidentally activate a
+ban policy. `setup` renders the explicit host enablement in
+`jail.d/90-baseline.local`, validates it with `fail2ban-client -t`, restores
+the previous files if validation or activation fails, and only then enables
+the service.
+
+Administrative addresses must use explicit CIDR notation. They are host
+state, supplied at setup time, and must not be committed to this repository.
+The setup tool refuses to enable any jail without at least one administrative
+CIDR. Render a candidate without changing a host by replacing `--plan` with
+`--output DIRECTORY`.
 
 ## Jails
 

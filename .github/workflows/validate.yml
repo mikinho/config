@@ -413,7 +413,37 @@ jobs:
                 grep --fixed-strings "backend: native"
               /workspace/certbot/install --plan --backend snap |
                 grep --fixed-strings "backend: snap"
-              dnf install --assumeyes logrotate shadow-utils systemd
+              dnf install --assumeyes logrotate python3 shadow-utils systemd
+              /workspace/deploy/setup-host \
+                --plan \
+                --profile edge-direct \
+                --ssh-phase prepare \
+                --authorized-key-ready \
+                --ignore-ip 192.0.2.0/24 \
+                > /tmp/edge-direct.plan
+              grep --fixed-strings \
+                "Host setup: profile=edge-direct, topology=direct, ssh-phase=prepare" \
+                /tmp/edge-direct.plan
+              grep --fixed-strings \
+                "Fail2ban setup: topology=direct, ssh-phase=prepare" \
+                /tmp/edge-direct.plan
+              /workspace/deploy/setup-host \
+                --plan \
+                --profile edge-proxied \
+                --ssh-phase none \
+                --ignore-ip 2001:db8::/32 \
+                --certbot-backend snap \
+                > /tmp/edge-proxied.plan
+              grep --fixed-strings \
+                "Host setup: profile=edge-proxied, topology=proxied, ssh-phase=none" \
+                /tmp/edge-proxied.plan
+              grep --fixed-strings \
+                "Fail2ban setup: topology=proxied, ssh-phase=final" \
+                /tmp/edge-proxied.plan
+              if grep --fixed-strings "zones/public.xml" /tmp/edge-direct.plan; then
+                echo "Host setup must never install the reference zone." >&2
+                exit 1
+              fi
               install -D -m 0755 /usr/bin/true /usr/sbin/nginx
               install -D -m 0755 /usr/bin/true /sbin/php-fpm
               install -D -m 0755 /usr/bin/true /bin/certbot
@@ -731,11 +761,24 @@ jobs:
             /bin/bash -euxo pipefail -c '
               dnf install --assumeyes openssh-server
               grep -q "^Include /etc/ssh/sshd_config.d/\*.conf" /etc/ssh/sshd_config
+              /workspace/ssh/install --plan
+              /workspace/ssh/setup \
+                --plan \
+                --phase prepare \
+                --authorized-key-ready
               install -m 0644 /workspace/ssh/sshd_config.d/*.conf /etc/ssh/sshd_config.d/
+              install -m 0644 \
+                /workspace/ssh/transitions/10-baseline-transition-port.conf \
+                /etc/ssh/sshd_config.d/10-baseline-transition-port.conf
               ssh-keygen -A
               /usr/sbin/sshd -t
+              /usr/sbin/sshd -T | grep -x "port 22"
               /usr/sbin/sshd -T | grep -x "port 2356"
+              test "$(/usr/sbin/sshd -T | grep -c "^port ")" = 2
+              rm /etc/ssh/sshd_config.d/10-baseline-transition-port.conf
+              /usr/sbin/sshd -t
               test "$(/usr/sbin/sshd -T | grep -c "^port ")" = 1
+              /usr/sbin/sshd -T | grep -x "port 2356"
               /usr/sbin/sshd -T | grep -x "permitrootlogin no"
               /usr/sbin/sshd -T | grep -x "passwordauthentication no"
               /usr/sbin/sshd -T | grep -x "kbdinteractiveauthentication no"
@@ -767,6 +810,16 @@ jobs:
             "${{ matrix.image }}" \
             /bin/bash -euxo pipefail -c '
               dnf install --assumeyes firewalld
+              /workspace/firewalld/install --plan
+              /workspace/firewalld/setup \
+                --plan \
+                --service nginx \
+                --service ssh-hardened \
+                > /tmp/firewalld-setup.plan
+              if grep --fixed-strings "zones/public.xml" /tmp/firewalld-setup.plan; then
+                echo "firewalld setup must not install the reference zone." >&2
+                exit 1
+              fi
               install -m 0644 /workspace/firewalld/services/*.xml /etc/firewalld/services/
               install -m 0644 /workspace/firewalld/zones/*.xml /etc/firewalld/zones/
               firewall-offline-cmd --check-config
@@ -776,6 +829,62 @@ jobs:
                 grep -w nginx
               firewall-offline-cmd --zone=public --list-services |
                 grep -w ssh-hardened
+            '
+
+  fail2ban:
+    name: Fail2ban policy on ${{ matrix.target }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: rockylinux:9
+            target: Rocky Linux 9
+          - image: quay.io/centos/centos:stream10
+            target: CentOS Stream 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install and validate rendered policy
+        run: |
+          docker run --rm \
+            --volume "$PWD:/workspace:ro" \
+            "${{ matrix.image }}" \
+            /bin/bash -euxo pipefail -c '
+              /workspace/fail2ban/install
+              /workspace/fail2ban/setup \
+                --output /tmp/fail2ban-direct \
+                --topology direct \
+                --ssh-phase prepare \
+                --ignore-ip 192.0.2.0/24
+              install -d -m 0755 /var/log/nginx
+              install -m 0644 /dev/null /var/log/nginx/access.log
+              install -m 0644 /dev/null /var/log/nginx/error.log
+              install -m 0644 \
+                /tmp/fail2ban-direct/etc/fail2ban/jail.local \
+                /etc/fail2ban/jail.local
+              install -m 0644 \
+                /tmp/fail2ban-direct/etc/fail2ban/filter.d/nginx-444.conf \
+                /etc/fail2ban/filter.d/nginx-444.conf
+              install -m 0644 \
+                /tmp/fail2ban-direct/etc/fail2ban/jail.d/90-baseline.local \
+                /etc/fail2ban/jail.d/90-baseline.local
+              fail2ban-client -t
+
+              /workspace/fail2ban/setup \
+                --output /tmp/fail2ban-proxied \
+                --topology proxied \
+                --ssh-phase final \
+                --ignore-ip 2001:db8::/32
+              test "$(grep -c "^enabled = true$" \
+                /tmp/fail2ban-proxied/etc/fail2ban/jail.d/90-baseline.local)" = 1
+              test "$(grep -c "^enabled = false$" \
+                /tmp/fail2ban-proxied/etc/fail2ban/jail.d/90-baseline.local)" = 3
             '
 
   selinux:
@@ -808,6 +917,12 @@ jobs:
                 policycoreutils \
                 policycoreutils-python-utils \
                 selinux-policy-targeted
+              /workspace/selinux/install --plan
+              /workspace/selinux/setup \
+                --plan \
+                --component nginx \
+                --component ssh \
+                --quic-bpf
               for path_specification in \
                 "/run/nginx(/.*)?" \
                 "/var/run/nginx(/.*)?" \

@@ -1,0 +1,96 @@
+#!/bin/sh
+
+set -eu
+
+PROGRAM_NAME=${0##*/}
+SCRIPT_DIRECTORY=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+REPOSITORY_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIRECTORY/.." && pwd)
+PLATFORM_LIBRARY=$REPOSITORY_ROOT/deploy/lib/platform.sh
+
+[ -f "$PLATFORM_LIBRARY" ] && [ ! -L "$PLATFORM_LIBRARY" ] || {
+    printf '%s: platform library must be a regular file: %s\n' \
+        "$PROGRAM_NAME" "$PLATFORM_LIBRARY" >&2
+    exit 1
+}
+# shellcheck disable=SC1090,SC1091
+. "$PLATFORM_LIBRARY"
+
+MODE=install
+OS_RELEASE_FILE=$PLATFORM_DEFAULT_OS_RELEASE
+OS_RELEASE_OVERRIDDEN=no
+
+usage() {
+    cat <<EOF
+Usage:
+  $PROGRAM_NAME
+  $PROGRAM_NAME --plan [--os-release FILE]
+  $PROGRAM_NAME --check
+
+Installs and starts firewalld on a supported RHEL-family host without changing
+zone allowances. Run firewalld/setup to install and enable repository service
+definitions. The reference public zone is never installed automatically.
+EOF
+}
+
+fail() {
+    printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2
+    exit 1
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --check)
+            [ "$MODE" = install ] || fail "select exactly one mode"
+            MODE=check
+            shift
+            ;;
+        --plan)
+            [ "$MODE" = install ] || fail "select exactly one mode"
+            MODE=plan
+            shift
+            ;;
+        --os-release)
+            [ "$#" -ge 2 ] || fail "--os-release requires a file"
+            OS_RELEASE_FILE=$2
+            OS_RELEASE_OVERRIDDEN=yes
+            shift 2
+            ;;
+        --help | -h)
+            usage
+            exit 0
+            ;;
+        *) fail "unknown argument: $1" ;;
+    esac
+done
+
+if [ "$MODE" = check ]; then
+    [ "$OS_RELEASE_OVERRIDDEN" = no ] \
+        || fail "--os-release is accepted only with --plan"
+    printf 'Validated firewalld installer and shared platform source.\n'
+    exit 0
+fi
+if [ "$OS_RELEASE_OVERRIDDEN" = yes ] && [ "$MODE" != plan ]; then
+    fail "--os-release is accepted only with --plan"
+fi
+
+platform_detect_supported_os "$OS_RELEASE_FILE"
+printf 'firewalld installation target: %s (%s)\n' \
+    "$PLATFORM_OS_LABEL" "$PLATFORM_OS_ARCHITECTURE"
+if [ "$MODE" = install ]; then
+    [ "$(id -u)" -eq 0 ] || fail "run as root or use --plan"
+    command -v dnf >/dev/null 2>&1 || fail "required command not found: dnf"
+    command -v systemctl >/dev/null 2>&1 \
+        || fail "required command not found: systemctl"
+fi
+
+# Consumed by the sourced platform library.
+# shellcheck disable=SC2034
+PLATFORM_MODE=$MODE
+platform_run dnf install --assumeyes firewalld
+platform_run systemctl enable --now firewalld.service
+
+if [ "$MODE" = plan ]; then
+    printf 'Plan complete; no host changes were made.\n'
+else
+    printf 'Installed and started firewalld without changing zone allowances.\n'
+fi

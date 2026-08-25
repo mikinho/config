@@ -6,7 +6,15 @@ already covers most of what nginx needs. This directory supplies only the
 pieces the base policy does not provide, plus the administration steps that
 are deployment-specific.
 
-Install the administration tooling first:
+Install the administration tooling first. The standard installer detects the
+supported base OS and installs the complete tool set without changing policy:
+
+```sh
+selinux/install --plan
+sudo selinux/install
+```
+
+The equivalent package transaction is:
 
 ```sh
 dnf install policycoreutils policycoreutils-python-utils libselinux-utils setools-console
@@ -32,8 +40,14 @@ updates:
 | `httpd_setrlimit` on | `worker_rlimit_nofile` needs setrlimit permission. Without it nginx starts normally and workers silently keep the default descriptor limit — a failure that only surfaces under load. |
 
 ```sh
-sudo selinux/apply-nginx-policy
+selinux/setup --plan --component nginx
+sudo selinux/setup --component nginx
 ```
+
+The setup entry point delegates to `apply-nginx-policy`. Add the SSH component
+(`--component ssh`) to label TCP 2356 as `ssh_port_t`, and add `--quic-bpf`
+alongside the nginx component when the nginx profile selects eBPF QUIC
+acceleration.
 
 It deliberately registers nothing else: `/var/log/nginx`, `/var/lib/nginx`,
 `/var/www`, and `/etc/nginx` are labeled correctly by the distribution
@@ -116,7 +130,13 @@ still fails.
 `nginx_quic_bpf.te` accompanies the `quic-bpf` deployment profile. The base
 policy grants `httpd_t` no BPF permissions, so `quic_bpf on;` fails under
 enforcing mode without it. Build and load the module only on hosts that
-select that profile:
+select that profile. The standard setup command is:
+
+```sh
+sudo selinux/setup --component nginx --quic-bpf
+```
+
+The equivalent manual build is:
 
 ```sh
 dnf install checkpolicy

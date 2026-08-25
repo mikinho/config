@@ -1,0 +1,328 @@
+#!/bin/sh
+
+set -eu
+
+PROGRAM_NAME=${0##*/}
+SCRIPT_DIRECTORY=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+REPOSITORY_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIRECTORY/.." && pwd)
+SELINUX_SETUP=$REPOSITORY_ROOT/selinux/setup
+FIREWALL_SETUP=$REPOSITORY_ROOT/firewalld/setup
+
+AUTH_SOURCE=$SCRIPT_DIRECTORY/sshd_config.d/40-baseline-auth.conf
+PORT_SOURCE=$SCRIPT_DIRECTORY/sshd_config.d/40-baseline-port.conf
+TRANSITION_SOURCE=$SCRIPT_DIRECTORY/transitions/10-baseline-transition-port.conf
+SSHD_TARGET_DIRECTORY=/etc/ssh/sshd_config.d
+AUTH_TARGET=$SSHD_TARGET_DIRECTORY/40-baseline-auth.conf
+PORT_TARGET=$SSHD_TARGET_DIRECTORY/40-baseline-port.conf
+TRANSITION_TARGET=$SSHD_TARGET_DIRECTORY/10-baseline-transition-port.conf
+
+MODE=apply
+PHASE=
+ZONE=public
+AUTHORIZED_KEY_READY=no
+CONSOLE_CONFIRMED=no
+SCRATCH_DIRECTORY=
+ROLLBACK_REQUIRED=no
+
+usage() {
+    cat <<EOF
+Usage:
+  $PROGRAM_NAME --check
+  $PROGRAM_NAME --plan --phase prepare --authorized-key-ready [--zone NAME]
+  sudo $PROGRAM_NAME --phase prepare --authorized-key-ready [--zone NAME]
+  $PROGRAM_NAME --plan --phase finalize [--console-confirmed] [--zone NAME]
+  sudo $PROGRAM_NAME --phase finalize [--console-confirmed] [--zone NAME]
+
+Prepare labels TCP 2356, opens the ssh-hardened firewall service, installs the
+key-only baseline, and deliberately keeps both ports 22 and 2356 listening.
+Finalize removes the temporary port-22 directive and the built-in SSH firewall
+allowance. Finalize requires the current SSH session to terminate on port 2356,
+unless --console-confirmed explicitly records out-of-band console access.
+EOF
+}
+
+fail() {
+    printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2
+    exit 1
+}
+
+validate_source() {
+    ssh_source=$1
+    [ -f "$ssh_source" ] && [ ! -L "$ssh_source" ] \
+        || fail "repository source must be a regular file: $ssh_source"
+}
+
+validate_executable_source() {
+    ssh_source=$1
+    validate_source "$ssh_source"
+    [ -x "$ssh_source" ] \
+        || fail "repository dependency must be executable: $ssh_source"
+}
+
+validate_sources() {
+    validate_source "$AUTH_SOURCE"
+    validate_source "$PORT_SOURCE"
+    validate_source "$TRANSITION_SOURCE"
+    validate_executable_source "$SELINUX_SETUP"
+    validate_executable_source "$FIREWALL_SETUP"
+}
+
+validate_zone() {
+    case "$ZONE" in
+        '' | -* | *[!A-Za-z0-9_-]*) fail "invalid firewalld zone: $ZONE" ;;
+    esac
+}
+
+validate_selection() {
+    case "$PHASE" in
+        prepare)
+            [ "$AUTHORIZED_KEY_READY" = yes ] \
+                || fail "--phase prepare requires --authorized-key-ready"
+            ;;
+        finalize) ;;
+        '') fail "--phase prepare or --phase finalize is required" ;;
+        *) fail "unsupported SSH setup phase: $PHASE" ;;
+    esac
+}
+
+validate_target_file() {
+    ssh_target=$1
+    if [ -e "$ssh_target" ] || [ -L "$ssh_target" ]; then
+        [ -f "$ssh_target" ] && [ ! -L "$ssh_target" ] \
+            || fail "SSH target must be a regular file: $ssh_target"
+    fi
+}
+
+validate_live_host() {
+    [ "$(id -u)" -eq 0 ] || fail "run as root or use --plan"
+    for ssh_command in firewall-cmd install sshd systemctl; do
+        command -v "$ssh_command" >/dev/null 2>&1 \
+            || fail "required command not found: $ssh_command"
+    done
+    [ -d "$SSHD_TARGET_DIRECTORY" ] && [ ! -L "$SSHD_TARGET_DIRECTORY" ] \
+        || fail "sshd drop-in target must be a real directory"
+    validate_target_file "$AUTH_TARGET"
+    validate_target_file "$PORT_TARGET"
+    validate_target_file "$TRANSITION_TARGET"
+    systemctl is-active --quiet sshd.service \
+        || fail "sshd.service must be active before changing its configuration"
+}
+
+validate_finalize_session() {
+    [ "$MODE" = apply ] || return
+    [ "$CONSOLE_CONFIRMED" = yes ] && return
+    ssh_server_port=$(printf '%s\n' "${SSH_CONNECTION:-}" | awk '{ print $4 }')
+    [ "$ssh_server_port" = 2356 ] \
+        || fail "finalize must run from an SSH session on port 2356 or use --console-confirmed"
+}
+
+effective_ports() {
+    sshd -T 2>/dev/null | awk '$1 == "port" { print $2 }' | LC_ALL=C sort -u
+}
+
+require_prepare_ports() {
+    prepare_ports=$(effective_ports)
+    [ "$prepare_ports" = "22
+2356" ] \
+        || fail "prepared sshd must listen on exactly ports 22 and 2356; found: $prepare_ports"
+}
+
+require_final_port() {
+    final_ports=$(effective_ports)
+    [ "$final_ports" = 2356 ] \
+        || fail "final sshd must listen only on port 2356; found: $final_ports"
+}
+
+backup_ssh_file() {
+    backup_target=$1
+    backup_name=$2
+    if [ -f "$backup_target" ]; then
+        cp "$backup_target" "$SCRATCH_DIRECTORY/$backup_name"
+        : > "$SCRATCH_DIRECTORY/$backup_name.present"
+    fi
+}
+
+restore_ssh_file() {
+    restore_target=$1
+    restore_name=$2
+    if [ -f "$SCRATCH_DIRECTORY/$restore_name.present" ]; then
+        install -D -o root -g root -m 0644 \
+            "$SCRATCH_DIRECTORY/$restore_name" "$restore_target"
+    else
+        rm -f -- "$restore_target"
+    fi
+}
+
+rollback_ssh_files() {
+    [ -n "$SCRATCH_DIRECTORY" ] && [ -d "$SCRATCH_DIRECTORY" ] || return
+    restore_ssh_file "$AUTH_TARGET" auth.conf
+    restore_ssh_file "$PORT_TARGET" port.conf
+    restore_ssh_file "$TRANSITION_TARGET" transition.conf
+    sshd -t >/dev/null 2>&1 && systemctl reload sshd.service >/dev/null 2>&1 || true
+    ROLLBACK_REQUIRED=no
+}
+
+cleanup() {
+    if [ "$ROLLBACK_REQUIRED" = yes ]; then
+        rollback_ssh_files
+    fi
+    if [ -n "$SCRATCH_DIRECTORY" ] && [ -d "$SCRATCH_DIRECTORY" ]; then
+        rm -rf -- "$SCRATCH_DIRECTORY"
+    fi
+}
+
+trap cleanup EXIT HUP INT TERM
+
+prepare_ssh() {
+    validate_live_host
+    "$SELINUX_SETUP" --component ssh
+    "$FIREWALL_SETUP" --service ssh-hardened --zone "$ZONE"
+
+    SCRATCH_DIRECTORY=$(mktemp -d "${TMPDIR:-/tmp}/config-ssh-setup.XXXXXX")
+    backup_ssh_file "$AUTH_TARGET" auth.conf
+    backup_ssh_file "$PORT_TARGET" port.conf
+    backup_ssh_file "$TRANSITION_TARGET" transition.conf
+    ROLLBACK_REQUIRED=yes
+    install -D -o root -g root -m 0644 "$AUTH_SOURCE" "$AUTH_TARGET"
+    install -D -o root -g root -m 0644 "$PORT_SOURCE" "$PORT_TARGET"
+    install -D -o root -g root -m 0644 \
+        "$TRANSITION_SOURCE" "$TRANSITION_TARGET"
+    command -v restorecon >/dev/null 2>&1 \
+        && restorecon -RF "$AUTH_TARGET" "$PORT_TARGET" "$TRANSITION_TARGET"
+    sshd -t || {
+        rollback_ssh_files
+        fail "prepared sshd configuration failed syntax validation; previous files restored"
+    }
+    require_prepare_ports
+    systemctl reload sshd.service || {
+        rollback_ssh_files
+        fail "sshd reload failed; previous files restored"
+    }
+    ROLLBACK_REQUIRED=no
+    printf 'Prepared SSH transition on ports 22 and 2356. Prove a new key login on 2356 before finalizing.\n'
+}
+
+finalize_ssh() {
+    validate_live_host
+    validate_finalize_session
+    cmp -s "$AUTH_SOURCE" "$AUTH_TARGET" \
+        || fail "installed SSH authentication baseline differs from repository source"
+    cmp -s "$PORT_SOURCE" "$PORT_TARGET" \
+        || fail "installed SSH port baseline differs from repository source"
+
+    if [ -f "$TRANSITION_TARGET" ]; then
+        cmp -s "$TRANSITION_SOURCE" "$TRANSITION_TARGET" \
+            || fail "installed SSH transition file is locally modified"
+        SCRATCH_DIRECTORY=$(mktemp -d "${TMPDIR:-/tmp}/config-ssh-finalize.XXXXXX")
+        backup_ssh_file "$TRANSITION_TARGET" transition.conf
+        ROLLBACK_REQUIRED=yes
+        rm -f -- "$TRANSITION_TARGET"
+        sshd -t || {
+            rollback_ssh_files
+            fail "final sshd configuration failed syntax validation; transition restored"
+        }
+        require_final_port
+        systemctl reload sshd.service || {
+            rollback_ssh_files
+            fail "sshd reload failed; transition restored"
+        }
+        ROLLBACK_REQUIRED=no
+    else
+        # A previous finalize may have completed sshd but stopped during
+        # firewall cleanup. Accept that safe partial state so the operation is
+        # rerunnable, while still refusing any remaining port-22 listener.
+        require_final_port
+    fi
+
+    if firewall-cmd --permanent --zone="$ZONE" --query-service=ssh >/dev/null 2>&1; then
+        firewall-cmd --permanent --zone="$ZONE" --remove-service=ssh
+    fi
+    if firewall-cmd --permanent --zone="$ZONE" --query-port=22/tcp >/dev/null 2>&1; then
+        firewall-cmd --permanent --zone="$ZONE" --remove-port=22/tcp
+    fi
+    firewall-cmd --reload
+    printf 'Finalized SSH on port 2356 and removed standard port-22 firewall allowances.\n'
+}
+
+print_plan() {
+    case "$PHASE" in
+        prepare)
+            "$SELINUX_SETUP" --plan --component ssh
+            "$FIREWALL_SETUP" --plan --service ssh-hardened --zone "$ZONE"
+            printf '+ install -D -o root -g root -m 0644 %s %s\n' "$AUTH_SOURCE" "$AUTH_TARGET"
+            printf '+ install -D -o root -g root -m 0644 %s %s\n' "$PORT_SOURCE" "$PORT_TARGET"
+            printf '+ install -D -o root -g root -m 0644 %s %s\n' \
+                "$TRANSITION_SOURCE" "$TRANSITION_TARGET"
+            printf '+ sshd -t\n+ systemctl reload sshd.service\n'
+            ;;
+        finalize)
+            printf '+ rm -f -- %s\n' "$TRANSITION_TARGET"
+            printf '+ sshd -t\n+ systemctl reload sshd.service\n'
+            printf '+ firewall-cmd --permanent --zone=%s --remove-service=ssh\n' "$ZONE"
+            printf '+ firewall-cmd --permanent --zone=%s --remove-port=22/tcp\n' "$ZONE"
+            printf '+ firewall-cmd --reload\n'
+            ;;
+    esac
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --authorized-key-ready)
+            AUTHORIZED_KEY_READY=yes
+            shift
+            ;;
+        --check)
+            [ "$MODE" = apply ] || fail "select exactly one mode"
+            MODE=check
+            shift
+            ;;
+        --console-confirmed)
+            CONSOLE_CONFIRMED=yes
+            shift
+            ;;
+        --phase)
+            [ "$#" -ge 2 ] || fail "--phase requires prepare or finalize"
+            PHASE=$2
+            shift 2
+            ;;
+        --plan)
+            [ "$MODE" = apply ] || fail "select exactly one mode"
+            MODE=plan
+            shift
+            ;;
+        --zone)
+            [ "$#" -ge 2 ] || fail "--zone requires a name"
+            ZONE=$2
+            shift 2
+            ;;
+        --help | -h)
+            usage
+            exit 0
+            ;;
+        *) fail "unknown argument: $1" ;;
+    esac
+done
+
+validate_sources
+validate_zone
+if [ "$MODE" = check ]; then
+    [ -z "$PHASE" ] && [ "$AUTHORIZED_KEY_READY$CONSOLE_CONFIRMED" = nono ] \
+        || fail "--check does not accept phase confirmations"
+    printf 'Validated SSH setup sources and dependency entry points.\n'
+    exit 0
+fi
+validate_selection
+
+case "$MODE" in
+    plan)
+        printf 'SSH setup phase: %s, zone: %s\n' "$PHASE" "$ZONE"
+        print_plan
+        printf 'Plan complete; no host changes were made.\n'
+        ;;
+    apply)
+        case "$PHASE" in
+            prepare) prepare_ssh ;;
+            finalize) finalize_ssh ;;
+        esac
+        ;;
+esac

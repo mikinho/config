@@ -83,6 +83,24 @@ contracts: HTTPS redirection, inherited baseline headers, application CSP
 preservation, untrusted forwarding-header replacement, internal-only
 maintenance responses, and failure-only static asset logging.
 
+## Host runtime setup
+
+After a reviewed render has been assembled at `/etc/nginx` and the exact live
+tree passes `nginx -t`, apply its surrounding host settings with:
+
+```sh
+nginx/setup --plan
+sudo nginx/setup
+```
+
+The setup entry point verifies the installed nginx binary and live
+configuration before changing anything, then applies the repository SELinux
+registrations, additive firewalld service, systemd unit, logrotate policy,
+QUIC sysctl limits, and host verification tools. Add `--quic-bpf` only when
+the rendered nginx profile selected that feature. It never copies, renders,
+or deletes anything under `/etc/nginx`; the reviewed tree remains a separate
+deployment transaction.
+
 `sites/sample_wp.conf.example` matches the `sample_wp` PHP-FPM pool and systemd
 instance. Replace its domains, certificate paths, and site tag, then install it
 as `sites/SITE_TAG.conf`; only the installed `*.conf` copy becomes active.

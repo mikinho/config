@@ -170,4 +170,14 @@ expect_failure \
     "$fixture_root/certbot/install" \
     --check
 
+rm "$fixture_root/systemd/system/certbot.timer"
+cp "$REPOSITORY_ROOT/systemd/system/certbot.timer" \
+    "$fixture_root/systemd/system/certbot.timer"
+rm "$fixture_root/deploy/lib/platform.sh"
+ln -s /etc/passwd "$fixture_root/deploy/lib/platform.sh"
+expect_failure \
+    'platform library must be a regular file' \
+    "$fixture_root/certbot/install" \
+    --check
+
 printf 'Validated Certbot installer OS routing and backend plans.\n'

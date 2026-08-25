@@ -1,0 +1,312 @@
+#!/bin/sh
+
+set -eu
+
+PROGRAM_NAME=${0##*/}
+SCRIPT_DIRECTORY=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+JAIL_SOURCE=$SCRIPT_DIRECTORY/jail.local
+FILTER_SOURCE=$SCRIPT_DIRECTORY/filter.d/nginx-444.conf
+ENABLE_TEMPLATE=$SCRIPT_DIRECTORY/templates/90-baseline.local.in
+
+FAIL2BAN_TARGET=/etc/fail2ban
+ENABLE_TARGET=$FAIL2BAN_TARGET/jail.d/90-baseline.local
+FILTER_TARGET=$FAIL2BAN_TARGET/filter.d/nginx-444.conf
+JAIL_TARGET=$FAIL2BAN_TARGET/jail.local
+
+MODE=apply
+TOPOLOGY=
+SSH_PHASE=final
+IGNORE_IPS=
+OUTPUT_DIRECTORY=
+SCRATCH_DIRECTORY=
+ROLLBACK_REQUIRED=no
+
+usage() {
+    cat <<EOF
+Usage:
+  $PROGRAM_NAME --check
+  $PROGRAM_NAME --output DIRECTORY --topology direct|proxied \\
+      --ignore-ip CIDR [--ignore-ip CIDR ...] [--ssh-phase prepare|final]
+  $PROGRAM_NAME --plan --topology direct|proxied \\
+      --ignore-ip CIDR [--ignore-ip CIDR ...] [--ssh-phase prepare|final]
+  sudo $PROGRAM_NAME --topology direct|proxied \\
+      --ignore-ip CIDR [--ignore-ip CIDR ...] [--ssh-phase prepare|final]
+
+Renders or applies the repository Fail2ban policy. Direct topology enables the
+nginx and SSH jails. Proxied topology enables only SSH because host firewalld
+cannot ban a restored client address that arrives through a proxy. At least
+one administrative CIDR is required. SSH prepare mode covers ports 22 and
+2356 during the lockout-safe transition; final mode covers only 2356.
+EOF
+}
+
+fail() {
+    printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2
+    exit 1
+}
+
+cleanup() {
+    if [ "$ROLLBACK_REQUIRED" = yes ]; then
+        rollback_live_files
+    fi
+    if [ -n "$SCRATCH_DIRECTORY" ] && [ -d "$SCRATCH_DIRECTORY" ]; then
+        rm -rf -- "$SCRATCH_DIRECTORY"
+    fi
+}
+
+trap cleanup EXIT HUP INT TERM
+
+validate_source() {
+    setup_source=$1
+    [ -f "$setup_source" ] && [ ! -L "$setup_source" ] \
+        || fail "repository source must be a regular file: $setup_source"
+}
+
+validate_sources() {
+    validate_source "$JAIL_SOURCE"
+    validate_source "$FILTER_SOURCE"
+    validate_source "$ENABLE_TEMPLATE"
+    grep -F '@@IGNORE_IP@@' "$ENABLE_TEMPLATE" >/dev/null \
+        || fail "Fail2ban template is missing @@IGNORE_IP@@"
+    grep -F '@@SSHD_PORTS@@' "$ENABLE_TEMPLATE" >/dev/null \
+        || fail "Fail2ban template is missing @@SSHD_PORTS@@"
+    grep -F '@@NGINX_ENABLED@@' "$ENABLE_TEMPLATE" >/dev/null \
+        || fail "Fail2ban template is missing @@NGINX_ENABLED@@"
+}
+
+validate_ignore_ip() {
+    ignore_candidate=$1
+    case "$ignore_candidate" in
+        */*) ;;
+        *) fail "administrative address must use CIDR notation: $ignore_candidate" ;;
+    esac
+    command -v python3 >/dev/null 2>&1 \
+        || fail "python3 is required for exact CIDR validation"
+    python3 -c \
+        'import ipaddress, sys; ipaddress.ip_interface(sys.argv[1])' \
+        "$ignore_candidate" >/dev/null 2>&1 \
+        || fail "invalid administrative CIDR: $ignore_candidate"
+}
+
+append_ignore_ip() {
+    validate_ignore_ip "$1"
+    IGNORE_IPS=$IGNORE_IPS${IGNORE_IPS:+ }$1
+}
+
+validate_selection() {
+    case "$TOPOLOGY" in
+        direct | proxied) ;;
+        '') fail "--topology is required" ;;
+        *) fail "unsupported Fail2ban topology: $TOPOLOGY" ;;
+    esac
+    case "$SSH_PHASE" in
+        prepare | final) ;;
+        *) fail "unsupported SSH phase: $SSH_PHASE" ;;
+    esac
+    [ -n "$IGNORE_IPS" ] \
+        || fail "at least one administrative --ignore-ip CIDR is required"
+}
+
+render_candidate() {
+    candidate_output=$1
+    case "$candidate_output" in
+        '' | / | . | ..) fail "refusing unsafe output directory: $candidate_output" ;;
+    esac
+    [ ! -e "$candidate_output" ] && [ ! -L "$candidate_output" ] \
+        || fail "output already exists: $candidate_output"
+
+    candidate_parent=${candidate_output%/*}
+    [ "$candidate_parent" != "$candidate_output" ] || candidate_parent=.
+    candidate_name=${candidate_output##*/}
+    mkdir -p "$candidate_parent"
+    candidate_staging=$(mktemp -d "$candidate_parent/.$candidate_name.XXXXXX")
+    mkdir -p \
+        "$candidate_staging/etc/fail2ban/filter.d" \
+        "$candidate_staging/etc/fail2ban/jail.d"
+    cp "$JAIL_SOURCE" "$candidate_staging/etc/fail2ban/jail.local"
+    cp "$FILTER_SOURCE" \
+        "$candidate_staging/etc/fail2ban/filter.d/nginx-444.conf"
+
+    nginx_enabled=false
+    [ "$TOPOLOGY" = direct ] && nginx_enabled=true
+    sshd_ports=2356
+    [ "$SSH_PHASE" = prepare ] && sshd_ports=22,2356
+    sed \
+        -e "s|@@IGNORE_IP@@|$IGNORE_IPS|" \
+        -e "s|@@SSHD_PORTS@@|$sshd_ports|" \
+        -e "s|@@NGINX_ENABLED@@|$nginx_enabled|g" \
+        "$ENABLE_TEMPLATE" \
+        > "$candidate_staging/etc/fail2ban/jail.d/90-baseline.local"
+
+    if grep -R '@@[A-Z_]*@@' "$candidate_staging" >/dev/null; then
+        rm -rf -- "$candidate_staging"
+        fail "rendered Fail2ban policy contains unresolved template tokens"
+    fi
+    mv "$candidate_staging" "$candidate_output"
+}
+
+print_plan() {
+    printf '+ install -D -o root -g root -m 0644 %s %s\n' "$JAIL_SOURCE" "$JAIL_TARGET"
+    printf '+ install -D -o root -g root -m 0644 %s %s\n' "$FILTER_SOURCE" "$FILTER_TARGET"
+    printf '+ install -D -o root -g root -m 0644 rendered/90-baseline.local %s\n' "$ENABLE_TARGET"
+    printf '+ fail2ban-client -t\n'
+    printf '+ systemctl reload-or-restart fail2ban.service\n'
+    printf '+ systemctl enable fail2ban.service\n'
+}
+
+validate_target_file() {
+    setup_target=$1
+    if [ -e "$setup_target" ] || [ -L "$setup_target" ]; then
+        [ -f "$setup_target" ] && [ ! -L "$setup_target" ] \
+            || fail "installation target must be a regular file: $setup_target"
+    fi
+}
+
+validate_live_host() {
+    [ "$(id -u)" -eq 0 ] || fail "run as root or use --plan/--output"
+    for setup_command in fail2ban-client install systemctl; do
+        command -v "$setup_command" >/dev/null 2>&1 \
+            || fail "required command not found: $setup_command"
+    done
+    for setup_directory in \
+        "$FAIL2BAN_TARGET" \
+        "$FAIL2BAN_TARGET/filter.d" \
+        "$FAIL2BAN_TARGET/jail.d"
+    do
+        [ -d "$setup_directory" ] && [ ! -L "$setup_directory" ] \
+            || fail "Fail2ban target must be a real directory: $setup_directory"
+    done
+    validate_target_file "$JAIL_TARGET"
+    validate_target_file "$FILTER_TARGET"
+    validate_target_file "$ENABLE_TARGET"
+}
+
+backup_live_file() {
+    live_target=$1
+    backup_name=$2
+    if [ -f "$live_target" ]; then
+        cp "$live_target" "$SCRATCH_DIRECTORY/backup/$backup_name"
+        : > "$SCRATCH_DIRECTORY/backup/$backup_name.present"
+    fi
+}
+
+restore_live_file() {
+    live_target=$1
+    backup_name=$2
+    if [ -f "$SCRATCH_DIRECTORY/backup/$backup_name.present" ]; then
+        install -D -o root -g root -m 0644 \
+            "$SCRATCH_DIRECTORY/backup/$backup_name" "$live_target"
+    else
+        rm -f -- "$live_target"
+    fi
+}
+
+rollback_live_files() {
+    [ -n "$SCRATCH_DIRECTORY" ] && [ -d "$SCRATCH_DIRECTORY/backup" ] || return
+    restore_live_file "$JAIL_TARGET" jail.local
+    restore_live_file "$FILTER_TARGET" nginx-444.conf
+    restore_live_file "$ENABLE_TARGET" 90-baseline.local
+    ROLLBACK_REQUIRED=no
+}
+
+apply_candidate() {
+    validate_live_host
+    SCRATCH_DIRECTORY=$(mktemp -d "${TMPDIR:-/tmp}/config-fail2ban-setup.XXXXXX")
+    mkdir -p "$SCRATCH_DIRECTORY/backup"
+    render_candidate "$SCRATCH_DIRECTORY/rendered"
+    backup_live_file "$JAIL_TARGET" jail.local
+    backup_live_file "$FILTER_TARGET" nginx-444.conf
+    backup_live_file "$ENABLE_TARGET" 90-baseline.local
+    ROLLBACK_REQUIRED=yes
+
+    install -D -o root -g root -m 0644 \
+        "$SCRATCH_DIRECTORY/rendered/etc/fail2ban/jail.local" "$JAIL_TARGET"
+    install -D -o root -g root -m 0644 \
+        "$SCRATCH_DIRECTORY/rendered/etc/fail2ban/filter.d/nginx-444.conf" \
+        "$FILTER_TARGET"
+    install -D -o root -g root -m 0644 \
+        "$SCRATCH_DIRECTORY/rendered/etc/fail2ban/jail.d/90-baseline.local" \
+        "$ENABLE_TARGET"
+    if command -v restorecon >/dev/null 2>&1; then
+        restorecon -RF "$JAIL_TARGET" "$FILTER_TARGET" "$ENABLE_TARGET"
+    fi
+
+    if ! fail2ban-client -t; then
+        rollback_live_files
+        fail "rendered Fail2ban configuration failed validation; previous files restored"
+    fi
+    if ! systemctl reload-or-restart fail2ban.service; then
+        rollback_live_files
+        fail2ban-client -t >/dev/null 2>&1 || true
+        systemctl reload-or-restart fail2ban.service >/dev/null 2>&1 || true
+        fail "Fail2ban activation failed; previous files restored"
+    fi
+    systemctl enable fail2ban.service
+    ROLLBACK_REQUIRED=no
+    printf 'Applied %s Fail2ban policy with SSH phase %s.\n' "$TOPOLOGY" "$SSH_PHASE"
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --check)
+            [ "$MODE" = apply ] || fail "select exactly one mode"
+            MODE=check
+            shift
+            ;;
+        --ignore-ip)
+            [ "$#" -ge 2 ] || fail "--ignore-ip requires a CIDR"
+            append_ignore_ip "$2"
+            shift 2
+            ;;
+        --output)
+            [ "$MODE" = apply ] || fail "select exactly one mode"
+            [ "$#" -ge 2 ] || fail "--output requires a directory"
+            MODE=render
+            OUTPUT_DIRECTORY=$2
+            shift 2
+            ;;
+        --plan)
+            [ "$MODE" = apply ] || fail "select exactly one mode"
+            MODE=plan
+            shift
+            ;;
+        --ssh-phase)
+            [ "$#" -ge 2 ] || fail "--ssh-phase requires prepare or final"
+            SSH_PHASE=$2
+            shift 2
+            ;;
+        --topology)
+            [ "$#" -ge 2 ] || fail "--topology requires direct or proxied"
+            TOPOLOGY=$2
+            shift 2
+            ;;
+        --help | -h)
+            usage
+            exit 0
+            ;;
+        *) fail "unknown argument: $1" ;;
+    esac
+done
+
+validate_sources
+if [ "$MODE" = check ]; then
+    [ -z "$TOPOLOGY$IGNORE_IPS$OUTPUT_DIRECTORY" ] \
+        || fail "--check does not accept topology, CIDR, or output options"
+    printf 'Validated Fail2ban policy sources and template tokens.\n'
+    exit 0
+fi
+
+validate_selection
+case "$MODE" in
+    render)
+        render_candidate "$OUTPUT_DIRECTORY"
+        printf 'Rendered Fail2ban policy: %s\n' "$OUTPUT_DIRECTORY"
+        ;;
+    plan)
+        printf 'Fail2ban setup: topology=%s, ssh-phase=%s, ignore-ip=%s\n' \
+            "$TOPOLOGY" "$SSH_PHASE" "$IGNORE_IPS"
+        print_plan
+        printf 'Plan complete; no host changes were made.\n'
+        ;;
+    apply) apply_candidate ;;
+esac

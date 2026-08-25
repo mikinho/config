@@ -1,0 +1,367 @@
+#!/bin/sh
+
+set -eu
+set -f
+
+PROGRAM_NAME=${0##*/}
+SCRIPT_DIRECTORY=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+REPOSITORY_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIRECTORY/.." && pwd)
+PROFILE_DIRECTORY=$SCRIPT_DIRECTORY/host-profiles
+
+SELINUX_INSTALL=$REPOSITORY_ROOT/selinux/install
+SELINUX_SETUP=$REPOSITORY_ROOT/selinux/setup
+FIREWALL_INSTALL=$REPOSITORY_ROOT/firewalld/install
+FIREWALL_SETUP=$REPOSITORY_ROOT/firewalld/setup
+SSH_INSTALL=$REPOSITORY_ROOT/ssh/install
+SSH_SETUP=$REPOSITORY_ROOT/ssh/setup
+NGINX_SETUP=$REPOSITORY_ROOT/nginx/setup
+CERTBOT_SETUP=$REPOSITORY_ROOT/certbot/setup
+FAIL2BAN_INSTALL=$REPOSITORY_ROOT/fail2ban/install
+FAIL2BAN_SETUP=$REPOSITORY_ROOT/fail2ban/setup
+HOST_VERIFIER=$REPOSITORY_ROOT/deploy/verify-deployment
+
+MODE=apply
+PROFILE=
+TOPOLOGY=
+ZONE=public
+SSH_PHASE=
+AUTHORIZED_KEY_READY=no
+CONSOLE_CONFIRMED=no
+CERTBOT_BACKEND=native
+QUIC_BPF=no
+IGNORE_IPS=
+OS_RELEASE_FILE=/etc/os-release
+OS_RELEASE_OVERRIDDEN=no
+
+usage() {
+    cat <<EOF
+Usage:
+  $PROGRAM_NAME --check
+  $PROGRAM_NAME --plan --profile edge-direct|edge-proxied \\
+      --ssh-phase prepare|finalize|none --ignore-ip CIDR [--ignore-ip CIDR ...] \\
+      [--authorized-key-ready] [--console-confirmed] \\
+      [--certbot-backend native|snap] [--zone NAME] [--quic-bpf] \\
+      [--os-release FILE]
+  sudo $PROGRAM_NAME --profile edge-direct|edge-proxied \\
+      --ssh-phase prepare|finalize|none --ignore-ip CIDR [--ignore-ip CIDR ...] \\
+      [--authorized-key-ready] [--console-confirmed] \\
+      [--certbot-backend native|snap] [--zone NAME] [--quic-bpf]
+
+Applies the standard edge-host components in dependency order. The reviewed
+/etc/nginx tree and supported nginx binary must already exist. SSH prepare
+keeps ports 22 and 2356 available; rerun with finalize only after proving a
+new key-authenticated 2356 session. 'none' leaves SSH untouched and assumes it
+is already finalized. The selected profile controls Fail2ban nginx jails.
+EOF
+}
+
+fail() {
+    printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2
+    exit 1
+}
+
+validate_executable() {
+    host_dependency=$1
+    [ -f "$host_dependency" ] && [ ! -L "$host_dependency" ] \
+        && [ -x "$host_dependency" ] \
+        || fail "host setup dependency must be a real executable: $host_dependency"
+}
+
+validate_dependencies() {
+    for host_dependency in \
+        "$SELINUX_INSTALL" \
+        "$SELINUX_SETUP" \
+        "$FIREWALL_INSTALL" \
+        "$FIREWALL_SETUP" \
+        "$SSH_INSTALL" \
+        "$SSH_SETUP" \
+        "$NGINX_SETUP" \
+        "$CERTBOT_SETUP" \
+        "$FAIL2BAN_INSTALL" \
+        "$FAIL2BAN_SETUP" \
+        "$HOST_VERIFIER"
+    do
+        validate_executable "$host_dependency"
+    done
+}
+
+validate_profile_name() {
+    case "$PROFILE" in
+        edge-direct | edge-proxied) ;;
+        '') fail "--profile is required" ;;
+        *) fail "unsupported host profile: $PROFILE" ;;
+    esac
+}
+
+load_profile() {
+    validate_profile_name
+    profile_path=$PROFILE_DIRECTORY/$PROFILE.profile
+    [ -f "$profile_path" ] && [ ! -L "$profile_path" ] \
+        || fail "host profile must be a regular file: $profile_path"
+    profile_topology=
+    while IFS=' ' read -r profile_key profile_value profile_extra \
+        || [ -n "$profile_key$profile_value$profile_extra" ]
+    do
+        case "$profile_key" in
+            '' | \#*) continue ;;
+            topology)
+                [ -n "$profile_value" ] && [ -z "$profile_extra" ] \
+                    || fail "invalid topology directive in $profile_path"
+                [ -z "$profile_topology" ] \
+                    || fail "duplicate topology directive in $profile_path"
+                profile_topology=$profile_value
+                ;;
+            *) fail "unknown host profile directive: $profile_key" ;;
+        esac
+    done < "$profile_path"
+    case "$profile_topology" in
+        direct | proxied) TOPOLOGY=$profile_topology ;;
+        *) fail "host profile has invalid or missing topology: $profile_path" ;;
+    esac
+}
+
+validate_all_profiles() {
+    for checked_profile in edge-direct edge-proxied; do
+        PROFILE=$checked_profile
+        load_profile
+    done
+    PROFILE=
+    TOPOLOGY=
+}
+
+append_ignore_ip() {
+    ignore_value=$1
+    IGNORE_IPS=$IGNORE_IPS${IGNORE_IPS:+"
+"}$ignore_value
+}
+
+validate_selection() {
+    load_profile
+    case "$SSH_PHASE" in
+        prepare)
+            [ "$AUTHORIZED_KEY_READY" = yes ] \
+                || fail "--ssh-phase prepare requires --authorized-key-ready"
+            ;;
+        finalize | none) ;;
+        '') fail "--ssh-phase is required" ;;
+        *) fail "unsupported host SSH phase: $SSH_PHASE" ;;
+    esac
+    case "$CERTBOT_BACKEND" in
+        native | snap) ;;
+        *) fail "unsupported Certbot backend: $CERTBOT_BACKEND" ;;
+    esac
+    case "$ZONE" in
+        '' | -* | *[!A-Za-z0-9_-]*) fail "invalid firewalld zone: $ZONE" ;;
+    esac
+    [ -n "$IGNORE_IPS" ] \
+        || fail "at least one administrative --ignore-ip CIDR is required"
+    if [ "$OS_RELEASE_OVERRIDDEN" = yes ] && [ "$MODE" != plan ]; then
+        fail "--os-release is accepted only with --plan"
+    fi
+}
+
+run_platform_installer() {
+    platform_installer=$1
+    if [ "$MODE" = plan ]; then
+        "$platform_installer" --plan --os-release "$OS_RELEASE_FILE"
+    else
+        "$platform_installer"
+    fi
+}
+
+run_ssh_setup() {
+    [ "$SSH_PHASE" != none ] || return
+    if [ "$MODE" = plan ]; then
+        set -- "$SSH_SETUP" --plan --phase "$SSH_PHASE" --zone "$ZONE"
+    else
+        set -- "$SSH_SETUP" --phase "$SSH_PHASE" --zone "$ZONE"
+    fi
+    [ "$AUTHORIZED_KEY_READY" = yes ] && set -- "$@" --authorized-key-ready
+    [ "$CONSOLE_CONFIRMED" = yes ] && set -- "$@" --console-confirmed
+    "$@"
+}
+
+run_nginx_setup() {
+    if [ "$MODE" = plan ]; then
+        set -- "$NGINX_SETUP" --plan --zone "$ZONE"
+    else
+        set -- "$NGINX_SETUP" --zone "$ZONE"
+    fi
+    [ "$QUIC_BPF" = yes ] && set -- "$@" --quic-bpf
+    "$@"
+}
+
+run_certbot_setup() {
+    if [ "$MODE" = plan ]; then
+        "$CERTBOT_SETUP" \
+            --plan \
+            --backend "$CERTBOT_BACKEND" \
+            --os-release "$OS_RELEASE_FILE"
+    else
+        "$CERTBOT_SETUP" --backend "$CERTBOT_BACKEND"
+    fi
+}
+
+run_fail2ban_setup() {
+    fail2ban_ssh_phase=final
+    [ "$SSH_PHASE" = prepare ] && fail2ban_ssh_phase=prepare
+    if [ "$MODE" = plan ]; then
+        set -- \
+            "$FAIL2BAN_SETUP" \
+            --plan \
+            --topology "$TOPOLOGY" \
+            --ssh-phase "$fail2ban_ssh_phase"
+    else
+        set -- \
+            "$FAIL2BAN_SETUP" \
+            --topology "$TOPOLOGY" \
+            --ssh-phase "$fail2ban_ssh_phase"
+    fi
+    for host_ignore_ip in $IGNORE_IPS; do
+        set -- "$@" --ignore-ip "$host_ignore_ip"
+    done
+    "$@"
+}
+
+preflight_selection() {
+    # Exercise every child parser and source boundary before an applying run
+    # can change packages or live configuration.
+    "$SELINUX_INSTALL" --check >/dev/null
+    "$FIREWALL_INSTALL" --check >/dev/null
+    "$SSH_INSTALL" --check >/dev/null
+    "$NGINX_SETUP" --check >/dev/null
+    "$CERTBOT_SETUP" --check >/dev/null
+    "$FAIL2BAN_INSTALL" --check >/dev/null
+    "$SELINUX_SETUP" --plan --component nginx >/dev/null
+    "$FIREWALL_SETUP" --plan --service nginx --zone "$ZONE" >/dev/null
+    if [ "$SSH_PHASE" != none ]; then
+        set -- "$SSH_SETUP" --plan --phase "$SSH_PHASE" --zone "$ZONE"
+        [ "$AUTHORIZED_KEY_READY" = yes ] && set -- "$@" --authorized-key-ready
+        [ "$CONSOLE_CONFIRMED" = yes ] && set -- "$@" --console-confirmed
+        "$@" >/dev/null
+    fi
+    preflight_fail2ban_phase=final
+    [ "$SSH_PHASE" = prepare ] && preflight_fail2ban_phase=prepare
+    set -- \
+        "$FAIL2BAN_SETUP" \
+        --plan \
+        --topology "$TOPOLOGY" \
+        --ssh-phase "$preflight_fail2ban_phase"
+    for preflight_ignore_ip in $IGNORE_IPS; do
+        set -- "$@" --ignore-ip "$preflight_ignore_ip"
+    done
+    "$@" >/dev/null
+}
+
+run_host_setup() {
+    run_platform_installer "$SELINUX_INSTALL"
+    run_platform_installer "$FIREWALL_INSTALL"
+    run_platform_installer "$SSH_INSTALL"
+    run_ssh_setup
+    run_nginx_setup
+    run_certbot_setup
+    run_platform_installer "$FAIL2BAN_INSTALL"
+    run_fail2ban_setup
+
+    if [ "$MODE" = apply ]; then
+        case "$SSH_PHASE" in
+            prepare)
+                printf 'Host preparation complete. Prove a new SSH key login on port 2356, then rerun with --ssh-phase finalize.\n'
+                ;;
+            finalize | none)
+                "$HOST_VERIFIER" --backend "$CERTBOT_BACKEND"
+                ;;
+        esac
+    fi
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --authorized-key-ready)
+            AUTHORIZED_KEY_READY=yes
+            shift
+            ;;
+        --certbot-backend)
+            [ "$#" -ge 2 ] || fail "--certbot-backend requires native or snap"
+            CERTBOT_BACKEND=$2
+            shift 2
+            ;;
+        --check)
+            [ "$MODE" = apply ] || fail "select exactly one mode"
+            MODE=check
+            shift
+            ;;
+        --console-confirmed)
+            CONSOLE_CONFIRMED=yes
+            shift
+            ;;
+        --ignore-ip)
+            [ "$#" -ge 2 ] || fail "--ignore-ip requires a CIDR"
+            append_ignore_ip "$2"
+            shift 2
+            ;;
+        --os-release)
+            [ "$#" -ge 2 ] || fail "--os-release requires a file"
+            OS_RELEASE_FILE=$2
+            OS_RELEASE_OVERRIDDEN=yes
+            shift 2
+            ;;
+        --plan)
+            [ "$MODE" = apply ] || fail "select exactly one mode"
+            MODE=plan
+            shift
+            ;;
+        --profile)
+            [ "$#" -ge 2 ] || fail "--profile requires a name"
+            PROFILE=$2
+            shift 2
+            ;;
+        --quic-bpf)
+            QUIC_BPF=yes
+            shift
+            ;;
+        --ssh-phase)
+            [ "$#" -ge 2 ] || fail "--ssh-phase requires prepare, finalize, or none"
+            SSH_PHASE=$2
+            shift 2
+            ;;
+        --zone)
+            [ "$#" -ge 2 ] || fail "--zone requires a name"
+            ZONE=$2
+            shift 2
+            ;;
+        --help | -h)
+            usage
+            exit 0
+            ;;
+        *) fail "unknown argument: $1" ;;
+    esac
+done
+
+validate_dependencies
+if [ "$MODE" = check ]; then
+    [ -z "$PROFILE$SSH_PHASE$IGNORE_IPS" ] \
+        || fail "--check does not accept host-selection options"
+    validate_all_profiles
+    "$SELINUX_INSTALL" --check >/dev/null
+    "$SELINUX_SETUP" --check >/dev/null
+    "$FIREWALL_INSTALL" --check >/dev/null
+    "$FIREWALL_SETUP" --check >/dev/null
+    "$SSH_INSTALL" --check >/dev/null
+    "$SSH_SETUP" --check >/dev/null
+    "$NGINX_SETUP" --check >/dev/null
+    "$CERTBOT_SETUP" --check >/dev/null
+    "$FAIL2BAN_INSTALL" --check >/dev/null
+    "$FAIL2BAN_SETUP" --check >/dev/null
+    printf 'Validated host profiles and every component setup entry point.\n'
+    exit 0
+fi
+
+validate_selection
+preflight_selection
+printf 'Host setup: profile=%s, topology=%s, ssh-phase=%s, certbot=%s, zone=%s\n' \
+    "$PROFILE" "$TOPOLOGY" "$SSH_PHASE" "$CERTBOT_BACKEND" "$ZONE"
+run_host_setup
+if [ "$MODE" = plan ]; then
+    printf 'Host plan complete; no host changes were made.\n'
+fi

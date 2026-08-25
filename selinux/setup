@@ -1,0 +1,171 @@
+#!/bin/sh
+
+set -eu
+
+PROGRAM_NAME=${0##*/}
+SCRIPT_DIRECTORY=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+NGINX_POLICY_SCRIPT=$SCRIPT_DIRECTORY/apply-nginx-policy
+QUIC_POLICY_SOURCE=$SCRIPT_DIRECTORY/nginx_quic_bpf.te
+
+MODE=apply
+SELECTED_COMPONENTS=
+QUIC_BPF=no
+SCRATCH_DIRECTORY=
+
+usage() {
+    cat <<EOF
+Usage:
+  $PROGRAM_NAME --check
+  $PROGRAM_NAME --plan --component nginx|ssh [--component ...] [--quic-bpf]
+  sudo $PROGRAM_NAME --component nginx|ssh [--component ...] [--quic-bpf]
+
+Applies the SELinux registrations owned by selected baseline components.
+The nginx component registers runtime labels, UDP 443, and httpd_setrlimit.
+The SSH component labels TCP 2356 as ssh_port_t. --quic-bpf builds and installs
+the optional nginx policy module and requires --component nginx.
+EOF
+}
+
+fail() {
+    printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2
+    exit 1
+}
+
+component_selected() {
+    selinux_candidate=$1
+    printf '%s\n' "$SELECTED_COMPONENTS" | grep -qx "$selinux_candidate"
+}
+
+add_component() {
+    selinux_component=$1
+    case "$selinux_component" in
+        nginx | ssh) ;;
+        *) fail "unsupported SELinux component: $selinux_component" ;;
+    esac
+    if ! component_selected "$selinux_component"; then
+        SELECTED_COMPONENTS=$SELECTED_COMPONENTS${SELECTED_COMPONENTS:+"
+"}$selinux_component
+    fi
+}
+
+validate_sources() {
+    [ -f "$NGINX_POLICY_SCRIPT" ] && [ ! -L "$NGINX_POLICY_SCRIPT" ] \
+        && [ -x "$NGINX_POLICY_SCRIPT" ] \
+        || fail "nginx policy source must be a real executable file"
+    [ -f "$QUIC_POLICY_SOURCE" ] && [ ! -L "$QUIC_POLICY_SOURCE" ] \
+        || fail "QUIC policy source must be a regular file"
+}
+
+print_plan() {
+    if component_selected nginx; then
+        printf '+ %s\n' "$NGINX_POLICY_SCRIPT"
+    fi
+    if component_selected ssh; then
+        printf '+ semanage port --add --type ssh_port_t --proto tcp 2356\n'
+        printf '+ semanage port --modify --type ssh_port_t --proto tcp 2356\n'
+    fi
+    if [ "$QUIC_BPF" = yes ]; then
+        printf '+ checkmodule -M -m -o SCRATCH/nginx_quic_bpf.mod %s\n' "$QUIC_POLICY_SOURCE"
+        printf '+ semodule_package -o SCRATCH/nginx_quic_bpf.pp -m SCRATCH/nginx_quic_bpf.mod\n'
+        printf '+ semodule --install SCRATCH/nginx_quic_bpf.pp\n'
+    fi
+}
+
+validate_live_host() {
+    [ "$(id -u)" -eq 0 ] || fail "run as root or use --plan"
+    for selinux_command in selinuxenabled semanage; do
+        command -v "$selinux_command" >/dev/null 2>&1 \
+            || fail "required command not found: $selinux_command"
+    done
+    selinuxenabled || fail "SELinux is not enabled on this host"
+    if [ "$QUIC_BPF" = yes ]; then
+        for policy_command in checkmodule semodule_package semodule; do
+            command -v "$policy_command" >/dev/null 2>&1 \
+                || fail "required policy-build command not found: $policy_command"
+        done
+    fi
+}
+
+apply_components() {
+    validate_live_host
+    if component_selected nginx; then
+        "$NGINX_POLICY_SCRIPT"
+    fi
+    if component_selected ssh; then
+        semanage port --add --type ssh_port_t --proto tcp 2356 2>/dev/null \
+            || semanage port --modify --type ssh_port_t --proto tcp 2356
+    fi
+    if [ "$QUIC_BPF" = yes ]; then
+        SCRATCH_DIRECTORY=$(mktemp -d "${TMPDIR:-/tmp}/config-selinux-setup.XXXXXX")
+        checkmodule -M -m \
+            -o "$SCRATCH_DIRECTORY/nginx_quic_bpf.mod" \
+            "$QUIC_POLICY_SOURCE"
+        semodule_package \
+            -o "$SCRATCH_DIRECTORY/nginx_quic_bpf.pp" \
+            -m "$SCRATCH_DIRECTORY/nginx_quic_bpf.mod"
+        semodule --install "$SCRATCH_DIRECTORY/nginx_quic_bpf.pp"
+        rm -rf -- "$SCRATCH_DIRECTORY"
+        SCRATCH_DIRECTORY=
+    fi
+    printf 'Applied SELinux components: %s\n' \
+        "$(printf '%s' "$SELECTED_COMPONENTS" | tr '\n' ' ')"
+}
+
+cleanup() {
+    if [ -n "$SCRATCH_DIRECTORY" ] && [ -d "$SCRATCH_DIRECTORY" ]; then
+        rm -rf -- "$SCRATCH_DIRECTORY"
+    fi
+}
+
+trap cleanup EXIT HUP INT TERM
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --check)
+            [ "$MODE" = apply ] || fail "select exactly one mode"
+            MODE=check
+            shift
+            ;;
+        --component)
+            [ "$#" -ge 2 ] || fail "--component requires nginx or ssh"
+            add_component "$2"
+            shift 2
+            ;;
+        --plan)
+            [ "$MODE" = apply ] || fail "select exactly one mode"
+            MODE=plan
+            shift
+            ;;
+        --quic-bpf)
+            QUIC_BPF=yes
+            shift
+            ;;
+        --help | -h)
+            usage
+            exit 0
+            ;;
+        *) fail "unknown argument: $1" ;;
+    esac
+done
+
+validate_sources
+if [ "$MODE" = check ]; then
+    [ -z "$SELECTED_COMPONENTS" ] && [ "$QUIC_BPF" = no ] \
+        || fail "--check does not accept component options"
+    printf 'Validated SELinux setup policy sources.\n'
+    exit 0
+fi
+[ -n "$SELECTED_COMPONENTS" ] || fail "at least one --component is required"
+if [ "$QUIC_BPF" = yes ] && ! component_selected nginx; then
+    fail "--quic-bpf requires --component nginx"
+fi
+
+case "$MODE" in
+    plan)
+        printf 'SELinux setup components: %s\n' \
+            "$(printf '%s' "$SELECTED_COMPONENTS" | tr '\n' ' ')"
+        print_plan
+        printf 'Plan complete; no host changes were made.\n'
+        ;;
+    apply) apply_components ;;
+esac
