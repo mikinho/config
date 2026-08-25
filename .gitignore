@@ -41,6 +41,10 @@ letsencrypt/
 credentials/
 secrets/
 
+# Local working directories
+/production-bootstrap/
+/scratch/
+
 # Runtime artifacts
 /build/
 __pycache__/
