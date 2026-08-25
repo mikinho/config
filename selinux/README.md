@@ -9,7 +9,7 @@ are deployment-specific.
 Install the administration tooling first:
 
 ```sh
-dnf install policycoreutils policycoreutils-python-utils libselinux-utils
+dnf install policycoreutils policycoreutils-python-utils libselinux-utils setools-console
 ```
 
 After installing or overlaying configuration and content, restore labels

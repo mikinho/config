@@ -624,6 +624,10 @@ class CoreRendererTests(unittest.TestCase):
             )
             positions = [main.index(call) for call in ordered_calls]
             self.assertEqual(positions, sorted(positions))
+            require_platform = setup[
+                setup.index("require_platform() {") : setup.index("verify_source_bundle() {")
+            ]
+            self.assertIn("restorecon rpm sesearch sha256sum", require_platform)
             self.assertIn("trap failure_guard ERR EXIT", setup)
             self.assertIn("setup failed; deployment SSH remains denied", setup)
             self.assertIn('"$SECURE_DIR/scripts/verify-host" --pre-ssh', setup)
