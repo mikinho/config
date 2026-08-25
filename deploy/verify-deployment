@@ -83,6 +83,23 @@ version_at_least() {
     return 0
 }
 
+parse_nginx_version() {
+    parse_version_raw=$1
+    parse_version_candidate=
+
+    case "$parse_version_raw" in
+        'nginx version: '*/*)
+            parse_version_candidate=$(printf '%s\n' "$parse_version_raw" \
+                | sed 's|^.*/||; s|[^0-9.].*$||')
+            ;;
+    esac
+
+    if printf '%s\n' "$parse_version_candidate" \
+        | grep -Eq '^[0-9]+([.][0-9]+){0,2}$'; then
+        printf '%s\n' "$parse_version_candidate"
+    fi
+}
+
 check_nginx() {
     printf 'Checking nginx binary and configuration...\n'
     if [ ! -x "$NGINX_BINARY" ]; then
@@ -94,7 +111,7 @@ check_nginx() {
         fail_msg "unable to read nginx version from $NGINX_BINARY"
         return
     }
-    host_version=$(printf '%s' "$host_version_raw" | sed 's|^.*nginx/||; s|[^0-9.].*$||')
+    host_version=$(parse_nginx_version "$host_version_raw")
     if [ -z "$host_version" ]; then
         fail_msg "unable to parse nginx version: $host_version_raw"
     elif printf '%s\n' "$host_version" | grep -Eq '^[0-9]+([.][0-9]+){0,2}$'; then
