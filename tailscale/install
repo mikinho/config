@@ -1,0 +1,208 @@
+#!/bin/sh
+
+set -eu
+
+PROGRAM_NAME=${0##*/}
+SCRIPT_DIRECTORY=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+REPOSITORY_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIRECTORY/.." && pwd)
+PLATFORM_LIBRARY=$REPOSITORY_ROOT/deploy/lib/platform.sh
+
+[ -f "$PLATFORM_LIBRARY" ] && [ ! -L "$PLATFORM_LIBRARY" ] || {
+    printf '%s: platform library must be a regular file: %s\n' \
+        "$PROGRAM_NAME" "$PLATFORM_LIBRARY" >&2
+    exit 1
+}
+# shellcheck disable=SC1090,SC1091
+. "$PLATFORM_LIBRARY"
+
+TAILSCALE_PACKAGE_ROOT=https://pkgs.tailscale.com/stable
+TAILSCALE_REPOSITORY_DIRECTORY=/etc/yum.repos.d
+TAILSCALE_REPOSITORY_TARGET=$TAILSCALE_REPOSITORY_DIRECTORY/tailscale.repo
+
+MODE=install
+OS_RELEASE_FILE=$PLATFORM_DEFAULT_OS_RELEASE
+OS_RELEASE_OVERRIDDEN=no
+TAILSCALE_REPOSITORY_PATH=
+TAILSCALE_REPOSITORY_URL=
+TAILSCALE_REPOSITORY_BASE_URL=
+TAILSCALE_REPOSITORY_KEY_URL=
+
+usage() {
+    cat <<EOF
+Usage:
+  $PROGRAM_NAME
+  $PROGRAM_NAME --plan [--os-release FILE]
+  $PROGRAM_NAME --check
+
+Installs Tailscale from its official stable RPM repository and enables the
+tailscaled service on a supported RHEL-family host. It does not enroll the
+host in a tailnet or enable Tailscale SSH; run the three tailscale/setup phases
+after the tailnet policy has been reviewed.
+EOF
+}
+
+fail() {
+    printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2
+    exit 1
+}
+
+select_repository() {
+    case "$PLATFORM_OS_ID" in
+        rhel)
+            TAILSCALE_REPOSITORY_PATH=rhel/$PLATFORM_OS_VERSION_MAJOR
+            ;;
+        rocky)
+            # Tailscale's official installer maps Rocky Linux to its generic
+            # Fedora RPM repository rather than a versioned RHEL repository.
+            TAILSCALE_REPOSITORY_PATH=fedora
+            ;;
+        centos)
+            TAILSCALE_REPOSITORY_PATH=centos/$PLATFORM_OS_VERSION_MAJOR
+            ;;
+        *) fail "platform detection returned an unsupported OS: $PLATFORM_OS_ID" ;;
+    esac
+
+    TAILSCALE_REPOSITORY_URL=$TAILSCALE_PACKAGE_ROOT/$TAILSCALE_REPOSITORY_PATH/tailscale.repo
+    TAILSCALE_REPOSITORY_BASE_URL=$TAILSCALE_PACKAGE_ROOT/$TAILSCALE_REPOSITORY_PATH/\$basearch
+    TAILSCALE_REPOSITORY_KEY_URL=$TAILSCALE_PACKAGE_ROOT/$TAILSCALE_REPOSITORY_PATH/repo.gpg
+}
+
+validate_repository_line() {
+    repository_line=$1
+    grep -Fqx -- "$repository_line" "$TAILSCALE_REPOSITORY_TARGET" \
+        || fail "existing Tailscale repository does not match the official stable configuration: $TAILSCALE_REPOSITORY_TARGET"
+}
+
+validate_existing_repository() {
+    if [ -e "$TAILSCALE_REPOSITORY_TARGET" ] || [ -L "$TAILSCALE_REPOSITORY_TARGET" ]; then
+        [ -f "$TAILSCALE_REPOSITORY_TARGET" ] && [ ! -L "$TAILSCALE_REPOSITORY_TARGET" ] \
+            || fail "Tailscale repository target must be a regular file: $TAILSCALE_REPOSITORY_TARGET"
+        validate_repository_line '[tailscale-stable]'
+        validate_repository_line "baseurl=$TAILSCALE_REPOSITORY_BASE_URL"
+        validate_repository_line 'repo_gpgcheck=1'
+        validate_repository_line 'gpgcheck=1'
+        validate_repository_line "gpgkey=$TAILSCALE_REPOSITORY_KEY_URL"
+        return 0
+    fi
+    return 1
+}
+
+detect_dnf_generation() {
+    if command -v dnf >/dev/null 2>&1; then
+        if LC_ALL=C dnf --version 2>/dev/null | grep -q '^dnf5 version'; then
+            printf '5\n'
+        else
+            printf '4\n'
+        fi
+        return
+    fi
+
+    # Plan mode can run on a non-RHEL workstation. Use the supported platform's
+    # normal package-manager generation so the printed plan stays reviewable.
+    case "$PLATFORM_OS_VERSION_MAJOR" in
+        10) printf '5\n' ;;
+        *) printf '4\n' ;;
+    esac
+}
+
+configure_repository() {
+    if validate_existing_repository; then
+        printf 'Tailscale stable repository already configured: %s\n' \
+            "$TAILSCALE_REPOSITORY_TARGET"
+        return
+    fi
+
+    dnf_generation=$(detect_dnf_generation)
+    case "$dnf_generation" in
+        4)
+            platform_run dnf config-manager --add-repo \
+                "$TAILSCALE_REPOSITORY_URL"
+            ;;
+        5)
+            platform_run dnf config-manager addrepo --overwrite \
+                --from-repofile="$TAILSCALE_REPOSITORY_URL"
+            ;;
+        *) fail "unsupported DNF generation: $dnf_generation" ;;
+    esac
+
+    if [ "$MODE" = install ]; then
+        validate_existing_repository \
+            || fail "DNF did not create the expected Tailscale repository file"
+    fi
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --check)
+            [ "$MODE" = install ] || fail "select exactly one mode"
+            MODE=check
+            shift
+            ;;
+        --plan)
+            [ "$MODE" = install ] || fail "select exactly one mode"
+            MODE=plan
+            shift
+            ;;
+        --os-release)
+            [ "$#" -ge 2 ] || fail "--os-release requires a file"
+            OS_RELEASE_FILE=$2
+            OS_RELEASE_OVERRIDDEN=yes
+            shift 2
+            ;;
+        --help | -h)
+            usage
+            exit 0
+            ;;
+        *) fail "unknown argument: $1" ;;
+    esac
+done
+
+if [ "$MODE" = check ]; then
+    [ "$OS_RELEASE_OVERRIDDEN" = no ] \
+        || fail "--os-release is accepted only with --plan"
+    printf 'Validated Tailscale installer and shared platform source.\n'
+    exit 0
+fi
+if [ "$OS_RELEASE_OVERRIDDEN" = yes ] && [ "$MODE" != plan ]; then
+    fail "--os-release is accepted only with --plan"
+fi
+
+platform_detect_supported_os "$OS_RELEASE_FILE"
+select_repository
+printf 'Tailscale installation target: %s (%s)\n' \
+    "$PLATFORM_OS_LABEL" "$PLATFORM_OS_ARCHITECTURE"
+printf 'Tailscale repository: %s\n' "$TAILSCALE_REPOSITORY_URL"
+
+if [ "$MODE" = install ]; then
+    [ "$(id -u)" -eq 0 ] || fail "run as root or use --plan"
+    for required_command in dnf grep rpm systemctl; do
+        command -v "$required_command" >/dev/null 2>&1 \
+            || fail "required command not found: $required_command"
+    done
+    [ -d "$TAILSCALE_REPOSITORY_DIRECTORY" ] \
+        && [ ! -L "$TAILSCALE_REPOSITORY_DIRECTORY" ] \
+        || fail "RPM repository target must be a real directory: $TAILSCALE_REPOSITORY_DIRECTORY"
+fi
+
+# Consumed by the sourced platform library.
+# shellcheck disable=SC2034
+PLATFORM_MODE=$MODE
+platform_run dnf install --assumeyes \
+    ca-certificates \
+    'dnf-command(config-manager)'
+configure_repository
+platform_run dnf install --assumeyes tailscale
+platform_run systemctl enable --now tailscaled.service
+
+if [ "$MODE" = install ]; then
+    rpm -q tailscale >/dev/null \
+        || fail "Tailscale package verification failed after installation"
+    systemctl is-active --quiet tailscaled.service \
+        || fail "tailscaled.service is not active after installation"
+fi
+
+if [ "$MODE" = plan ]; then
+    printf 'Plan complete; no host changes were made.\n'
+else
+    printf 'Installed Tailscale and started tailscaled; the host is not enrolled and Tailscale SSH remains disabled.\n'
+fi

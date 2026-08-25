@@ -33,6 +33,7 @@ but only for explicitly trusted immediate peers.
 | logrotate | A currently supported release | Required only when installing the included nginx file-log rotation policy. |
 | fail2ban | A currently supported EPEL release | Required only for the optional intrusion-ban policy in `fail2ban/`. |
 | OpenSSH | A supported RHEL-family sshd with the stock `sshd_config.d` include | Required only for the `ssh/` drop-ins; RHEL 8-era sshd lacks the include and silently ignores them. |
+| Tailscale | Current stable RPM from Tailscale's official repository | Required only for tagged-server enrollment and Tailscale SSH under the explicit two-plane policy in `tailscale/`. |
 | rsync | **3.5.0 or newer** for restricted `rrsync` deployment identities | 3.5.0 adds the confinement contract needed to close CVE-2026-53783. `packages/rsync/` supplies an audited temporary EL9 rebuild while the vendor package lags. |
 | firewalld | A currently supported RHEL-family release | Required only for the `firewalld/` service definitions and reference zone. |
 | SELinux | Enforcing mode with the RHEL `httpd` policy | Expected on the supported platforms; do not disable it to deploy this baseline. |
@@ -192,6 +193,9 @@ TCP 443 so clients always have an HTTP/2 or HTTP/1.1 fallback.
   depend on.
 - `ssh/` contains the OpenSSH installer and lockout-safe, two-phase setup for
   the repository `sshd_config.d` hardening drop-ins.
+- `tailscale/` contains the official-repository installer and three-phase tagged
+  server setup that keeps native deployment SSH on TCP 2356 while enabling
+  Tailscale SSH on tailnet TCP 22 for explicitly named human accounts.
 - `firewalld/` contains the installer, additive per-product service setup,
   and a deliberately manual reference zone.
 - `packages/` contains pinned, source-signature-verified package bridges for
