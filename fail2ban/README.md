@@ -26,8 +26,20 @@ sudo fail2ban/install
 ```
 
 Subscription-managed RHEL uses `subscription-manager`; RHEL cloud images use
-a discovered CodeReady Builder RHUI repository. The installer fails closed
-when a configured RHUI does not provide that repository.
+a discovered non-EUS CodeReady Builder RHUI repository. The installer fails
+closed when a configured RHUI does not provide that repository.
+
+The native EPEL path requires the current RHEL major-version package stream.
+The installer rejects enabled EUS and E4S repositories before changing the
+host because those streams pin a minor release while EPEL continues advancing
+within the major release. This can make EPEL's `fail2ban-selinux` require a
+newer `selinux-policy` than the pinned stream supplies. On an Azure PAYG VM,
+follow [Microsoft's documented procedure][azure-rhui] to switch the VM to
+non-EUS RHUI, fully update the host, reboot when required, and rerun this
+installer. Do not use `--skip-broken`, omit `fail2ban-selinux`, or mix standard
+and EUS RHEL repositories to force the transaction.
+
+[azure-rhui]: https://learn.microsoft.com/en-us/azure/virtual-machines/workloads/redhat/redhat-rhui#switch-a-rhel-server-to-non-eus-repositories
 
 `fail2ban-firewalld` selects the firewalld ban action through its own
 `jail.d` drop-in, and `fail2ban-selinux` provides the enforcing-mode policy.

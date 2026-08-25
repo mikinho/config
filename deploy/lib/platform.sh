@@ -14,6 +14,8 @@ PLATFORM_OS_NAME=
 PLATFORM_OS_VERSION_MAJOR=
 PLATFORM_OS_ARCHITECTURE=
 PLATFORM_OS_LABEL=
+PLATFORM_RHEL_REPOSITORY_LISTING=
+PLATFORM_RHEL_REPOSITORY_LISTING_STATE=unknown
 
 platform_fail() {
     printf '%s: %s\n' "${PROGRAM_NAME:-platform}" "$*" >&2
@@ -137,8 +139,6 @@ platform_select_rhel_builder_repository() {
         function is_builder(repository_id) {
             return repository_id == builder_prefix "-rpms" \
                 || repository_id == builder_prefix "-rhui-rpms" \
-                || repository_id == builder_prefix "-eus-rhui-rpms" \
-                || repository_id == builder_prefix "-e4s-rhui-rpms" \
                 || repository_id == generic_rhui_builder_prefix "-rhui-rpms"
         }
 
@@ -150,6 +150,46 @@ platform_select_rhel_builder_repository() {
             exit
         }
     '
+}
+
+platform_select_enabled_rhel_extended_repository() {
+    platform_repository_listing=$1
+
+    printf '%s\n' "$platform_repository_listing" | awk '
+        $NF == "enabled" \
+            && ($1 ~ /-eus(-rhui)?-rpms$/ \
+                || $1 ~ /-e4s(-rhui)?-rpms$/) {
+            print $1
+            exit
+        }
+    '
+}
+
+platform_load_rhel_repository_listing() {
+    [ "$PLATFORM_RHEL_REPOSITORY_LISTING_STATE" = unknown ] || return 0
+
+    PLATFORM_RHEL_REPOSITORY_LISTING_STATE=unavailable
+    if command -v dnf >/dev/null 2>&1; then
+        PLATFORM_RHEL_REPOSITORY_LISTING=$(LC_ALL=C dnf -q repolist --all) \
+            || platform_fail "cannot inspect configured RHEL repositories"
+        PLATFORM_RHEL_REPOSITORY_LISTING_STATE=available
+    elif [ "$PLATFORM_MODE" = install ]; then
+        platform_fail "dnf is required to inspect configured RHEL repositories"
+    fi
+
+    return 0
+}
+
+platform_assert_rhel_epel_stream_supported() {
+    platform_load_rhel_repository_listing
+    [ "$PLATFORM_RHEL_REPOSITORY_LISTING_STATE" = available ] || return 0
+
+    platform_extended_repository=$(
+        platform_select_enabled_rhel_extended_repository \
+            "$PLATFORM_RHEL_REPOSITORY_LISTING"
+    )
+    [ -z "$platform_extended_repository" ] || platform_fail \
+        "this installer does not support rolling EPEL with a pinned RHEL extended-update stream (enabled: $platform_extended_repository); switch to current non-EUS RHEL repositories (non-EUS RHUI on Azure) or use a reviewed package source built for this minor release"
 }
 
 platform_has_rhel_rhui_repository() {
@@ -167,20 +207,11 @@ platform_has_rhel_rhui_repository() {
 }
 
 platform_enable_rhel_builder_repository() {
-    platform_repository_listing=
-    platform_repository_listing_available=no
+    platform_load_rhel_repository_listing
 
-    if command -v dnf >/dev/null 2>&1; then
-        platform_repository_listing=$(LC_ALL=C dnf -q repolist --all) \
-            || platform_fail "cannot inspect configured RHEL repositories"
-        platform_repository_listing_available=yes
-    elif [ "$PLATFORM_MODE" = install ]; then
-        platform_fail "dnf is required to inspect configured RHEL repositories"
-    fi
-
-    if [ "$platform_repository_listing_available" = yes ]; then
+    if [ "$PLATFORM_RHEL_REPOSITORY_LISTING_STATE" = available ]; then
         platform_builder_repository=$(platform_select_rhel_builder_repository \
-            "$platform_repository_listing" enabled any)
+            "$PLATFORM_RHEL_REPOSITORY_LISTING" enabled any)
         if [ -n "$platform_builder_repository" ]; then
             printf 'CodeReady Builder repository already enabled: %s\n' \
                 "$platform_builder_repository"
@@ -188,14 +219,15 @@ platform_enable_rhel_builder_repository() {
         fi
 
         platform_builder_repository=$(platform_select_rhel_builder_repository \
-            "$platform_repository_listing" any rhui)
+            "$PLATFORM_RHEL_REPOSITORY_LISTING" any rhui)
         if [ -n "$platform_builder_repository" ]; then
             platform_run dnf config-manager --set-enabled \
                 "$platform_builder_repository"
             return
         fi
 
-        if platform_has_rhel_rhui_repository "$platform_repository_listing"; then
+        if platform_has_rhel_rhui_repository \
+            "$PLATFORM_RHEL_REPOSITORY_LISTING"; then
             platform_fail \
                 "CodeReady Builder repository is unavailable through configured RHEL RHUI repositories"
         fi
@@ -211,6 +243,14 @@ platform_enable_rhel_builder_repository() {
 }
 
 platform_install_epel_repository() {
+    case "$PLATFORM_OS_ID" in
+        rhel) platform_assert_rhel_epel_stream_supported ;;
+        rocky | centos) ;;
+        *)
+            platform_fail "platform detection must run before EPEL installation"
+            ;;
+    esac
+
     platform_run dnf install --assumeyes ca-certificates dnf-plugins-core
 
     case "$PLATFORM_OS_ID" in
@@ -218,9 +258,7 @@ platform_install_epel_repository() {
         rocky | centos)
             platform_run dnf config-manager --set-enabled crb
             ;;
-        *)
-            platform_fail "platform detection must run before EPEL installation"
-            ;;
+        *) platform_fail "platform detection must run before EPEL installation" ;;
     esac
 
     platform_run dnf install --assumeyes \

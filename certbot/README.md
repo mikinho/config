@@ -17,9 +17,9 @@ host; the installer fails if the other backend is still installed.
 - Run this after the repository nginx baseline is installed. The installer
   requires `/usr/sbin/nginx`, the `nginx` group, and systemd.
 - Subscription-managed RHEL must be registered with access to its matching
-  CodeReady Builder repository. A RHEL RHUI image must expose its matching
-  CodeReady Builder RHUI repository. Rocky Linux and CentOS Stream use their
-  `crb` repository.
+  CodeReady Builder repository. A RHEL RHUI image must expose its current
+  non-EUS CodeReady Builder RHUI repository. Rocky Linux and CentOS Stream use
+  their `crb` repository.
 - The host needs outbound access to its configured DNF repositories and, for
   the Snap backend, the Snap Store.
 - Review the plan on the target host before running it as root.
@@ -30,7 +30,12 @@ unknown operating systems, unsupported major versions, and ambiguous CentOS
 variants before installing anything. On RHEL it reuses an enabled CodeReady
 Builder repository, enables a discovered RHUI variant with DNF, or uses
 `subscription-manager` for a subscription-managed host. It fails closed when
-the configured RHUI does not publish CodeReady Builder.
+the configured RHUI does not publish CodeReady Builder. Native EPEL packages
+are not installed while EUS or E4S repositories are enabled: those streams
+pin a RHEL minor release while EPEL advances within the major release, so its
+dependencies can move beyond the pinned RHEL content. Switch an Azure VM to
+non-EUS RHUI or provide a reviewed package source built for the pinned minor
+release instead of mixing repository streams.
 
 ## Install
 

@@ -135,8 +135,8 @@ chmod 0755 "$fake_binary_directory/uname"
 
 cat > "$TEST_ROOT/azure-rhui-enabled.repos" <<'EOF'
 repo id                                                  repo name status
-codeready-builder-for-rhel-9-x86_64-eus-rhui-rpms        CodeReady enabled
-rhel-9-for-x86_64-baseos-eus-rhui-rpms                   BaseOS enabled
+codeready-builder-for-rhel-9-x86_64-rhui-rpms            CodeReady enabled
+rhel-9-for-x86_64-baseos-rhui-rpms                       BaseOS enabled
 EOF
 FAKE_DNF_REPOSITORY_LIST="$TEST_ROOT/azure-rhui-enabled.repos" \
 PATH="$fake_binary_directory:$PATH" \
@@ -146,15 +146,15 @@ PATH="$fake_binary_directory:$PATH" \
     > "$TEST_ROOT/azure-rhui-enabled.plan"
 assert_plan_contains \
     "$TEST_ROOT/azure-rhui-enabled.plan" \
-    'CodeReady Builder repository already enabled: codeready-builder-for-rhel-9-x86_64-eus-rhui-rpms'
+    'CodeReady Builder repository already enabled: codeready-builder-for-rhel-9-x86_64-rhui-rpms'
 assert_plan_excludes \
     "$TEST_ROOT/azure-rhui-enabled.plan" \
     'subscription-manager repos --enable'
 
 cat > "$TEST_ROOT/azure-rhui-disabled.repos" <<'EOF'
 repo id                                                  repo name status
-codeready-builder-for-rhel-9-x86_64-eus-rhui-rpms        CodeReady disabled
-rhel-9-for-x86_64-baseos-eus-rhui-rpms                   BaseOS enabled
+codeready-builder-for-rhel-9-x86_64-rhui-rpms            CodeReady disabled
+rhel-9-for-x86_64-baseos-rhui-rpms                       BaseOS enabled
 EOF
 FAKE_DNF_REPOSITORY_LIST="$TEST_ROOT/azure-rhui-disabled.repos" \
 PATH="$fake_binary_directory:$PATH" \
@@ -164,7 +164,7 @@ PATH="$fake_binary_directory:$PATH" \
     > "$TEST_ROOT/azure-rhui-disabled.plan"
 assert_plan_contains \
     "$TEST_ROOT/azure-rhui-disabled.plan" \
-    'dnf config-manager --set-enabled codeready-builder-for-rhel-9-x86_64-eus-rhui-rpms'
+    'dnf config-manager --set-enabled codeready-builder-for-rhel-9-x86_64-rhui-rpms'
 assert_plan_excludes \
     "$TEST_ROOT/azure-rhui-disabled.plan" \
     'subscription-manager repos --enable'
@@ -189,13 +189,42 @@ assert_plan_excludes \
 
 cat > "$TEST_ROOT/azure-rhui-missing-builder.repos" <<'EOF'
 repo id                                    repo name status
-rhel-9-for-x86_64-baseos-eus-rhui-rpms     BaseOS enabled
-rhel-9-for-x86_64-appstream-eus-rhui-rpms  AppStream enabled
+rhel-9-for-x86_64-baseos-rhui-rpms         BaseOS enabled
+rhel-9-for-x86_64-appstream-rhui-rpms      AppStream enabled
 EOF
 expect_failure \
     'CodeReady Builder repository is unavailable through configured RHEL RHUI repositories' \
     env \
     "FAKE_DNF_REPOSITORY_LIST=$TEST_ROOT/azure-rhui-missing-builder.repos" \
+    "PATH=$fake_binary_directory:$PATH" \
+    "$CERTBOT_INSTALLER" \
+    --plan \
+    --os-release "$TEST_ROOT/rhel-9"
+
+cat > "$TEST_ROOT/azure-eus-enabled.repos" <<'EOF'
+repo id                                                  repo name status
+codeready-builder-for-rhel-9-x86_64-eus-rhui-rpms        CodeReady enabled
+rhel-9-for-x86_64-baseos-eus-rhui-rpms                   BaseOS enabled
+rhel-9-for-x86_64-appstream-eus-rhui-rpms                AppStream enabled
+EOF
+expect_failure \
+    'this installer does not support rolling EPEL with a pinned RHEL extended-update stream' \
+    env \
+    "FAKE_DNF_REPOSITORY_LIST=$TEST_ROOT/azure-eus-enabled.repos" \
+    "PATH=$fake_binary_directory:$PATH" \
+    "$CERTBOT_INSTALLER" \
+    --plan \
+    --os-release "$TEST_ROOT/rhel-9"
+
+cat > "$TEST_ROOT/subscription-e4s-enabled.repos" <<'EOF'
+repo id                                             repo name status
+codeready-builder-for-rhel-9-x86_64-e4s-rpms        CodeReady enabled
+rhel-9-for-x86_64-baseos-e4s-rpms                   BaseOS enabled
+EOF
+expect_failure \
+    'this installer does not support rolling EPEL with a pinned RHEL extended-update stream' \
+    env \
+    "FAKE_DNF_REPOSITORY_LIST=$TEST_ROOT/subscription-e4s-enabled.repos" \
     "PATH=$fake_binary_directory:$PATH" \
     "$CERTBOT_INSTALLER" \
     --plan \

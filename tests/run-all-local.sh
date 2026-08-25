@@ -48,14 +48,18 @@ if command -v shellcheck >/dev/null 2>&1; then
         "$REPOSITORY_ROOT/selinux/setup" \
         "$REPOSITORY_ROOT/ssh/install" \
         "$REPOSITORY_ROOT/ssh/setup" \
+        "$REPOSITORY_ROOT/tailscale/install" \
+        "$REPOSITORY_ROOT/tailscale/setup" \
         "$REPOSITORY_ROOT/tests/certbot-installer.sh" \
         "$REPOSITORY_ROOT/tests/certbot-issue.sh" \
         "$REPOSITORY_ROOT/tests/deploy-renderers.sh" \
+        "$REPOSITORY_ROOT/tests/fail2ban-installer.sh" \
         "$REPOSITORY_ROOT/tests/health-verifiers.sh" \
         "$REPOSITORY_ROOT/tests/host-setup.sh" \
         "$REPOSITORY_ROOT/tests/nginx-runtime.sh" \
         "$REPOSITORY_ROOT/tests/rsync-packaging.sh" \
-        "$REPOSITORY_ROOT/tests/run-all-local.sh"
+        "$REPOSITORY_ROOT/tests/run-all-local.sh" \
+        "$REPOSITORY_ROOT/tests/tailscale.sh"
     printf 'ShellCheck passed with 0 warnings.\n'
 else
     printf 'Notice: shellcheck not found in PATH; skipping static shell analysis.\n'
@@ -81,8 +85,14 @@ step "Running Certbot installer routing tests..."
 step "Running Certbot first-lineage issuance tests..."
 "$REPOSITORY_ROOT/tests/certbot-issue.sh"
 
+step "Running Fail2ban installer routing tests..."
+"$REPOSITORY_ROOT/tests/fail2ban-installer.sh"
+
 step "Running component and host setup tests..."
 "$REPOSITORY_ROOT/tests/host-setup.sh"
+
+step "Running Tailscale installer and setup tests..."
+"$REPOSITORY_ROOT/tests/tailscale.sh"
 
 step "Running strict host and certificate healthcheck tests..."
 "$REPOSITORY_ROOT/tests/health-verifiers.sh"
