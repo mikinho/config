@@ -225,6 +225,21 @@ assert_contains "$TEST_ROOT/host-proxied.plan" \
     'Fail2ban setup: topology=proxied, ssh-phase=final'
 assert_contains "$TEST_ROOT/host-proxied.plan" 'backend: snap'
 
+"$HOST_SETUP" \
+    --plan \
+    --profile edge-proxied \
+    --ssh-phase none \
+    --ignore-ip 2001:db8::/32 \
+    --certbot-backend snap \
+    --os-release "$TEST_ROOT/centos-stream-10" \
+    > "$TEST_ROOT/host-proxied-no-ssh.plan"
+assert_contains "$TEST_ROOT/host-proxied-no-ssh.plan" \
+    'Host setup: profile=edge-proxied, topology=proxied, ssh-phase=none'
+assert_contains "$TEST_ROOT/host-proxied-no-ssh.plan" \
+    'Fail2ban setup: topology=proxied, ssh-phase=final'
+assert_contains "$TEST_ROOT/host-proxied-no-ssh.plan" \
+    'Host plan complete; no host changes were made.'
+
 expect_failure \
     '--ssh-phase prepare requires --authorized-key-ready' \
     "$HOST_SETUP" \
