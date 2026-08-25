@@ -8,6 +8,7 @@ REPOSITORY_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIRECTORY/.." && pwd)
 PLATFORM_LIBRARY=$REPOSITORY_ROOT/deploy/lib/platform.sh
 SYSTEMD_SOURCE=$REPOSITORY_ROOT/systemd/system
 HEALTHCHECK_SOURCE=$REPOSITORY_ROOT/deploy/certbot-healthcheck
+ISSUE_SOURCE=$SCRIPT_DIRECTORY/issue
 
 [ -f "$PLATFORM_LIBRARY" ] && [ ! -L "$PLATFORM_LIBRARY" ] || {
     printf '%s: platform library must be a regular file: %s\n' \
@@ -77,6 +78,9 @@ validate_executable_source() {
 validate_repository_sources() {
     validate_regular_source "$PLATFORM_LIBRARY"
     validate_executable_source "$HEALTHCHECK_SOURCE"
+    validate_executable_source "$ISSUE_SOURCE"
+    validate_regular_source "$SYSTEMD_SOURCE/certbot-healthcheck.service"
+    validate_regular_source "$SYSTEMD_SOURCE/certbot-healthcheck.timer"
     validate_regular_source "$SYSTEMD_SOURCE/certbot.service"
     validate_regular_source "$SYSTEMD_SOURCE/certbot.timer"
     validate_regular_source "$SYSTEMD_SOURCE/certbot.timer.d/10-snap-runner.conf"
@@ -122,6 +126,10 @@ validate_install_host() {
         || fail "nginx group is missing; install the nginx baseline first"
     [ -x /usr/sbin/nginx ] \
         || fail "nginx service binary is missing: /usr/sbin/nginx"
+    validate_install_target "$LOCAL_BIN_TARGET/certbot-healthcheck"
+    validate_install_target "$SYSTEMD_TARGET/certbot-healthcheck.service"
+    validate_install_target "$SYSTEMD_TARGET/certbot-healthcheck.timer"
+    validate_install_target "$SYSTEMD_TARGET/certbot.timer"
 
     case "$BACKEND" in
         native)
@@ -133,8 +141,6 @@ validate_install_host() {
                     fail "the Certbot Snap command remains under /usr/local/bin; remove it before selecting the native backend"
                     ;;
             esac
-            validate_install_target "$LOCAL_BIN_TARGET/certbot-healthcheck"
-            validate_install_target "$SYSTEMD_TARGET/certbot.timer"
             validate_install_target "$SYSTEMD_TARGET/certbot.service"
             validate_repository_removal \
                 "$SYSTEMD_SOURCE/certbot.timer.d/10-snap-runner.conf" \
@@ -156,8 +162,6 @@ validate_install_host() {
                     && [ "$(readlink "$LOCAL_BIN_TARGET/certbot")" = /snap/bin/certbot ] \
                     || fail "$LOCAL_BIN_TARGET/certbot exists and is not the expected Certbot Snap link"
             fi
-            validate_install_target "$LOCAL_BIN_TARGET/certbot-healthcheck"
-            validate_install_target "$SYSTEMD_TARGET/certbot.timer"
             validate_install_target \
                 "$SYSTEMD_TARGET/certbot.timer.d/10-snap-runner.conf"
             validate_install_target \
@@ -254,6 +258,14 @@ install_common_assets() {
         "$LOCAL_BIN_TARGET/certbot-healthcheck" \
         0755
     install_file \
+        "$SYSTEMD_SOURCE/certbot-healthcheck.service" \
+        "$SYSTEMD_TARGET/certbot-healthcheck.service" \
+        0644
+    install_file \
+        "$SYSTEMD_SOURCE/certbot-healthcheck.timer" \
+        "$SYSTEMD_TARGET/certbot-healthcheck.timer" \
+        0644
+    install_file \
         "$SYSTEMD_SOURCE/certbot.timer" \
         "$SYSTEMD_TARGET/certbot.timer" \
         0644
@@ -302,12 +314,19 @@ install_native_backend() {
     restore_system_labels \
         "$SYSTEMD_TARGET/certbot.service" \
         "$SYSTEMD_TARGET/certbot.timer" \
+        "$SYSTEMD_TARGET/certbot-healthcheck.service" \
+        "$SYSTEMD_TARGET/certbot-healthcheck.timer" \
         "$ACME_WEBROOT" \
         "$LOCAL_BIN_TARGET/certbot-healthcheck"
 
     run_command systemctl daemon-reload
-    run_command systemd-analyze --man=no verify certbot.service certbot.timer
+    run_command systemd-analyze --man=no verify \
+        certbot.service \
+        certbot.timer \
+        certbot-healthcheck.service \
+        certbot-healthcheck.timer
     run_command systemctl enable --now certbot.timer
+    run_command systemctl enable --now certbot-healthcheck.timer
     run_command /bin/certbot --version
 }
 
@@ -379,6 +398,8 @@ install_snap_backend() {
         0644
     restore_system_labels \
         "$SYSTEMD_TARGET/certbot.timer" \
+        "$SYSTEMD_TARGET/certbot-healthcheck.service" \
+        "$SYSTEMD_TARGET/certbot-healthcheck.timer" \
         "$SYSTEMD_TARGET/certbot.timer.d" \
         "$SYSTEMD_TARGET/snap.certbot.renew.service.d" \
         "$ACME_WEBROOT" \
@@ -387,8 +408,11 @@ install_snap_backend() {
     run_command systemctl daemon-reload
     run_command systemd-analyze --man=no verify \
         certbot.timer \
-        snap.certbot.renew.service
+        snap.certbot.renew.service \
+        certbot-healthcheck.service \
+        certbot-healthcheck.timer
     run_command systemctl enable --now certbot.timer
+    run_command systemctl enable --now certbot-healthcheck.timer
     run_command "$LOCAL_BIN_TARGET/certbot" --version
 }
 

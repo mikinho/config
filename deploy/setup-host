@@ -223,6 +223,19 @@ run_fail2ban_setup() {
     "$@"
 }
 
+run_host_verifier() {
+    set -- \
+        "$HOST_VERIFIER" \
+        --backend "$CERTBOT_BACKEND" \
+        --zone "$ZONE" \
+        --topology "$TOPOLOGY" \
+        --ssh-phase final
+    for verifier_ignore_ip in $IGNORE_IPS; do
+        set -- "$@" --ignore-ip "$verifier_ignore_ip"
+    done
+    "$@"
+}
+
 preflight_selection() {
     # Exercise every child parser and source boundary before an applying run
     # can change packages or live configuration.
@@ -269,7 +282,7 @@ run_host_setup() {
                 printf 'Host preparation complete. Prove a new SSH key login on port 2356, then rerun with --ssh-phase finalize.\n'
                 ;;
             finalize | none)
-                "$HOST_VERIFIER" --backend "$CERTBOT_BACKEND"
+                run_host_verifier
                 ;;
         esac
     fi

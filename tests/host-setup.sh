@@ -206,6 +206,8 @@ assert_contains "$TEST_ROOT/host-direct.plan" \
 assert_contains "$TEST_ROOT/host-direct.plan" \
     'Fail2ban setup: topology=direct, ssh-phase=prepare'
 assert_contains "$TEST_ROOT/host-direct.plan" 'backend: native'
+assert_contains "$TEST_ROOT/host-direct.plan" 'certbot-healthcheck.service'
+assert_contains "$TEST_ROOT/host-direct.plan" 'certbot-healthcheck.timer'
 assert_not_contains "$TEST_ROOT/host-direct.plan" 'zones/public.xml'
 
 "$HOST_SETUP" \

@@ -15,15 +15,19 @@ jail is unaffected and appropriate everywhere.
 ## Installation and setup
 
 `install` detects RHEL, Rocky Linux, or CentOS Stream major version 9 or 10,
-enables the matching EPEL/CRB repositories, and installs `fail2ban`,
-`fail2ban-firewalld`, `fail2ban-selinux`, and the Python runtime used for exact
-CIDR validation. It deliberately leaves the service inactive until a
-deployment topology and administrative CIDR have been selected:
+enables the matching EPEL and CodeReady Builder/CRB repositories, and installs
+`fail2ban`, `fail2ban-firewalld`, `fail2ban-selinux`, and the Python runtime
+used for exact CIDR validation. It deliberately leaves the service inactive
+until a deployment topology and administrative CIDR have been selected:
 
 ```sh
 fail2ban/install --plan
 sudo fail2ban/install
 ```
+
+Subscription-managed RHEL uses `subscription-manager`; RHEL cloud images use
+a discovered CodeReady Builder RHUI repository. The installer fails closed
+when a configured RHUI does not provide that repository.
 
 `fail2ban-firewalld` selects the firewalld ban action through its own
 `jail.d` drop-in, and `fail2ban-selinux` provides the enforcing-mode policy.

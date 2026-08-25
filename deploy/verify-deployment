@@ -2,19 +2,27 @@
 
 PROGRAM_NAME=${0##*/}
 set -eu
+set -f
 
 NGINX_BINARY=/usr/sbin/nginx
 NGINX_CONFIG=/etc/nginx/nginx.conf
 NGINX_VERSION_FLOOR=1.29.3
 
 BACKEND=auto
+ZONE=public
+TOPOLOGY=direct
+SSH_PHASE=final
+EXPECTED_IGNORE_IPS=
 SITE_TAG=
 VERBOSE=0
 FAILED_CHECKS=0
 
 CERTBOT_TIMER_UNIT=certbot.timer
+CERTBOT_HEALTHCHECK=/usr/local/bin/certbot-healthcheck
+CERTBOT_HEALTHCHECK_TIMER=certbot-healthcheck.timer
 CERTBOT_SNAP_RUNNER_DROPIN=/etc/systemd/system/certbot.timer.d/10-snap-runner.conf
 CERTBOT_SNAP_NGINX_DROPIN=/etc/systemd/system/snap.certbot.renew.service.d/10-nginx.conf
+FAIL2BAN_POLICY=/etc/fail2ban/jail.d/90-baseline.local
 SELINUX_CONFIG=/etc/selinux/config
 
 usage() {
@@ -23,11 +31,15 @@ Usage:
   $PROGRAM_NAME [OPTIONS]
 
 Non-destructive host post-deployment verification. Validates installed Nginx,
-systemd units, OpenSSH configuration, firewalld services, SELinux policies,
-QUIC kernel buffers, and runtime socket permissions.
+managed certificates, systemd units, OpenSSH, Fail2ban, firewalld, synchronized
+time, SELinux policy, QUIC kernel buffers, and runtime socket permissions.
 
 Options:
   --backend BACKEND   Certbot renewal backend: 'auto' (default), 'native', or 'snap'
+  --zone ZONE         Existing firewalld zone selected during setup (default: public)
+  --topology TYPE     Client topology: 'direct' (default) or 'proxied'
+  --ssh-phase PHASE   Expected SSH state: 'prepare' or 'final' (default: final)
+  --ignore-ip CIDR    Expected Fail2ban administrative CIDR; repeat as needed
   --site SITE_TAG     Validate per-site PHP-FPM socket and systemd instance
   --verbose, -v       Show detailed diagnostic outputs for each check
   --help, -h          Show this help message
@@ -50,6 +62,68 @@ info_msg() {
     if [ "$VERBOSE" -eq 1 ]; then
         printf '       %s\n' "$*"
     fi
+}
+
+append_expected_ignore_ip() {
+    expected_ignore_ip=$1
+    case "$expected_ignore_ip" in
+        '' | -* | *[!0-9A-Fa-f:./]* | */*/*)
+            printf '%s: invalid expected administrative CIDR: %s\n' \
+                "$PROGRAM_NAME" "$expected_ignore_ip" >&2
+            exit 1
+            ;;
+    esac
+    case "$expected_ignore_ip" in
+        */*) ;;
+        *)
+            printf '%s: expected administrative address must use CIDR notation: %s\n' \
+                "$PROGRAM_NAME" "$expected_ignore_ip" >&2
+            exit 1
+            ;;
+    esac
+    command -v python3 >/dev/null 2>&1 || {
+        printf '%s: python3 is required for exact CIDR validation\n' \
+            "$PROGRAM_NAME" >&2
+        exit 1
+    }
+    python3 -c \
+        'import ipaddress, sys; ipaddress.ip_interface(sys.argv[1])' \
+        "$expected_ignore_ip" >/dev/null 2>&1 || {
+        printf '%s: invalid expected administrative CIDR: %s\n' \
+            "$PROGRAM_NAME" "$expected_ignore_ip" >&2
+        exit 1
+    }
+    EXPECTED_IGNORE_IPS=$EXPECTED_IGNORE_IPS${EXPECTED_IGNORE_IPS:+"
+"}$expected_ignore_ip
+}
+
+validate_options() {
+    case "$BACKEND" in
+        auto | native | snap) ;;
+        *) printf '%s: unknown backend: %s\n' "$PROGRAM_NAME" "$BACKEND" >&2; exit 1 ;;
+    esac
+    case "$ZONE" in
+        '' | -* | *[!A-Za-z0-9_-]*)
+            printf '%s: invalid firewalld zone: %s\n' "$PROGRAM_NAME" "$ZONE" >&2
+            exit 1
+            ;;
+    esac
+    case "$TOPOLOGY" in
+        direct | proxied) ;;
+        *) printf '%s: unknown topology: %s\n' "$PROGRAM_NAME" "$TOPOLOGY" >&2; exit 1 ;;
+    esac
+    case "$SSH_PHASE" in
+        prepare | final) ;;
+        *) printf '%s: unknown SSH phase: %s\n' "$PROGRAM_NAME" "$SSH_PHASE" >&2; exit 1 ;;
+    esac
+    case "$SITE_TAG" in
+        '') ;;
+        [a-z]*[!a-z0-9_]* | [!a-z]*)
+            printf '%s: invalid PHP-FPM site tag: %s\n' \
+                "$PROGRAM_NAME" "$SITE_TAG" >&2
+            exit 1
+            ;;
+    esac
 }
 
 require_root() {
@@ -181,6 +255,53 @@ check_quic_state() {
     fi
 }
 
+check_clock_synchronization() {
+    printf 'Checking system clock synchronization...\n'
+    synchronized=no
+    if command -v timedatectl >/dev/null 2>&1; then
+        ntp_state=$(timedatectl show --property=NTPSynchronized --value 2>/dev/null || true)
+        [ "$ntp_state" = yes ] && synchronized=yes
+    fi
+    if [ "$synchronized" = no ] && command -v chronyc >/dev/null 2>&1; then
+        if chronyc tracking 2>/dev/null \
+            | grep -Eq '^Leap status[[:space:]]*:[[:space:]]*Normal$'; then
+            synchronized=yes
+        fi
+    fi
+    if [ "$synchronized" = yes ]; then
+        pass_msg "system clock reports synchronized time"
+    else
+        fail_msg "system clock is not synchronized; ACME and TLS validation require reliable time"
+    fi
+}
+
+check_certificate_health() {
+    printf 'Checking managed certificate validity and expiration...\n'
+    if [ ! -x "$CERTBOT_HEALTHCHECK" ]; then
+        fail_msg "certificate healthcheck is missing: $CERTBOT_HEALTHCHECK"
+        return
+    fi
+    if certificate_report=$("$CERTBOT_HEALTHCHECK" 2>&1); then
+        pass_msg "all managed certificates are valid beyond the warning threshold"
+        if [ -n "$certificate_report" ]; then
+            while IFS= read -r certificate_line; do
+                info_msg "$certificate_line"
+            done <<EOF
+$certificate_report
+EOF
+        fi
+    else
+        fail_msg "managed certificate healthcheck failed"
+        if [ -n "$certificate_report" ]; then
+            while IFS= read -r certificate_line; do
+                info_msg "$certificate_line"
+            done <<EOF
+$certificate_report
+EOF
+        fi
+    fi
+}
+
 resolve_certbot_backend() {
     case "$BACKEND" in
         auto)
@@ -218,6 +339,28 @@ check_systemd_services() {
         pass_msg "$CERTBOT_TIMER_UNIT is active"
     else
         fail_msg "$CERTBOT_TIMER_UNIT is not active"
+    fi
+    if systemctl is-enabled --quiet "$CERTBOT_TIMER_UNIT" 2>/dev/null; then
+        pass_msg "$CERTBOT_TIMER_UNIT is enabled"
+    else
+        fail_msg "$CERTBOT_TIMER_UNIT is not enabled"
+    fi
+
+    if systemctl is-active --quiet "$CERTBOT_HEALTHCHECK_TIMER" 2>/dev/null; then
+        pass_msg "$CERTBOT_HEALTHCHECK_TIMER is active"
+    else
+        fail_msg "$CERTBOT_HEALTHCHECK_TIMER is not active"
+    fi
+    if systemctl is-enabled --quiet "$CERTBOT_HEALTHCHECK_TIMER" 2>/dev/null; then
+        pass_msg "$CERTBOT_HEALTHCHECK_TIMER is enabled"
+    else
+        fail_msg "$CERTBOT_HEALTHCHECK_TIMER is not enabled"
+    fi
+
+    if systemctl is-active --quiet certbot-renew.timer 2>/dev/null; then
+        fail_msg "certbot-renew.timer is active; repository timer must be the sole scheduler"
+    else
+        pass_msg "distribution certbot-renew.timer is inactive"
     fi
 
     resolve_certbot_backend || return
@@ -271,11 +414,25 @@ check_ssh_hardening() {
     fi
 
     port_count=$(printf '%s\n' "$effective_config" | grep -c '^port ' || true)
-    if [ "$port_count" -eq 1 ] && printf '%s\n' "$effective_config" | grep -qx 'port 2356'; then
-        pass_msg "sshd listens exclusively on hardened port 2356"
-    else
-        fail_msg "sshd port configuration does not match port 2356 alone (found $port_count port entries)"
-    fi
+    case "$SSH_PHASE" in
+        prepare)
+            if [ "$port_count" -eq 2 ] \
+                && printf '%s\n' "$effective_config" | grep -qx 'port 22' \
+                && printf '%s\n' "$effective_config" | grep -qx 'port 2356'; then
+                pass_msg "sshd transition listens on exactly ports 22 and 2356"
+            else
+                fail_msg "sshd prepare state must expose exactly ports 22 and 2356 (found $port_count port entries)"
+            fi
+            ;;
+        final)
+            if [ "$port_count" -eq 1 ] \
+                && printf '%s\n' "$effective_config" | grep -qx 'port 2356'; then
+                pass_msg "sshd listens exclusively on hardened port 2356"
+            else
+                fail_msg "sshd final state must expose port 2356 alone (found $port_count port entries)"
+            fi
+            ;;
+    esac
 
     if printf '%s\n' "$effective_config" | grep -qx 'permitrootlogin no' && \
        printf '%s\n' "$effective_config" | grep -qx 'passwordauthentication no' && \
@@ -300,12 +457,18 @@ check_firewalld() {
         return
     fi
 
+    if ! "$cmd" --get-zones 2>/dev/null | tr ' ' '\n' | grep -qx "$ZONE"; then
+        fail_msg "selected firewalld zone does not exist: $ZONE"
+        return
+    fi
+    zone_services=$("$cmd" --zone="$ZONE" --list-services 2>/dev/null || true)
+
     if "$cmd" --info-service=nginx >/dev/null 2>&1; then
         pass_msg "firewalld service 'nginx' (TCP 80/443, UDP 443) is defined"
-        if "$cmd" --list-services 2>/dev/null | grep -qw nginx; then
-            pass_msg "firewalld service 'nginx' is active in the current zone"
+        if printf '%s\n' "$zone_services" | tr ' ' '\n' | grep -qxF nginx; then
+            pass_msg "firewalld service 'nginx' is active in zone $ZONE"
         else
-            fail_msg "firewalld service 'nginx' is defined but not active in the current zone"
+            fail_msg "firewalld service 'nginx' is defined but not active in zone $ZONE"
         fi
     else
         fail_msg "firewalld service 'nginx' is missing; install firewalld/services/nginx.xml"
@@ -313,14 +476,139 @@ check_firewalld() {
 
     if "$cmd" --info-service=ssh-hardened >/dev/null 2>&1; then
         pass_msg "firewalld service 'ssh-hardened' (TCP 2356) is defined"
-        if "$cmd" --list-services 2>/dev/null | grep -qw ssh-hardened; then
-            pass_msg "firewalld service 'ssh-hardened' is active in the current zone"
+        if printf '%s\n' "$zone_services" | tr ' ' '\n' | grep -qxF ssh-hardened; then
+            pass_msg "firewalld service 'ssh-hardened' is active in zone $ZONE"
         else
-            fail_msg "firewalld service 'ssh-hardened' is defined but not active in the current zone"
+            fail_msg "firewalld service 'ssh-hardened' is defined but not active in zone $ZONE"
         fi
     else
         fail_msg "firewalld service 'ssh-hardened' is missing; install firewalld/services/ssh-hardened.xml"
     fi
+
+    case "$SSH_PHASE" in
+        prepare)
+            if printf '%s\n' "$zone_services" | tr ' ' '\n' | grep -qxF ssh; then
+                pass_msg "stock SSH service remains active in zone $ZONE during transition"
+            else
+                fail_msg "stock SSH service is missing from zone $ZONE during prepare phase"
+            fi
+            ;;
+        final)
+            if printf '%s\n' "$zone_services" | tr ' ' '\n' | grep -qxF ssh; then
+                fail_msg "stock SSH service remains active in zone $ZONE after finalization"
+            else
+                pass_msg "stock SSH service is absent from zone $ZONE after finalization"
+            fi
+            ;;
+    esac
+}
+
+fail2ban_jail_active() {
+    checked_jail=$1
+    fail2ban-client status "$checked_jail" >/dev/null 2>&1
+}
+
+check_fail2ban() {
+    printf 'Checking Fail2ban runtime and topology policy...\n'
+    if ! command -v fail2ban-client >/dev/null 2>&1; then
+        fail_msg "fail2ban-client is unavailable"
+        return
+    fi
+    if ! command -v systemctl >/dev/null 2>&1; then
+        fail_msg "systemctl is unavailable for Fail2ban verification"
+        return
+    fi
+
+    fail2ban_active=yes
+    if systemctl is-enabled --quiet fail2ban.service 2>/dev/null; then
+        pass_msg "fail2ban.service is enabled"
+    else
+        fail_msg "fail2ban.service is not enabled"
+    fi
+    if systemctl is-active --quiet fail2ban.service 2>/dev/null; then
+        pass_msg "fail2ban.service is active"
+    else
+        fail_msg "fail2ban.service is not active"
+        fail2ban_active=no
+    fi
+    if fail2ban-client -t >/dev/null 2>&1; then
+        pass_msg "Fail2ban merged configuration test passed"
+    else
+        fail_msg "Fail2ban merged configuration test failed"
+    fi
+
+    if [ ! -f "$FAIL2BAN_POLICY" ] || [ -L "$FAIL2BAN_POLICY" ]; then
+        fail_msg "generated Fail2ban policy is missing or unsafe: $FAIL2BAN_POLICY"
+        return
+    fi
+
+    policy_ports=$(awk '
+        /^\[sshd\][[:space:]]*$/ { in_sshd = 1; next }
+        /^\[/ { in_sshd = 0 }
+        in_sshd && /^[[:space:]]*port[[:space:]]*=/ {
+            sub(/^[^=]*=[[:space:]]*/, "")
+            print
+            exit
+        }
+    ' "$FAIL2BAN_POLICY")
+    expected_ports=2356
+    [ "$SSH_PHASE" = prepare ] && expected_ports=22,2356
+    if [ "$policy_ports" = "$expected_ports" ]; then
+        pass_msg "Fail2ban sshd jail watches expected ports $expected_ports"
+    else
+        fail_msg "Fail2ban sshd jail ports are '${policy_ports:-missing}', expected $expected_ports"
+    fi
+
+    policy_ignore=$(awk '
+        /^\[DEFAULT\][[:space:]]*$/ { in_default = 1; next }
+        /^\[/ { in_default = 0 }
+        in_default && /^[[:space:]]*ignoreip[[:space:]]*=/ {
+            sub(/^[^=]*=[[:space:]]*/, "")
+            print
+            exit
+        }
+    ' "$FAIL2BAN_POLICY")
+    policy_ignore_count=$(printf '%s\n' "$policy_ignore" | awk '{ print NF }')
+    if [ "$policy_ignore_count" -gt 2 ] \
+        && printf ' %s ' "$policy_ignore" | grep -F ' 127.0.0.1/8 ' >/dev/null \
+        && printf ' %s ' "$policy_ignore" | grep -F ' ::1 ' >/dev/null; then
+        pass_msg "Fail2ban policy contains loopback and administrative exclusions"
+    else
+        fail_msg "Fail2ban policy must contain loopback and at least one administrative ignore CIDR"
+    fi
+    for expected_ignore_ip in $EXPECTED_IGNORE_IPS; do
+        if printf ' %s ' "$policy_ignore" \
+            | grep -F " $expected_ignore_ip " >/dev/null; then
+            pass_msg "Fail2ban policy excludes administrative CIDR $expected_ignore_ip"
+        else
+            fail_msg "Fail2ban policy is missing administrative CIDR $expected_ignore_ip"
+        fi
+    done
+
+    [ "$fail2ban_active" = yes ] || return
+    if fail2ban_jail_active sshd; then
+        pass_msg "Fail2ban sshd jail is active"
+    else
+        fail_msg "Fail2ban sshd jail is not active"
+    fi
+    for nginx_jail in nginx-http-auth nginx-limit-req nginx-444; do
+        case "$TOPOLOGY" in
+            direct)
+                if fail2ban_jail_active "$nginx_jail"; then
+                    pass_msg "Fail2ban $nginx_jail jail is active for direct topology"
+                else
+                    fail_msg "Fail2ban $nginx_jail jail is not active for direct topology"
+                fi
+                ;;
+            proxied)
+                if fail2ban_jail_active "$nginx_jail"; then
+                    fail_msg "Fail2ban $nginx_jail jail must be disabled for proxied topology"
+                else
+                    pass_msg "Fail2ban $nginx_jail jail is disabled for proxied topology"
+                fi
+                ;;
+        esac
+    done
 }
 
 check_selinux() {
@@ -416,14 +704,34 @@ while [ "$#" -gt 0 ]; do
             BACKEND=$2
             shift 2
             ;;
+        --ignore-ip)
+            [ "$#" -ge 2 ] || { usage >&2; exit 1; }
+            append_expected_ignore_ip "$2"
+            shift 2
+            ;;
+        --ssh-phase)
+            [ "$#" -ge 2 ] || { usage >&2; exit 1; }
+            SSH_PHASE=$2
+            shift 2
+            ;;
         --site)
             [ "$#" -ge 2 ] || { usage >&2; exit 1; }
             SITE_TAG=$2
             shift 2
             ;;
+        --topology)
+            [ "$#" -ge 2 ] || { usage >&2; exit 1; }
+            TOPOLOGY=$2
+            shift 2
+            ;;
         --verbose | -v)
             VERBOSE=1
             shift
+            ;;
+        --zone)
+            [ "$#" -ge 2 ] || { usage >&2; exit 1; }
+            ZONE=$2
+            shift 2
             ;;
         --help | -h)
             usage
@@ -437,14 +745,18 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
+validate_options
 require_root || exit 1
 
 printf '=== Baseline Deployment Preflight & Health Verification ===\n\n'
 check_nginx
 check_quic_state
+check_clock_synchronization
 check_systemd_services
+check_certificate_health
 check_ssh_hardening
 check_firewalld
+check_fail2ban
 check_selinux
 check_site_socket
 

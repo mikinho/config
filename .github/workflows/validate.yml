@@ -447,6 +447,9 @@ jobs:
               install -D -m 0755 /usr/bin/true /usr/sbin/nginx
               install -D -m 0755 /usr/bin/true /sbin/php-fpm
               install -D -m 0755 /usr/bin/true /bin/certbot
+              install -D -m 0755 \
+                /workspace/deploy/certbot-healthcheck \
+                /usr/local/bin/certbot-healthcheck
               getent group nginx >/dev/null || groupadd --system nginx
               id nginx >/dev/null 2>&1 ||
                 useradd --system --gid nginx --no-create-home nginx
@@ -468,6 +471,12 @@ jobs:
               install -D -m 0644 \
                 /workspace/systemd/system/certbot.timer \
                 /etc/systemd/system/certbot.timer
+              install -D -m 0644 \
+                /workspace/systemd/system/certbot-healthcheck.service \
+                /etc/systemd/system/certbot-healthcheck.service
+              install -D -m 0644 \
+                /workspace/systemd/system/certbot-healthcheck.timer \
+                /etc/systemd/system/certbot-healthcheck.timer
               systemd-analyze --version
               # The container uses executable shims for services that are not
               # installed, so their Documentation= man pages are absent.
@@ -475,6 +484,8 @@ jobs:
                 nginx.service \
                 certbot.service \
                 certbot.timer \
+                certbot-healthcheck.service \
+                certbot-healthcheck.timer \
                 php-fpm@sample_wp.service
 
               # Compose the optional Snap backend against a representative
@@ -507,6 +518,8 @@ jobs:
               if ! systemd-analyze --man=no verify \
                 certbot.timer \
                 snap.certbot.renew.service \
+                certbot-healthcheck.service \
+                certbot-healthcheck.timer \
                 nginx.service \
                 > "${snap_verify_output}" 2>&1; then
                 cat "${snap_verify_output}" >&2
@@ -553,6 +566,22 @@ jobs:
                 grep --fixed-strings --line-regexp \
                   "${timer_contract}" \
                   /workspace/systemd/system/certbot.timer
+              done
+              for health_timer_contract in \
+                "OnCalendar=*-*-* 03:00:00" \
+                "RandomizedDelaySec=2h" \
+                "Persistent=true"; do
+                grep --fixed-strings --line-regexp \
+                  "${health_timer_contract}" \
+                  /workspace/systemd/system/certbot-healthcheck.timer
+              done
+              for health_service_contract in \
+                "ExecStart=/usr/local/bin/certbot-healthcheck --warn-days 30" \
+                "PrivateNetwork=yes" \
+                "ProtectSystem=strict"; do
+                grep --fixed-strings --line-regexp \
+                  "${health_service_contract}" \
+                  /workspace/systemd/system/certbot-healthcheck.service
               done
               if grep --extended-regexp --quiet \
                 "^[[:space:]]*Unit=" \

@@ -35,6 +35,7 @@ if command -v shellcheck >/dev/null 2>&1; then
         "$REPOSITORY_ROOT/deploy/lib/platform.sh" \
         "$REPOSITORY_ROOT/deploy/setup-host" \
         "$REPOSITORY_ROOT/certbot/install" \
+        "$REPOSITORY_ROOT/certbot/issue" \
         "$REPOSITORY_ROOT/certbot/setup" \
         "$REPOSITORY_ROOT/fail2ban/install" \
         "$REPOSITORY_ROOT/fail2ban/setup" \
@@ -48,6 +49,7 @@ if command -v shellcheck >/dev/null 2>&1; then
         "$REPOSITORY_ROOT/ssh/install" \
         "$REPOSITORY_ROOT/ssh/setup" \
         "$REPOSITORY_ROOT/tests/certbot-installer.sh" \
+        "$REPOSITORY_ROOT/tests/certbot-issue.sh" \
         "$REPOSITORY_ROOT/tests/deploy-renderers.sh" \
         "$REPOSITORY_ROOT/tests/health-verifiers.sh" \
         "$REPOSITORY_ROOT/tests/host-setup.sh" \
@@ -75,6 +77,9 @@ step "Running deployment renderer and path boundary tests..."
 
 step "Running Certbot installer routing tests..."
 "$REPOSITORY_ROOT/tests/certbot-installer.sh"
+
+step "Running Certbot first-lineage issuance tests..."
+"$REPOSITORY_ROOT/tests/certbot-issue.sh"
 
 step "Running component and host setup tests..."
 "$REPOSITORY_ROOT/tests/host-setup.sh"
