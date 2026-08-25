@@ -39,6 +39,10 @@ Every deployment MUST use this state sequence:
 3. Restricted rsync writes only to a new candidate directory. The receiver MUST
    enforce path confinement, refuse devices and special files, and durably
    synchronize transferred content before the session can publish completion.
+   The gateway MUST pin the received top-level directory, accept only the
+   reviewed `0755` receiver outcome or the intended `02755` candidate mode,
+   restore `02755` through that pinned inode when required, and verify the
+   normalized identity before publishing completion.
 4. The gateway atomically publishes one token-bound sentinel into a watched
    directory that the deploy account cannot mutate directly.
 5. The root finalizer atomically claims that sentinel into private state and

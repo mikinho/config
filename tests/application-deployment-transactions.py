@@ -29,6 +29,7 @@ TRIGGER_TEST_ENV: Final = "EXAMPLE_NODE_APP_DEPLOY_TRIGGER_TESTING"
 GATEWAY_TEST_ENV: Final = "EXAMPLE_NODE_APP_DEPLOY_GATEWAY_TESTING"
 SNAPSHOT_TEST_ENV: Final = "EXAMPLE_NODE_APP_MANIFEST_SNAPSHOT_TESTING"
 CLAIM_PATTERN: Final = r"^deploy-trigger-[0-9]+-[0-9a-f]{24}$"
+CANDIDATE_MODE: Final = 0o2755
 
 
 def run(
@@ -179,6 +180,9 @@ status = int(os.environ.get("FAKE_RRSYNC_STATUS", "0"))
 if status:
     raise SystemExit(status)
 (root / token).mkdir(mode=0o755)
+candidate_mode = os.environ.get("FAKE_RRSYNC_CANDIDATE_MODE")
+if candidate_mode:
+    (root / token).chmod(int(candidate_mode, 8))
 print("wrapper=" + "|".join(sys.argv[1:]))
 """,
             encoding="utf-8",
@@ -211,7 +215,12 @@ print("wrapper=" + "|".join(sys.argv[1:]))
         deadline = time.monotonic() + 5.0
         while not sentinel.exists() and time.monotonic() < deadline:
             time.sleep(0.01)
-        self.assertTrue(sentinel.exists(), "gateway did not publish a sentinel")
+        if not sentinel.exists():
+            stdout, stderr = child.communicate(timeout=5.0)
+            self.fail(
+                "gateway did not publish a sentinel; "
+                f"status={child.returncode} stdout={stdout!r} stderr={stderr!r}"
+            )
         self.assertIsNone(child.poll(), "gateway acknowledged before host result evidence")
         self.assertEqual(sentinel.read_text(encoding="utf-8").strip(), FIRST_TOKEN)
 
@@ -251,6 +260,61 @@ print("wrapper=" + "|".join(sys.argv[1:]))
         )
         self.assertNotEqual(second.returncode, 0)
         self.assertIn("interrupted deploy transfer requires recovery", second.stderr)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "setgid normalization is a Linux host contract")
+    def test_gateway_restores_receiver_stripped_candidate_setgid(self) -> None:
+        """A safe rsync 3.5 mode outcome is normalized before publication."""
+
+        harness, sentinel, results = self.create_gateway_harness()
+        helper = self.bundle / "scripts" / "deploy-gateway.py"
+        environment = os.environ.copy()
+        environment.update(
+            {
+                GATEWAY_TEST_ENV: "1",
+                "SSH_ORIGINAL_COMMAND": self.session_command(FIRST_TOKEN),
+                "FAKE_RRSYNC_CANDIDATE_MODE": "0755",
+            }
+        )
+        child = subprocess.Popen(
+            (sys.executable, str(helper), "--test-root", str(harness)),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=environment,
+        )
+        deadline = time.monotonic() + 5.0
+        while not sentinel.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertTrue(sentinel.exists(), "gateway did not publish a sentinel")
+        candidate_mode = stat.S_IMODE((harness / "app" / FIRST_TOKEN).stat().st_mode)
+        self.assertEqual(candidate_mode, CANDIDATE_MODE)
+
+        sentinel.unlink()
+        claim = f"deploy-trigger-1787531002000000000-{'e' * 24}"
+        result_path = results / f"{FIRST_TOKEN}.{claim}"
+        result_path.write_text("success\n", encoding="utf-8")
+        result_path.chmod(0o640)
+        _stdout, stderr = child.communicate(timeout=5.0)
+        self.assertEqual(child.returncode, 0, stderr)
+
+    def test_gateway_rejects_every_other_candidate_mode(self) -> None:
+        """Receiver output outside exact 0755 or 02755 modes stays latched."""
+
+        harness, sentinel, _results = self.create_gateway_harness()
+        helper = self.bundle / "scripts" / "deploy-gateway.py"
+        result = run(
+            (sys.executable, str(helper), "--test-root", str(harness)),
+            environment={
+                GATEWAY_TEST_ENV: "1",
+                "SSH_ORIGINAL_COMMAND": self.session_command(FIRST_TOKEN),
+                "FAKE_RRSYNC_CANDIDATE_MODE": "0700",
+            },
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("received candidate has an unsafe mode: 700", result.stderr)
+        marker = harness / "inbox" / ".transfer-in-progress"
+        self.assertEqual(marker.read_text(encoding="ascii"), f"{FIRST_TOKEN}\n")
+        self.assertFalse(sentinel.exists())
 
 
 class TriggerTransactionTests(RenderedBundleTestCase):
