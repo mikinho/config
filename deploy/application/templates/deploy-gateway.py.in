@@ -58,6 +58,9 @@ TRIGGER_ROOT_MODE: Final = 0o755
 INBOX_MODE: Final = 0o2770
 RRSYNC_ROOT_MODE: Final = 0o2770
 CANDIDATE_MODE: Final = 0o2755
+SAFE_RECEIVED_CANDIDATE_MODES: Final = frozenset(
+    (0o755, 0o2700, CANDIDATE_MODE)
+)
 RESULTS_MODE: Final = 0o750
 LOCK_MODE: Final = 0o660
 SENTINEL_MODE: Final = 0o660
@@ -431,9 +434,11 @@ def normalize_received_candidate(
 ) -> None:
     """Pin and normalize one safe deploy-owned candidate directory.
 
-    Rsync 3.5 can clear the setgid bit inherited from the incoming root even
-    when the client disables permission preservation. Accept only that exact
-    ``0755`` receiver outcome or the already-correct ``02755`` mode, restore
+    Rsync 3.5 derives a new directory's access bits from the client source root
+    even when the client disables permission preservation. A ``0700`` clean
+    build root therefore arrives as ``02700`` beneath the setgid incoming root;
+    another receiver can clear that inherited bit and leave ``0755``. Accept
+    only those exact outcomes or the already-correct ``02755`` mode, restore
     the reviewed mode through the pinned inode, and durably verify it before
     publishing the completion token.
     """
@@ -449,7 +454,7 @@ def normalize_received_candidate(
             f"uid={metadata.st_uid} gid={metadata.st_gid}"
         )
     actual_mode = stat.S_IMODE(metadata.st_mode)
-    if actual_mode not in (0o755, config.candidate_mode):
+    if actual_mode not in SAFE_RECEIVED_CANDIDATE_MODES:
         raise GatewayError(f"received candidate has an unsafe mode: {actual_mode:o}")
 
     candidate_fd = -1
@@ -465,7 +470,7 @@ def normalize_received_candidate(
             or stat.S_IMODE(pinned.st_mode) != actual_mode
         ):
             raise GatewayError("received candidate identity changed after it was pinned")
-        if actual_mode == 0o755:
+        if actual_mode != config.candidate_mode:
             os.fchmod(candidate_fd, config.candidate_mode)
             os.fsync(candidate_fd)
         normalized = os.fstat(candidate_fd)

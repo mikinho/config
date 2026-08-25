@@ -297,8 +297,44 @@ print("wrapper=" + "|".join(sys.argv[1:]))
         _stdout, stderr = child.communicate(timeout=5.0)
         self.assertEqual(child.returncode, 0, stderr)
 
+    @unittest.skipUnless(sys.platform.startswith("linux"), "setgid normalization is a Linux host contract")
+    def test_gateway_normalizes_restrictive_clean_build_candidate(self) -> None:
+        """A candidate derived from a 0700 clean build root becomes 02755."""
+
+        harness, sentinel, results = self.create_gateway_harness()
+        helper = self.bundle / "scripts" / "deploy-gateway.py"
+        environment = os.environ.copy()
+        environment.update(
+            {
+                GATEWAY_TEST_ENV: "1",
+                "SSH_ORIGINAL_COMMAND": self.session_command(FIRST_TOKEN),
+                "FAKE_RRSYNC_CANDIDATE_MODE": "2700",
+            }
+        )
+        child = subprocess.Popen(
+            (sys.executable, str(helper), "--test-root", str(harness)),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=environment,
+        )
+        deadline = time.monotonic() + 5.0
+        while not sentinel.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertTrue(sentinel.exists(), "gateway did not publish a sentinel")
+        candidate_mode = stat.S_IMODE((harness / "app" / FIRST_TOKEN).stat().st_mode)
+        self.assertEqual(candidate_mode, CANDIDATE_MODE)
+
+        sentinel.unlink()
+        claim = f"deploy-trigger-1787531002000000000-{'e' * 24}"
+        result_path = results / f"{FIRST_TOKEN}.{claim}"
+        result_path.write_text("success\n", encoding="utf-8")
+        result_path.chmod(0o640)
+        _stdout, stderr = child.communicate(timeout=5.0)
+        self.assertEqual(child.returncode, 0, stderr)
+
     def test_gateway_rejects_every_other_candidate_mode(self) -> None:
-        """Receiver output outside exact 0755 or 02755 modes stays latched."""
+        """Receiver output outside exact 02700, 0755, or 02755 stays latched."""
 
         harness, sentinel, _results = self.create_gateway_harness()
         helper = self.bundle / "scripts" / "deploy-gateway.py"

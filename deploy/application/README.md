@@ -67,8 +67,9 @@ repository over the network and never depend on a mutable shared checkout.
 The standard owns:
 
 - restricted, transaction-bound SSH and rsync ingress;
-- pinned normalization of rsync's safe `0755` top-level candidate outcome to
-  the intended deploy-group-inheriting `02755` mode before publication;
+- pinned normalization of rsync's safe `02700`, `0755`, or already-correct
+  `02755` top-level candidate outcomes to the intended deploy-group-inheriting
+  `02755` mode before publication;
 - durable trigger claims and append-only terminal results;
 - manifest snapshot and dependency trust boundaries;
 - immutable release promotion, isolated preflight, activation, rollback, and
