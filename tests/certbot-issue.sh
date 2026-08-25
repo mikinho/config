@@ -75,7 +75,7 @@ assert_not_contains "$TEST_ROOT/staging.plan" 'certbot-healthcheck'
 assert_contains "$TEST_ROOT/production.plan" 'environment=production, backend=snap, primary=example.com'
 assert_contains "$TEST_ROOT/production.plan" '/usr/local/bin/certbot certonly'
 assert_contains "$TEST_ROOT/production.plan" \
-    '/usr/local/bin/certbot renew --cert-name example.com --dry-run'
+    '/usr/local/bin/certbot renew --cert-name example.com --dry-run --no-random-sleep-on-renew'
 assert_contains "$TEST_ROOT/production.plan" '/usr/local/bin/certbot-healthcheck'
 assert_not_contains "$TEST_ROOT/production.plan" '--domain example.com --dry-run'
 
