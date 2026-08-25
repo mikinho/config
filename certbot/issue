@@ -5,6 +5,7 @@ set -f
 
 PROGRAM_NAME=${0##*/}
 ACME_WEBROOT=/var/www/letsencrypt
+HTTP_PROBE_ADDRESS=127.0.0.2
 NGINX_BINARY=/usr/sbin/nginx
 NGINX_CONFIG=/etc/nginx/nginx.conf
 NATIVE_CERTBOT=/bin/certbot
@@ -225,11 +226,12 @@ verify_local_webroot() {
     for probe_domain in $DOMAINS; do
         probe_response=$(curl \
             --fail \
+            --noproxy '*' \
             --silent \
             --show-error \
             --max-time 10 \
-            --header "Host: $probe_domain" \
-            "http://127.0.0.1/.well-known/acme-challenge/$probe_name") \
+            --resolve "$probe_domain:80:$HTTP_PROBE_ADDRESS" \
+            "http://$probe_domain/.well-known/acme-challenge/$probe_name") \
             || fail "nginx did not serve the local HTTP-01 probe for $probe_domain"
         [ "$probe_response" = "$probe_token" ] \
             || fail "nginx returned unexpected HTTP-01 content for $probe_domain"
@@ -241,8 +243,8 @@ verify_local_webroot() {
 print_plan() {
     printf 'Certbot first-lineage plan: environment=%s, backend=%s, primary=%s\n' \
         "$ENVIRONMENT" "$BACKEND" "$PRIMARY_DOMAIN"
-    printf '+ verify active nginx serves %s/.well-known/acme-challenge/ for every requested name\n' \
-        "$ACME_WEBROOT"
+    printf '+ verify active nginx serves %s/.well-known/acme-challenge/ through %s for every requested name\n' \
+        "$ACME_WEBROOT" "$HTTP_PROBE_ADDRESS"
     print_certbot_command
     if [ "$ENVIRONMENT" = production ]; then
         print_command \

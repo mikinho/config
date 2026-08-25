@@ -58,6 +58,7 @@ assert_not_contains() {
     --domain www.example.com \
     > "$TEST_ROOT/staging.plan"
 assert_contains "$TEST_ROOT/staging.plan" 'environment=staging, backend=native, primary=example.com'
+assert_contains "$TEST_ROOT/staging.plan" 'through 127.0.0.2 for every requested name'
 assert_contains "$TEST_ROOT/staging.plan" '/bin/certbot certonly --non-interactive --agree-tos'
 assert_contains "$TEST_ROOT/staging.plan" '--preferred-challenges http'
 assert_contains "$TEST_ROOT/staging.plan" '--domain example.com --domain www.example.com --dry-run'
