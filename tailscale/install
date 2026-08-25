@@ -7,11 +7,11 @@ SCRIPT_DIRECTORY=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 REPOSITORY_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIRECTORY/.." && pwd)
 PLATFORM_LIBRARY=$REPOSITORY_ROOT/deploy/lib/platform.sh
 
-[ -f "$PLATFORM_LIBRARY" ] && [ ! -L "$PLATFORM_LIBRARY" ] || {
+if [ ! -f "$PLATFORM_LIBRARY" ] || [ -L "$PLATFORM_LIBRARY" ]; then
     printf '%s: platform library must be a regular file: %s\n' \
         "$PROGRAM_NAME" "$PLATFORM_LIBRARY" >&2
     exit 1
-}
+fi
 # shellcheck disable=SC1090,SC1091
 . "$PLATFORM_LIBRARY"
 
@@ -75,8 +75,10 @@ validate_repository_line() {
 
 validate_existing_repository() {
     if [ -e "$TAILSCALE_REPOSITORY_TARGET" ] || [ -L "$TAILSCALE_REPOSITORY_TARGET" ]; then
-        [ -f "$TAILSCALE_REPOSITORY_TARGET" ] && [ ! -L "$TAILSCALE_REPOSITORY_TARGET" ] \
-            || fail "Tailscale repository target must be a regular file: $TAILSCALE_REPOSITORY_TARGET"
+        if [ ! -f "$TAILSCALE_REPOSITORY_TARGET" ] \
+            || [ -L "$TAILSCALE_REPOSITORY_TARGET" ]; then
+            fail "Tailscale repository target must be a regular file: $TAILSCALE_REPOSITORY_TARGET"
+        fi
         validate_repository_line '[tailscale-stable]'
         validate_repository_line "baseurl=$TAILSCALE_REPOSITORY_BASE_URL"
         validate_repository_line 'repo_gpgcheck=1'
@@ -179,9 +181,10 @@ if [ "$MODE" = install ]; then
         command -v "$required_command" >/dev/null 2>&1 \
             || fail "required command not found: $required_command"
     done
-    [ -d "$TAILSCALE_REPOSITORY_DIRECTORY" ] \
-        && [ ! -L "$TAILSCALE_REPOSITORY_DIRECTORY" ] \
-        || fail "RPM repository target must be a real directory: $TAILSCALE_REPOSITORY_DIRECTORY"
+    if [ ! -d "$TAILSCALE_REPOSITORY_DIRECTORY" ] \
+        || [ -L "$TAILSCALE_REPOSITORY_DIRECTORY" ]; then
+        fail "RPM repository target must be a real directory: $TAILSCALE_REPOSITORY_DIRECTORY"
+    fi
 fi
 
 # Consumed by the sourced platform library.

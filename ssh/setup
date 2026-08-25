@@ -88,8 +88,9 @@ validate_selection() {
 validate_target_file() {
     ssh_target=$1
     if [ -e "$ssh_target" ] || [ -L "$ssh_target" ]; then
-        [ -f "$ssh_target" ] && [ ! -L "$ssh_target" ] \
-            || fail "SSH target must be a regular file: $ssh_target"
+        if [ ! -f "$ssh_target" ] || [ -L "$ssh_target" ]; then
+            fail "SSH target must be a regular file: $ssh_target"
+        fi
     fi
 }
 
@@ -99,8 +100,9 @@ validate_live_host() {
         command -v "$ssh_command" >/dev/null 2>&1 \
             || fail "required command not found: $ssh_command"
     done
-    [ -d "$SSHD_TARGET_DIRECTORY" ] && [ ! -L "$SSHD_TARGET_DIRECTORY" ] \
-        || fail "sshd drop-in target must be a real directory"
+    if [ ! -d "$SSHD_TARGET_DIRECTORY" ] || [ -L "$SSHD_TARGET_DIRECTORY" ]; then
+        fail "sshd drop-in target must be a real directory"
+    fi
     validate_target_file "$AUTH_TARGET"
     validate_target_file "$PORT_TARGET"
     validate_target_file "$TRANSITION_TARGET"
@@ -158,7 +160,9 @@ rollback_ssh_files() {
     restore_ssh_file "$AUTH_TARGET" auth.conf
     restore_ssh_file "$PORT_TARGET" port.conf
     restore_ssh_file "$TRANSITION_TARGET" transition.conf
-    sshd -t >/dev/null 2>&1 && systemctl reload sshd.service >/dev/null 2>&1 || true
+    if sshd -t >/dev/null 2>&1; then
+        systemctl reload sshd.service >/dev/null 2>&1 || true
+    fi
     ROLLBACK_REQUIRED=no
 }
 
@@ -306,8 +310,10 @@ done
 validate_sources
 validate_zone
 if [ "$MODE" = check ]; then
-    [ -z "$PHASE" ] && [ "$AUTHORIZED_KEY_READY$CONSOLE_CONFIRMED" = nono ] \
-        || fail "--check does not accept phase confirmations"
+    if [ -n "$PHASE" ] \
+        || [ "$AUTHORIZED_KEY_READY$CONSOLE_CONFIRMED" != nono ]; then
+        fail "--check does not accept phase confirmations"
+    fi
     printf 'Validated SSH setup sources and dependency entry points.\n'
     exit 0
 fi

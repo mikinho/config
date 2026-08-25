@@ -153,11 +153,14 @@ validate_live_host() {
 
 validate_native_deny_target() {
     native_deny_directory=${NATIVE_DENY_TARGET%/*}
-    [ -d "$native_deny_directory" ] && [ ! -L "$native_deny_directory" ] \
-        || fail "native SSH drop-in target must be a real directory: $native_deny_directory"
+    if [ ! -d "$native_deny_directory" ] \
+        || [ -L "$native_deny_directory" ]; then
+        fail "native SSH drop-in target must be a real directory: $native_deny_directory"
+    fi
     if [ -e "$NATIVE_DENY_TARGET" ] || [ -L "$NATIVE_DENY_TARGET" ]; then
-        [ -f "$NATIVE_DENY_TARGET" ] && [ ! -L "$NATIVE_DENY_TARGET" ] \
-            || fail "native SSH restriction target must be a regular file: $NATIVE_DENY_TARGET"
+        if [ ! -f "$NATIVE_DENY_TARGET" ] || [ -L "$NATIVE_DENY_TARGET" ]; then
+            fail "native SSH restriction target must be a regular file: $NATIVE_DENY_TARGET"
+        fi
     fi
 }
 
@@ -231,7 +234,9 @@ rollback_native_restriction() {
     else
         rm -f -- "$NATIVE_DENY_TARGET"
     fi
-    sshd -t >/dev/null 2>&1 && systemctl reload sshd.service >/dev/null 2>&1 || true
+    if sshd -t >/dev/null 2>&1; then
+        systemctl reload sshd.service >/dev/null 2>&1 || true
+    fi
     ROLLBACK_REQUIRED=no
 }
 
@@ -388,9 +393,10 @@ while [ "$#" -gt 0 ]; do
 done
 
 if [ "$MODE" = check ]; then
-    [ -z "$PHASE$ADVERTISE_TAGS$TAILSCALE_HOSTNAME$DENY_NATIVE_USERS" ] \
-        && [ "$POLICY_READY$TAILSCALE_SSH_CONFIRMED$CONSOLE_CONFIRMED" = nonono ] \
-        || fail "--check does not accept setup selections or confirmations"
+    if [ -n "$PHASE$ADVERTISE_TAGS$TAILSCALE_HOSTNAME$DENY_NATIVE_USERS" ] \
+        || [ "$POLICY_READY$TAILSCALE_SSH_CONFIRMED$CONSOLE_CONFIRMED" != nonono ]; then
+        fail "--check does not accept setup selections or confirmations"
+    fi
     printf 'Validated Tailscale setup safety boundaries.\n'
     exit 0
 fi

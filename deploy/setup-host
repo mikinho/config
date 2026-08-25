@@ -170,7 +170,7 @@ run_platform_installer() {
 }
 
 run_ssh_setup() {
-    [ "$SSH_PHASE" != none ] || return
+    [ "$SSH_PHASE" != none ] || return 0
     if [ "$MODE" = plan ]; then
         set -- "$SSH_SETUP" --plan --phase "$SSH_PHASE" --zone "$ZONE"
     else
