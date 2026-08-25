@@ -77,7 +77,9 @@ platform_detect_architecture() {
 
 platform_detect_supported_os() {
     platform_os_release_file=$1
-    [ -f "$platform_os_release_file" ] && [ ! -L "$platform_os_release_file" ] \
+    # /etc/os-release is commonly a relative link to /usr/lib/os-release.
+    # -f follows valid links while rejecting broken links and non-files.
+    [ -f "$platform_os_release_file" ] \
         || platform_fail "OS release metadata must be a regular file: $platform_os_release_file"
 
     PLATFORM_OS_ID=$(platform_strip_os_release_quotes \
