@@ -24,8 +24,9 @@ start so the unit's runtime directories are created with the right labels and
 the QUIC listener and worker rlimits are permitted. Mask or remove any
 distribution-provided nginx unit before enabling this one.
 
-Choose exactly one Certbot backend. Both use the repository's `certbot.timer`;
-do not leave a distribution or Snap Certbot timer active alongside it.
+Choose exactly one Certbot backend. Both use the repository's `certbot.timer`
+and the common `certbot-healthcheck.timer`; do not leave a distribution or
+Snap Certbot renewal timer active alongside the repository renewal timer.
 When switching backends, stop `certbot.timer` before changing files. Reinstalling
 the base timer does not remove anything under `certbot.timer.d/`.
 
@@ -43,8 +44,15 @@ Snap launcher:
 ```sh
 install -m 0644 systemd/system/certbot.service /etc/systemd/system/certbot.service
 install -m 0644 systemd/system/certbot.timer /etc/systemd/system/certbot.timer
+install -m 0755 deploy/certbot-healthcheck /usr/local/bin/certbot-healthcheck
+install -m 0644 \
+    systemd/system/certbot-healthcheck.service \
+    /etc/systemd/system/certbot-healthcheck.service
+install -m 0644 \
+    systemd/system/certbot-healthcheck.timer \
+    /etc/systemd/system/certbot-healthcheck.timer
 systemctl daemon-reload
-systemctl enable --now certbot.timer
+systemctl enable --now certbot.timer certbot-healthcheck.timer
 ```
 
 Without a `Unit=` directive, systemd derives `certbot.service` from the timer's
@@ -66,6 +74,13 @@ snapd. Install the repository timer and optional Snap drop-ins instead:
 
 ```sh
 install -m 0644 systemd/system/certbot.timer /etc/systemd/system/certbot.timer
+install -m 0755 deploy/certbot-healthcheck /usr/local/bin/certbot-healthcheck
+install -m 0644 \
+    systemd/system/certbot-healthcheck.service \
+    /etc/systemd/system/certbot-healthcheck.service
+install -m 0644 \
+    systemd/system/certbot-healthcheck.timer \
+    /etc/systemd/system/certbot-healthcheck.timer
 install -D -m 0644 \
     systemd/system/certbot.timer.d/10-snap-runner.conf \
     /etc/systemd/system/certbot.timer.d/10-snap-runner.conf
@@ -77,7 +92,7 @@ restorecon -RFv \
     /etc/systemd/system/snap.certbot.renew.service.d
 systemctl daemon-reload
 snap stop --disable certbot.renew
-systemctl enable --now certbot.timer
+systemctl enable --now certbot.timer certbot-healthcheck.timer
 ```
 
 `snap stop --disable certbot.renew` disables Snap's automatic timer activation
@@ -132,12 +147,14 @@ sudo systemd-analyze verify /etc/systemd/system/nginx.service
 # Run only the selected Certbot backend block.
 # Native Certbot backend:
 sudo systemd-analyze verify /etc/systemd/system/certbot.service /etc/systemd/system/certbot.timer
+sudo systemd-analyze verify certbot-healthcheck.service certbot-healthcheck.timer
 sudo systemd-analyze security nginx.service certbot.service
 sudo systemctl start certbot.service
 sudo systemctl --no-pager show certbot.service \
     -p Result -p ExecMainCode -p ExecMainStatus -p ExecStopPost
 # Snap Certbot backend:
 sudo systemd-analyze verify certbot.timer snap.certbot.renew.service
+sudo systemd-analyze verify certbot-healthcheck.service certbot-healthcheck.timer
 sudo systemctl start snap.certbot.renew.service
 sudo systemctl --no-pager show snap.certbot.renew.service \
     -p Result -p ExecMainCode -p ExecMainStatus -p ExecStopPost -p DropInPaths
@@ -147,14 +164,19 @@ sudo systemctl --no-pager show \
     certbot.timer snap.certbot.renew.timer \
     -p Id -p UnitFileState -p ActiveState
 # Both backends:
-sudo systemctl --no-pager show certbot.timer \
+sudo systemctl --no-pager show certbot.timer certbot-healthcheck.timer \
     -p Unit -p TimersCalendar -p RandomizedDelayUSec -p Persistent
 sudo systemctl list-timers --no-pager | grep -Ei 'certbot|letsencrypt'
 sudo systemd-analyze verify php-fpm@SITE_TAG.service
 sudo systemd-analyze security nginx.service php-fpm@SITE_TAG.service
 sudo certbot renew --dry-run
-deploy/certbot-healthcheck
+sudo /usr/local/bin/certbot-healthcheck
+sudo systemctl start certbot-healthcheck.service
 ```
+
+The health timer checks every managed lineage daily and fails at a 30-day
+threshold. Connect failed-unit state to the host's monitoring transport; the
+unit intentionally contains no provider-specific alert credentials.
 
 CI runs `systemd-analyze verify` for every push on Rocky Linux 9 and CentOS
 Stream 10 and composes the optional Snap drop-ins against a representative

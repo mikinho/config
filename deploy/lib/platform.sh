@@ -122,19 +122,99 @@ platform_detect_supported_os() {
     platform_detect_architecture
 }
 
+platform_select_rhel_builder_repository() {
+    platform_repository_listing=$1
+    platform_requested_state=$2
+    platform_requested_transport=$3
+    platform_builder_prefix="codeready-builder-for-rhel-$PLATFORM_OS_VERSION_MAJOR-$PLATFORM_OS_ARCHITECTURE"
+    platform_generic_rhui_builder_prefix="codeready-builder-for-rhel-$PLATFORM_OS_VERSION_MAJOR"
+
+    printf '%s\n' "$platform_repository_listing" | awk \
+        -v builder_prefix="$platform_builder_prefix" \
+        -v generic_rhui_builder_prefix="$platform_generic_rhui_builder_prefix" \
+        -v requested_state="$platform_requested_state" \
+        -v requested_transport="$platform_requested_transport" '
+        function is_builder(repository_id) {
+            return repository_id == builder_prefix "-rpms" \
+                || repository_id == builder_prefix "-rhui-rpms" \
+                || repository_id == builder_prefix "-eus-rhui-rpms" \
+                || repository_id == builder_prefix "-e4s-rhui-rpms" \
+                || repository_id == generic_rhui_builder_prefix "-rhui-rpms"
+        }
+
+        is_builder($1) \
+            && (requested_state == "any" || $NF == requested_state) \
+            && (requested_transport == "any" \
+                || $1 != builder_prefix "-rpms") {
+            print $1
+            exit
+        }
+    '
+}
+
+platform_has_rhel_rhui_repository() {
+    platform_repository_listing=$1
+    platform_rhui_prefix="rhel-$PLATFORM_OS_VERSION_MAJOR-"
+
+    printf '%s\n' "$platform_repository_listing" | awk \
+        -v rhui_prefix="$platform_rhui_prefix" '
+        index($1, rhui_prefix) == 1 && $1 ~ /-rhui-rpms$/ {
+            found = 1
+            exit
+        }
+        END { exit found ? 0 : 1 }
+    '
+}
+
+platform_enable_rhel_builder_repository() {
+    platform_repository_listing=
+    platform_repository_listing_available=no
+
+    if command -v dnf >/dev/null 2>&1; then
+        platform_repository_listing=$(LC_ALL=C dnf -q repolist --all) \
+            || platform_fail "cannot inspect configured RHEL repositories"
+        platform_repository_listing_available=yes
+    elif [ "$PLATFORM_MODE" = install ]; then
+        platform_fail "dnf is required to inspect configured RHEL repositories"
+    fi
+
+    if [ "$platform_repository_listing_available" = yes ]; then
+        platform_builder_repository=$(platform_select_rhel_builder_repository \
+            "$platform_repository_listing" enabled any)
+        if [ -n "$platform_builder_repository" ]; then
+            printf 'CodeReady Builder repository already enabled: %s\n' \
+                "$platform_builder_repository"
+            return
+        fi
+
+        platform_builder_repository=$(platform_select_rhel_builder_repository \
+            "$platform_repository_listing" any rhui)
+        if [ -n "$platform_builder_repository" ]; then
+            platform_run dnf config-manager --set-enabled \
+                "$platform_builder_repository"
+            return
+        fi
+
+        if platform_has_rhel_rhui_repository "$platform_repository_listing"; then
+            platform_fail \
+                "CodeReady Builder repository is unavailable through configured RHEL RHUI repositories"
+        fi
+    fi
+
+    if [ "$PLATFORM_MODE" = install ]; then
+        command -v subscription-manager >/dev/null 2>&1 \
+            || platform_fail \
+                "subscription-manager is required to enable CodeReady Builder on RHEL"
+    fi
+    platform_run subscription-manager repos --enable \
+        "codeready-builder-for-rhel-$PLATFORM_OS_VERSION_MAJOR-$PLATFORM_OS_ARCHITECTURE-rpms"
+}
+
 platform_install_epel_repository() {
     platform_run dnf install --assumeyes ca-certificates dnf-plugins-core
 
     case "$PLATFORM_OS_ID" in
-        rhel)
-            if [ "$PLATFORM_MODE" = install ]; then
-                command -v subscription-manager >/dev/null 2>&1 \
-                    || platform_fail \
-                        "subscription-manager is required to enable CodeReady Builder on RHEL"
-            fi
-            platform_run subscription-manager repos --enable \
-                "codeready-builder-for-rhel-$PLATFORM_OS_VERSION_MAJOR-$PLATFORM_OS_ARCHITECTURE-rpms"
-            ;;
+        rhel) platform_enable_rhel_builder_repository ;;
         rocky | centos)
             platform_run dnf config-manager --set-enabled crb
             ;;

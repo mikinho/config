@@ -1,0 +1,39 @@
+# systemd/system/certbot-healthcheck.service
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
+[Unit]
+Description=Verify managed TLS certificate validity and expiration
+Documentation=https://eff-certbot.readthedocs.io/en/stable/using.html#automated-renewals
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/certbot-healthcheck --warn-days 30
+
+# This check needs read access to root-owned certificate lineages but no host
+# writes, capabilities, devices, or network access.
+UMask=0077
+CapabilityBoundingSet=
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectProc=invisible
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+TasksMax=32

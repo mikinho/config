@@ -1,0 +1,339 @@
+#!/bin/sh
+
+set -eu
+set -f
+
+PROGRAM_NAME=${0##*/}
+ACME_WEBROOT=/var/www/letsencrypt
+NGINX_BINARY=/usr/sbin/nginx
+NGINX_CONFIG=/etc/nginx/nginx.conf
+NATIVE_CERTBOT=/bin/certbot
+SNAP_CERTBOT=/usr/local/bin/certbot
+HEALTHCHECK=/usr/local/bin/certbot-healthcheck
+
+MODE=apply
+BACKEND=native
+ENVIRONMENT=
+EMAIL=
+DOMAINS=
+PRIMARY_DOMAIN=
+STAGING_PASSED=no
+SELECTION_OPTIONS=no
+PROBE_FILE=
+
+usage() {
+    cat <<EOF
+Usage:
+  $PROGRAM_NAME --check
+  $PROGRAM_NAME --plan --staging|--production --email ADDRESS \
+      --domain DNS_NAME [--domain DNS_NAME ...] [--backend native|snap] \
+      [--staging-passed]
+  sudo $PROGRAM_NAME --staging --email ADDRESS \
+      --domain DNS_NAME [--domain DNS_NAME ...] [--backend native|snap]
+  sudo $PROGRAM_NAME --production --staging-passed --email ADDRESS \
+      --domain DNS_NAME [--domain DNS_NAME ...] [--backend native|snap]
+
+Tests or obtains the first certificate lineage with the repository HTTP-01
+webroot. Staging uses Certbot's non-persistent --dry-run. Production requires
+an explicit assertion that the same names passed staging. Existing lineages
+are never modified; use 'certbot reconfigure' for a managed certificate.
+EOF
+}
+
+fail() {
+    printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2
+    exit 1
+}
+
+cleanup() {
+    if [ -n "$PROBE_FILE" ] && [ -f "$PROBE_FILE" ]; then
+        rm -f -- "$PROBE_FILE"
+    fi
+}
+
+trap cleanup EXIT HUP INT TERM
+
+print_command() {
+    printf '+'
+    for command_argument do
+        printf ' %s' "$command_argument"
+    done
+    printf '\n'
+}
+
+validate_dns_name() {
+    dns_name=$1
+    case "$dns_name" in
+        \*.*) fail "wildcard names require a reviewed DNS-01 workflow: $dns_name" ;;
+        '' | -* | *- | .* | *. | *..* | *[!A-Za-z0-9.-]*)
+            fail "invalid DNS name: $dns_name"
+            ;;
+    esac
+    [ "${#dns_name}" -le 253 ] || fail "DNS name exceeds 253 characters: $dns_name"
+    printf '%s\n' "$dns_name" | awk -F. '
+        NF < 2 { exit 1 }
+        {
+            for (label_index = 1; label_index <= NF; label_index++) {
+                if (length($label_index) < 1 || length($label_index) > 63 ||
+                    $label_index ~ /^-/ || $label_index ~ /-$/) {
+                    exit 1
+                }
+            }
+        }
+    ' || fail "invalid DNS label in name: $dns_name"
+}
+
+append_domain() {
+    requested_domain=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+    validate_dns_name "$requested_domain"
+    if printf '%s\n' "$DOMAINS" | grep -qxF "$requested_domain"; then
+        fail "duplicate DNS name: $requested_domain"
+    fi
+    DOMAINS=$DOMAINS${DOMAINS:+"
+"}$requested_domain
+    [ -n "$PRIMARY_DOMAIN" ] || PRIMARY_DOMAIN=$requested_domain
+}
+
+validate_email() {
+    case "$EMAIL" in
+        '' | -* | .*@* | *.@* | *@.* | *..* | *[!A-Za-z0-9@._%+-]*)
+            fail "invalid ACME account email address: $EMAIL"
+            ;;
+    esac
+    email_local=${EMAIL%%@*}
+    email_domain=${EMAIL#*@}
+    [ -n "$email_local" ] && [ "$email_domain" != "$EMAIL" ] \
+        && [ -n "$email_domain" ] \
+        && [ "${email_domain#*@}" = "$email_domain" ] \
+        || fail "invalid ACME account email address: $EMAIL"
+    validate_dns_name "$email_domain"
+}
+
+validate_selection() {
+    case "$BACKEND" in
+        native | snap) ;;
+        *) fail "unsupported Certbot backend: $BACKEND" ;;
+    esac
+    case "$ENVIRONMENT" in
+        staging) ;;
+        production)
+            [ "$STAGING_PASSED" = yes ] \
+                || fail "production issuance requires --staging-passed"
+            ;;
+        '') fail "select exactly one issuance environment: --staging or --production" ;;
+        *) fail "unsupported issuance environment: $ENVIRONMENT" ;;
+    esac
+    [ -n "$DOMAINS" ] || fail "at least one --domain is required"
+    validate_email
+}
+
+select_certbot_binary() {
+    case "$BACKEND" in
+        native) CERTBOT_BINARY=$NATIVE_CERTBOT ;;
+        snap) CERTBOT_BINARY=$SNAP_CERTBOT ;;
+    esac
+}
+
+build_certbot_command() {
+    set -- \
+        "$CERTBOT_BINARY" \
+        certonly \
+        --non-interactive \
+        --agree-tos \
+        --email "$EMAIL" \
+        --cert-name "$PRIMARY_DOMAIN" \
+        --webroot \
+        --webroot-path "$ACME_WEBROOT" \
+        --preferred-challenges http
+    for issuance_domain in $DOMAINS; do
+        set -- "$@" --domain "$issuance_domain"
+    done
+    if [ "$ENVIRONMENT" = staging ]; then
+        set -- "$@" --dry-run
+    fi
+    "$@"
+}
+
+print_certbot_command() {
+    set -- \
+        "$CERTBOT_BINARY" \
+        certonly \
+        --non-interactive \
+        --agree-tos \
+        --email "$EMAIL" \
+        --cert-name "$PRIMARY_DOMAIN" \
+        --webroot \
+        --webroot-path "$ACME_WEBROOT" \
+        --preferred-challenges http
+    for issuance_domain in $DOMAINS; do
+        set -- "$@" --domain "$issuance_domain"
+    done
+    if [ "$ENVIRONMENT" = staging ]; then
+        set -- "$@" --dry-run
+    fi
+    print_command "$@"
+}
+
+validate_certbot_binary() {
+    [ -x "$CERTBOT_BINARY" ] || fail "Certbot binary is missing: $CERTBOT_BINARY"
+    case "$BACKEND" in
+        native)
+            case $(readlink -f "$CERTBOT_BINARY" 2>/dev/null || true) in
+                /snap/*) fail "native Certbot binary resolves to the Snap launcher" ;;
+            esac
+            ;;
+        snap)
+            [ -L "$CERTBOT_BINARY" ] \
+                && [ "$(readlink "$CERTBOT_BINARY")" = /snap/bin/certbot ] \
+                || fail "$CERTBOT_BINARY is not the expected Certbot Snap link"
+            ;;
+    esac
+}
+
+validate_live_host() {
+    [ "$(id -u)" -eq 0 ] || fail "run as root or use --plan"
+    for required_command in awk curl install mktemp readlink systemctl tr; do
+        command -v "$required_command" >/dev/null 2>&1 \
+            || fail "required command not found: $required_command"
+    done
+    validate_certbot_binary
+    [ -x "$NGINX_BINARY" ] || fail "nginx binary is missing: $NGINX_BINARY"
+    [ -f "$NGINX_CONFIG" ] && [ ! -L "$NGINX_CONFIG" ] \
+        || fail "nginx configuration must be a regular file: $NGINX_CONFIG"
+    [ -d "$ACME_WEBROOT" ] && [ ! -L "$ACME_WEBROOT" ] \
+        || fail "ACME webroot must be a real directory: $ACME_WEBROOT"
+    [ ! -e "/etc/letsencrypt/renewal/$PRIMARY_DOMAIN.conf" ] \
+        && [ ! -L "/etc/letsencrypt/renewal/$PRIMARY_DOMAIN.conf" ] \
+        || fail "certificate lineage already exists; use certbot reconfigure: $PRIMARY_DOMAIN"
+    systemctl is-active --quiet nginx.service \
+        || fail "nginx.service must be active for HTTP-01 validation"
+    "$NGINX_BINARY" -t -q -c "$NGINX_CONFIG" \
+        || fail "nginx configuration failed before HTTP-01 validation"
+}
+
+verify_local_webroot() {
+    challenge_directory=$ACME_WEBROOT/.well-known/acme-challenge
+    install -d -o root -g nginx -m 0755 "$challenge_directory"
+    PROBE_FILE=$(mktemp "$challenge_directory/config-probe.XXXXXX")
+    chmod 0644 "$PROBE_FILE"
+    probe_name=${PROBE_FILE##*/}
+    probe_token=config-certbot-webroot-$probe_name
+    printf '%s\n' "$probe_token" > "$PROBE_FILE"
+    if command -v restorecon >/dev/null 2>&1; then
+        restorecon "$PROBE_FILE"
+    fi
+    for probe_domain in $DOMAINS; do
+        probe_response=$(curl \
+            --fail \
+            --silent \
+            --show-error \
+            --max-time 10 \
+            --header "Host: $probe_domain" \
+            "http://127.0.0.1/.well-known/acme-challenge/$probe_name") \
+            || fail "nginx did not serve the local HTTP-01 probe for $probe_domain"
+        [ "$probe_response" = "$probe_token" ] \
+            || fail "nginx returned unexpected HTTP-01 content for $probe_domain"
+    done
+    rm -f -- "$PROBE_FILE"
+    PROBE_FILE=
+}
+
+print_plan() {
+    printf 'Certbot first-lineage plan: environment=%s, backend=%s, primary=%s\n' \
+        "$ENVIRONMENT" "$BACKEND" "$PRIMARY_DOMAIN"
+    printf '+ verify active nginx serves %s/.well-known/acme-challenge/ for every requested name\n' \
+        "$ACME_WEBROOT"
+    print_certbot_command
+    if [ "$ENVIRONMENT" = production ]; then
+        print_command \
+            "$CERTBOT_BINARY" renew --cert-name "$PRIMARY_DOMAIN" --dry-run
+        print_command "$HEALTHCHECK"
+    fi
+    printf 'Plan complete; no certificate or host state was changed.\n'
+}
+
+issue_certificate() {
+    validate_live_host
+    verify_local_webroot
+    build_certbot_command
+    if [ "$ENVIRONMENT" = production ]; then
+        "$CERTBOT_BINARY" renew --cert-name "$PRIMARY_DOMAIN" --dry-run
+        [ -x "$HEALTHCHECK" ] \
+            || fail "certificate healthcheck is missing: $HEALTHCHECK"
+        "$HEALTHCHECK"
+        printf 'Issued and renewal-tested production certificate lineage: %s\n' \
+            "$PRIMARY_DOMAIN"
+    else
+        printf 'Staging validation passed for: %s\n' \
+            "$(printf '%s' "$DOMAINS" | tr '\n' ' ')"
+    fi
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --backend)
+            [ "$#" -ge 2 ] || fail "--backend requires native or snap"
+            BACKEND=$2
+            SELECTION_OPTIONS=yes
+            shift 2
+            ;;
+        --check)
+            [ "$MODE" = apply ] || fail "select exactly one mode"
+            MODE=check
+            shift
+            ;;
+        --domain)
+            [ "$#" -ge 2 ] || fail "--domain requires a DNS name"
+            append_domain "$2"
+            SELECTION_OPTIONS=yes
+            shift 2
+            ;;
+        --email)
+            [ "$#" -ge 2 ] || fail "--email requires an address"
+            EMAIL=$2
+            SELECTION_OPTIONS=yes
+            shift 2
+            ;;
+        --plan)
+            [ "$MODE" = apply ] || fail "select exactly one mode"
+            MODE=plan
+            shift
+            ;;
+        --production)
+            [ -z "$ENVIRONMENT" ] || fail "select exactly one issuance environment"
+            ENVIRONMENT=production
+            SELECTION_OPTIONS=yes
+            shift
+            ;;
+        --staging)
+            [ -z "$ENVIRONMENT" ] || fail "select exactly one issuance environment"
+            ENVIRONMENT=staging
+            SELECTION_OPTIONS=yes
+            shift
+            ;;
+        --staging-passed)
+            STAGING_PASSED=yes
+            SELECTION_OPTIONS=yes
+            shift
+            ;;
+        --help | -h)
+            usage
+            exit 0
+            ;;
+        *) fail "unknown argument: $1" ;;
+    esac
+done
+
+if [ "$MODE" = check ]; then
+    [ "$SELECTION_OPTIONS" = no ] \
+        || fail "--check does not accept issuance options"
+    printf 'Validated Certbot first-lineage issuance helper.\n'
+    exit 0
+fi
+
+validate_selection
+select_certbot_binary
+case "$MODE" in
+    plan) print_plan ;;
+    apply) issue_certificate ;;
+esac

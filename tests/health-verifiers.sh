@@ -1,4 +1,6 @@
 #!/bin/sh
+# Mock scripts below intentionally preserve runtime shell expansions.
+# shellcheck disable=SC2016
 
 set -eu
 
@@ -166,6 +168,215 @@ printf '%s\\n' \"\$RESOLVED_BACKEND\"
 ")
 [ "$backend_result" = 'snap native' ] \
     || fail "Certbot backend auto-detection returned: $backend_result"
+
+expect_failure 'unknown topology: arbitrary' \
+    "$HOST_VERIFIER" --topology arbitrary
+expect_failure 'invalid firewalld zone' \
+    "$HOST_VERIFIER" --zone '../public'
+expect_failure 'unknown SSH phase: arbitrary' \
+    "$HOST_VERIFIER" --ssh-phase arbitrary
+expect_failure 'invalid expected administrative CIDR' \
+    "$HOST_VERIFIER" --ignore-ip 'not a CIDR'
+expect_failure 'invalid expected administrative CIDR' \
+    "$HOST_VERIFIER" --ignore-ip '999.0.0.1/33'
+expect_failure 'expected administrative address must use CIDR notation' \
+    "$HOST_VERIFIER" --ignore-ip '192.0.2.1'
+expect_failure 'invalid PHP-FPM site tag' \
+    "$HOST_VERIFIER" --site '../site'
+
+mkdir -p "$TEST_ROOT/clock-bin"
+printf '%s\n' \
+    '#!/bin/sh' \
+    '[ "${MOCK_CLOCK_STATE:-yes}" = yes ] && printf "yes\\n" || printf "no\\n"' \
+    > "$TEST_ROOT/clock-bin/timedatectl"
+printf '%s\n' \
+    '#!/bin/sh' \
+    '[ "${MOCK_CHRONY_NORMAL:-no}" = yes ] && printf "Leap status     : Normal\\n" || printf "Leap status     : Not synchronised\\n"' \
+    > "$TEST_ROOT/clock-bin/chronyc"
+chmod 0755 "$TEST_ROOT/clock-bin/timedatectl" "$TEST_ROOT/clock-bin/chronyc"
+clock_function=$(extract_function check_clock_synchronization "$HOST_VERIFIER")
+for clock_contract in timedatectl chrony; do
+    case "$clock_contract" in
+        timedatectl) clock_environment='MOCK_CLOCK_STATE=yes MOCK_CHRONY_NORMAL=no' ;;
+        chrony) clock_environment='MOCK_CLOCK_STATE=no MOCK_CHRONY_NORMAL=yes' ;;
+    esac
+    clock_result=$(PATH="$TEST_ROOT/clock-bin:$PATH" \
+        sh -c "$clock_environment
+export MOCK_CLOCK_STATE MOCK_CHRONY_NORMAL
+FAILED_CHECKS=0
+fail_msg() { FAILED_CHECKS=\$((FAILED_CHECKS + 1)); }
+pass_msg() { :; }
+$clock_function
+check_clock_synchronization >/dev/null
+printf '%s\\n' \"\$FAILED_CHECKS\"
+")
+    [ "$clock_result" = 0 ] \
+        || fail "$clock_contract clock verification recorded $clock_result failures"
+done
+clock_failure_result=$(PATH="$TEST_ROOT/clock-bin:$PATH" \
+    MOCK_CLOCK_STATE=no MOCK_CHRONY_NORMAL=no sh -c "
+FAILED_CHECKS=0
+fail_msg() { FAILED_CHECKS=\$((FAILED_CHECKS + 1)); }
+pass_msg() { :; }
+$clock_function
+check_clock_synchronization >/dev/null
+printf '%s\\n' \"\$FAILED_CHECKS\"
+")
+[ "$clock_failure_result" = 1 ] \
+    || fail "unsynchronized clock recorded $clock_failure_result failures"
+
+mkdir -p "$TEST_ROOT/ssh-bin"
+printf '%s\n' \
+    '#!/bin/sh' \
+    'case "$1" in' \
+    '    -t) exit 0 ;;' \
+    '    -T)' \
+    '        [ "${MOCK_SSH_PHASE:-final}" = prepare ] && printf "port 22\\n"' \
+    '        printf "%s\\n" "port 2356" "permitrootlogin no" "passwordauthentication no" "kbdinteractiveauthentication no"' \
+    '        ;;' \
+    '    *) exit 1 ;;' \
+    'esac' \
+    > "$TEST_ROOT/ssh-bin/sshd"
+chmod 0755 "$TEST_ROOT/ssh-bin/sshd"
+ssh_function=$(extract_function check_ssh_hardening "$HOST_VERIFIER")
+for tested_ssh_phase in prepare final; do
+    ssh_result=$(PATH="$TEST_ROOT/ssh-bin:$PATH" \
+        MOCK_SSH_PHASE="$tested_ssh_phase" sh -c "
+FAILED_CHECKS=0
+SSH_PHASE=$tested_ssh_phase
+fail_msg() { FAILED_CHECKS=\$((FAILED_CHECKS + 1)); }
+pass_msg() { :; }
+$ssh_function
+check_ssh_hardening >/dev/null
+printf '%s\\n' \"\$FAILED_CHECKS\"
+")
+    [ "$ssh_result" = 0 ] \
+        || fail "$tested_ssh_phase SSH verification recorded $ssh_result failures"
+done
+
+mkdir -p "$TEST_ROOT/firewall-bin"
+printf '%s\n' \
+    '#!/bin/sh' \
+    'case "$*" in' \
+    '    --state) exit 0 ;;' \
+    '    --get-zones) printf "public edge-custom\\n" ;;' \
+    '    --info-service=nginx | --info-service=ssh-hardened) exit 0 ;;' \
+    '    "--zone=edge-custom --list-services")' \
+    '        printf "nginx ssh-hardened"' \
+    '        [ "${MOCK_FIREWALL_SSH:-final}" = prepare ] && printf " ssh"' \
+    '        printf "\\n"' \
+    '        ;;' \
+    '    *) exit 1 ;;' \
+    'esac' \
+    > "$TEST_ROOT/firewall-bin/firewall-cmd"
+chmod 0755 "$TEST_ROOT/firewall-bin/firewall-cmd"
+firewall_function=$(extract_function check_firewalld "$HOST_VERIFIER")
+for tested_firewall_phase in prepare final; do
+    firewall_result=$(PATH="$TEST_ROOT/firewall-bin:$PATH" \
+        MOCK_FIREWALL_SSH="$tested_firewall_phase" sh -c "
+FAILED_CHECKS=0
+ZONE=edge-custom
+SSH_PHASE=$tested_firewall_phase
+fail_msg() { FAILED_CHECKS=\$((FAILED_CHECKS + 1)); }
+pass_msg() { :; }
+$firewall_function
+check_firewalld >/dev/null
+printf '%s\\n' \"\$FAILED_CHECKS\"
+")
+    [ "$firewall_result" = 0 ] \
+        || fail "$tested_firewall_phase firewalld verification recorded $firewall_result failures"
+done
+
+mkdir -p "$TEST_ROOT/fail2ban-bin"
+printf '%s\n' \
+    '#!/bin/sh' \
+    'case "$1" in' \
+    '    is-active | is-enabled) exit 0 ;;' \
+    '    *) exit 1 ;;' \
+    'esac' \
+    > "$TEST_ROOT/fail2ban-bin/systemctl"
+printf '%s\n' \
+    '#!/bin/sh' \
+    'case "$1" in' \
+    '    -t) exit 0 ;;' \
+    '    status)' \
+    '        [ "$2" = sshd ] && exit 0' \
+    '        [ "${MOCK_TOPOLOGY:-direct}" = direct ] && exit 0' \
+    '        exit 1' \
+    '        ;;' \
+    '    *) exit 1 ;;' \
+    'esac' \
+    > "$TEST_ROOT/fail2ban-bin/fail2ban-client"
+chmod 0755 \
+    "$TEST_ROOT/fail2ban-bin/systemctl" \
+    "$TEST_ROOT/fail2ban-bin/fail2ban-client"
+printf '%s\n' \
+    '[DEFAULT]' \
+    'ignoreip = 127.0.0.1/8 ::1 192.0.2.0/24' \
+    '' \
+    '[sshd]' \
+    'enabled = true' \
+    'port = 2356' \
+    > "$TEST_ROOT/fail2ban-policy.local"
+fail2ban_status_function=$(extract_function fail2ban_jail_active "$HOST_VERIFIER")
+fail2ban_check_function=$(extract_function check_fail2ban "$HOST_VERIFIER")
+for tested_topology in direct proxied; do
+    fail2ban_result=$(PATH="$TEST_ROOT/fail2ban-bin:$PATH" \
+        MOCK_TOPOLOGY="$tested_topology" sh -c "
+FAILED_CHECKS=0
+FAIL2BAN_POLICY=$TEST_ROOT/fail2ban-policy.local
+TOPOLOGY=$tested_topology
+SSH_PHASE=final
+EXPECTED_IGNORE_IPS=192.0.2.0/24
+fail_msg() { FAILED_CHECKS=\$((FAILED_CHECKS + 1)); }
+pass_msg() { :; }
+$fail2ban_status_function
+$fail2ban_check_function
+check_fail2ban >/dev/null
+printf '%s\n' \"\$FAILED_CHECKS\"
+")
+    [ "$fail2ban_result" = 0 ] \
+        || fail "$tested_topology Fail2ban verification recorded $fail2ban_result failures"
+done
+
+missing_ignore_result=$(PATH="$TEST_ROOT/fail2ban-bin:$PATH" \
+    MOCK_TOPOLOGY=direct sh -c "
+FAILED_CHECKS=0
+FAIL2BAN_POLICY=$TEST_ROOT/fail2ban-policy.local
+TOPOLOGY=direct
+SSH_PHASE=final
+EXPECTED_IGNORE_IPS=198.51.100.0/24
+fail_msg() { FAILED_CHECKS=\$((FAILED_CHECKS + 1)); }
+pass_msg() { :; }
+$fail2ban_status_function
+$fail2ban_check_function
+check_fail2ban >/dev/null
+printf '%s\n' \"\$FAILED_CHECKS\"
+")
+[ "$missing_ignore_result" = 1 ] \
+    || fail "missing Fail2ban ignore CIDR recorded $missing_ignore_result failures"
+
+certificate_function=$(extract_function check_certificate_health "$HOST_VERIFIER")
+printf '#!/bin/sh\nprintf "certificate ok\\n"\n' \
+    > "$TEST_ROOT/certificate-pass"
+printf '#!/bin/sh\nprintf "certificate failed\\n" >&2\nexit 1\n' \
+    > "$TEST_ROOT/certificate-fail"
+chmod 0755 "$TEST_ROOT/certificate-pass" "$TEST_ROOT/certificate-fail"
+certificate_result=$(sh -c "
+FAILED_CHECKS=0
+VERBOSE=0
+CERTBOT_HEALTHCHECK=$TEST_ROOT/certificate-pass
+fail_msg() { FAILED_CHECKS=\$((FAILED_CHECKS + 1)); }
+pass_msg() { :; }
+info_msg() { :; }
+$certificate_function
+check_certificate_health >/dev/null
+CERTBOT_HEALTHCHECK=$TEST_ROOT/certificate-fail
+check_certificate_health >/dev/null
+printf '%s\n' \"\$FAILED_CHECKS\"
+")
+[ "$certificate_result" = 1 ] \
+    || fail "certificate health verification recorded $certificate_result failures"
 
 for nginx_verifier in \
     "$REPOSITORY_ROOT/deploy/install-nginx" \

@@ -51,6 +51,14 @@ assert_plan_contains() {
         || fail "installation plan is missing: $expected_line"
 }
 
+assert_plan_excludes() {
+    plan_file=$1
+    rejected_line=$2
+    if grep -F -- "$rejected_line" "$plan_file" >/dev/null; then
+        fail "installation plan unexpectedly contains: $rejected_line"
+    fi
+}
+
 trap cleanup EXIT HUP INT TERM
 
 [ -x "$CERTBOT_INSTALLER" ] || fail 'certbot/install is not executable'
@@ -99,6 +107,99 @@ assert_plan_contains \
 assert_plan_contains \
     "$TEST_ROOT/centos-stream-10.plan" \
     'Certbot installation target: CentOS Stream 10'
+
+fake_binary_directory=$TEST_ROOT/fake-bin
+mkdir "$fake_binary_directory"
+cat > "$fake_binary_directory/dnf" <<'EOF'
+#!/bin/sh
+
+if [ "$#" -eq 3 ] \
+    && [ "$1" = -q ] \
+    && [ "$2" = repolist ] \
+    && [ "$3" = --all ]; then
+    cat "$FAKE_DNF_REPOSITORY_LIST"
+    exit 0
+fi
+
+printf 'unexpected fake dnf invocation: %s\n' "$*" >&2
+exit 1
+EOF
+chmod 0755 "$fake_binary_directory/dnf"
+cat > "$fake_binary_directory/uname" <<'EOF'
+#!/bin/sh
+
+[ "$#" -eq 1 ] && [ "$1" = -m ] || exit 1
+printf 'x86_64\n'
+EOF
+chmod 0755 "$fake_binary_directory/uname"
+
+cat > "$TEST_ROOT/azure-rhui-enabled.repos" <<'EOF'
+repo id                                                  repo name status
+codeready-builder-for-rhel-9-x86_64-eus-rhui-rpms        CodeReady enabled
+rhel-9-for-x86_64-baseos-eus-rhui-rpms                   BaseOS enabled
+EOF
+FAKE_DNF_REPOSITORY_LIST="$TEST_ROOT/azure-rhui-enabled.repos" \
+PATH="$fake_binary_directory:$PATH" \
+    "$CERTBOT_INSTALLER" \
+    --plan \
+    --os-release "$TEST_ROOT/rhel-9" \
+    > "$TEST_ROOT/azure-rhui-enabled.plan"
+assert_plan_contains \
+    "$TEST_ROOT/azure-rhui-enabled.plan" \
+    'CodeReady Builder repository already enabled: codeready-builder-for-rhel-9-x86_64-eus-rhui-rpms'
+assert_plan_excludes \
+    "$TEST_ROOT/azure-rhui-enabled.plan" \
+    'subscription-manager repos --enable'
+
+cat > "$TEST_ROOT/azure-rhui-disabled.repos" <<'EOF'
+repo id                                                  repo name status
+codeready-builder-for-rhel-9-x86_64-eus-rhui-rpms        CodeReady disabled
+rhel-9-for-x86_64-baseos-eus-rhui-rpms                   BaseOS enabled
+EOF
+FAKE_DNF_REPOSITORY_LIST="$TEST_ROOT/azure-rhui-disabled.repos" \
+PATH="$fake_binary_directory:$PATH" \
+    "$CERTBOT_INSTALLER" \
+    --plan \
+    --os-release "$TEST_ROOT/rhel-9" \
+    > "$TEST_ROOT/azure-rhui-disabled.plan"
+assert_plan_contains \
+    "$TEST_ROOT/azure-rhui-disabled.plan" \
+    'dnf config-manager --set-enabled codeready-builder-for-rhel-9-x86_64-eus-rhui-rpms'
+assert_plan_excludes \
+    "$TEST_ROOT/azure-rhui-disabled.plan" \
+    'subscription-manager repos --enable'
+
+cat > "$TEST_ROOT/aws-rhui-disabled.repos" <<'EOF'
+repo id                                    repo name status
+codeready-builder-for-rhel-9-rhui-rpms     CodeReady disabled
+rhel-9-baseos-rhui-rpms                    BaseOS enabled
+EOF
+FAKE_DNF_REPOSITORY_LIST="$TEST_ROOT/aws-rhui-disabled.repos" \
+PATH="$fake_binary_directory:$PATH" \
+    "$CERTBOT_INSTALLER" \
+    --plan \
+    --os-release "$TEST_ROOT/rhel-9" \
+    > "$TEST_ROOT/aws-rhui-disabled.plan"
+assert_plan_contains \
+    "$TEST_ROOT/aws-rhui-disabled.plan" \
+    'dnf config-manager --set-enabled codeready-builder-for-rhel-9-rhui-rpms'
+assert_plan_excludes \
+    "$TEST_ROOT/aws-rhui-disabled.plan" \
+    'subscription-manager repos --enable'
+
+cat > "$TEST_ROOT/azure-rhui-missing-builder.repos" <<'EOF'
+repo id                                    repo name status
+rhel-9-for-x86_64-baseos-eus-rhui-rpms     BaseOS enabled
+rhel-9-for-x86_64-appstream-eus-rhui-rpms  AppStream enabled
+EOF
+expect_failure \
+    'CodeReady Builder repository is unavailable through configured RHEL RHUI repositories' \
+    env \
+    "FAKE_DNF_REPOSITORY_LIST=$TEST_ROOT/azure-rhui-missing-builder.repos" \
+    "PATH=$fake_binary_directory:$PATH" \
+    "$CERTBOT_INSTALLER" \
+    --plan \
+    --os-release "$TEST_ROOT/rhel-9"
 
 "$CERTBOT_INSTALLER" \
     --plan \

@@ -16,8 +16,10 @@ host; the installer fails if the other backend is still installed.
 
 - Run this after the repository nginx baseline is installed. The installer
   requires `/usr/sbin/nginx`, the `nginx` group, and systemd.
-- RHEL must be registered with access to its matching CodeReady Builder
-  repository. Rocky Linux and CentOS Stream use their `crb` repository.
+- Subscription-managed RHEL must be registered with access to its matching
+  CodeReady Builder repository. A RHEL RHUI image must expose its matching
+  CodeReady Builder RHUI repository. Rocky Linux and CentOS Stream use their
+  `crb` repository.
 - The host needs outbound access to its configured DNF repositories and, for
   the Snap backend, the Snap Store.
 - Review the plan on the target host before running it as root.
@@ -25,7 +27,10 @@ host; the installer fails if the other backend is still installed.
 The installer enables the matching EPEL release through Fedora's stable
 major-version permalink. It supports `x86_64` and `aarch64` hosts and rejects
 unknown operating systems, unsupported major versions, and ambiguous CentOS
-variants before installing anything.
+variants before installing anything. On RHEL it reuses an enabled CodeReady
+Builder repository, enables a discovered RHUI variant with DNF, or uses
+`subscription-manager` for a subscription-managed host. It fails closed when
+the configured RHUI does not publish CodeReady Builder.
 
 ## Install
 
@@ -59,6 +64,8 @@ The installation performs these common actions:
 - installs the repository `certbot.timer` and the selected renewal payload;
 - disables the package-owned renewal scheduler so exactly one timer remains;
 - installs `certbot-healthcheck` under `/usr/local/bin`;
+- installs and enables a daily certificate-health timer with a 30-day warning
+  threshold;
 - verifies the composed systemd units; and
 - enables the repository's twice-daily renewal timer.
 
@@ -67,23 +74,49 @@ link targets and will not delete a locally modified file while changing the
 backend integration. It does not request a certificate or edit a site; those
 actions require deployment-specific domain names and review.
 
-## Request the first certificate
+## Issue the first certificate
 
 The nginx baseline already serves `/.well-known/acme-challenge/` from the
-shared webroot. Request certificates without allowing Certbot to rewrite the
-repository-managed nginx configuration:
+shared webroot. Use `issue` so the first request is plan-first, proves the
+local HTTP-01 path, and cannot silently target production before the same
+names pass Let's Encrypt staging. Repeat `--domain` in the intended lineage
+order; the first name becomes the Certbot lineage name.
 
 ```sh
-sudo certbot certonly \
-    --webroot \
-    --webroot-path /var/www/letsencrypt \
+certbot/issue --plan --staging \
+    --email admin@example.com \
+    --domain example.com \
+    --domain www.example.com
+sudo certbot/issue --staging \
+    --email admin@example.com \
+    --domain example.com \
+    --domain www.example.com
+
+certbot/issue --plan --production --staging-passed \
+    --email admin@example.com \
+    --domain example.com \
+    --domain www.example.com
+sudo certbot/issue --production --staging-passed \
+    --email admin@example.com \
     --domain example.com \
     --domain www.example.com
 ```
 
+Add `--backend snap` to every command when that backend is installed. Staging
+uses Certbot's non-persistent `--dry-run`; `--staging-passed` is an explicit
+operator assertion that the production names match the successful test. The
+helper rejects wildcard names because they require a deployment-specific
+DNS-01 plugin and protected provider credentials.
+
 Add the resulting `/etc/letsencrypt/live/DOMAIN/` paths to the reviewed site
 configuration, run `/usr/sbin/nginx -t`, and reload nginx only after that test
 passes.
+
+The helper refuses an existing lineage. Change lineage-specific settings with
+`certbot reconfigure`; do not hand-edit files under
+`/etc/letsencrypt/renewal/`. Do not place domains or per-site authenticator
+settings in a global `cli.ini`, because those defaults affect every Certbot
+invocation on the host.
 
 Then validate renewal and expiry monitoring:
 
@@ -92,11 +125,17 @@ sudo certbot renew --dry-run
 sudo systemctl start certbot.service
 sudo systemctl list-timers --no-pager | grep -Ei 'certbot|letsencrypt'
 sudo /usr/local/bin/certbot-healthcheck
+sudo systemctl start certbot-healthcheck.service
 ```
 
 For the Snap backend, start `snap.certbot.renew.service` instead of
 `certbot.service`. See [`../systemd/README.md`](../systemd/README.md) for the
 complete backend contract, sandbox rationale, and runtime checks.
+
+The daily health service exits nonzero when any managed certificate is
+missing, invalid, or within 30 days of expiry. It intentionally has no email,
+webhook, or vendor-specific notification credential; host monitoring must
+alert on a failed `certbot-healthcheck.service` unit.
 
 ## Switching backends
 

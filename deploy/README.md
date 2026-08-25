@@ -107,8 +107,14 @@ sudo deploy/setup-host \
 ```
 
 Preparation keeps both SSH ports 22 and 2356 open and configures Fail2ban to
-watch both. Prove a new key-authenticated, non-root login on port 2356. From
-that new session, preview and apply finalization:
+watch both. It also installs the selected Certbot backend and its renewal and
+health timers. Before finalization, use the staging-then-production workflow
+in [`../certbot/README.md`](../certbot/README.md), install the resulting
+certificate paths in the reviewed site, run `nginx -t`, and reload nginx.
+Final verification fails closed when no valid managed certificate exists.
+
+Prove a new key-authenticated, non-root login on port 2356. From that new
+session, preview and apply finalization:
 
 ```sh
 deploy/setup-host \
@@ -160,11 +166,11 @@ sudo deploy/install-host-tools
 ```
 
 `verify-deployment` performs a non-destructive, root-only audit of live host
-state,
-asserting Nginx version and configuration, active systemd units, OpenSSH port
-and authentication restrictions, firewalld service definitions, SELinux
-Enforcing mode and port labels, QUIC buffer limits, and per-site PHP-FPM socket
-permissions.
+state, asserting Nginx version and configuration, certificate validity,
+synchronized time, active systemd units, OpenSSH phase and authentication
+restrictions, Fail2ban runtime and topology policy, services in the selected
+firewalld zone, SELinux Enforcing mode and port labels, QUIC buffer limits,
+and per-site PHP-FPM socket permissions.
 
 ```sh
 # Auto-detect the installed Certbot backend (recommended):
@@ -173,9 +179,19 @@ sudo /usr/local/bin/verify-deployment
 # Explicit override for operator diagnosis:
 sudo /usr/local/bin/verify-deployment --backend snap
 
+# Match a non-default setup contract:
+sudo /usr/local/bin/verify-deployment \
+    --zone edge \
+    --topology proxied \
+    --ignore-ip 192.0.2.0/24
+
 # With per-site PHP-FPM socket check:
 sudo /usr/local/bin/verify-deployment --site example_wp --verbose
 ```
+
+Repeat `--ignore-ip` for every administrative CIDR passed to host setup. Use
+`--ssh-phase prepare` only while both transition ports are intentionally
+active; final is the default. The verifier never changes host state.
 
 `certbot-healthcheck` fails closed when the live tree is missing, empty, or
 contains an invalid certificate. JSON output requires `jq`; file output is

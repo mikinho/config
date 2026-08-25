@@ -228,11 +228,13 @@ sudo deploy/setup-host \
 ```
 
 Prove a new key-authenticated SSH session on TCP 2356 while keeping the
-original session open, then rerun with `--ssh-phase finalize` from that new
-session. The finalize phase removes the temporary port-22 listener and
-firewall allowances, changes Fail2ban to watch only 2356, and runs the strict
-host verifier. See [`deploy/README.md`](deploy/README.md) for the full profile
-and rerun contract.
+original session open. Before finalization, pass the Certbot staging workflow,
+issue the production lineage, and install its paths in the reviewed nginx
+site. Then rerun with `--ssh-phase finalize` from the new session. The finalize
+phase removes the temporary port-22 listener and firewall allowances, changes
+Fail2ban to watch only 2356, and runs the strict host verifier, which requires
+a healthy managed certificate. See [`deploy/README.md`](deploy/README.md) for
+the full profile and rerun contract.
 
 Install Certbot only after the nginx baseline is present. The component
 installer detects supported RHEL, Rocky Linux, and CentOS Stream releases,
@@ -564,6 +566,12 @@ acts only on certificates near expiry, while the randomized windows avoid
 synchronized ACME traffic. Keep `Persistent=true` so a missed run is triggered
 after the host returns.
 
+An independent `certbot-healthcheck.timer` runs daily at 03:00 local time with
+up to two hours of randomized delay. Its read-only service checks every
+managed lineage and fails when a certificate is invalid or within 30 days of
+expiry. Connect failed-unit state to the host's monitoring system; alert
+transport and credentials are deployment state rather than repository config.
+
 The included nginx HTTP listener serves `/.well-known/acme-challenge/` from
 `/var/www/letsencrypt`. Certificates and account data under `/etc/letsencrypt`
 are host state and must never be committed.
@@ -679,17 +687,19 @@ sudo /usr/sbin/nginx -t -c /etc/nginx/nginx.conf
 sudo systemd-analyze verify /etc/systemd/system/nginx.service
 # Native Certbot backend only:
 sudo systemd-analyze verify certbot.service certbot.timer
+sudo systemd-analyze verify certbot-healthcheck.service certbot-healthcheck.timer
 sudo systemd-analyze security nginx.service certbot.service
 sudo systemctl start certbot.service
 sudo systemctl --no-pager show certbot.service \
     -p Result -p ExecMainCode -p ExecMainStatus -p ExecStopPost
 # Snap Certbot backend only:
 sudo systemd-analyze verify snap.certbot.renew.service certbot.timer
+sudo systemd-analyze verify certbot-healthcheck.service certbot-healthcheck.timer
 sudo systemctl start snap.certbot.renew.service
 sudo systemctl --no-pager show snap.certbot.renew.service \
     -p Result -p ExecMainCode -p ExecMainStatus -p ExecStopPost -p DropInPaths
 # Both backends:
-sudo systemctl --no-pager show certbot.timer \
+sudo systemctl --no-pager show certbot.timer certbot-healthcheck.timer \
     -p Unit -p TimersCalendar -p RandomizedDelayUSec -p Persistent
 sudo systemctl list-timers --no-pager | grep -Ei 'certbot|letsencrypt'
 sudo certbot renew --dry-run
