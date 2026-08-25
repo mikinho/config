@@ -145,9 +145,10 @@ any denial instead of weakening the policy globally. Non-standard content
 roots need a persistent `semanage fcontext` rule followed by `restorecon`.
 When nginx must proxy to a TCP upstream, review and enable the standard
 `httpd_can_network_connect` boolean; a Unix-domain socket or a tighter local
-policy is preferable when practical. The `policycoreutils` and
-`policycoreutils-python-utils` packages provide the relevant administration
-tools on RHEL-family systems. The `selinux/` directory supplies the policy
+policy is preferable when practical. The `policycoreutils`,
+`policycoreutils-python-utils`, and `setools-console` packages provide the
+relevant administration and loaded-policy inspection tools on RHEL-family
+systems. The `selinux/` directory supplies the policy
 registrations this baseline needs beyond the distribution policy — runtime
 file contexts, the QUIC UDP port label, the setrlimit boolean — and the
 optional `quic_bpf` policy module.
