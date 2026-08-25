@@ -1,0 +1,100 @@
+#!/bin/sh
+
+set -eu
+
+PROGRAM_NAME=${0##*/}
+SCRIPT_DIRECTORY=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+REPOSITORY_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIRECTORY/.." && pwd)
+PLATFORM_LIBRARY=$REPOSITORY_ROOT/deploy/lib/platform.sh
+
+[ -f "$PLATFORM_LIBRARY" ] && [ ! -L "$PLATFORM_LIBRARY" ] || {
+    printf '%s: platform library must be a regular file: %s\n' \
+        "$PROGRAM_NAME" "$PLATFORM_LIBRARY" >&2
+    exit 1
+}
+# shellcheck disable=SC1090,SC1091
+. "$PLATFORM_LIBRARY"
+
+MODE=install
+OS_RELEASE_FILE=$PLATFORM_DEFAULT_OS_RELEASE
+OS_RELEASE_OVERRIDDEN=no
+
+usage() {
+    cat <<EOF
+Usage:
+  $PROGRAM_NAME
+  $PROGRAM_NAME --plan [--os-release FILE]
+  $PROGRAM_NAME --check
+
+Installs the Fail2ban packages required by this repository on a supported
+RHEL-family host. It does not install jail policy or start Fail2ban; run
+fail2ban/setup with an explicit topology and administrative ignore CIDR next.
+EOF
+}
+
+fail() {
+    printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2
+    exit 1
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --check)
+            [ "$MODE" = install ] || fail "select exactly one mode"
+            MODE=check
+            shift
+            ;;
+        --plan)
+            [ "$MODE" = install ] || fail "select exactly one mode"
+            MODE=plan
+            shift
+            ;;
+        --os-release)
+            [ "$#" -ge 2 ] || fail "--os-release requires a file"
+            OS_RELEASE_FILE=$2
+            OS_RELEASE_OVERRIDDEN=yes
+            shift 2
+            ;;
+        --help | -h)
+            usage
+            exit 0
+            ;;
+        *) fail "unknown argument: $1" ;;
+    esac
+done
+
+if [ "$MODE" = check ]; then
+    [ "$OS_RELEASE_OVERRIDDEN" = no ] \
+        || fail "--os-release is accepted only with --plan"
+    printf 'Validated Fail2ban installer and shared platform source.\n'
+    exit 0
+fi
+
+if [ "$OS_RELEASE_OVERRIDDEN" = yes ] && [ "$MODE" != plan ]; then
+    fail "--os-release is accepted only with --plan"
+fi
+
+platform_detect_supported_os "$OS_RELEASE_FILE"
+printf 'Fail2ban installation target: %s (%s)\n' \
+    "$PLATFORM_OS_LABEL" "$PLATFORM_OS_ARCHITECTURE"
+
+if [ "$MODE" = install ]; then
+    [ "$(id -u)" -eq 0 ] || fail "run as root or use --plan"
+    command -v dnf >/dev/null 2>&1 || fail "required command not found: dnf"
+fi
+
+# Consumed by the sourced platform library.
+# shellcheck disable=SC2034
+PLATFORM_MODE=$MODE
+platform_install_epel_repository
+platform_run dnf install --assumeyes \
+    fail2ban \
+    fail2ban-firewalld \
+    fail2ban-selinux \
+    python3
+
+if [ "$MODE" = plan ]; then
+    printf 'Plan complete; no host changes were made.\n'
+else
+    printf 'Installed Fail2ban packages; policy remains inactive until fail2ban/setup succeeds.\n'
+fi

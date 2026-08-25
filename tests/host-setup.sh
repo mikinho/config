@@ -1,0 +1,257 @@
+#!/bin/sh
+
+set -eu
+
+PROGRAM_NAME=${0##*/}
+SCRIPT_DIRECTORY=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+REPOSITORY_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIRECTORY/.." && pwd)
+TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/config-host-setup.XXXXXX")
+
+FAIL2BAN_INSTALL=$REPOSITORY_ROOT/fail2ban/install
+FAIL2BAN_SETUP=$REPOSITORY_ROOT/fail2ban/setup
+FIREWALL_INSTALL=$REPOSITORY_ROOT/firewalld/install
+FIREWALL_SETUP=$REPOSITORY_ROOT/firewalld/setup
+SELINUX_INSTALL=$REPOSITORY_ROOT/selinux/install
+SELINUX_SETUP=$REPOSITORY_ROOT/selinux/setup
+SSH_INSTALL=$REPOSITORY_ROOT/ssh/install
+SSH_SETUP=$REPOSITORY_ROOT/ssh/setup
+NGINX_SETUP=$REPOSITORY_ROOT/nginx/setup
+CERTBOT_SETUP=$REPOSITORY_ROOT/certbot/setup
+HOST_SETUP=$REPOSITORY_ROOT/deploy/setup-host
+
+cleanup() {
+    if [ -d "$TEST_ROOT" ]; then
+        rm -rf -- "$TEST_ROOT"
+    fi
+}
+
+trap cleanup EXIT HUP INT TERM
+
+fail() {
+    printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2
+    exit 1
+}
+
+expect_failure() {
+    expected_message=$1
+    shift
+    if "$@" >"$TEST_ROOT/command.stdout" 2>"$TEST_ROOT/command.stderr"; then
+        fail "command unexpectedly succeeded: $*"
+    fi
+    grep -F -- "$expected_message" "$TEST_ROOT/command.stderr" >/dev/null \
+        || fail "command failed without expected message: $expected_message"
+}
+
+assert_contains() {
+    checked_file=$1
+    expected_text=$2
+    grep -F -- "$expected_text" "$checked_file" >/dev/null \
+        || fail "$checked_file is missing: $expected_text"
+}
+
+assert_not_contains() {
+    checked_file=$1
+    rejected_text=$2
+    if grep -F -- "$rejected_text" "$checked_file" >/dev/null; then
+        fail "$checked_file unexpectedly contains: $rejected_text"
+    fi
+}
+
+write_os_release() {
+    release_path=$1
+    release_id=$2
+    release_name=$3
+    release_version=$4
+    printf 'ID=%s\nPRETTY_NAME="%s"\nVERSION_ID="%s"\n' \
+        "$release_id" "$release_name" "$release_version" \
+        > "$release_path"
+}
+
+for setup_entrypoint in \
+    "$FAIL2BAN_INSTALL" \
+    "$FAIL2BAN_SETUP" \
+    "$FIREWALL_INSTALL" \
+    "$FIREWALL_SETUP" \
+    "$SELINUX_INSTALL" \
+    "$SELINUX_SETUP" \
+    "$SSH_INSTALL" \
+    "$SSH_SETUP" \
+    "$NGINX_SETUP" \
+    "$CERTBOT_SETUP" \
+    "$HOST_SETUP"
+do
+    [ -x "$setup_entrypoint" ] || fail "entry point is not executable: $setup_entrypoint"
+    "$setup_entrypoint" --help >/dev/null
+    "$setup_entrypoint" --check >/dev/null
+done
+
+write_os_release "$TEST_ROOT/rocky-9" rocky 'Rocky Linux 9.7' 9.7
+write_os_release "$TEST_ROOT/centos-stream-10" centos 'CentOS Stream 10' 10
+
+for platform_installer in \
+    "$FAIL2BAN_INSTALL" \
+    "$FIREWALL_INSTALL" \
+    "$SELINUX_INSTALL" \
+    "$SSH_INSTALL"
+do
+    "$platform_installer" --plan --os-release "$TEST_ROOT/rocky-9" \
+        > "$TEST_ROOT/$(basename "${platform_installer%/*}")-rocky.plan"
+done
+assert_contains "$TEST_ROOT/fail2ban-rocky.plan" \
+    'dnf config-manager --set-enabled crb'
+assert_contains "$TEST_ROOT/fail2ban-rocky.plan" \
+    'fail2ban-firewalld fail2ban-selinux'
+assert_contains "$TEST_ROOT/fail2ban-rocky.plan" 'python3'
+assert_contains "$TEST_ROOT/firewalld-rocky.plan" \
+    'systemctl enable --now firewalld.service'
+assert_contains "$TEST_ROOT/selinux-rocky.plan" \
+    'policycoreutils-python-utils'
+assert_contains "$TEST_ROOT/ssh-rocky.plan" \
+    'dnf install --assumeyes openssh-server'
+
+"$FAIL2BAN_SETUP" \
+    --output "$TEST_ROOT/fail2ban-direct" \
+    --topology direct \
+    --ssh-phase prepare \
+    --ignore-ip 192.0.2.0/24 \
+    --ignore-ip 2001:db8::/32 \
+    >/dev/null
+"$FAIL2BAN_SETUP" \
+    --output "$TEST_ROOT/fail2ban-proxied" \
+    --topology proxied \
+    --ssh-phase final \
+    --ignore-ip 198.51.100.9/32 \
+    >/dev/null
+
+direct_enable=$TEST_ROOT/fail2ban-direct/etc/fail2ban/jail.d/90-baseline.local
+proxied_enable=$TEST_ROOT/fail2ban-proxied/etc/fail2ban/jail.d/90-baseline.local
+assert_contains "$direct_enable" 'ignoreip = 127.0.0.1/8 ::1 192.0.2.0/24 2001:db8::/32'
+assert_contains "$direct_enable" 'port = 22,2356'
+[ "$(grep -c '^enabled = true$' "$direct_enable")" -eq 4 ] \
+    || fail 'direct Fail2ban policy did not enable all four jails'
+assert_contains "$proxied_enable" 'port = 2356'
+[ "$(grep -c '^enabled = false$' "$proxied_enable")" -eq 3 ] \
+    || fail 'proxied Fail2ban policy did not disable all nginx jails'
+[ "$(grep -c '^enabled = true$' "$proxied_enable")" -eq 1 ] \
+    || fail 'proxied Fail2ban policy did not enable only sshd'
+
+for safe_jail in \
+    "$TEST_ROOT/fail2ban-direct/etc/fail2ban/jail.local" \
+    "$TEST_ROOT/fail2ban-proxied/etc/fail2ban/jail.local"
+do
+    [ "$(grep -c '^enabled = false$' "$safe_jail")" -eq 4 ] \
+        || fail 'shared Fail2ban jail policy is not disabled by default'
+done
+
+expect_failure \
+    'at least one administrative --ignore-ip CIDR is required' \
+    "$FAIL2BAN_SETUP" --plan --topology direct
+expect_failure \
+    'invalid administrative CIDR' \
+    "$FAIL2BAN_SETUP" --plan --topology direct --ignore-ip 999.0.0.1/24
+expect_failure \
+    'unsupported Fail2ban topology' \
+    "$FAIL2BAN_SETUP" --plan --topology arbitrary --ignore-ip 192.0.2.0/24
+
+"$FIREWALL_SETUP" --plan --service nginx --service ssh-hardened \
+    > "$TEST_ROOT/firewall.plan"
+assert_contains "$TEST_ROOT/firewall.plan" '--add-service=nginx'
+assert_contains "$TEST_ROOT/firewall.plan" '--add-service=ssh-hardened'
+assert_not_contains "$TEST_ROOT/firewall.plan" 'zones/public.xml'
+assert_not_contains "$TEST_ROOT/firewall.plan" '--remove-service'
+expect_failure \
+    'unsupported firewalld service' \
+    "$FIREWALL_SETUP" --plan --service arbitrary
+
+"$SSH_SETUP" --plan --phase prepare --authorized-key-ready \
+    > "$TEST_ROOT/ssh-prepare.plan"
+assert_contains "$TEST_ROOT/ssh-prepare.plan" \
+    '10-baseline-transition-port.conf'
+assert_contains "$TEST_ROOT/ssh-prepare.plan" '--add-service=ssh-hardened'
+assert_not_contains "$TEST_ROOT/ssh-prepare.plan" '--remove-service=ssh'
+"$SSH_SETUP" --plan --phase finalize --console-confirmed \
+    > "$TEST_ROOT/ssh-finalize.plan"
+assert_contains "$TEST_ROOT/ssh-finalize.plan" \
+    'rm -f -- /etc/ssh/sshd_config.d/10-baseline-transition-port.conf'
+assert_contains "$TEST_ROOT/ssh-finalize.plan" '--remove-service=ssh'
+assert_contains "$TEST_ROOT/ssh-finalize.plan" '--remove-port=22/tcp'
+expect_failure \
+    '--phase prepare requires --authorized-key-ready' \
+    "$SSH_SETUP" --plan --phase prepare
+
+"$NGINX_SETUP" --plan > "$TEST_ROOT/nginx.plan"
+assert_contains "$TEST_ROOT/nginx.plan" '--add-service=nginx'
+assert_contains "$TEST_ROOT/nginx.plan" '/etc/systemd/system/nginx.service'
+assert_contains "$TEST_ROOT/nginx.plan" '/etc/sysctl.d/99-nginx-quic.conf'
+assert_contains "$TEST_ROOT/nginx.plan" \
+    'sysctl --load=/etc/sysctl.d/99-nginx-quic.conf'
+assert_not_contains "$TEST_ROOT/nginx.plan" 'sysctl --system'
+assert_not_contains "$TEST_ROOT/nginx.plan" \
+    'install -D -o root -g root -m 0644 nginx.conf /etc/nginx/nginx.conf'
+assert_not_contains "$TEST_ROOT/nginx.plan" 'zones/public.xml'
+
+"$HOST_SETUP" \
+    --plan \
+    --profile edge-direct \
+    --ssh-phase prepare \
+    --authorized-key-ready \
+    --ignore-ip 192.0.2.0/24 \
+    --os-release "$TEST_ROOT/rocky-9" \
+    > "$TEST_ROOT/host-direct.plan"
+assert_contains "$TEST_ROOT/host-direct.plan" \
+    'Host setup: profile=edge-direct, topology=direct, ssh-phase=prepare'
+assert_contains "$TEST_ROOT/host-direct.plan" \
+    'Fail2ban setup: topology=direct, ssh-phase=prepare'
+assert_contains "$TEST_ROOT/host-direct.plan" 'backend: native'
+assert_not_contains "$TEST_ROOT/host-direct.plan" 'zones/public.xml'
+
+"$HOST_SETUP" \
+    --plan \
+    --profile edge-proxied \
+    --ssh-phase finalize \
+    --console-confirmed \
+    --ignore-ip 2001:db8::/32 \
+    --certbot-backend snap \
+    --os-release "$TEST_ROOT/centos-stream-10" \
+    > "$TEST_ROOT/host-proxied.plan"
+assert_contains "$TEST_ROOT/host-proxied.plan" \
+    'Host setup: profile=edge-proxied, topology=proxied, ssh-phase=finalize'
+assert_contains "$TEST_ROOT/host-proxied.plan" \
+    'Fail2ban setup: topology=proxied, ssh-phase=final'
+assert_contains "$TEST_ROOT/host-proxied.plan" 'backend: snap'
+
+expect_failure \
+    '--ssh-phase prepare requires --authorized-key-ready' \
+    "$HOST_SETUP" \
+    --plan \
+    --profile edge-direct \
+    --ssh-phase prepare \
+    --ignore-ip 192.0.2.0/24 \
+    --os-release "$TEST_ROOT/rocky-9"
+expect_failure \
+    'unsupported host profile' \
+    "$HOST_SETUP" \
+    --plan \
+    --profile arbitrary \
+    --ssh-phase none \
+    --ignore-ip 192.0.2.0/24 \
+    --os-release "$TEST_ROOT/rocky-9"
+expect_failure \
+    'invalid administrative CIDR' \
+    "$HOST_SETUP" \
+    --plan \
+    --profile edge-direct \
+    --ssh-phase none \
+    --ignore-ip '*/24' \
+    --os-release "$TEST_ROOT/rocky-9"
+
+fixture_root=$TEST_ROOT/repository
+mkdir -p "$fixture_root/fail2ban"
+cp -R "$REPOSITORY_ROOT/fail2ban/." "$fixture_root/fail2ban/"
+rm "$fixture_root/fail2ban/templates/90-baseline.local.in"
+ln -s /etc/passwd "$fixture_root/fail2ban/templates/90-baseline.local.in"
+expect_failure \
+    'repository source must be a regular file' \
+    "$fixture_root/fail2ban/setup" --check
+
+printf 'Validated component setup safety boundaries and host profiles.\n'

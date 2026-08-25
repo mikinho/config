@@ -178,25 +178,61 @@ TCP 443 so clients always have an HTTP/2 or HTTP/1.1 fallback.
 - `php-fpm/` contains the optional per-site PHP-FPM pool, main configuration,
   provisioning contract, and validation guidance.
 - `logrotate/` contains the nginx file-log rotation policy.
-- `certbot/` contains the supported-OS installer and first-certificate
-  workflow for the native EPEL and official Snap Certbot backends.
-- `deploy/` contains the profile installer and its profile manifests.
-- `selinux/` contains the SELinux file-context and policy-module assets that
-  enforcing-mode deployments need beyond the distribution policy.
-- `fail2ban/` contains an optional intrusion-ban policy for deployments that
-  receive client traffic directly.
+- `certbot/` contains the supported-OS installer, standard setup entry point,
+  and first-certificate workflow for the native EPEL and official Snap
+  Certbot backends.
+- `deploy/` contains the nginx profile renderer, standard host profiles, and
+  the cross-component host setup orchestrator.
+- `selinux/` contains the supported-OS tooling installer plus the SELinux
+  file-context and policy-module setup assets enforcing-mode deployments need
+  beyond the distribution policy.
+- `fail2ban/` contains the supported-OS installer and topology-aware
+  intrusion-ban setup for both direct and proxied deployments.
 - `sysctl/` contains the kernel socket-buffer limits the QUIC listeners
   depend on.
-- `ssh/` contains `sshd_config.d` drop-ins hardening the distribution
-  OpenSSH daemon.
-- `firewalld/` contains per-product firewall service definitions and a
-  reference zone.
+- `ssh/` contains the OpenSSH installer and lockout-safe, two-phase setup for
+  the repository `sshd_config.d` hardening drop-ins.
+- `firewalld/` contains the installer, additive per-product service setup,
+  and a deliberately manual reference zone.
 - `packages/` contains pinned, source-signature-verified package bridges for
   security interfaces not yet available from a supported RHEL-family vendor.
 
 Each component directory carries its own README covering that component's
 installation and validation; this document remains authoritative for the
 platform baseline and the cross-component contracts.
+
+For a standard edge host, `deploy/setup-host` coordinates the component
+installers and setup entry points in dependency order. Select `edge-direct`
+when clients reach nginx directly or `edge-proxied` when a CDN or load
+balancer is the immediate peer. The profile controls Fail2ban nginx-jail
+activation; proxied hosts still retain the SSH jail. At least one trusted
+administrative CIDR is always required.
+
+The reviewed nginx tree must already exist at `/etc/nginx`. The orchestrator
+never renders or overwrites it. Review a non-mutating plan before applying the
+first SSH transition:
+
+```sh
+deploy/setup-host \
+    --plan \
+    --profile edge-direct \
+    --ssh-phase prepare \
+    --authorized-key-ready \
+    --ignore-ip 192.0.2.0/24
+
+sudo deploy/setup-host \
+    --profile edge-direct \
+    --ssh-phase prepare \
+    --authorized-key-ready \
+    --ignore-ip 192.0.2.0/24
+```
+
+Prove a new key-authenticated SSH session on TCP 2356 while keeping the
+original session open, then rerun with `--ssh-phase finalize` from that new
+session. The finalize phase removes the temporary port-22 listener and
+firewall allowances, changes Fail2ban to watch only 2356, and runs the strict
+host verifier. See [`deploy/README.md`](deploy/README.md) for the full profile
+and rerun contract.
 
 Install Certbot only after the nginx baseline is present. The component
 installer detects supported RHEL, Rocky Linux, and CentOS Stream releases,
@@ -612,10 +648,12 @@ material application, plugin, theme, proxy, or CDN change.
 GitHub Actions validates deployment profile coverage, exercises the installer,
 runs `nginx -t` against stable and mainline nginx.org packages on Rocky Linux
 9, exercises security and failure behavior against a running nginx, checks the
-units and logrotate policy on Rocky Linux 9 and CentOS Stream 10, builds the
-pinned rsync bridge as an unprivileged user on CentOS Stream 9, and scans the
-complete Git history for secrets. The weekly run also compares the pinned
-Actionlint and rsync releases with their current upstream releases; the rsync
+units, logrotate policy, two-stage SSH ports, firewalld/SELinux assets,
+Fail2ban topology policy, and standard host plans on Rocky Linux 9 and CentOS
+Stream 10, builds the pinned rsync bridge as an unprivileged user on CentOS
+Stream 9, and scans the complete Git history for secrets. The weekly run also
+compares the pinned Actionlint and rsync releases with their current upstream
+releases; the rsync
 job fails as soon as CentOS supplies an eligible replacement. GitHub's Ubuntu
 hosted runner is only the Docker and portable-tooling executor; it is not a
 supported deployment target. The third-party Brotli modules, `quic_bpf`

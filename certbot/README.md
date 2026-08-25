@@ -29,11 +29,21 @@ variants before installing anything.
 
 ## Install
 
+`setup` is the standard component entry point used by the host orchestrator.
+For Certbot it delegates to `install`, because the payload, webroot, timer,
+service/drop-ins, and healthcheck form one atomic runtime contract. The two
+commands therefore accept the same options; use `setup` in standardized host
+workflows and `install` when working on this component directly.
+
 Native EPEL backend:
 
 ```sh
 certbot/install --plan
 sudo certbot/install
+
+# Equivalent standardized entry point:
+certbot/setup --plan
+sudo certbot/setup
 ```
 
 Official Snap backend:

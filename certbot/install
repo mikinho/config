@@ -5,24 +5,25 @@ set -eu
 PROGRAM_NAME=${0##*/}
 SCRIPT_DIRECTORY=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 REPOSITORY_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIRECTORY/.." && pwd)
+PLATFORM_LIBRARY=$REPOSITORY_ROOT/deploy/lib/platform.sh
 SYSTEMD_SOURCE=$REPOSITORY_ROOT/systemd/system
 HEALTHCHECK_SOURCE=$REPOSITORY_ROOT/deploy/certbot-healthcheck
+
+[ -f "$PLATFORM_LIBRARY" ] && [ ! -L "$PLATFORM_LIBRARY" ] || {
+    printf '%s: platform library must be a regular file: %s\n' \
+        "$PROGRAM_NAME" "$PLATFORM_LIBRARY" >&2
+    exit 1
+}
+# shellcheck disable=SC1090,SC1091
+. "$PLATFORM_LIBRARY"
 
 SYSTEMD_TARGET=/etc/systemd/system
 LOCAL_BIN_TARGET=/usr/local/bin
 ACME_WEBROOT=/var/www/letsencrypt
-DEFAULT_OS_RELEASE=/etc/os-release
-EPEL_RELEASE_BASE_URL=https://dl.fedoraproject.org/pub/epel
-
 MODE=install
 BACKEND=native
-OS_RELEASE_FILE=$DEFAULT_OS_RELEASE
+OS_RELEASE_FILE=$PLATFORM_DEFAULT_OS_RELEASE
 OS_RELEASE_OVERRIDDEN=no
-OS_ID=
-OS_NAME=
-OS_VERSION_MAJOR=
-OS_ARCHITECTURE=
-OS_LABEL=
 
 usage() {
     cat <<EOF
@@ -60,78 +61,6 @@ run_command() {
     fi
 }
 
-read_os_release_value() {
-    release_key=$1
-
-    awk -F= -v requested_key="$release_key" '
-        $1 == requested_key {
-            sub(/^[^=]*=/, "")
-            print
-            exit
-        }
-    ' "$OS_RELEASE_FILE"
-}
-
-strip_os_release_quotes() {
-    release_value=$1
-
-    case "$release_value" in
-        \"*\")
-            release_value=${release_value#\"}
-            release_value=${release_value%\"}
-            ;;
-        \'*\')
-            release_value=${release_value#\'}
-            release_value=${release_value%\'}
-            ;;
-    esac
-
-    printf '%s\n' "$release_value"
-}
-
-detect_architecture() {
-    detected_architecture=$(uname -m)
-    case "$detected_architecture" in
-        x86_64 | amd64) OS_ARCHITECTURE=x86_64 ;;
-        aarch64 | arm64) OS_ARCHITECTURE=aarch64 ;;
-        *) fail "unsupported host architecture: $detected_architecture" ;;
-    esac
-}
-
-detect_supported_os() {
-    [ -f "$OS_RELEASE_FILE" ] && [ ! -L "$OS_RELEASE_FILE" ] \
-        || fail "OS release metadata must be a regular file: $OS_RELEASE_FILE"
-
-    OS_ID=$(strip_os_release_quotes "$(read_os_release_value ID)")
-    OS_NAME=$(strip_os_release_quotes "$(read_os_release_value PRETTY_NAME)")
-    release_version=$(strip_os_release_quotes "$(read_os_release_value VERSION_ID)")
-    OS_VERSION_MAJOR=${release_version%%.*}
-
-    case "$OS_VERSION_MAJOR" in
-        9 | 10) ;;
-        *) fail "unsupported OS version in $OS_RELEASE_FILE: ${release_version:-missing VERSION_ID}" ;;
-    esac
-
-    case "$OS_ID" in
-        rhel)
-            OS_LABEL="Red Hat Enterprise Linux $OS_VERSION_MAJOR"
-            ;;
-        rocky)
-            OS_LABEL="Rocky Linux $OS_VERSION_MAJOR"
-            ;;
-        centos)
-            case "$OS_NAME" in
-                *CentOS*Stream*) ;;
-                *) fail "CentOS Stream is required; detected: ${OS_NAME:-unknown CentOS variant}" ;;
-            esac
-            OS_LABEL="CentOS Stream $OS_VERSION_MAJOR"
-            ;;
-        *) fail "unsupported base OS: ${OS_ID:-missing ID}" ;;
-    esac
-
-    detect_architecture
-}
-
 validate_regular_source() {
     source_path=$1
     [ -f "$source_path" ] && [ ! -L "$source_path" ] \
@@ -146,6 +75,7 @@ validate_executable_source() {
 }
 
 validate_repository_sources() {
+    validate_regular_source "$PLATFORM_LIBRARY"
     validate_executable_source "$HEALTHCHECK_SOURCE"
     validate_regular_source "$SYSTEMD_SOURCE/certbot.service"
     validate_regular_source "$SYSTEMD_SOURCE/certbot.timer"
@@ -240,27 +170,6 @@ validate_install_host() {
                 "$SYSTEMD_TARGET/certbot.service"
             ;;
     esac
-}
-
-install_epel_repository() {
-    run_command dnf install --assumeyes ca-certificates dnf-plugins-core
-
-    case "$OS_ID" in
-        rhel)
-            if [ "$MODE" = install ]; then
-                command -v subscription-manager >/dev/null 2>&1 \
-                    || fail "subscription-manager is required to enable CodeReady Builder on RHEL"
-            fi
-            run_command subscription-manager repos --enable \
-                "codeready-builder-for-rhel-$OS_VERSION_MAJOR-$OS_ARCHITECTURE-rpms"
-            ;;
-        rocky | centos)
-            run_command dnf config-manager --set-enabled crb
-            ;;
-    esac
-
-    run_command dnf install --assumeyes \
-        "$EPEL_RELEASE_BASE_URL/epel-release-latest-$OS_VERSION_MAJOR.noarch.rpm"
 }
 
 stop_unit_if_present() {
@@ -363,7 +272,10 @@ restore_system_labels() {
 
 install_native_backend() {
     stop_unit_if_present certbot.timer
-    install_epel_repository
+    # Consumed by the sourced platform library.
+    # shellcheck disable=SC2034
+    PLATFORM_MODE=$MODE
+    platform_install_epel_repository
     run_command dnf install --assumeyes certbot
 
     if [ "$MODE" = install ]; then
@@ -426,7 +338,10 @@ ensure_snap_certbot_command() {
 
 install_snap_backend() {
     stop_unit_if_present certbot.timer
-    install_epel_repository
+    # Consumed by the sourced platform library.
+    # shellcheck disable=SC2034
+    PLATFORM_MODE=$MODE
+    platform_install_epel_repository
     run_command dnf install --assumeyes snapd
     run_command systemctl enable --now snapd.socket
     ensure_classic_snap_link
@@ -522,9 +437,9 @@ if [ "$OS_RELEASE_OVERRIDDEN" = yes ] && [ "$MODE" != plan ]; then
     fail "--os-release is accepted only with --plan"
 fi
 
-detect_supported_os
+platform_detect_supported_os "$OS_RELEASE_FILE"
 printf 'Certbot installation target: %s (%s), backend: %s\n' \
-    "$OS_LABEL" "$OS_ARCHITECTURE" "$BACKEND"
+    "$PLATFORM_OS_LABEL" "$PLATFORM_OS_ARCHITECTURE" "$BACKEND"
 
 if [ "$MODE" = install ]; then
     validate_install_host

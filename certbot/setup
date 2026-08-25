@@ -1,0 +1,18 @@
+#!/bin/sh
+
+set -eu
+
+PROGRAM_NAME=${0##*/}
+SCRIPT_DIRECTORY=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+INSTALLER=$SCRIPT_DIRECTORY/install
+
+[ -f "$INSTALLER" ] && [ ! -L "$INSTALLER" ] && [ -x "$INSTALLER" ] || {
+    printf '%s: Certbot installer must be a real executable file: %s\n' \
+        "$PROGRAM_NAME" "$INSTALLER" >&2
+    exit 1
+}
+
+# Certbot installation and runtime integration are intentionally atomic: the
+# selected payload, timer, service/drop-ins, webroot, and healthcheck must move
+# together. This standard setup entry point preserves that transaction.
+exec "$INSTALLER" "$@"

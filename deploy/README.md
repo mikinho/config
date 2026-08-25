@@ -63,6 +63,78 @@ If using `rsync`, apply `--delete` only to the exact managed `includes/` and
 `stubs/` directories, never to `/etc/nginx` as a whole. This prevents stale
 fragments without deleting package, certificate, or deployment-local state.
 
+## Standard host setup
+
+`setup-host` composes the supported-OS component installers with their
+repository setup policy. It supports two closed host profiles:
+
+| Profile | Client path | Fail2ban policy |
+| --- | --- | --- |
+| `edge-direct` | Clients connect directly to nginx. | Enables SSH and nginx jails. |
+| `edge-proxied` | A CDN or external load balancer is nginx's immediate peer. | Enables only SSH; firewall bans cannot act on restored client addresses. |
+
+The profile is intentionally small: site configuration, trusted proxy CIDRs,
+PHP pools, application services, and administrative ignore CIDRs remain
+deployment state. The selected firewalld zone must already exist. Setup adds
+the repository services but never installs `firewalld/zones/public.xml` or
+removes unrelated allowances.
+
+The exact reviewed nginx tree and supported `/usr/sbin/nginx` binary must be
+installed first. Preview a complete first-pass plan with:
+
+```sh
+deploy/setup-host \
+    --plan \
+    --profile edge-direct \
+    --ssh-phase prepare \
+    --authorized-key-ready \
+    --ignore-ip 192.0.2.0/24
+```
+
+Repeat `--ignore-ip` for each trusted administrative IPv4 or IPv6 CIDR. Add
+`--certbot-backend snap` only for the official Snap payload, `--zone NAME` for
+a non-default existing firewalld zone, and `--quic-bpf` only when the reviewed
+nginx render selected that profile.
+
+Apply preparation as root while retaining the existing SSH session:
+
+```sh
+sudo deploy/setup-host \
+    --profile edge-direct \
+    --ssh-phase prepare \
+    --authorized-key-ready \
+    --ignore-ip 192.0.2.0/24
+```
+
+Preparation keeps both SSH ports 22 and 2356 open and configures Fail2ban to
+watch both. Prove a new key-authenticated, non-root login on port 2356. From
+that new session, preview and apply finalization:
+
+```sh
+deploy/setup-host \
+    --plan \
+    --profile edge-direct \
+    --ssh-phase finalize \
+    --ignore-ip 192.0.2.0/24
+
+sudo deploy/setup-host \
+    --profile edge-direct \
+    --ssh-phase finalize \
+    --ignore-ip 192.0.2.0/24
+```
+
+Finalize refuses an SSH session not terminating on port 2356 unless
+`--console-confirmed` explicitly records out-of-band recovery access. It
+removes the temporary port-22 listener and allowances, updates Fail2ban to
+2356, and runs `verify-deployment`. Use `--ssh-phase none` only for an already
+finalized host; it leaves SSH untouched but still applies the other
+components and verifies the result.
+
+Each component remains independently callable through its `install` and
+`setup` entry points. The orchestrator is rerunnable and each setup validates
+before activation, but it is not one cross-component rollback transaction.
+Always inspect the plan and retain recoverable host backups.
+
 ## PHP site renderer
 
 `install-php-site` applies the same render-only philosophy to the per-site
@@ -159,13 +231,17 @@ Selection rationale, so the host's choices stay written down:
 
 ## Validation
 
-CI shellchecks the installers and their negative-path test, runs `--check`,
-exercises a full render, and verifies rejection of existing or ambiguous
-outputs and symbolic-link source files. It then renders a CI
+CI shellchecks the installers and their negative-path tests, validates both
+standard host profiles and their safety gates, runs `--check`, exercises a
+full render, and verifies rejection of existing or ambiguous outputs and
+symbolic-link source files. It then renders a CI
 profile and runs `nginx -t` against the pinned stable and mainline nginx.org
 packages on Rocky Linux 9. CI parses both the uncached and explicitly cached
 WordPress site variants. It also renders the documented production profile so
-profile drift is visible. The Brotli modules, `quic_bpf` kernel/SELinux path,
+profile drift is visible. RHEL-family jobs validate the two-stage effective
+sshd ports, firewalld definitions, SELinux assets, component plans, and
+rendered direct/proxied Fail2ban policy. The Brotli modules, `quic_bpf`
+kernel/SELinux path,
 and OpenSSL 3.5 hybrid group cannot be fully exercised by the stock CI
 environment, so `brotli`, `quic-bpf`, and `post-quantum` must be syntax- and
 runtime-tested with the exact modules, TLS provider, kernel, and policy on the

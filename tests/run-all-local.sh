@@ -32,12 +32,25 @@ if command -v shellcheck >/dev/null 2>&1; then
         "$REPOSITORY_ROOT/deploy/install-host-tools" \
         "$REPOSITORY_ROOT/deploy/verify-deployment" \
         "$REPOSITORY_ROOT/deploy/certbot-healthcheck" \
+        "$REPOSITORY_ROOT/deploy/lib/platform.sh" \
+        "$REPOSITORY_ROOT/deploy/setup-host" \
         "$REPOSITORY_ROOT/certbot/install" \
+        "$REPOSITORY_ROOT/certbot/setup" \
+        "$REPOSITORY_ROOT/fail2ban/install" \
+        "$REPOSITORY_ROOT/fail2ban/setup" \
+        "$REPOSITORY_ROOT/firewalld/install" \
+        "$REPOSITORY_ROOT/firewalld/setup" \
+        "$REPOSITORY_ROOT/nginx/setup" \
         "$REPOSITORY_ROOT/packages/rsync/build-el9" \
         "$REPOSITORY_ROOT/selinux/apply-nginx-policy" \
+        "$REPOSITORY_ROOT/selinux/install" \
+        "$REPOSITORY_ROOT/selinux/setup" \
+        "$REPOSITORY_ROOT/ssh/install" \
+        "$REPOSITORY_ROOT/ssh/setup" \
         "$REPOSITORY_ROOT/tests/certbot-installer.sh" \
         "$REPOSITORY_ROOT/tests/deploy-renderers.sh" \
         "$REPOSITORY_ROOT/tests/health-verifiers.sh" \
+        "$REPOSITORY_ROOT/tests/host-setup.sh" \
         "$REPOSITORY_ROOT/tests/nginx-runtime.sh" \
         "$REPOSITORY_ROOT/tests/rsync-packaging.sh" \
         "$REPOSITORY_ROOT/tests/run-all-local.sh"
@@ -62,6 +75,9 @@ step "Running deployment renderer and path boundary tests..."
 
 step "Running Certbot installer routing tests..."
 "$REPOSITORY_ROOT/tests/certbot-installer.sh"
+
+step "Running component and host setup tests..."
+"$REPOSITORY_ROOT/tests/host-setup.sh"
 
 step "Running strict host and certificate healthcheck tests..."
 "$REPOSITORY_ROOT/tests/health-verifiers.sh"

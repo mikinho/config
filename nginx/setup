@@ -1,0 +1,196 @@
+#!/bin/sh
+
+set -eu
+
+PROGRAM_NAME=${0##*/}
+SCRIPT_DIRECTORY=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+REPOSITORY_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIRECTORY/.." && pwd)
+
+NGINX_RENDERER=$REPOSITORY_ROOT/deploy/install-nginx
+HOST_TOOL_INSTALLER=$REPOSITORY_ROOT/deploy/install-host-tools
+SELINUX_SETUP=$REPOSITORY_ROOT/selinux/setup
+FIREWALL_SETUP=$REPOSITORY_ROOT/firewalld/setup
+NGINX_UNIT_SOURCE=$REPOSITORY_ROOT/systemd/system/nginx.service
+LOGROTATE_SOURCE=$REPOSITORY_ROOT/logrotate/nginx
+SYSCTL_SOURCE=$REPOSITORY_ROOT/sysctl/99-nginx-quic.conf
+
+NGINX_UNIT_TARGET=/etc/systemd/system/nginx.service
+LOGROTATE_TARGET=/etc/logrotate.d/nginx
+SYSCTL_TARGET=/etc/sysctl.d/99-nginx-quic.conf
+NGINX_BINARY=/usr/sbin/nginx
+NGINX_CONFIG=/etc/nginx/nginx.conf
+
+MODE=apply
+ZONE=public
+QUIC_BPF=no
+
+usage() {
+    cat <<EOF
+Usage:
+  $PROGRAM_NAME --check
+  $PROGRAM_NAME --plan [--zone NAME] [--quic-bpf]
+  sudo $PROGRAM_NAME [--zone NAME] [--quic-bpf]
+
+Applies the host-level runtime settings around an already assembled and
+reviewed /etc/nginx tree: SELinux, firewalld, systemd, QUIC sysctl limits,
+logrotate, and host verification tools. It never renders over /etc/nginx.
+Install the exact reviewed nginx configuration first and ensure nginx -t passes.
+EOF
+}
+
+fail() {
+    printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2
+    exit 1
+}
+
+validate_regular_source() {
+    nginx_source=$1
+    [ -f "$nginx_source" ] && [ ! -L "$nginx_source" ] \
+        || fail "repository source must be a regular file: $nginx_source"
+}
+
+validate_executable_source() {
+    nginx_source=$1
+    validate_regular_source "$nginx_source"
+    [ -x "$nginx_source" ] \
+        || fail "repository dependency must be executable: $nginx_source"
+}
+
+validate_sources() {
+    validate_executable_source "$NGINX_RENDERER"
+    validate_executable_source "$HOST_TOOL_INSTALLER"
+    validate_executable_source "$SELINUX_SETUP"
+    validate_executable_source "$FIREWALL_SETUP"
+    validate_regular_source "$NGINX_UNIT_SOURCE"
+    validate_regular_source "$LOGROTATE_SOURCE"
+    validate_regular_source "$SYSCTL_SOURCE"
+}
+
+validate_zone() {
+    case "$ZONE" in
+        '' | -* | *[!A-Za-z0-9_-]*) fail "invalid firewalld zone: $ZONE" ;;
+    esac
+}
+
+validate_target_file() {
+    nginx_target=$1
+    if [ -e "$nginx_target" ] || [ -L "$nginx_target" ]; then
+        [ -f "$nginx_target" ] && [ ! -L "$nginx_target" ] \
+            || fail "installation target must be a regular file: $nginx_target"
+    fi
+}
+
+validate_live_host() {
+    [ "$(id -u)" -eq 0 ] || fail "run as root or use --plan"
+    for nginx_command in install logrotate sysctl systemctl systemd-analyze; do
+        command -v "$nginx_command" >/dev/null 2>&1 \
+            || fail "required command not found: $nginx_command"
+    done
+    [ -x "$NGINX_BINARY" ] || fail "nginx binary is missing: $NGINX_BINARY"
+    [ -f "$NGINX_CONFIG" ] && [ ! -L "$NGINX_CONFIG" ] \
+        || fail "live nginx configuration must be a regular file: $NGINX_CONFIG"
+    validate_target_file "$NGINX_UNIT_TARGET"
+    validate_target_file "$LOGROTATE_TARGET"
+    validate_target_file "$SYSCTL_TARGET"
+    "$NGINX_RENDERER" --verify-host
+    "$NGINX_BINARY" -t -q -c "$NGINX_CONFIG" \
+        || fail "live nginx configuration failed pre-application validation"
+    systemd-analyze --man=no verify "$NGINX_UNIT_SOURCE" \
+        || fail "repository nginx unit failed pre-application validation"
+    logrotate --debug "$LOGROTATE_SOURCE" >/dev/null \
+        || fail "repository logrotate policy failed validation"
+}
+
+print_plan() {
+    printf '+ %s --verify-host\n' "$NGINX_RENDERER"
+    if [ "$QUIC_BPF" = yes ]; then
+        "$SELINUX_SETUP" --plan --component nginx --quic-bpf
+    else
+        "$SELINUX_SETUP" --plan --component nginx
+    fi
+    "$FIREWALL_SETUP" --plan --service nginx --zone "$ZONE"
+    printf '+ install -D -o root -g root -m 0644 %s %s\n' "$NGINX_UNIT_SOURCE" "$NGINX_UNIT_TARGET"
+    printf '+ install -D -o root -g root -m 0644 %s %s\n' "$LOGROTATE_SOURCE" "$LOGROTATE_TARGET"
+    printf '+ install -D -o root -g root -m 0644 %s %s\n' "$SYSCTL_SOURCE" "$SYSCTL_TARGET"
+    printf '+ %s\n' "$HOST_TOOL_INSTALLER"
+    printf '+ sysctl --load=%s\n' "$SYSCTL_TARGET"
+    printf '+ systemctl daemon-reload\n'
+    printf '+ systemd-analyze --man=no verify nginx.service\n'
+    printf '+ %s -t -q -c %s\n' "$NGINX_BINARY" "$NGINX_CONFIG"
+    printf '+ systemctl reload-or-restart nginx.service\n'
+    printf '+ systemctl enable nginx.service\n'
+}
+
+apply_runtime() {
+    validate_live_host
+    if [ "$QUIC_BPF" = yes ]; then
+        "$SELINUX_SETUP" --component nginx --quic-bpf
+    else
+        "$SELINUX_SETUP" --component nginx
+    fi
+    "$FIREWALL_SETUP" --service nginx --zone "$ZONE"
+    install -D -o root -g root -m 0644 "$NGINX_UNIT_SOURCE" "$NGINX_UNIT_TARGET"
+    install -D -o root -g root -m 0644 "$LOGROTATE_SOURCE" "$LOGROTATE_TARGET"
+    install -D -o root -g root -m 0644 "$SYSCTL_SOURCE" "$SYSCTL_TARGET"
+    "$HOST_TOOL_INSTALLER"
+    if command -v restorecon >/dev/null 2>&1; then
+        restorecon -RF \
+            "$NGINX_UNIT_TARGET" \
+            "$LOGROTATE_TARGET" \
+            "$SYSCTL_TARGET"
+    fi
+    sysctl "--load=$SYSCTL_TARGET"
+    systemctl daemon-reload
+    systemd-analyze --man=no verify nginx.service
+    "$NGINX_BINARY" -t -q -c "$NGINX_CONFIG"
+    systemctl reload-or-restart nginx.service
+    systemctl enable nginx.service
+    logrotate --debug "$LOGROTATE_TARGET" >/dev/null
+    printf 'Applied nginx host runtime settings in firewalld zone %s.\n' "$ZONE"
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --check)
+            [ "$MODE" = apply ] || fail "select exactly one mode"
+            MODE=check
+            shift
+            ;;
+        --plan)
+            [ "$MODE" = apply ] || fail "select exactly one mode"
+            MODE=plan
+            shift
+            ;;
+        --quic-bpf)
+            QUIC_BPF=yes
+            shift
+            ;;
+        --zone)
+            [ "$#" -ge 2 ] || fail "--zone requires a name"
+            ZONE=$2
+            shift 2
+            ;;
+        --help | -h)
+            usage
+            exit 0
+            ;;
+        *) fail "unknown argument: $1" ;;
+    esac
+done
+
+validate_sources
+validate_zone
+if [ "$MODE" = check ]; then
+    [ "$QUIC_BPF" = no ] || fail "--check does not accept --quic-bpf"
+    printf 'Validated nginx setup sources and component dependencies.\n'
+    exit 0
+fi
+
+case "$MODE" in
+    plan)
+        printf 'nginx runtime setup: zone=%s, quic-bpf=%s\n' "$ZONE" "$QUIC_BPF"
+        print_plan
+        printf 'Plan complete; no host changes were made.\n'
+        ;;
+    apply) apply_runtime ;;
+esac

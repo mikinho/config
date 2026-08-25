@@ -16,7 +16,27 @@ PHP-FPM pools — deliberately have no service definition; nothing about them
 belongs in the host firewall. fail2ban needs none either: its bans are rich
 rules inserted at runtime, independent of zone services.
 
-## Installing the services
+## Installation and additive setup
+
+The standard scripts install firewalld separately from product exposure. The
+installer starts the daemon but changes no zone allowances; setup installs
+only the selected service definitions and adds them to an existing zone:
+
+```sh
+firewalld/install --plan
+sudo firewalld/install
+
+firewalld/setup --plan --service nginx --service ssh-hardened --zone public
+sudo firewalld/setup --service nginx --service ssh-hardened --zone public
+```
+
+`setup` rejects unknown services and zones, validates the composed firewalld
+configuration, and rolls back its own service files and additions on failure.
+It never removes an existing allowance and never installs the reference zone.
+That additive behavior makes it appropriate for a host that may have
+deployment-specific monitoring or management services.
+
+The equivalent manual service installation is:
 
 ```sh
 install -m 0644 firewalld/services/*.xml /etc/firewalld/services/
@@ -26,8 +46,9 @@ firewall-cmd --permanent --add-service=ssh-hardened
 firewall-cmd --reload
 ```
 
-Then follow the cutover order in `ssh/README.md`: the built-in `ssh` service
-is removed only after key login on 2356 is proven, and the stock `http`,
+Then follow the cutover order in `ssh/README.md`: `ssh/setup` removes the
+built-in `ssh` service only after key login on 2356 is proven. For a manual
+cutover, the stock `http`,
 `https`, and any raw port entries the host accumulated should be removed once
 the `nginx` service covers them:
 
@@ -48,6 +69,7 @@ host needing extras keeps its own zone and uses the service definitions with
 `--add-service`; the zone file stays a reference for what a clean baseline
 host allows. `dhcpv6-client` is retained so IPv6 auto-configuration keeps
 working on DHCPv6 networks; drop it only on statically addressed hosts.
+No repository setup script installs this file.
 
 ```sh
 install -m 0644 firewalld/zones/public.xml /etc/firewalld/zones/public.xml
