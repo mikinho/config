@@ -1,4 +1,4 @@
-module nginx_quic_bpf 1.0;
+module nginx_quic_bpf 1.2;
 
 # Optional: SELinux policy module for the quic-bpf deployment profile.
 #
@@ -7,16 +7,18 @@ module nginx_quic_bpf 1.0;
 # only on hosts that select stubs/quic-bpf.conf, and remove it with
 # `semodule -r nginx_quic_bpf` when the profile is removed.
 #
-# Validated against the CAP_BPF path used by RHEL 9 era kernels. If ausearch
-# still reports an AVC denial for capability net_admin or sys_admin on the
-# target kernel and nginx build, extend this module only with the audited
-# permission.
+# RHEL 9.4 additionally checks net_admin when nginx creates the
+# BPF_MAP_TYPE_REUSEPORT_SOCKARRAY and checks sys_admin plus perfmon when nginx
+# loads the reuseport selector program. Keep any further capability additions
+# tied to a reproduced AVC denial on the target kernel and nginx build.
 
 require {
     type httpd_t;
     class bpf { map_create map_read map_write prog_load prog_run };
-    class capability2 bpf;
+    class capability { net_admin sys_admin };
+    class capability2 { bpf perfmon };
 }
 
-allow httpd_t self:capability2 bpf;
+allow httpd_t self:capability { net_admin sys_admin };
+allow httpd_t self:capability2 { bpf perfmon };
 allow httpd_t self:bpf { map_create map_read map_write prog_load prog_run };
