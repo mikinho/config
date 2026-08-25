@@ -664,9 +664,9 @@ units, logrotate policy, two-stage SSH ports, firewalld/SELinux assets,
 Fail2ban topology policy, and standard host plans on Rocky Linux 9 and CentOS
 Stream 10, builds the pinned rsync bridge as an unprivileged user on CentOS
 Stream 9, and scans the complete Git history for secrets. The weekly run also
-compares the pinned Actionlint and rsync releases with their current upstream
-releases; the rsync
-job fails as soon as CentOS supplies an eligible replacement. GitHub's Ubuntu
+compares the pinned Actionlint, ShellCheck, and rsync releases with their
+current upstream releases; the rsync job fails as soon as CentOS supplies an
+eligible replacement. GitHub's Ubuntu
 hosted runner is only the Docker and portable-tooling executor; it is not a
 supported deployment target. The third-party Brotli modules, `quic_bpf`
 kernel/SELinux path, and OpenSSL 3.5 hybrid group cannot be fully exercised by

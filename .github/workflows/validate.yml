@@ -25,6 +25,7 @@ jobs:
     timeout-minutes: 10
     env:
       ACTIONLINT_VERSION: 1.7.12
+      SHELLCHECK_VERSION: 0.11.0
 
     steps:
       - name: Check out repository
@@ -35,7 +36,7 @@ jobs:
       - name: Install validation tools
         run: |
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends jq shellcheck
+          sudo apt-get install --yes --no-install-recommends jq
           # Pin both the release and archive digest; do not execute the
           # project's mutable download helper directly from the network.
           actionlint_archive="/tmp/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
@@ -53,7 +54,24 @@ jobs:
           sudo install -m 0755 /tmp/actionlint /usr/local/bin/actionlint
           actionlint -version
 
-      - name: Check pinned Actionlint release
+          shellcheck_archive="/tmp/shellcheck-v${SHELLCHECK_VERSION}.linux.x86_64.tar.gz"
+          curl --fail --location --silent --show-error \
+            --output "${shellcheck_archive}" \
+            "https://github.com/koalaman/shellcheck/releases/download/v${SHELLCHECK_VERSION}/shellcheck-v${SHELLCHECK_VERSION}.linux.x86_64.tar.gz"
+          printf '%s  %s\n' \
+            'b7af85e41cc99489dcc21d66c6d5f3685138f06d34651e6d34b42ec6d54fe6f6' \
+            "${shellcheck_archive}" |
+            sha256sum --check --strict
+          tar --extract --gzip \
+            --file "${shellcheck_archive}" \
+            --directory /tmp \
+            --strip-components 1 \
+            "shellcheck-v${SHELLCHECK_VERSION}/shellcheck"
+          sudo install -m 0755 /tmp/shellcheck /usr/local/bin/shellcheck
+          shellcheck --version |
+            grep --fixed-strings "version: ${SHELLCHECK_VERSION}"
+
+      - name: Check pinned validation tool releases
         if: github.event_name == 'schedule'
         run: |
           latest_tag=$(curl --fail --location --silent --show-error \
@@ -61,6 +79,13 @@ jobs:
             jq --exit-status --raw-output '.tag_name | select(type == "string")')
           if [ "${latest_tag}" != "v${ACTIONLINT_VERSION}" ]; then
             echo "Actionlint ${ACTIONLINT_VERSION} is stale; latest release is ${latest_tag}." >&2
+            exit 1
+          fi
+          latest_tag=$(curl --fail --location --silent --show-error \
+            https://api.github.com/repos/koalaman/shellcheck/releases/latest |
+            jq --exit-status --raw-output '.tag_name | select(type == "string")')
+          if [ "${latest_tag}" != "v${SHELLCHECK_VERSION}" ]; then
+            echo "ShellCheck ${SHELLCHECK_VERSION} is stale; latest release is ${latest_tag}." >&2
             exit 1
           fi
 
