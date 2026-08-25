@@ -248,7 +248,8 @@ print_plan() {
     print_certbot_command
     if [ "$ENVIRONMENT" = production ]; then
         print_command \
-            "$CERTBOT_BINARY" renew --cert-name "$PRIMARY_DOMAIN" --dry-run
+            "$CERTBOT_BINARY" renew --cert-name "$PRIMARY_DOMAIN" --dry-run \
+            --no-random-sleep-on-renew
         print_command "$HEALTHCHECK"
     fi
     printf 'Plan complete; no certificate or host state was changed.\n'
@@ -259,7 +260,8 @@ issue_certificate() {
     verify_local_webroot
     build_certbot_command
     if [ "$ENVIRONMENT" = production ]; then
-        "$CERTBOT_BINARY" renew --cert-name "$PRIMARY_DOMAIN" --dry-run
+        "$CERTBOT_BINARY" renew --cert-name "$PRIMARY_DOMAIN" --dry-run \
+            --no-random-sleep-on-renew
         [ -x "$HEALTHCHECK" ] \
             || fail "certificate healthcheck is missing: $HEALTHCHECK"
         "$HEALTHCHECK"
