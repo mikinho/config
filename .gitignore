@@ -44,6 +44,8 @@ secrets/
 # Local working directories
 /production-bootstrap/
 /scratch/
+/.*-hotfix/
+/*.tar.gz
 
 # Runtime artifacts
 /build/
