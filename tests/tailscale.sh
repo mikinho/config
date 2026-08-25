@@ -1,0 +1,191 @@
+#!/bin/sh
+
+set -eu
+
+PROGRAM_NAME=${0##*/}
+SCRIPT_DIRECTORY=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+REPOSITORY_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIRECTORY/.." && pwd)
+TAILSCALE_INSTALLER=$REPOSITORY_ROOT/tailscale/install
+TAILSCALE_SETUP=$REPOSITORY_ROOT/tailscale/setup
+TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/config-tailscale-tests.XXXXXX")
+
+cleanup() {
+    if [ -d "$TEST_ROOT" ]; then
+        rm -rf -- "$TEST_ROOT"
+    fi
+}
+
+fail() {
+    printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2
+    exit 1
+}
+
+expect_failure() {
+    expected_message=$1
+    shift
+    if "$@" >"$TEST_ROOT/command.stdout" 2>"$TEST_ROOT/command.stderr"; then
+        fail "command unexpectedly succeeded: $*"
+    fi
+    grep -F -- "$expected_message" "$TEST_ROOT/command.stderr" >/dev/null \
+        || fail "command failed without expected message: $expected_message"
+}
+
+assert_contains() {
+    checked_file=$1
+    expected_text=$2
+    grep -F -- "$expected_text" "$checked_file" >/dev/null \
+        || fail "$checked_file is missing: $expected_text"
+}
+
+write_os_release() {
+    release_path=$1
+    release_id=$2
+    release_name=$3
+    release_version=$4
+    printf 'ID=%s\nPRETTY_NAME="%s"\nVERSION_ID="%s"\n' \
+        "$release_id" "$release_name" "$release_version" \
+        > "$release_path"
+}
+
+trap cleanup EXIT HUP INT TERM
+
+for entry_point in "$TAILSCALE_INSTALLER" "$TAILSCALE_SETUP"; do
+    [ -x "$entry_point" ] || fail "entry point is not executable: $entry_point"
+    "$entry_point" --help >/dev/null
+    "$entry_point" --check >/dev/null
+done
+
+write_os_release "$TEST_ROOT/rhel-9" rhel 'Red Hat Enterprise Linux 9.7' 9.7
+write_os_release "$TEST_ROOT/rhel-10" rhel 'Red Hat Enterprise Linux 10.3' 10.3
+write_os_release "$TEST_ROOT/rocky-9" rocky 'Rocky Linux 9.7' 9.7
+write_os_release "$TEST_ROOT/centos-stream-9" centos 'CentOS Stream 9' 9
+
+for supported_release in rhel-9 rhel-10 rocky-9 centos-stream-9; do
+    "$TAILSCALE_INSTALLER" \
+        --plan \
+        --os-release "$TEST_ROOT/$supported_release" \
+        > "$TEST_ROOT/$supported_release.plan"
+    assert_contains "$TEST_ROOT/$supported_release.plan" \
+        'dnf install --assumeyes tailscale'
+    assert_contains "$TEST_ROOT/$supported_release.plan" \
+        'systemctl enable --now tailscaled.service'
+    assert_contains "$TEST_ROOT/$supported_release.plan" \
+        'Plan complete; no host changes were made.'
+done
+
+assert_contains "$TEST_ROOT/rhel-9.plan" \
+    'https://pkgs.tailscale.com/stable/rhel/9/tailscale.repo'
+assert_contains "$TEST_ROOT/rhel-9.plan" \
+    'dnf config-manager --add-repo'
+assert_contains "$TEST_ROOT/rhel-10.plan" \
+    'dnf config-manager addrepo --overwrite'
+assert_contains "$TEST_ROOT/rocky-9.plan" \
+    'https://pkgs.tailscale.com/stable/fedora/tailscale.repo'
+assert_contains "$TEST_ROOT/centos-stream-9.plan" \
+    'https://pkgs.tailscale.com/stable/centos/9/tailscale.repo'
+
+"$TAILSCALE_SETUP" \
+    --plan \
+    --phase join \
+    --policy-ready \
+    --advertise-tag tag:mikinho-server \
+    --advertise-tag tag:production \
+    --hostname mikinho-server \
+    > "$TEST_ROOT/join.plan"
+assert_contains "$TEST_ROOT/join.plan" \
+    'tailscale up --accept-dns=false --accept-routes=false --advertise-tags=tag:mikinho-server,tag:production --hostname=mikinho-server'
+assert_contains "$TEST_ROOT/join.plan" 'tailscale get ssh'
+
+"$TAILSCALE_SETUP" \
+    --plan \
+    --phase enable-ssh \
+    --policy-ready \
+    > "$TEST_ROOT/enable-ssh.plan"
+assert_contains "$TEST_ROOT/enable-ssh.plan" \
+    'require active sshd.service with effective port 2356'
+assert_contains "$TEST_ROOT/enable-ssh.plan" 'tailscale set --ssh=true'
+assert_contains "$TEST_ROOT/enable-ssh.plan" \
+    'revalidate active sshd.service with effective port 2356'
+
+"$TAILSCALE_SETUP" \
+    --plan \
+    --phase restrict-native \
+    --policy-ready \
+    --tailscale-ssh-confirmed \
+    --console-confirmed \
+    --deny-native-user michael \
+    --deny-native-user release-admin \
+    > "$TEST_ROOT/restrict-native.plan"
+assert_contains "$TEST_ROOT/restrict-native.plan" \
+    'render DenyUsers michael release-admin into /etc/ssh/sshd_config.d/20-tailscale-human-deny.conf'
+assert_contains "$TEST_ROOT/restrict-native.plan" \
+    'verify effective DenyUsers for: michael release-admin'
+assert_contains "$TEST_ROOT/restrict-native.plan" \
+    'systemctl reload sshd.service'
+
+expect_failure \
+    '--policy-ready is required' \
+    "$TAILSCALE_SETUP" --plan --phase enable-ssh
+expect_failure \
+    '--phase join requires at least one --advertise-tag' \
+    "$TAILSCALE_SETUP" --plan --phase join --policy-ready
+expect_failure \
+    'invalid Tailscale device tag' \
+    "$TAILSCALE_SETUP" \
+    --plan --phase join --policy-ready --advertise-tag tag:Invalid
+expect_failure \
+    'duplicate Tailscale device tag' \
+    "$TAILSCALE_SETUP" \
+    --plan --phase join --policy-ready \
+    --advertise-tag tag:server --advertise-tag tag:server
+expect_failure \
+    'invalid Tailscale hostname' \
+    "$TAILSCALE_SETUP" \
+    --plan --phase join --policy-ready \
+    --advertise-tag tag:server --hostname mikinho.example.com
+expect_failure \
+    'join and native restriction options do not apply to --phase enable-ssh' \
+    "$TAILSCALE_SETUP" \
+    --plan --phase enable-ssh --policy-ready --advertise-tag tag:server
+expect_failure \
+    '--phase restrict-native requires at least one --deny-native-user' \
+    "$TAILSCALE_SETUP" \
+    --plan --phase restrict-native --policy-ready \
+    --tailscale-ssh-confirmed --console-confirmed
+expect_failure \
+    '--phase restrict-native requires --tailscale-ssh-confirmed' \
+    "$TAILSCALE_SETUP" \
+    --plan --phase restrict-native --policy-ready \
+    --console-confirmed --deny-native-user michael
+expect_failure \
+    '--phase restrict-native requires --console-confirmed' \
+    "$TAILSCALE_SETUP" \
+    --plan --phase restrict-native --policy-ready \
+    --tailscale-ssh-confirmed --deny-native-user michael
+expect_failure \
+    'invalid native SSH user' \
+    "$TAILSCALE_SETUP" \
+    --plan --phase restrict-native --policy-ready \
+    --tailscale-ssh-confirmed --console-confirmed \
+    --deny-native-user 'Michael@example.com'
+expect_failure \
+    'duplicate native SSH user' \
+    "$TAILSCALE_SETUP" \
+    --plan --phase restrict-native --policy-ready \
+    --tailscale-ssh-confirmed --console-confirmed \
+    --deny-native-user michael --deny-native-user michael
+expect_failure \
+    '--check does not accept setup selections or confirmations' \
+    "$TAILSCALE_SETUP" --check --policy-ready
+
+write_os_release "$TEST_ROOT/rocky-8" rocky 'Rocky Linux 8.10' 8.10
+expect_failure \
+    'unsupported OS version' \
+    "$TAILSCALE_INSTALLER" \
+    --plan --os-release "$TEST_ROOT/rocky-8"
+expect_failure \
+    '--os-release is accepted only with --plan' \
+    "$TAILSCALE_INSTALLER" \
+    --check --os-release "$TEST_ROOT/rocky-9"
+
+printf 'Validated Tailscale installer routing and three-phase setup guards.\n'

@@ -1,0 +1,412 @@
+#!/bin/sh
+
+set -eu
+
+PROGRAM_NAME=${0##*/}
+NATIVE_DEPLOYMENT_SSH_PORT=2356
+NATIVE_DENY_TARGET=/etc/ssh/sshd_config.d/20-tailscale-human-deny.conf
+
+MODE=apply
+PHASE=
+POLICY_READY=no
+ADVERTISE_TAGS=
+TAILSCALE_HOSTNAME=
+DENY_NATIVE_USERS=
+TAILSCALE_SSH_CONFIRMED=no
+CONSOLE_CONFIRMED=no
+SCRATCH_DIRECTORY=
+ROLLBACK_REQUIRED=no
+
+usage() {
+    cat <<EOF
+Usage:
+  $PROGRAM_NAME --check
+  $PROGRAM_NAME --plan --phase join --policy-ready \
+      --advertise-tag tag:NAME [--advertise-tag tag:NAME ...] \
+      [--hostname NAME]
+  sudo $PROGRAM_NAME --phase join --policy-ready \
+      --advertise-tag tag:NAME [--advertise-tag tag:NAME ...] \
+      [--hostname NAME]
+  $PROGRAM_NAME --plan --phase enable-ssh --policy-ready
+  sudo $PROGRAM_NAME --phase enable-ssh --policy-ready
+  $PROGRAM_NAME --plan --phase restrict-native --policy-ready \
+      --tailscale-ssh-confirmed --console-confirmed \
+      --deny-native-user USER [--deny-native-user USER ...]
+  sudo $PROGRAM_NAME --phase restrict-native --policy-ready \
+      --tailscale-ssh-confirmed --console-confirmed \
+      --deny-native-user USER [--deny-native-user USER ...]
+
+Join enrolls a new server as a tagged tailnet device without accepting
+Tailscale DNS or subnet routes. Enable-ssh requires an authenticated node,
+an active native sshd listener on deployment port 2356, and an explicit
+acknowledgment that restrictive tailnet SSH policy and tests are already in
+place. Restrict-native removes the named human accounts from native OpenSSH
+only after Tailscale SSH and console recovery are confirmed. No phase disables
+native sshd or changes its deployment port or firewall policy.
+EOF
+}
+
+fail() {
+    printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2
+    exit 1
+}
+
+validate_tag() {
+    tag_candidate=$1
+    case "$tag_candidate" in
+        tag:*) tag_name=${tag_candidate#tag:} ;;
+        *) fail "Tailscale device tag must start with tag:: $tag_candidate" ;;
+    esac
+    case "$tag_name" in
+        '' | -* | *- | *[!a-z0-9-]*)
+            fail "invalid Tailscale device tag: $tag_candidate"
+            ;;
+    esac
+}
+
+append_tag() {
+    validate_tag "$1"
+    case ",$ADVERTISE_TAGS," in
+        *,"$1",*) fail "duplicate Tailscale device tag: $1" ;;
+    esac
+    ADVERTISE_TAGS=$ADVERTISE_TAGS${ADVERTISE_TAGS:+,}$1
+}
+
+validate_local_user() {
+    user_candidate=$1
+    case "$user_candidate" in
+        '' | -* | *[!a-z0-9_-]*) fail "invalid native SSH user: $user_candidate" ;;
+    esac
+}
+
+append_native_user() {
+    validate_local_user "$1"
+    case " $DENY_NATIVE_USERS " in
+        *" $1 "*) fail "duplicate native SSH user: $1" ;;
+    esac
+    DENY_NATIVE_USERS=$DENY_NATIVE_USERS${DENY_NATIVE_USERS:+ }$1
+}
+
+validate_hostname() {
+    [ -n "$TAILSCALE_HOSTNAME" ] || return 0
+    [ "${#TAILSCALE_HOSTNAME}" -le 63 ] \
+        || fail "Tailscale hostname must not exceed 63 characters"
+    case "$TAILSCALE_HOSTNAME" in
+        -* | *- | *[!a-z0-9-]*)
+            fail "invalid Tailscale hostname: $TAILSCALE_HOSTNAME"
+            ;;
+    esac
+}
+
+validate_selection() {
+    [ "$POLICY_READY" = yes ] \
+        || fail "--policy-ready is required after restrictive tailnet policy and SSH tests are in place"
+    validate_hostname
+
+    case "$PHASE" in
+        join)
+            [ -n "$ADVERTISE_TAGS" ] \
+                || fail "--phase join requires at least one --advertise-tag"
+            [ -z "$DENY_NATIVE_USERS" ] \
+                || fail "--deny-native-user is accepted only with --phase restrict-native"
+            [ "$TAILSCALE_SSH_CONFIRMED$CONSOLE_CONFIRMED" = nono ] \
+                || fail "restriction confirmations apply only to --phase restrict-native"
+            ;;
+        enable-ssh)
+            [ -z "$ADVERTISE_TAGS$TAILSCALE_HOSTNAME$DENY_NATIVE_USERS" ] \
+                || fail "join and native restriction options do not apply to --phase enable-ssh"
+            [ "$TAILSCALE_SSH_CONFIRMED$CONSOLE_CONFIRMED" = nono ] \
+                || fail "restriction confirmations apply only to --phase restrict-native"
+            ;;
+        restrict-native)
+            [ -z "$ADVERTISE_TAGS$TAILSCALE_HOSTNAME" ] \
+                || fail "--advertise-tag and --hostname are accepted only with --phase join"
+            [ -n "$DENY_NATIVE_USERS" ] \
+                || fail "--phase restrict-native requires at least one --deny-native-user"
+            [ "$TAILSCALE_SSH_CONFIRMED" = yes ] \
+                || fail "--phase restrict-native requires --tailscale-ssh-confirmed"
+            [ "$CONSOLE_CONFIRMED" = yes ] \
+                || fail "--phase restrict-native requires --console-confirmed"
+            ;;
+        '') fail "--phase join, --phase enable-ssh, or --phase restrict-native is required" ;;
+        *) fail "unsupported Tailscale setup phase: $PHASE" ;;
+    esac
+}
+
+print_command() {
+    printf '+'
+    for command_argument do
+        printf ' %s' "$command_argument"
+    done
+    printf '\n'
+}
+
+validate_live_host() {
+    [ "$(id -u)" -eq 0 ] || fail "run as root or use --plan"
+    for required_command in awk cp getent grep install mktemp rm sshd systemctl tailscale; do
+        command -v "$required_command" >/dev/null 2>&1 \
+            || fail "required command not found: $required_command"
+    done
+    systemctl is-active --quiet tailscaled.service \
+        || fail "tailscaled.service must be active before setup"
+}
+
+validate_native_deny_target() {
+    native_deny_directory=${NATIVE_DENY_TARGET%/*}
+    [ -d "$native_deny_directory" ] && [ ! -L "$native_deny_directory" ] \
+        || fail "native SSH drop-in target must be a real directory: $native_deny_directory"
+    if [ -e "$NATIVE_DENY_TARGET" ] || [ -L "$NATIVE_DENY_TARGET" ]; then
+        [ -f "$NATIVE_DENY_TARGET" ] && [ ! -L "$NATIVE_DENY_TARGET" ] \
+            || fail "native SSH restriction target must be a regular file: $NATIVE_DENY_TARGET"
+    fi
+}
+
+tailscale_is_connected() {
+    tailscale_status=$(tailscale status --json 2>/dev/null) || return 1
+    printf '%s\n' "$tailscale_status" \
+        | grep -Eq '"BackendState"[[:space:]]*:[[:space:]]*"Running"' \
+        || return 1
+    tailscale ip -4 >/dev/null 2>&1
+}
+
+require_native_deployment_ssh() {
+    systemctl is-active --quiet sshd.service \
+        || fail "sshd.service must remain active for deployment access"
+    sshd -T 2>/dev/null | awk \
+        -v required_port="$NATIVE_DEPLOYMENT_SSH_PORT" \
+        '$1 == "port" && $2 == required_port { found = 1 } END { exit found ? 0 : 1 }' \
+        || fail "native sshd must listen on deployment port $NATIVE_DEPLOYMENT_SSH_PORT during Tailscale SSH migration"
+}
+
+validate_current_ssh_path() {
+    [ -n "${SSH_CONNECTION:-}" ] || return 0
+    current_server_port=$(printf '%s\n' "$SSH_CONNECTION" | awk '{ print $4 }')
+    [ "$current_server_port" = "$NATIVE_DEPLOYMENT_SSH_PORT" ] \
+        || fail "setup must run from native deployment port $NATIVE_DEPLOYMENT_SSH_PORT or a console"
+}
+
+join_tailnet() {
+    validate_live_host
+    if tailscale_is_connected; then
+        fail "host is already connected to a tailnet; use --phase enable-ssh"
+    fi
+
+    set -- tailscale up \
+        --accept-dns=false \
+        --accept-routes=false \
+        --advertise-tags="$ADVERTISE_TAGS"
+    if [ -n "$TAILSCALE_HOSTNAME" ]; then
+        set -- "$@" --hostname="$TAILSCALE_HOSTNAME"
+    fi
+    "$@"
+
+    tailscale_is_connected \
+        || fail "Tailscale enrollment did not produce a tailnet IPv4 address"
+    [ "$(tailscale get ssh)" = false ] \
+        || fail "Tailscale SSH unexpectedly enabled during enrollment"
+    printf 'Joined the tailnet with tags %s; Tailscale SSH remains disabled.\n' \
+        "$ADVERTISE_TAGS"
+}
+
+enable_tailscale_ssh() {
+    validate_live_host
+    tailscale_is_connected \
+        || fail "host must be authenticated to a tailnet before enabling Tailscale SSH"
+    require_native_deployment_ssh
+    validate_current_ssh_path
+
+    tailscale set --ssh=true
+    [ "$(tailscale get ssh)" = true ] \
+        || fail "Tailscale SSH preference did not become enabled"
+    require_native_deployment_ssh
+    printf 'Enabled Tailscale SSH on tailnet port 22; native deployment SSH remains active on port %s.\n' \
+        "$NATIVE_DEPLOYMENT_SSH_PORT"
+}
+
+rollback_native_restriction() {
+    [ -n "$SCRATCH_DIRECTORY" ] && [ -d "$SCRATCH_DIRECTORY" ] || return 0
+    if [ -f "$SCRATCH_DIRECTORY/native-deny.conf.present" ]; then
+        install -D -o root -g root -m 0644 \
+            "$SCRATCH_DIRECTORY/native-deny.conf.backup" "$NATIVE_DENY_TARGET"
+    else
+        rm -f -- "$NATIVE_DENY_TARGET"
+    fi
+    sshd -t >/dev/null 2>&1 && systemctl reload sshd.service >/dev/null 2>&1 || true
+    ROLLBACK_REQUIRED=no
+}
+
+cleanup() {
+    if [ "$ROLLBACK_REQUIRED" = yes ]; then
+        rollback_native_restriction
+    fi
+    if [ -n "$SCRATCH_DIRECTORY" ] && [ -d "$SCRATCH_DIRECTORY" ]; then
+        rm -rf -- "$SCRATCH_DIRECTORY"
+    fi
+}
+
+trap cleanup EXIT HUP INT TERM
+
+require_effective_native_denial() {
+    for denied_user in $DENY_NATIVE_USERS; do
+        effective_deny_users=$(sshd -T \
+            -C "user=$denied_user,host=localhost,addr=127.0.0.1" 2>/dev/null \
+            | awk '$1 == "denyusers" { $1 = ""; sub(/^ /, ""); print; exit }')
+        case " $effective_deny_users " in
+            *" $denied_user "*) ;;
+            *) fail "native SSH denial is not effective for user: $denied_user" ;;
+        esac
+    done
+}
+
+restrict_native_human_access() {
+    validate_live_host
+    tailscale_is_connected \
+        || fail "host must be authenticated to a tailnet before restricting native SSH"
+    [ "$(tailscale get ssh)" = true ] \
+        || fail "Tailscale SSH must be enabled before restricting native SSH"
+    require_native_deployment_ssh
+    validate_current_ssh_path
+    validate_native_deny_target
+
+    for denied_user in $DENY_NATIVE_USERS; do
+        getent passwd "$denied_user" >/dev/null 2>&1 \
+            || fail "native SSH user does not exist: $denied_user"
+    done
+
+    SCRATCH_DIRECTORY=$(mktemp -d "${TMPDIR:-/tmp}/config-tailscale-native-ssh.XXXXXX")
+    if [ -f "$NATIVE_DENY_TARGET" ]; then
+        cp "$NATIVE_DENY_TARGET" "$SCRATCH_DIRECTORY/native-deny.conf.backup"
+        : > "$SCRATCH_DIRECTORY/native-deny.conf.present"
+    fi
+    {
+        printf '# Managed by the config repository Tailscale setup.\n'
+        printf '# Human administrators authenticate through Tailscale SSH.\n'
+        printf 'DenyUsers %s\n' "$DENY_NATIVE_USERS"
+    } > "$SCRATCH_DIRECTORY/native-deny.conf"
+
+    ROLLBACK_REQUIRED=yes
+    install -D -o root -g root -m 0644 \
+        "$SCRATCH_DIRECTORY/native-deny.conf" "$NATIVE_DENY_TARGET"
+    command -v restorecon >/dev/null 2>&1 && restorecon -F "$NATIVE_DENY_TARGET"
+    sshd -t \
+        || fail "native SSH restriction failed syntax validation; previous policy will be restored"
+    require_effective_native_denial
+    systemctl reload sshd.service \
+        || fail "sshd reload failed; previous native SSH policy will be restored"
+    require_native_deployment_ssh
+    ROLLBACK_REQUIRED=no
+    printf 'Denied native OpenSSH for human users: %s. Deployment SSH remains active on port %s.\n' \
+        "$DENY_NATIVE_USERS" "$NATIVE_DEPLOYMENT_SSH_PORT"
+}
+
+print_plan() {
+    case "$PHASE" in
+        join)
+            print_command systemctl enable --now tailscaled.service
+            set -- tailscale up \
+                --accept-dns=false \
+                --accept-routes=false \
+                --advertise-tags="$ADVERTISE_TAGS"
+            if [ -n "$TAILSCALE_HOSTNAME" ]; then
+                set -- "$@" --hostname="$TAILSCALE_HOSTNAME"
+            fi
+            print_command "$@"
+            print_command tailscale get ssh
+            ;;
+        enable-ssh)
+            printf '+ require active sshd.service with effective port %s\n' \
+                "$NATIVE_DEPLOYMENT_SSH_PORT"
+            print_command tailscale set --ssh=true
+            print_command tailscale get ssh
+            printf '+ revalidate active sshd.service with effective port %s\n' \
+                "$NATIVE_DEPLOYMENT_SSH_PORT"
+            ;;
+        restrict-native)
+            printf '+ require confirmed Tailscale SSH and console recovery\n'
+            printf '+ render DenyUsers %s into %s\n' \
+                "$DENY_NATIVE_USERS" "$NATIVE_DENY_TARGET"
+            print_command sshd -t
+            printf '+ verify effective DenyUsers for: %s\n' "$DENY_NATIVE_USERS"
+            print_command systemctl reload sshd.service
+            printf '+ revalidate active sshd.service with effective port %s\n' \
+                "$NATIVE_DEPLOYMENT_SSH_PORT"
+            ;;
+    esac
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --advertise-tag)
+            [ "$#" -ge 2 ] || fail "--advertise-tag requires tag:NAME"
+            append_tag "$2"
+            shift 2
+            ;;
+        --check)
+            [ "$MODE" = apply ] || fail "select exactly one mode"
+            MODE=check
+            shift
+            ;;
+        --console-confirmed)
+            CONSOLE_CONFIRMED=yes
+            shift
+            ;;
+        --deny-native-user)
+            [ "$#" -ge 2 ] || fail "--deny-native-user requires a user"
+            append_native_user "$2"
+            shift 2
+            ;;
+        --hostname)
+            [ "$#" -ge 2 ] || fail "--hostname requires a name"
+            TAILSCALE_HOSTNAME=$2
+            shift 2
+            ;;
+        --phase)
+            [ "$#" -ge 2 ] \
+                || fail "--phase requires join, enable-ssh, or restrict-native"
+            PHASE=$2
+            shift 2
+            ;;
+        --plan)
+            [ "$MODE" = apply ] || fail "select exactly one mode"
+            MODE=plan
+            shift
+            ;;
+        --policy-ready)
+            POLICY_READY=yes
+            shift
+            ;;
+        --tailscale-ssh-confirmed)
+            TAILSCALE_SSH_CONFIRMED=yes
+            shift
+            ;;
+        --help | -h)
+            usage
+            exit 0
+            ;;
+        *) fail "unknown argument: $1" ;;
+    esac
+done
+
+if [ "$MODE" = check ]; then
+    [ -z "$PHASE$ADVERTISE_TAGS$TAILSCALE_HOSTNAME$DENY_NATIVE_USERS" ] \
+        && [ "$POLICY_READY$TAILSCALE_SSH_CONFIRMED$CONSOLE_CONFIRMED" = nonono ] \
+        || fail "--check does not accept setup selections or confirmations"
+    printf 'Validated Tailscale setup safety boundaries.\n'
+    exit 0
+fi
+
+validate_selection
+case "$MODE" in
+    plan)
+        printf 'Tailscale setup phase: %s\n' "$PHASE"
+        print_plan
+        printf 'Plan complete; no host changes were made.\n'
+        ;;
+    apply)
+        case "$PHASE" in
+            join) join_tailnet ;;
+            enable-ssh) enable_tailscale_ssh ;;
+            restrict-native) restrict_native_human_access ;;
+        esac
+        ;;
+esac
