@@ -225,6 +225,35 @@ printf '%s\\n' \"\$FAILED_CHECKS\"
 [ "$clock_failure_result" = 1 ] \
     || fail "unsynchronized clock recorded $clock_failure_result failures"
 
+mkdir -p "$TEST_ROOT/shell-bin"
+printf '%s\n' \
+    '#!/bin/sh' \
+    '[ "${MOCK_SHELL_POLICY:-valid}" = valid ]' \
+    > "$TEST_ROOT/shell-bin/bash"
+printf '%s\n' \
+    '#!/bin/sh' \
+    'printf "root:root:644\n"' \
+    > "$TEST_ROOT/shell-bin/stat"
+chmod 0755 "$TEST_ROOT/shell-bin/bash" "$TEST_ROOT/shell-bin/stat"
+: > "$TEST_ROOT/shell-history-policy.sh"
+shell_history_function=$(extract_function check_shell_history "$HOST_VERIFIER")
+for tested_shell_policy in valid invalid; do
+    shell_history_result=$(PATH="$TEST_ROOT/shell-bin:$PATH" \
+        MOCK_SHELL_POLICY="$tested_shell_policy" sh -c "
+FAILED_CHECKS=0
+SHELL_HISTORY_POLICY=$TEST_ROOT/shell-history-policy.sh
+fail_msg() { FAILED_CHECKS=\$((FAILED_CHECKS + 1)); }
+pass_msg() { :; }
+$shell_history_function
+check_shell_history >/dev/null
+printf '%s\\n' \"\$FAILED_CHECKS\"
+")
+    case "$tested_shell_policy:$shell_history_result" in
+        valid:0 | invalid:1) ;;
+        *) fail "$tested_shell_policy shell history policy recorded $shell_history_result failures" ;;
+    esac
+done
+
 mkdir -p "$TEST_ROOT/ssh-bin"
 printf '%s\n' \
     '#!/bin/sh' \

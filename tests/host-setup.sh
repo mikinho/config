@@ -15,6 +15,7 @@ SELINUX_INSTALL=$REPOSITORY_ROOT/selinux/install
 SELINUX_SETUP=$REPOSITORY_ROOT/selinux/setup
 SSH_INSTALL=$REPOSITORY_ROOT/ssh/install
 SSH_SETUP=$REPOSITORY_ROOT/ssh/setup
+SHELL_SETUP=$REPOSITORY_ROOT/shell/setup
 NGINX_SETUP=$REPOSITORY_ROOT/nginx/setup
 CERTBOT_SETUP=$REPOSITORY_ROOT/certbot/setup
 HOST_SETUP=$REPOSITORY_ROOT/deploy/setup-host
@@ -76,6 +77,7 @@ for setup_entrypoint in \
     "$SELINUX_SETUP" \
     "$SSH_INSTALL" \
     "$SSH_SETUP" \
+    "$SHELL_SETUP" \
     "$NGINX_SETUP" \
     "$CERTBOT_SETUP" \
     "$HOST_SETUP"
@@ -182,6 +184,12 @@ expect_failure \
     '--phase prepare requires --authorized-key-ready' \
     "$SSH_SETUP" --plan --phase prepare
 
+"$SHELL_SETUP" --plan > "$TEST_ROOT/shell.plan"
+assert_contains "$TEST_ROOT/shell.plan" \
+    '/etc/profile.d/90-no-persistent-history.sh'
+assert_contains "$TEST_ROOT/shell.plan" \
+    'verify non-persistent history with positive HISTSIZE'
+
 "$NGINX_SETUP" --plan > "$TEST_ROOT/nginx.plan"
 assert_contains "$TEST_ROOT/nginx.plan" '--add-service=nginx'
 assert_contains "$TEST_ROOT/nginx.plan" '/etc/systemd/system/nginx.service'
@@ -205,6 +213,8 @@ assert_contains "$TEST_ROOT/host-direct.plan" \
     'Host setup: profile=edge-direct, topology=direct, ssh-phase=prepare'
 assert_contains "$TEST_ROOT/host-direct.plan" \
     'Fail2ban setup: topology=direct, ssh-phase=prepare'
+assert_contains "$TEST_ROOT/host-direct.plan" \
+    '/etc/profile.d/90-no-persistent-history.sh'
 assert_contains "$TEST_ROOT/host-direct.plan" 'backend: native'
 assert_contains "$TEST_ROOT/host-direct.plan" 'certbot-healthcheck.service'
 assert_contains "$TEST_ROOT/host-direct.plan" 'certbot-healthcheck.timer'

@@ -80,7 +80,9 @@ the repository services but never installs `firewalld/zones/public.xml` or
 removes unrelated allowances.
 
 The exact reviewed nginx tree and supported `/usr/sbin/nginx` binary must be
-installed first. Preview a complete first-pass plan with:
+installed first. The same plan installs the repository's no-persistent-history
+Bash policy without deleting any existing history files. Preview a complete
+first-pass plan with:
 
 ```sh
 deploy/setup-host \
@@ -167,10 +169,11 @@ sudo deploy/install-host-tools
 
 `verify-deployment` performs a non-destructive, root-only audit of live host
 state, asserting Nginx version and configuration, certificate validity,
-synchronized time, active systemd units, OpenSSH phase and authentication
-restrictions, Fail2ban runtime and topology policy, services in the selected
-firewalld zone, SELinux Enforcing mode and port labels, QUIC buffer limits,
-and per-site PHP-FPM socket permissions.
+synchronized time, active systemd units, non-persistent Bash history with
+same-session recall, OpenSSH phase and authentication restrictions, Fail2ban
+runtime and topology policy, services in the selected firewalld zone, SELinux
+Enforcing mode and port labels, QUIC buffer limits, and per-site PHP-FPM socket
+permissions.
 
 ```sh
 # Auto-detect the installed Certbot backend (recommended):

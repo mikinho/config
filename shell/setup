@@ -1,0 +1,249 @@
+#!/bin/sh
+
+set -eu
+
+PROGRAM_NAME=${0##*/}
+SCRIPT_DIRECTORY=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+POLICY_SOURCE=$SCRIPT_DIRECTORY/profile.d/90-no-persistent-history.sh
+TARGET_DIRECTORY=/etc/profile.d
+POLICY_TARGET=$TARGET_DIRECTORY/90-no-persistent-history.sh
+
+MODE=apply
+REPLACED_POLICY=
+SCRATCH_DIRECTORY=
+ROLLBACK_REQUIRED=no
+
+usage() {
+    cat <<EOF
+Usage:
+  $PROGRAM_NAME --check
+  $PROGRAM_NAME --plan [--replace /etc/profile.d/OLD.sh]
+  sudo $PROGRAM_NAME [--replace /etc/profile.d/OLD.sh]
+
+Installs the Bash interactive-shell policy that retains history for the active
+session but writes no history to persistent storage. Existing history files are
+not removed; review their retention separately. --replace atomically retires
+one explicitly named legacy profile fragment after validating its path.
+EOF
+}
+
+fail() {
+    printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2
+    exit 1
+}
+
+validate_source() {
+    [ -f "$POLICY_SOURCE" ] && [ ! -L "$POLICY_SOURCE" ] \
+        || fail "repository source must be a regular file: $POLICY_SOURCE"
+    command -v bash >/dev/null 2>&1 \
+        || fail "bash is required to validate the shell policy"
+    bash --noprofile --norc -n "$POLICY_SOURCE" \
+        || fail "repository shell policy failed Bash syntax validation"
+
+    bash --noprofile --norc -c '
+        HISTFILE=/tmp/config-noninteractive-history
+        HISTSIZE=73
+        . "$1"
+        [ "$HISTFILE" = /tmp/config-noninteractive-history ]
+        [ "$HISTSIZE" = 73 ]
+    ' sh "$POLICY_SOURCE" \
+        || fail "repository shell policy changed a non-interactive shell"
+
+    bash --noprofile --norc -ic '
+        HISTFILE=/tmp/config-interactive-history
+        HISTSIZE=73
+        . "$1"
+        [ "$HISTFILE" = /dev/null ]
+        [ "$HISTSIZE" = 73 ]
+        readonly -p HISTFILE >/dev/null 2>&1
+    ' sh "$POLICY_SOURCE" >/dev/null 2>&1 \
+        || fail "repository shell policy does not enforce non-persistent interactive history"
+}
+
+validate_target() {
+    if [ ! -d "$TARGET_DIRECTORY" ] || [ -L "$TARGET_DIRECTORY" ]; then
+        fail "shell policy target must be a real directory: $TARGET_DIRECTORY"
+    fi
+    target_directory_identity=$(stat -Lc '%U:%G:%a' "$TARGET_DIRECTORY" 2>/dev/null) \
+        || fail "cannot inspect shell policy target: $TARGET_DIRECTORY"
+    [ "$target_directory_identity" = root:root:755 ] \
+        || fail "$TARGET_DIRECTORY must be owned by root:root with mode 0755"
+    if [ -e "$POLICY_TARGET" ] || [ -L "$POLICY_TARGET" ]; then
+        [ -f "$POLICY_TARGET" ] && [ ! -L "$POLICY_TARGET" ] \
+            || fail "shell policy target must be a regular file: $POLICY_TARGET"
+    fi
+}
+
+validate_replacement_path() {
+    [ -n "$REPLACED_POLICY" ] || return 0
+    case "$REPLACED_POLICY" in
+        /etc/profile.d/*) replacement_name=${REPLACED_POLICY#/etc/profile.d/} ;;
+        *) fail "replacement must name one .sh file directly under /etc/profile.d" ;;
+    esac
+    case "$replacement_name" in
+        '' | .* | -* | */* | *[!A-Za-z0-9._-]*)
+            fail "replacement must name one .sh file directly under /etc/profile.d"
+            ;;
+        *.sh) ;;
+        *) fail "replacement must name one .sh file directly under /etc/profile.d" ;;
+    esac
+    [ "$REPLACED_POLICY" != "$POLICY_TARGET" ] \
+        || fail "replacement policy must differ from the managed target"
+}
+
+validate_replaced_policy() {
+    [ -n "$REPLACED_POLICY" ] || return 0
+    validate_replacement_path
+    if [ -e "$REPLACED_POLICY" ] || [ -L "$REPLACED_POLICY" ]; then
+        [ -f "$REPLACED_POLICY" ] && [ ! -L "$REPLACED_POLICY" ] \
+            || fail "replacement policy must be a regular file: $REPLACED_POLICY"
+        replaced_identity=$(stat -Lc '%U:%G:%a' "$REPLACED_POLICY" 2>/dev/null) \
+            || fail "cannot inspect replacement policy: $REPLACED_POLICY"
+        [ "$replaced_identity" = root:root:644 ] \
+            || fail "replacement policy has unsafe ownership or mode: $replaced_identity"
+    fi
+}
+
+backup_file() {
+    backup_target=$1
+    backup_name=$2
+    if [ -f "$backup_target" ]; then
+        cp "$backup_target" "$SCRATCH_DIRECTORY/$backup_name"
+        : > "$SCRATCH_DIRECTORY/$backup_name.present"
+    fi
+}
+
+restore_file() {
+    restore_target=$1
+    restore_name=$2
+    if [ -f "$SCRATCH_DIRECTORY/$restore_name.present" ]; then
+        install -o root -g root -m 0644 \
+            "$SCRATCH_DIRECTORY/$restore_name" "$restore_target"
+        command -v restorecon >/dev/null 2>&1 && restorecon -F "$restore_target"
+    else
+        rm -f -- "$restore_target"
+    fi
+}
+
+rollback_policy() {
+    [ -n "$SCRATCH_DIRECTORY" ] && [ -d "$SCRATCH_DIRECTORY" ] || return 0
+    restore_file "$POLICY_TARGET" managed-policy.sh
+    if [ -n "$REPLACED_POLICY" ]; then
+        restore_file "$REPLACED_POLICY" replaced-policy.sh
+    fi
+    ROLLBACK_REQUIRED=no
+}
+
+cleanup() {
+    if [ "$ROLLBACK_REQUIRED" = yes ]; then
+        rollback_policy
+    fi
+    if [ -n "$SCRATCH_DIRECTORY" ] && [ -d "$SCRATCH_DIRECTORY" ]; then
+        rm -rf -- "$SCRATCH_DIRECTORY"
+    fi
+}
+
+trap cleanup EXIT HUP INT TERM
+
+validate_login_behavior() {
+    # Expand history variables inside the clean child shells, not this setup.
+    # shellcheck disable=SC2016
+    env -u HISTFILE -u HISTSIZE -u HISTFILESIZE bash -lic '
+        [ "${HISTFILE:-}" = /dev/null ] || exit 1
+        [ "${HISTSIZE:-0}" -gt 0 ] 2>/dev/null || exit 1
+        readonly -p HISTFILE >/dev/null 2>&1 || exit 1
+        bash -ic "
+            [ \"\${HISTFILE:-}\" = /dev/null ] || exit 1
+            [ \"\${HISTSIZE:-0}\" -gt 0 ] 2>/dev/null
+        " >/dev/null 2>&1
+    ' >/dev/null 2>&1 \
+        || fail "a new Bash login or its interactive descendant does not use non-persistent history"
+}
+
+install_policy() {
+    [ "$(id -u)" -eq 0 ] || fail "run as root or use --plan"
+    for required_command in bash cmp cp env install mktemp rm stat; do
+        command -v "$required_command" >/dev/null 2>&1 \
+            || fail "required command not found: $required_command"
+    done
+    validate_target
+    validate_replaced_policy
+
+    SCRATCH_DIRECTORY=$(mktemp -d "${TMPDIR:-/tmp}/config-shell-setup.XXXXXX")
+    backup_file "$POLICY_TARGET" managed-policy.sh
+    if [ -n "$REPLACED_POLICY" ]; then
+        backup_file "$REPLACED_POLICY" replaced-policy.sh
+    fi
+    ROLLBACK_REQUIRED=yes
+    if [ -n "$REPLACED_POLICY" ]; then
+        rm -f -- "$REPLACED_POLICY"
+    fi
+    install -o root -g root -m 0644 "$POLICY_SOURCE" "$POLICY_TARGET"
+    command -v restorecon >/dev/null 2>&1 && restorecon -F "$POLICY_TARGET"
+    cmp -s "$POLICY_SOURCE" "$POLICY_TARGET" \
+        || fail "installed shell policy differs from repository source"
+    policy_identity=$(stat -Lc '%U:%G:%a' "$POLICY_TARGET" 2>/dev/null) \
+        || fail "cannot inspect installed shell policy: $POLICY_TARGET"
+    [ "$policy_identity" = root:root:644 ] \
+        || fail "installed shell policy has unsafe ownership or mode: $policy_identity"
+    validate_login_behavior
+    ROLLBACK_REQUIRED=no
+    printf 'Installed non-persistent Bash history policy: %s\n' "$POLICY_TARGET"
+    if [ -n "$REPLACED_POLICY" ]; then
+        printf 'Replaced legacy shell policy: %s\n' "$REPLACED_POLICY"
+    fi
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --check)
+            [ "$MODE" = apply ] || fail "select exactly one mode"
+            MODE=check
+            shift
+            ;;
+        --plan)
+            [ "$MODE" = apply ] || fail "select exactly one mode"
+            MODE=plan
+            shift
+            ;;
+        --replace)
+            [ "$#" -ge 2 ] || fail "--replace requires a profile path"
+            [ -z "$REPLACED_POLICY" ] || fail "--replace may be specified only once"
+            REPLACED_POLICY=$2
+            shift 2
+            ;;
+        --help | -h)
+            usage
+            exit 0
+            ;;
+        *) fail "unknown argument: $1" ;;
+    esac
+done
+
+validate_source
+if [ "$MODE" = check ] && [ -n "$REPLACED_POLICY" ]; then
+    fail "--check does not accept --replace"
+fi
+if [ -n "$REPLACED_POLICY" ]; then
+    validate_replacement_path
+fi
+
+case "$MODE" in
+    check)
+        printf 'Validated non-persistent Bash history policy source and behavior.\n'
+        ;;
+    plan)
+        if [ -n "$REPLACED_POLICY" ]; then
+            printf '+ backup %s for rollback\n' "$REPLACED_POLICY"
+            printf '+ rm -f -- %s\n' "$REPLACED_POLICY"
+        fi
+        printf '+ install -o root -g root -m 0644 %s %s\n' \
+            "$POLICY_SOURCE" "$POLICY_TARGET"
+        printf '+ restorecon -F %s\n' "$POLICY_TARGET"
+        printf '+ bash -lic <verify non-persistent history with positive HISTSIZE>\n'
+        printf 'Plan complete; no host changes were made.\n'
+        ;;
+    apply)
+        install_policy
+        ;;
+esac

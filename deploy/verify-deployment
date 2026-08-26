@@ -24,6 +24,7 @@ CERTBOT_SNAP_RUNNER_DROPIN=/etc/systemd/system/certbot.timer.d/10-snap-runner.co
 CERTBOT_SNAP_NGINX_DROPIN=/etc/systemd/system/snap.certbot.renew.service.d/10-nginx.conf
 FAIL2BAN_POLICY=/etc/fail2ban/jail.d/90-baseline.local
 SELINUX_CONFIG=/etc/selinux/config
+SHELL_HISTORY_POLICY=/etc/profile.d/90-no-persistent-history.sh
 
 usage() {
     cat <<EOF
@@ -31,8 +32,9 @@ Usage:
   $PROGRAM_NAME [OPTIONS]
 
 Non-destructive host post-deployment verification. Validates installed Nginx,
-managed certificates, systemd units, OpenSSH, Fail2ban, firewalld, synchronized
-time, SELinux policy, QUIC kernel buffers, and runtime socket permissions.
+managed certificates, systemd units, shell history policy, OpenSSH, Fail2ban,
+firewalld, synchronized time, SELinux policy, QUIC kernel buffers, and runtime
+socket permissions.
 
 Options:
   --backend BACKEND   Certbot renewal backend: 'auto' (default), 'native', or 'snap'
@@ -395,6 +397,47 @@ check_systemd_services() {
     fi
 }
 
+check_shell_history() {
+    printf 'Checking interactive shell history policy...\n'
+    if [ ! -f "$SHELL_HISTORY_POLICY" ] || [ -L "$SHELL_HISTORY_POLICY" ]; then
+        fail_msg "managed shell history policy is missing or unsafe: $SHELL_HISTORY_POLICY"
+        return
+    fi
+    if ! command -v stat >/dev/null 2>&1; then
+        fail_msg "stat is unavailable for shell history policy verification"
+        return
+    fi
+    policy_identity=$(stat -Lc '%U:%G:%a' "$SHELL_HISTORY_POLICY" 2>/dev/null || true)
+    if [ "$policy_identity" = root:root:644 ]; then
+        pass_msg "shell history policy is root-owned and mode 0644"
+    else
+        fail_msg "shell history policy has unsafe ownership or mode: ${policy_identity:-unknown}"
+    fi
+    if ! command -v bash >/dev/null 2>&1; then
+        fail_msg "bash is unavailable for shell history policy verification"
+        return
+    fi
+    if ! command -v env >/dev/null 2>&1; then
+        fail_msg "env is unavailable for clean shell history policy verification"
+        return
+    fi
+    # Expand history variables inside the clean child shells, not this verifier.
+    # shellcheck disable=SC2016
+    if env -u HISTFILE -u HISTSIZE -u HISTFILESIZE bash -lic '
+        [ "${HISTFILE:-}" = /dev/null ] || exit 1
+        [ "${HISTSIZE:-0}" -gt 0 ] 2>/dev/null || exit 1
+        readonly -p HISTFILE >/dev/null 2>&1 || exit 1
+        bash -ic "
+            [ \"\${HISTFILE:-}\" = /dev/null ] || exit 1
+            [ \"\${HISTSIZE:-0}\" -gt 0 ] 2>/dev/null
+        " >/dev/null 2>&1
+    ' >/dev/null 2>&1; then
+        pass_msg "Bash logins and interactive descendants use non-persistent history"
+    else
+        fail_msg "Bash login history is persistent, disabled in-session, unlocked, or not inherited"
+    fi
+}
+
 check_ssh_hardening() {
     printf 'Checking OpenSSH configuration...\n'
     if ! command -v sshd >/dev/null 2>&1; then
@@ -754,6 +797,7 @@ check_quic_state
 check_clock_synchronization
 check_systemd_services
 check_certificate_health
+check_shell_history
 check_ssh_hardening
 check_firewalld
 check_fail2ban

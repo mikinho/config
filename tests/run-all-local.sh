@@ -46,6 +46,8 @@ if command -v shellcheck >/dev/null 2>&1; then
         "$REPOSITORY_ROOT/selinux/apply-nginx-policy" \
         "$REPOSITORY_ROOT/selinux/install" \
         "$REPOSITORY_ROOT/selinux/setup" \
+        "$REPOSITORY_ROOT/shell/setup" \
+        "$REPOSITORY_ROOT/shell/profile.d/90-no-persistent-history.sh" \
         "$REPOSITORY_ROOT/ssh/install" \
         "$REPOSITORY_ROOT/ssh/setup" \
         "$REPOSITORY_ROOT/tailscale/install" \
@@ -59,6 +61,7 @@ if command -v shellcheck >/dev/null 2>&1; then
         "$REPOSITORY_ROOT/tests/nginx-runtime.sh" \
         "$REPOSITORY_ROOT/tests/rsync-packaging.sh" \
         "$REPOSITORY_ROOT/tests/run-all-local.sh" \
+        "$REPOSITORY_ROOT/tests/shell-history.sh" \
         "$REPOSITORY_ROOT/tests/tailscale.sh"
     printf 'ShellCheck passed with 0 warnings.\n'
 else
@@ -90,6 +93,9 @@ step "Running Fail2ban installer routing tests..."
 
 step "Running component and host setup tests..."
 "$REPOSITORY_ROOT/tests/host-setup.sh"
+
+step "Running interactive shell history tests..."
+"$REPOSITORY_ROOT/tests/shell-history.sh"
 
 step "Running Tailscale installer and setup tests..."
 "$REPOSITORY_ROOT/tests/tailscale.sh"

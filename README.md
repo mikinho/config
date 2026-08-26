@@ -193,6 +193,8 @@ TCP 443 so clients always have an HTTP/2 or HTTP/1.1 fallback.
   depend on.
 - `ssh/` contains the OpenSSH installer and lockout-safe, two-phase setup for
   the repository `sshd_config.d` hardening drop-ins.
+- `shell/` contains the interactive Bash policy that retains current-session
+  recall while preventing command history from persisting on the host.
 - `tailscale/` contains the official-repository installer and three-phase tagged
   server setup that keeps native deployment SSH on TCP 2356 while enabling
   Tailscale SSH on tailnet TCP 22 for explicitly named human accounts.
@@ -211,6 +213,12 @@ when clients reach nginx directly or `edge-proxied` when a CDN or load
 balancer is the immediate peer. The profile controls Fail2ban nginx-jail
 activation; proxied hosts still retain the SSH jail. At least one trusted
 administrative CIDR is always required.
+
+Standard host setup installs the shell policy at
+`/etc/profile.d/90-no-persistent-history.sh`. Existing `.bash_history` files are
+not deleted automatically; their retention or removal is a separate,
+destructive decision. See [`shell/README.md`](shell/README.md) for the privacy
+boundary and validation contract.
 
 The reviewed nginx tree must already exist at `/etc/nginx`. The orchestrator
 never renders or overwrites it. Review a non-mutating plan before applying the
@@ -660,10 +668,11 @@ material application, plugin, theme, proxy, or CDN change.
 GitHub Actions validates deployment profile coverage, exercises the installer,
 runs `nginx -t` against stable and mainline nginx.org packages on Rocky Linux
 9, exercises security and failure behavior against a running nginx, checks the
-units, logrotate policy, two-stage SSH ports, firewalld/SELinux assets,
-Fail2ban topology policy, and standard host plans on Rocky Linux 9 and CentOS
-Stream 10, builds the pinned rsync bridge as an unprivileged user on CentOS
-Stream 9, and scans the complete Git history for secrets. The weekly run also
+units, logrotate policy, non-persistent shell history, two-stage SSH ports,
+firewalld/SELinux assets, Fail2ban topology policy, and standard host plans on
+Rocky Linux 9 and CentOS Stream 10, builds the pinned rsync bridge as an
+unprivileged user on CentOS Stream 9, and scans the complete Git history for
+secrets. The weekly run also
 compares the pinned Actionlint, ShellCheck, and rsync releases with their
 current upstream releases; the rsync job fails as soon as CentOS supplies an
 eligible replacement. GitHub's Ubuntu

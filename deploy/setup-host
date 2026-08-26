@@ -14,6 +14,7 @@ FIREWALL_INSTALL=$REPOSITORY_ROOT/firewalld/install
 FIREWALL_SETUP=$REPOSITORY_ROOT/firewalld/setup
 SSH_INSTALL=$REPOSITORY_ROOT/ssh/install
 SSH_SETUP=$REPOSITORY_ROOT/ssh/setup
+SHELL_SETUP=$REPOSITORY_ROOT/shell/setup
 NGINX_SETUP=$REPOSITORY_ROOT/nginx/setup
 CERTBOT_SETUP=$REPOSITORY_ROOT/certbot/setup
 FAIL2BAN_INSTALL=$REPOSITORY_ROOT/fail2ban/install
@@ -75,6 +76,7 @@ validate_dependencies() {
         "$FIREWALL_SETUP" \
         "$SSH_INSTALL" \
         "$SSH_SETUP" \
+        "$SHELL_SETUP" \
         "$NGINX_SETUP" \
         "$CERTBOT_SETUP" \
         "$FAIL2BAN_INSTALL" \
@@ -181,6 +183,14 @@ run_ssh_setup() {
     "$@"
 }
 
+run_shell_setup() {
+    if [ "$MODE" = plan ]; then
+        "$SHELL_SETUP" --plan
+    else
+        "$SHELL_SETUP"
+    fi
+}
+
 run_nginx_setup() {
     if [ "$MODE" = plan ]; then
         set -- "$NGINX_SETUP" --plan --zone "$ZONE"
@@ -242,6 +252,7 @@ preflight_selection() {
     "$SELINUX_INSTALL" --check >/dev/null
     "$FIREWALL_INSTALL" --check >/dev/null
     "$SSH_INSTALL" --check >/dev/null
+    "$SHELL_SETUP" --check >/dev/null
     "$NGINX_SETUP" --check >/dev/null
     "$CERTBOT_SETUP" --check >/dev/null
     "$FAIL2BAN_INSTALL" --check >/dev/null
@@ -270,6 +281,7 @@ run_host_setup() {
     run_platform_installer "$SELINUX_INSTALL"
     run_platform_installer "$FIREWALL_INSTALL"
     run_platform_installer "$SSH_INSTALL"
+    run_shell_setup
     run_ssh_setup
     run_nginx_setup
     run_certbot_setup
@@ -362,6 +374,7 @@ if [ "$MODE" = check ]; then
     "$FIREWALL_SETUP" --check >/dev/null
     "$SSH_INSTALL" --check >/dev/null
     "$SSH_SETUP" --check >/dev/null
+    "$SHELL_SETUP" --check >/dev/null
     "$NGINX_SETUP" --check >/dev/null
     "$CERTBOT_SETUP" --check >/dev/null
     "$FAIL2BAN_INSTALL" --check >/dev/null
