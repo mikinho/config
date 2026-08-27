@@ -47,6 +47,7 @@ if command -v shellcheck >/dev/null 2>&1; then
         "$REPOSITORY_ROOT/selinux/install" \
         "$REPOSITORY_ROOT/selinux/setup" \
         "$REPOSITORY_ROOT/shell/setup" \
+        "$REPOSITORY_ROOT/shell/profile.d/80-admin-umask.sh" \
         "$REPOSITORY_ROOT/shell/profile.d/90-no-persistent-history.sh" \
         "$REPOSITORY_ROOT/ssh/install" \
         "$REPOSITORY_ROOT/ssh/setup" \

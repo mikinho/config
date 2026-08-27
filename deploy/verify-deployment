@@ -24,6 +24,7 @@ CERTBOT_SNAP_RUNNER_DROPIN=/etc/systemd/system/certbot.timer.d/10-snap-runner.co
 CERTBOT_SNAP_NGINX_DROPIN=/etc/systemd/system/snap.certbot.renew.service.d/10-nginx.conf
 FAIL2BAN_POLICY=/etc/fail2ban/jail.d/90-baseline.local
 SELINUX_CONFIG=/etc/selinux/config
+SHELL_UMASK_POLICY=/etc/profile.d/80-admin-umask.sh
 SHELL_HISTORY_POLICY=/etc/profile.d/90-no-persistent-history.sh
 
 usage() {
@@ -32,7 +33,7 @@ Usage:
   $PROGRAM_NAME [OPTIONS]
 
 Non-destructive host post-deployment verification. Validates installed Nginx,
-managed certificates, systemd units, shell history policy, OpenSSH, Fail2ban,
+managed certificates, systemd units, shell policies, OpenSSH, Fail2ban,
 firewalld, synchronized time, SELinux policy, QUIC kernel buffers, and runtime
 socket permissions.
 
@@ -398,27 +399,29 @@ check_systemd_services() {
 }
 
 check_shell_history() {
-    printf 'Checking interactive shell history policy...\n'
-    if [ ! -f "$SHELL_HISTORY_POLICY" ] || [ -L "$SHELL_HISTORY_POLICY" ]; then
-        fail_msg "managed shell history policy is missing or unsafe: $SHELL_HISTORY_POLICY"
-        return
-    fi
+    printf 'Checking interactive shell policies...\n'
     if ! command -v stat >/dev/null 2>&1; then
-        fail_msg "stat is unavailable for shell history policy verification"
+        fail_msg "stat is unavailable for shell policy verification"
         return
     fi
-    policy_identity=$(stat -Lc '%U:%G:%a' "$SHELL_HISTORY_POLICY" 2>/dev/null || true)
-    if [ "$policy_identity" = root:root:644 ]; then
-        pass_msg "shell history policy is root-owned and mode 0644"
-    else
-        fail_msg "shell history policy has unsafe ownership or mode: ${policy_identity:-unknown}"
-    fi
+    for shell_policy in "$SHELL_UMASK_POLICY" "$SHELL_HISTORY_POLICY"; do
+        if [ ! -f "$shell_policy" ] || [ -L "$shell_policy" ]; then
+            fail_msg "managed shell policy is missing or unsafe: $shell_policy"
+            return
+        fi
+        policy_identity=$(stat -Lc '%U:%G:%a' "$shell_policy" 2>/dev/null || true)
+        if [ "$policy_identity" = root:root:644 ]; then
+            pass_msg "shell policy is root-owned and mode 0644: $shell_policy"
+        else
+            fail_msg "shell policy has unsafe ownership or mode: $shell_policy (${policy_identity:-unknown})"
+        fi
+    done
     if ! command -v bash >/dev/null 2>&1; then
-        fail_msg "bash is unavailable for shell history policy verification"
+        fail_msg "bash is unavailable for shell policy verification"
         return
     fi
     if ! command -v env >/dev/null 2>&1; then
-        fail_msg "env is unavailable for clean shell history policy verification"
+        fail_msg "env is unavailable for clean shell policy verification"
         return
     fi
     # Expand history variables inside the clean child shells, not this verifier.
@@ -427,14 +430,20 @@ check_shell_history() {
         [ "${HISTFILE:-}" = /dev/null ] || exit 1
         [ "${HISTSIZE:-0}" -gt 0 ] 2>/dev/null || exit 1
         readonly -p HISTFILE >/dev/null 2>&1 || exit 1
+        managed_verify_umask=$(umask)
+        managed_verify_umask=${managed_verify_umask#0}
+        [ "$((8#$managed_verify_umask & 8#027))" -eq "$((8#027))" ] || exit 1
         bash -ic "
             [ \"\${HISTFILE:-}\" = /dev/null ] || exit 1
-            [ \"\${HISTSIZE:-0}\" -gt 0 ] 2>/dev/null
+            [ \"\${HISTSIZE:-0}\" -gt 0 ] 2>/dev/null || exit 1
+            managed_verify_child_umask=\$(umask)
+            managed_verify_child_umask=\${managed_verify_child_umask#0}
+            [ \"\$((8#\$managed_verify_child_umask & 8#027))\" -eq \"\$((8#027))\" ]
         " >/dev/null 2>&1
     ' >/dev/null 2>&1; then
-        pass_msg "Bash logins and interactive descendants use non-persistent history"
+        pass_msg "Bash logins use a restrictive umask and non-persistent history"
     else
-        fail_msg "Bash login history is persistent, disabled in-session, unlocked, or not inherited"
+        fail_msg "Bash login umask or history policy is not effective in interactive shells"
     fi
 }
 

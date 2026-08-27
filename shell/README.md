@@ -1,9 +1,10 @@
 # Interactive shell baseline
 
-This component prevents Bash from persisting interactive command history on a
-managed server. A shell still retains its current session history, including
-normal up-arrow recall, but Bash writes history to `/dev/null` instead of a
-file in the administrator's home directory.
+This component applies conservative interactive Bash defaults for managed
+servers. It prevents persistent command history and enforces an administrative
+umask of at least `027`. A shell still retains its current session history,
+including normal up-arrow recall, but Bash writes history to `/dev/null`
+instead of a file in the administrator's home directory.
 
 The policy is a residual-data minimization control. It reduces the commands
 available to a later administrator or IT provider from home-directory history;
@@ -19,6 +20,12 @@ belongs in reviewed documentation and version-controlled automation rather
 than personal shell history.
 
 ## Policy behavior
+
+`profile.d/80-admin-umask.sh` combines the current interactive Bash umask with
+`027`. A normal `0022` or `0002` becomes `0027`; an already stricter value such
+as `0037` or `0077` is preserved. Non-interactive shells are unchanged, and
+systemd services must continue to declare their own file-creation policy and
+explicit installation modes.
 
 `profile.d/90-no-persistent-history.sh` applies only to interactive Bash
 shells. It sets exported `HISTFILE=/dev/null` and marks the variable read-only
@@ -47,9 +54,10 @@ shell/setup --plan
 sudo shell/setup
 ```
 
-The setup is rerunnable, refuses symbolic-link sources and targets, installs a
-root-owned mode-`0644` drop-in, and verifies a fresh Bash login. The verification
-requires `HISTFILE=/dev/null`, a positive `HISTSIZE`, and a read-only `HISTFILE`.
+The setup is rerunnable, refuses symbolic-link sources and targets, installs
+root-owned mode-`0644` drop-ins, and verifies a fresh Bash login. Verification
+requires a umask containing every bit in `027`, `HISTFILE=/dev/null`, a positive
+`HISTSIZE`, and a read-only `HISTFILE`.
 Remove or park older profile fragments that set `HISTSIZE=0` before applying
 this baseline, or name one exact legacy fragment in a rollback-protected
 migration:
@@ -72,4 +80,5 @@ session after installation and verify:
 bash -lic 'printf "HISTFILE=%s HISTSIZE=%s\n" "$HISTFILE" "$HISTSIZE"'
 ```
 
-Expect `HISTFILE=/dev/null` and a positive `HISTSIZE`.
+Expect `HISTFILE=/dev/null`, a positive `HISTSIZE`, and a umask of `0027` or a
+stricter value.

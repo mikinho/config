@@ -186,9 +186,11 @@ expect_failure \
 
 "$SHELL_SETUP" --plan > "$TEST_ROOT/shell.plan"
 assert_contains "$TEST_ROOT/shell.plan" \
+    '/etc/profile.d/80-admin-umask.sh'
+assert_contains "$TEST_ROOT/shell.plan" \
     '/etc/profile.d/90-no-persistent-history.sh'
 assert_contains "$TEST_ROOT/shell.plan" \
-    'verify non-persistent history with positive HISTSIZE'
+    'verify umask and non-persistent history'
 
 "$NGINX_SETUP" --plan > "$TEST_ROOT/nginx.plan"
 assert_contains "$TEST_ROOT/nginx.plan" '--add-service=nginx'
@@ -213,6 +215,8 @@ assert_contains "$TEST_ROOT/host-direct.plan" \
     'Host setup: profile=edge-direct, topology=direct, ssh-phase=prepare'
 assert_contains "$TEST_ROOT/host-direct.plan" \
     'Fail2ban setup: topology=direct, ssh-phase=prepare'
+assert_contains "$TEST_ROOT/host-direct.plan" \
+    '/etc/profile.d/80-admin-umask.sh'
 assert_contains "$TEST_ROOT/host-direct.plan" \
     '/etc/profile.d/90-no-persistent-history.sh'
 assert_contains "$TEST_ROOT/host-direct.plan" 'backend: native'

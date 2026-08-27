@@ -10,6 +10,7 @@ REPOSITORY_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIRECTORY/.." && pwd)
 TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/config-shell-history.XXXXXX")
 SHELL_SETUP=$REPOSITORY_ROOT/shell/setup
 POLICY_SOURCE=$REPOSITORY_ROOT/shell/profile.d/90-no-persistent-history.sh
+UMASK_SOURCE=$REPOSITORY_ROOT/shell/profile.d/80-admin-umask.sh
 
 cleanup() {
     if [ -d "$TEST_ROOT" ]; then
@@ -37,6 +38,8 @@ trap cleanup EXIT HUP INT TERM
 [ -x "$SHELL_SETUP" ] || fail "shell setup is not executable"
 [ -f "$POLICY_SOURCE" ] && [ ! -L "$POLICY_SOURCE" ] \
     || fail "shell policy source is not a regular file"
+[ -f "$UMASK_SOURCE" ] && [ ! -L "$UMASK_SOURCE" ] \
+    || fail "umask policy source is not a regular file"
 
 "$SHELL_SETUP" --help >/dev/null
 "$SHELL_SETUP" --check >/dev/null
@@ -44,6 +47,9 @@ trap cleanup EXIT HUP INT TERM
 grep -F -- '/etc/profile.d/90-no-persistent-history.sh' \
     "$TEST_ROOT/setup.plan" >/dev/null \
     || fail "shell setup plan omitted the managed target"
+grep -F -- '/etc/profile.d/80-admin-umask.sh' \
+    "$TEST_ROOT/setup.plan" >/dev/null \
+    || fail "shell setup plan omitted the umask target"
 "$SHELL_SETUP" --plan --replace /etc/profile.d/00-legacy-history.sh \
     > "$TEST_ROOT/replacement.plan"
 grep -F -- 'rm -f -- /etc/profile.d/00-legacy-history.sh' \
@@ -56,9 +62,32 @@ expect_failure \
     'replacement must name one .sh file directly under /etc/profile.d' \
     "$SHELL_SETUP" --plan --replace /etc/profile.d/nested/legacy-history.sh
 expect_failure \
-    'replacement policy must differ from the managed target' \
+    'replacement policy must differ from the managed targets' \
     "$SHELL_SETUP" --plan \
     --replace /etc/profile.d/90-no-persistent-history.sh
+expect_failure \
+    'replacement policy must differ from the managed targets' \
+    "$SHELL_SETUP" --plan \
+    --replace /etc/profile.d/80-admin-umask.sh
+
+bash --noprofile --norc -c '
+    umask 0022
+    . "$1"
+    [ "$(umask)" = 0022 ]
+' sh "$UMASK_SOURCE" \
+    || fail "umask policy changed a non-interactive Bash shell"
+
+for umask_case in 0002:0027 0022:0027 0027:0027 0037:0037 0077:0077; do
+    initial_umask=${umask_case%:*}
+    expected_umask=${umask_case#*:}
+    bash --noprofile --norc -ic '
+        umask "$2"
+        . "$1"
+        [ "$(umask)" = "$3" ]
+    ' sh "$UMASK_SOURCE" "$initial_umask" "$expected_umask" \
+        >/dev/null 2>&1 \
+        || fail "umask policy failed $initial_umask to $expected_umask"
+done
 
 bash --noprofile --norc -c '
     HISTFILE=/tmp/noninteractive-history
@@ -90,8 +119,9 @@ cp "$SHELL_SETUP" "$fixture_root/shell/setup"
 chmod 0755 "$fixture_root/shell/setup"
 ln -s /etc/passwd \
     "$fixture_root/shell/profile.d/90-no-persistent-history.sh"
+cp "$UMASK_SOURCE" "$fixture_root/shell/profile.d/80-admin-umask.sh"
 expect_failure \
     'repository source must be a regular file' \
     "$fixture_root/shell/setup" --check
 
-printf 'Validated non-persistent Bash history source and setup boundaries.\n'
+printf 'Validated administrative Bash umask, history, and setup boundaries.\n'

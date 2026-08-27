@@ -4,9 +4,11 @@ set -eu
 
 PROGRAM_NAME=${0##*/}
 SCRIPT_DIRECTORY=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
-POLICY_SOURCE=$SCRIPT_DIRECTORY/profile.d/90-no-persistent-history.sh
+UMASK_SOURCE=$SCRIPT_DIRECTORY/profile.d/80-admin-umask.sh
+HISTORY_SOURCE=$SCRIPT_DIRECTORY/profile.d/90-no-persistent-history.sh
 TARGET_DIRECTORY=/etc/profile.d
-POLICY_TARGET=$TARGET_DIRECTORY/90-no-persistent-history.sh
+UMASK_TARGET=$TARGET_DIRECTORY/80-admin-umask.sh
+HISTORY_TARGET=$TARGET_DIRECTORY/90-no-persistent-history.sh
 
 MODE=apply
 REPLACED_POLICY=
@@ -20,10 +22,10 @@ Usage:
   $PROGRAM_NAME --plan [--replace /etc/profile.d/OLD.sh]
   sudo $PROGRAM_NAME [--replace /etc/profile.d/OLD.sh]
 
-Installs the Bash interactive-shell policy that retains history for the active
-session but writes no history to persistent storage. Existing history files are
-not removed; review their retention separately. --replace atomically retires
-one explicitly named legacy profile fragment after validating its path.
+Installs the interactive Bash policies that enforce an administrative umask of
+at least 027 and retain history only for the active session. Existing history
+files are not removed; review their retention separately. --replace atomically
+retires one explicitly named legacy history fragment after validating its path.
 EOF
 }
 
@@ -33,12 +35,33 @@ fail() {
 }
 
 validate_source() {
-    [ -f "$POLICY_SOURCE" ] && [ ! -L "$POLICY_SOURCE" ] \
-        || fail "repository source must be a regular file: $POLICY_SOURCE"
+    for policy_source in "$UMASK_SOURCE" "$HISTORY_SOURCE"; do
+        [ -f "$policy_source" ] && [ ! -L "$policy_source" ] \
+            || fail "repository source must be a regular file: $policy_source"
+    done
     command -v bash >/dev/null 2>&1 \
         || fail "bash is required to validate the shell policy"
-    bash --noprofile --norc -n "$POLICY_SOURCE" \
-        || fail "repository shell policy failed Bash syntax validation"
+    bash --noprofile --norc -n "$UMASK_SOURCE" "$HISTORY_SOURCE" \
+        || fail "repository shell policies failed Bash syntax validation"
+
+    bash --noprofile --norc -c '
+        umask 0022
+        . "$1"
+        [ "$(umask)" = 0022 ]
+    ' sh "$UMASK_SOURCE" \
+        || fail "repository umask policy changed a non-interactive shell"
+
+    for umask_case in 0002:0027 0022:0027 0027:0027 0037:0037 0077:0077; do
+        initial_umask=${umask_case%:*}
+        expected_umask=${umask_case#*:}
+        bash --noprofile --norc -ic '
+            umask "$2"
+            . "$1"
+            [ "$(umask)" = "$3" ]
+        ' sh "$UMASK_SOURCE" "$initial_umask" "$expected_umask" \
+            >/dev/null 2>&1 \
+            || fail "repository umask policy failed $initial_umask to $expected_umask"
+    done
 
     bash --noprofile --norc -c '
         HISTFILE=/tmp/config-noninteractive-history
@@ -46,7 +69,7 @@ validate_source() {
         . "$1"
         [ "$HISTFILE" = /tmp/config-noninteractive-history ]
         [ "$HISTSIZE" = 73 ]
-    ' sh "$POLICY_SOURCE" \
+    ' sh "$HISTORY_SOURCE" \
         || fail "repository shell policy changed a non-interactive shell"
 
     bash --noprofile --norc -ic '
@@ -56,7 +79,7 @@ validate_source() {
         [ "$HISTFILE" = /dev/null ]
         [ "$HISTSIZE" = 73 ]
         readonly -p HISTFILE >/dev/null 2>&1
-    ' sh "$POLICY_SOURCE" >/dev/null 2>&1 \
+    ' sh "$HISTORY_SOURCE" >/dev/null 2>&1 \
         || fail "repository shell policy does not enforce non-persistent interactive history"
 }
 
@@ -68,10 +91,12 @@ validate_target() {
         || fail "cannot inspect shell policy target: $TARGET_DIRECTORY"
     [ "$target_directory_identity" = root:root:755 ] \
         || fail "$TARGET_DIRECTORY must be owned by root:root with mode 0755"
-    if [ -e "$POLICY_TARGET" ] || [ -L "$POLICY_TARGET" ]; then
-        [ -f "$POLICY_TARGET" ] && [ ! -L "$POLICY_TARGET" ] \
-            || fail "shell policy target must be a regular file: $POLICY_TARGET"
-    fi
+    for policy_target in "$UMASK_TARGET" "$HISTORY_TARGET"; do
+        if [ -e "$policy_target" ] || [ -L "$policy_target" ]; then
+            [ -f "$policy_target" ] && [ ! -L "$policy_target" ] \
+                || fail "shell policy target must be a regular file: $policy_target"
+        fi
+    done
 }
 
 validate_replacement_path() {
@@ -87,8 +112,9 @@ validate_replacement_path() {
         *.sh) ;;
         *) fail "replacement must name one .sh file directly under /etc/profile.d" ;;
     esac
-    [ "$REPLACED_POLICY" != "$POLICY_TARGET" ] \
-        || fail "replacement policy must differ from the managed target"
+    [ "$REPLACED_POLICY" != "$UMASK_TARGET" ] \
+        && [ "$REPLACED_POLICY" != "$HISTORY_TARGET" ] \
+        || fail "replacement policy must differ from the managed targets"
 }
 
 validate_replaced_policy() {
@@ -127,7 +153,8 @@ restore_file() {
 
 rollback_policy() {
     [ -n "$SCRATCH_DIRECTORY" ] && [ -d "$SCRATCH_DIRECTORY" ] || return 0
-    restore_file "$POLICY_TARGET" managed-policy.sh
+    restore_file "$UMASK_TARGET" managed-umask.sh
+    restore_file "$HISTORY_TARGET" managed-history.sh
     if [ -n "$REPLACED_POLICY" ]; then
         restore_file "$REPLACED_POLICY" replaced-policy.sh
     fi
@@ -152,12 +179,19 @@ validate_login_behavior() {
         [ "${HISTFILE:-}" = /dev/null ] || exit 1
         [ "${HISTSIZE:-0}" -gt 0 ] 2>/dev/null || exit 1
         readonly -p HISTFILE >/dev/null 2>&1 || exit 1
+        managed_login_umask=$(umask)
+        managed_login_umask=${managed_login_umask#0}
+        [ "$((8#$managed_login_umask & 8#027))" -eq "$((8#027))" ] || exit 1
+        unset managed_login_umask
         bash -ic "
             [ \"\${HISTFILE:-}\" = /dev/null ] || exit 1
-            [ \"\${HISTSIZE:-0}\" -gt 0 ] 2>/dev/null
+            [ \"\${HISTSIZE:-0}\" -gt 0 ] 2>/dev/null || exit 1
+            managed_child_umask=\$(umask)
+            managed_child_umask=\${managed_child_umask#0}
+            [ \"\$((8#\$managed_child_umask & 8#027))\" -eq \"\$((8#027))\" ]
         " >/dev/null 2>&1
     ' >/dev/null 2>&1 \
-        || fail "a new Bash login or its interactive descendant does not use non-persistent history"
+        || fail "a new Bash login or interactive descendant does not enforce the shell baseline"
 }
 
 install_policy() {
@@ -170,7 +204,8 @@ install_policy() {
     validate_replaced_policy
 
     SCRATCH_DIRECTORY=$(mktemp -d "${TMPDIR:-/tmp}/config-shell-setup.XXXXXX")
-    backup_file "$POLICY_TARGET" managed-policy.sh
+    backup_file "$UMASK_TARGET" managed-umask.sh
+    backup_file "$HISTORY_TARGET" managed-history.sh
     if [ -n "$REPLACED_POLICY" ]; then
         backup_file "$REPLACED_POLICY" replaced-policy.sh
     fi
@@ -178,17 +213,28 @@ install_policy() {
     if [ -n "$REPLACED_POLICY" ]; then
         rm -f -- "$REPLACED_POLICY"
     fi
-    install -o root -g root -m 0644 "$POLICY_SOURCE" "$POLICY_TARGET"
-    command -v restorecon >/dev/null 2>&1 && restorecon -F "$POLICY_TARGET"
-    cmp -s "$POLICY_SOURCE" "$POLICY_TARGET" \
-        || fail "installed shell policy differs from repository source"
-    policy_identity=$(stat -Lc '%U:%G:%a' "$POLICY_TARGET" 2>/dev/null) \
-        || fail "cannot inspect installed shell policy: $POLICY_TARGET"
-    [ "$policy_identity" = root:root:644 ] \
-        || fail "installed shell policy has unsafe ownership or mode: $policy_identity"
+    install -o root -g root -m 0644 "$UMASK_SOURCE" "$UMASK_TARGET"
+    install -o root -g root -m 0644 "$HISTORY_SOURCE" "$HISTORY_TARGET"
+    if command -v restorecon >/dev/null 2>&1; then
+        restorecon -F "$UMASK_TARGET" "$HISTORY_TARGET"
+    fi
+    for policy_pair in \
+        "$UMASK_SOURCE:$UMASK_TARGET" \
+        "$HISTORY_SOURCE:$HISTORY_TARGET"
+    do
+        policy_source=${policy_pair%%:*}
+        policy_target=${policy_pair#*:}
+        cmp -s "$policy_source" "$policy_target" \
+            || fail "installed shell policy differs from repository source: $policy_target"
+        policy_identity=$(stat -Lc '%U:%G:%a' "$policy_target" 2>/dev/null) \
+            || fail "cannot inspect installed shell policy: $policy_target"
+        [ "$policy_identity" = root:root:644 ] \
+            || fail "installed shell policy has unsafe ownership or mode: $policy_identity"
+    done
     validate_login_behavior
     ROLLBACK_REQUIRED=no
-    printf 'Installed non-persistent Bash history policy: %s\n' "$POLICY_TARGET"
+    printf 'Installed administrative Bash umask policy: %s\n' "$UMASK_TARGET"
+    printf 'Installed non-persistent Bash history policy: %s\n' "$HISTORY_TARGET"
     if [ -n "$REPLACED_POLICY" ]; then
         printf 'Replaced legacy shell policy: %s\n' "$REPLACED_POLICY"
     fi
@@ -230,7 +276,7 @@ fi
 
 case "$MODE" in
     check)
-        printf 'Validated non-persistent Bash history policy source and behavior.\n'
+        printf 'Validated administrative Bash umask and history policy behavior.\n'
         ;;
     plan)
         if [ -n "$REPLACED_POLICY" ]; then
@@ -238,9 +284,11 @@ case "$MODE" in
             printf '+ rm -f -- %s\n' "$REPLACED_POLICY"
         fi
         printf '+ install -o root -g root -m 0644 %s %s\n' \
-            "$POLICY_SOURCE" "$POLICY_TARGET"
-        printf '+ restorecon -F %s\n' "$POLICY_TARGET"
-        printf '+ bash -lic <verify non-persistent history with positive HISTSIZE>\n'
+            "$UMASK_SOURCE" "$UMASK_TARGET"
+        printf '+ install -o root -g root -m 0644 %s %s\n' \
+            "$HISTORY_SOURCE" "$HISTORY_TARGET"
+        printf '+ restorecon -F %s %s\n' "$UMASK_TARGET" "$HISTORY_TARGET"
+        printf '+ bash -lic <verify umask and non-persistent history>\n'
         printf 'Plan complete; no host changes were made.\n'
         ;;
     apply)
