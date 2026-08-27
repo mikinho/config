@@ -1,4 +1,8 @@
-#!/bin/sh
+#!/usr/bin/env sh
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
 
 set -eu
 
@@ -111,7 +115,12 @@ assert_plan_contains \
 fake_binary_directory=$TEST_ROOT/fake-bin
 mkdir "$fake_binary_directory"
 cat > "$fake_binary_directory/dnf" <<'EOF'
-#!/bin/sh
+#!/usr/bin/env sh
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
 
 if [ "$#" -eq 3 ] \
     && [ "$1" = -q ] \
@@ -126,7 +135,12 @@ exit 1
 EOF
 chmod 0755 "$fake_binary_directory/dnf"
 cat > "$fake_binary_directory/uname" <<'EOF'
-#!/bin/sh
+#!/usr/bin/env sh
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
 
 [ "$#" -eq 1 ] && [ "$1" = -m ] || exit 1
 printf 'x86_64\n'

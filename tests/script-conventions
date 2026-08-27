@@ -1,0 +1,80 @@
+#!/usr/bin/env sh
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
+set -eu
+
+PROGRAM_NAME=${0##*/}
+SCRIPT_DIRECTORY=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+REPOSITORY_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIRECTORY/.." && pwd)
+SCAN_LIST=$(mktemp "${TMPDIR:-/tmp}/config-script-conventions.XXXXXX")
+AUTHOR_LINE='Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho'
+
+cleanup() {
+    if [ -f "$SCAN_LIST" ]; then
+        rm -f -- "$SCAN_LIST"
+    fi
+}
+
+fail() {
+    printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2
+    exit 1
+}
+
+read_line() {
+    line_number=$1
+    checked_file=$2
+    sed -n "${line_number}p" "$checked_file"
+}
+
+trap cleanup EXIT HUP INT TERM
+
+git -C "$REPOSITORY_ROOT" ls-files --cached --others --exclude-standard \
+    > "$SCAN_LIST"
+
+while IFS= read -r relative_file; do
+    checked_file=$REPOSITORY_ROOT/$relative_file
+    [ -f "$checked_file" ] || continue
+
+    if LC_ALL=C grep -E 'tests/[[:alnum:]_-]+\.sh([^[:alnum:]_.-]|$)' \
+        "$checked_file" >/dev/null 2>&1; then
+        fail "file references a test command with a .sh extension: $relative_file"
+    fi
+
+    case $relative_file in
+        *.sh)
+            [ ! -x "$checked_file" ] \
+                || fail "executable shell command retains a .sh extension: $relative_file"
+            ;;
+    esac
+
+    first_line=$(read_line 1 "$checked_file")
+    case $first_line in
+        '#!'*)
+            case $first_line in
+                '#!/usr/bin/env '*) ;;
+                *) fail "script does not use a /usr/bin/env shebang: $relative_file" ;;
+            esac
+
+            case $first_line in
+                '#!/usr/bin/env node') comment_marker=// ;;
+                *) comment_marker='#' ;;
+            esac
+
+            [ -z "$(read_line 2 "$checked_file")" ] \
+                || fail "author block lacks a blank line above it: $relative_file"
+            [ "$(read_line 3 "$checked_file")" = "$comment_marker" ] \
+                || fail "author block has an invalid opening marker: $relative_file"
+            [ "$(read_line 4 "$checked_file")" = "$comment_marker $AUTHOR_LINE" ] \
+                || fail "author block is missing or inconsistent: $relative_file"
+            [ "$(read_line 5 "$checked_file")" = "$comment_marker" ] \
+                || fail "author block has an invalid closing marker: $relative_file"
+            [ -z "$(read_line 6 "$checked_file")" ] \
+                || fail "author block lacks a blank line below it: $relative_file"
+            ;;
+    esac
+done < "$SCAN_LIST"
+
+printf 'Validated extensionless executable shell commands, env shebangs, and author blocks.\n'

@@ -1,4 +1,8 @@
-#!/bin/sh
+#!/usr/bin/env sh
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
 
 set -eu
 
@@ -29,6 +33,24 @@ assert_contains() {
         || fail "$checked_file is missing: $expected_text"
 }
 
+assert_mongodb_logrotate_header() {
+    logrotate_file=$MONGODB_DIRECTORY/logrotate/mongodb
+
+    [ "$(sed -n '1p' "$logrotate_file")" = '# mongodb/logrotate/mongodb' ] \
+        || fail 'MongoDB logrotate policy is missing its filename header'
+    [ -z "$(sed -n '2p' "$logrotate_file")" ] \
+        || fail 'MongoDB logrotate filename header must be followed by a blank line'
+    [ "$(sed -n '3p' "$logrotate_file")" = '#' ] \
+        || fail 'MongoDB logrotate author block has an invalid opening marker'
+    [ "$(sed -n '4p' "$logrotate_file")" = \
+        '# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho' ] \
+        || fail 'MongoDB logrotate author block is missing or inconsistent'
+    [ "$(sed -n '5p' "$logrotate_file")" = '#' ] \
+        || fail 'MongoDB logrotate author block has an invalid closing marker'
+    [ -z "$(sed -n '6p' "$logrotate_file")" ] \
+        || fail 'MongoDB logrotate author block must be followed by a blank line'
+}
+
 expect_failure() {
     expected_message=$1
     shift
@@ -48,6 +70,8 @@ write_os_release() {
 }
 
 trap cleanup EXIT HUP INT TERM
+
+assert_mongodb_logrotate_header
 
 for entry_point in "$INSTALLER" "$SETUP" "$VERIFIER"; do
     [ -x "$entry_point" ] || fail "entry point is not executable: $entry_point"

@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
 # Non-mutating verification for one rendered gold deployment host.
 # The compact check chains are safe because pass() is side-effect-only and
 # always successful; single-quoted jq programs intentionally remain literal.

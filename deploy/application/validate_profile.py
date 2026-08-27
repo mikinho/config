@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
 """Validate and canonically fingerprint gold deployment project profiles."""
 
 from __future__ import annotations

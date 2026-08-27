@@ -1,4 +1,9 @@
-#!/bin/sh
+#!/usr/bin/env sh
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
 # Mock scripts below intentionally preserve runtime shell expansions.
 # shellcheck disable=SC2016
 
@@ -136,7 +141,7 @@ mkdir -p "$TEST_ROOT/mock-bin"
 for tool_name in selinuxenabled getenforce sestatus semanage getsebool; do
     # The mock must inspect its own invoked basename at test runtime.
     # shellcheck disable=SC2016
-    printf '#!/bin/sh\n[ "${0##*/}" != selinuxenabled ]\n' \
+    printf '#!/usr/bin/env sh\n[ "${0##*/}" != selinuxenabled ]\n' \
         > "$TEST_ROOT/mock-bin/$tool_name"
     chmod 0755 "$TEST_ROOT/mock-bin/$tool_name"
 done
@@ -186,11 +191,11 @@ expect_failure 'invalid PHP-FPM site tag' \
 
 mkdir -p "$TEST_ROOT/clock-bin"
 printf '%s\n' \
-    '#!/bin/sh' \
+    '#!/usr/bin/env sh' \
     '[ "${MOCK_CLOCK_STATE:-yes}" = yes ] && printf "yes\\n" || printf "no\\n"' \
     > "$TEST_ROOT/clock-bin/timedatectl"
 printf '%s\n' \
-    '#!/bin/sh' \
+    '#!/usr/bin/env sh' \
     '[ "${MOCK_CHRONY_NORMAL:-no}" = yes ] && printf "Leap status     : Normal\\n" || printf "Leap status     : Not synchronised\\n"' \
     > "$TEST_ROOT/clock-bin/chronyc"
 chmod 0755 "$TEST_ROOT/clock-bin/timedatectl" "$TEST_ROOT/clock-bin/chronyc"
@@ -227,11 +232,11 @@ printf '%s\\n' \"\$FAILED_CHECKS\"
 
 mkdir -p "$TEST_ROOT/shell-bin"
 printf '%s\n' \
-    '#!/bin/sh' \
+    '#!/usr/bin/env sh' \
     '[ "${MOCK_SHELL_POLICY:-valid}" = valid ]' \
     > "$TEST_ROOT/shell-bin/bash"
 printf '%s\n' \
-    '#!/bin/sh' \
+    '#!/usr/bin/env sh' \
     'printf "root:root:644\n"' \
     > "$TEST_ROOT/shell-bin/stat"
 chmod 0755 "$TEST_ROOT/shell-bin/bash" "$TEST_ROOT/shell-bin/stat"
@@ -262,11 +267,11 @@ done
 
 mkdir -p "$TEST_ROOT/terminal-bin"
 printf '%s\n' \
-    '#!/bin/sh' \
+    '#!/usr/bin/env sh' \
     '[ "${MOCK_TERMINAL_READY:-yes}" = yes ]' \
     > "$TEST_ROOT/terminal-bin/verify-terminal-readiness"
 printf '%s\n' \
-    '#!/bin/sh' \
+    '#!/usr/bin/env sh' \
     'printf "root:root:755\n"' \
     > "$TEST_ROOT/terminal-bin/stat"
 chmod 0755 \
@@ -293,7 +298,7 @@ done
 
 mkdir -p "$TEST_ROOT/ssh-bin"
 printf '%s\n' \
-    '#!/bin/sh' \
+    '#!/usr/bin/env sh' \
     'case "$1" in' \
     '    -t) exit 0 ;;' \
     '    -T)' \
@@ -322,7 +327,7 @@ done
 
 mkdir -p "$TEST_ROOT/firewall-bin"
 printf '%s\n' \
-    '#!/bin/sh' \
+    '#!/usr/bin/env sh' \
     'case "$*" in' \
     '    --state) exit 0 ;;' \
     '    --get-zones) printf "public edge-custom\\n" ;;' \
@@ -355,14 +360,14 @@ done
 
 mkdir -p "$TEST_ROOT/fail2ban-bin"
 printf '%s\n' \
-    '#!/bin/sh' \
+    '#!/usr/bin/env sh' \
     'case "$1" in' \
     '    is-active | is-enabled) exit 0 ;;' \
     '    *) exit 1 ;;' \
     'esac' \
     > "$TEST_ROOT/fail2ban-bin/systemctl"
 printf '%s\n' \
-    '#!/bin/sh' \
+    '#!/usr/bin/env sh' \
     'case "$1" in' \
     '    -t) exit 0 ;;' \
     '    status)' \
@@ -423,9 +428,9 @@ printf '%s\n' \"\$FAILED_CHECKS\"
     || fail "missing Fail2ban ignore CIDR recorded $missing_ignore_result failures"
 
 certificate_function=$(extract_function check_certificate_health "$HOST_VERIFIER")
-printf '#!/bin/sh\nprintf "certificate ok\\n"\n' \
+printf '#!/usr/bin/env sh\nprintf "certificate ok\\n"\n' \
     > "$TEST_ROOT/certificate-pass"
-printf '#!/bin/sh\nprintf "certificate failed\\n" >&2\nexit 1\n' \
+printf '#!/usr/bin/env sh\nprintf "certificate failed\\n" >&2\nexit 1\n' \
     > "$TEST_ROOT/certificate-fail"
 chmod 0755 "$TEST_ROOT/certificate-pass" "$TEST_ROOT/certificate-fail"
 certificate_result=$(sh -c "

@@ -1,4 +1,9 @@
 #!/usr/bin/env node
+
+//
+// Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+//
+
 import { createHash } from "node:crypto";
 import { closeSync, constants, fstatSync, openSync, readSync } from "node:fs";
 import path from "node:path";

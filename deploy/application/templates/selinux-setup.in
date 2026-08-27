@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
 # Install the rendered SELinux policy and file-context contract.
 
 set -euo pipefail

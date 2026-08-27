@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
 # Fail-closed installer for one rendered gold deployment bundle.
 
 set -Eeuo pipefail

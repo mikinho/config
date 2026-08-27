@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
 set -euo pipefail
 
 readonly PROGRAM_NAME=${0##*/}

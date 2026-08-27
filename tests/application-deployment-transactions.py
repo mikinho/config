@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
 """Behavioral conformance tests for rendered deployment transactions."""
 
 from __future__ import annotations
@@ -189,7 +194,7 @@ print("wrapper=" + "|".join(sys.argv[1:]))
         )
         fake_rrsync.chmod(0o755)
         fake_sync = root / "sync"
-        fake_sync.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        fake_sync.write_text("#!/usr/bin/env sh\nexit 0\n", encoding="utf-8")
         fake_sync.chmod(0o755)
         return root, root / "inbox" / ".deploy-done", root / "results"
 

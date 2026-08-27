@@ -1,4 +1,9 @@
-#!/bin/sh
+#!/usr/bin/env sh
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
 # Interactive Bash is intentional in the behavioral checks below.
 # shellcheck disable=SC2016
 

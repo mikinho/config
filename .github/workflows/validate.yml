@@ -92,7 +92,7 @@ jobs:
       - name: Validate installer and profile coverage
         run: |
           actionlint -color
-          tests/run-all-local.sh
+          tests/run-all-local
 
       - name: Exercise a full profile render
         run: |
@@ -399,7 +399,7 @@ jobs:
                 "include includes/wordpress-by-tag.conf;" \
                 /tmp/nginx-safe/sites/sample_wp.conf
               nginx -t -p /tmp/nginx-safe/ -c nginx.conf
-              /workspace/tests/nginx-runtime.sh /tmp/nginx-safe
+              /workspace/tests/nginx-runtime /tmp/nginx-safe
 
               cp -R /profile-cache/. /tmp/nginx-cache/
               cp /etc/nginx/mime.types /etc/nginx/fastcgi_params /tmp/nginx-cache/

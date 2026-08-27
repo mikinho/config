@@ -1,4 +1,8 @@
-#!/bin/sh
+#!/usr/bin/env sh
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
 
 # Shared supported-platform and EPEL installation helpers. This file is sourced
 # by repository entry points; callers must validate that it is a regular,

@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
 """Verify a vendored deployment bundle against its pinned render inputs."""
 
 from __future__ import annotations

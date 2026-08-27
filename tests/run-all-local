@@ -1,4 +1,8 @@
-#!/bin/sh
+#!/usr/bin/env sh
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
 
 set -eu
 
@@ -60,21 +64,22 @@ if command -v shellcheck >/dev/null 2>&1; then
         "$REPOSITORY_ROOT/tailscale/setup" \
         "$REPOSITORY_ROOT/terminal/install" \
         "$REPOSITORY_ROOT/terminal/verify" \
-        "$REPOSITORY_ROOT/tests/certbot-installer.sh" \
-        "$REPOSITORY_ROOT/tests/certbot-issue.sh" \
-        "$REPOSITORY_ROOT/tests/deploy-renderers.sh" \
-        "$REPOSITORY_ROOT/tests/fail2ban-installer.sh" \
-        "$REPOSITORY_ROOT/tests/health-verifiers.sh" \
-        "$REPOSITORY_ROOT/tests/host-setup.sh" \
-        "$REPOSITORY_ROOT/tests/nginx-runtime.sh" \
+        "$REPOSITORY_ROOT/tests/certbot-installer" \
+        "$REPOSITORY_ROOT/tests/certbot-issue" \
+        "$REPOSITORY_ROOT/tests/deploy-renderers" \
+        "$REPOSITORY_ROOT/tests/fail2ban-installer" \
+        "$REPOSITORY_ROOT/tests/health-verifiers" \
+        "$REPOSITORY_ROOT/tests/host-setup" \
+        "$REPOSITORY_ROOT/tests/nginx-runtime" \
         "$REPOSITORY_ROOT/tests/mongodb" \
-        "$REPOSITORY_ROOT/tests/rsync-packaging.sh" \
+        "$REPOSITORY_ROOT/tests/rsync-packaging" \
         "$REPOSITORY_ROOT/tests/run-all-local" \
-        "$REPOSITORY_ROOT/tests/shell-history.sh" \
-        "$REPOSITORY_ROOT/tests/shell-prompt.sh" \
-        "$REPOSITORY_ROOT/tests/shell-verifier.sh" \
-        "$REPOSITORY_ROOT/tests/terminal-readiness.sh" \
-        "$REPOSITORY_ROOT/tests/tailscale.sh"
+        "$REPOSITORY_ROOT/tests/script-conventions" \
+        "$REPOSITORY_ROOT/tests/shell-history" \
+        "$REPOSITORY_ROOT/tests/shell-prompt" \
+        "$REPOSITORY_ROOT/tests/shell-verifier" \
+        "$REPOSITORY_ROOT/tests/terminal-readiness" \
+        "$REPOSITORY_ROOT/tests/tailscale"
     printf 'ShellCheck passed with 0 warnings.\n'
 else
     printf 'Notice: shellcheck not found in PATH; skipping static shell analysis.\n'
@@ -82,6 +87,9 @@ fi
 
 step "Validating deployment profile assignments..."
 "$REPOSITORY_ROOT/deploy/install-nginx" --check
+
+step "Validating repository script conventions..."
+"$REPOSITORY_ROOT/tests/script-conventions"
 
 step "Validating gold application deployment profiles..."
 python3 "$REPOSITORY_ROOT/tests/application-deployment-standard.py"
@@ -92,43 +100,43 @@ step "Exercising gold application deployment transactions..."
 python3 "$REPOSITORY_ROOT/tests/application-deployment-transactions.py"
 
 step "Running deployment renderer and path boundary tests..."
-"$REPOSITORY_ROOT/tests/deploy-renderers.sh"
+"$REPOSITORY_ROOT/tests/deploy-renderers"
 
 step "Running Certbot installer routing tests..."
-"$REPOSITORY_ROOT/tests/certbot-installer.sh"
+"$REPOSITORY_ROOT/tests/certbot-installer"
 
 step "Running Certbot first-lineage issuance tests..."
-"$REPOSITORY_ROOT/tests/certbot-issue.sh"
+"$REPOSITORY_ROOT/tests/certbot-issue"
 
 step "Running Fail2ban installer routing tests..."
-"$REPOSITORY_ROOT/tests/fail2ban-installer.sh"
+"$REPOSITORY_ROOT/tests/fail2ban-installer"
 
 step "Running component and host setup tests..."
-"$REPOSITORY_ROOT/tests/host-setup.sh"
+"$REPOSITORY_ROOT/tests/host-setup"
 
 step "Running interactive shell history tests..."
-"$REPOSITORY_ROOT/tests/shell-history.sh"
+"$REPOSITORY_ROOT/tests/shell-history"
 
 step "Running trusted environment prompt tests..."
-"$REPOSITORY_ROOT/tests/shell-prompt.sh"
+"$REPOSITORY_ROOT/tests/shell-prompt"
 
 step "Running shell startup and PATH integrity tests..."
-"$REPOSITORY_ROOT/tests/shell-verifier.sh"
+"$REPOSITORY_ROOT/tests/shell-verifier"
 
 step "Running generic terminal readiness tests..."
-"$REPOSITORY_ROOT/tests/terminal-readiness.sh"
+"$REPOSITORY_ROOT/tests/terminal-readiness"
 
 step "Running Tailscale installer and setup tests..."
-"$REPOSITORY_ROOT/tests/tailscale.sh"
+"$REPOSITORY_ROOT/tests/tailscale"
 
 step "Running MongoDB installer and initialized replica-set model tests..."
 "$REPOSITORY_ROOT/tests/mongodb"
 
 step "Running strict host and certificate healthcheck tests..."
-"$REPOSITORY_ROOT/tests/health-verifiers.sh"
+"$REPOSITORY_ROOT/tests/health-verifiers"
 
 step "Running rsync packaging contract tests..."
-"$REPOSITORY_ROOT/tests/rsync-packaging.sh"
+"$REPOSITORY_ROOT/tests/rsync-packaging"
 
 step "Exercising full profile render..."
 "$REPOSITORY_ROOT/deploy/install-nginx" \

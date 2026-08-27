@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
 # Root-owned server finalizer triggered after the write-only deploy completes.
 
 set -euo pipefail

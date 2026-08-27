@@ -1,4 +1,9 @@
-#!/usr/bin/python3 -I
+#!/usr/bin/env -S python3 -I
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
 """Serialize the restricted SSH ingress used by application deployments.
 
 The deploy account has no shell. Its SSH ForceCommand invokes this root-owned

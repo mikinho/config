@@ -1,4 +1,8 @@
-#!/bin/sh
+#!/usr/bin/env sh
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
 
 PROGRAM_NAME=${0##*/}
 set -eu

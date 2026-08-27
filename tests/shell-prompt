@@ -1,4 +1,9 @@
-#!/bin/sh
+#!/usr/bin/env sh
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
 # The extracted prompt function intentionally contains Bash prompt escapes.
 # shellcheck disable=SC2016
 

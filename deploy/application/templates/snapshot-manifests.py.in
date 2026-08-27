@@ -1,4 +1,9 @@
-#!/usr/bin/python3 -I
+#!/usr/bin/env -S python3 -I
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
 """Safely snapshot deploy manifests into one root-owned npm workspace.
 
 The application directory is writable by the deploy group, so pathname-level

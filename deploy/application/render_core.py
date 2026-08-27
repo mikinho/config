@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
 """Render the generic transaction core for one validated application profile."""
 
 from __future__ import annotations

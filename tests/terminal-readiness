@@ -1,4 +1,8 @@
-#!/bin/sh
+#!/usr/bin/env sh
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
 
 set -eu
 
@@ -96,7 +100,12 @@ expect_failure \
 
 mkdir "$TEST_ROOT/missing-entry-bin"
 cat > "$TEST_ROOT/missing-entry-bin/infocmp" <<'EOF'
-#!/bin/sh
+#!/usr/bin/env sh
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
 
 exit 1
 EOF
@@ -107,7 +116,12 @@ expect_failure \
 
 mkdir "$TEST_ROOT/broken-compiler-bin"
 cat > "$TEST_ROOT/broken-compiler-bin/tic" <<'EOF'
-#!/bin/sh
+#!/usr/bin/env sh
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
 
 exit 1
 EOF
