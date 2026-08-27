@@ -1,0 +1,662 @@
+#!/bin/sh
+
+set -eu
+set -f
+
+PROGRAM_NAME=${0##*/}
+SCRIPT_DIRECTORY=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+TEMPLATE_DIRECTORY=$SCRIPT_DIRECTORY/templates
+BOOTSTRAP_TEMPLATE=$TEMPLATE_DIRECTORY/mongod-bootstrap.conf.in
+LOCAL_TEMPLATE=$TEMPLATE_DIRECTORY/mongod-local.conf.in
+NETWORK_TEMPLATE=$TEMPLATE_DIRECTORY/mongod-network.conf.in
+BOOTSTRAP_SCRIPT=$SCRIPT_DIRECTORY/bootstrap.js
+ADD_USER_SCRIPT=$SCRIPT_DIRECTORY/add-application-user.js
+RECONFIGURE_SCRIPT=$SCRIPT_DIRECTORY/reconfigure-member.js
+VERIFIER=$SCRIPT_DIRECTORY/verify
+
+CONFIGURATION_PATH=/etc/mongod.conf
+KEY_FILE_PATH=/etc/mongod.keyfile
+DATA_DIRECTORY=/var/lib/mongo
+LOG_DIRECTORY=/var/log/mongodb
+MONGODB_PORT=27017
+
+MODE=apply
+PHASE=
+MODEL=
+REPLICA_SET=
+ADMIN_USER=
+ADMIN_PASSWORD_FILE=
+APPLICATION_USER=
+APPLICATION_DATABASE=
+APPLICATION_PASSWORD_FILE=
+BIND_ADDRESS=
+MEMBER_HOST=
+TLS_CERTIFICATE_KEY_FILE=
+TLS_CA_FILE=
+NETWORK_CONTROLS_CONFIRMED=no
+TEMPORARY_DIRECTORY=
+ORIGINAL_CONFIGURATION_PRESENT=no
+ROLLBACK_REQUIRED=no
+BOOTSTRAP_ATTEMPTED=no
+
+usage() {
+    cat <<EOF
+Usage:
+  $PROGRAM_NAME --check
+  $PROGRAM_NAME --plan --phase initialize OPTIONS
+  sudo $PROGRAM_NAME --phase initialize OPTIONS
+  $PROGRAM_NAME --plan --phase add-application-user --model local|network OPTIONS
+  sudo $PROGRAM_NAME --phase add-application-user --model local|network OPTIONS
+  $PROGRAM_NAME --plan --phase expose-network OPTIONS
+  sudo $PROGRAM_NAME --phase expose-network OPTIONS
+
+Initialize options:
+  --replica-set NAME
+  --admin-user USER --admin-password-file FILE
+  --application-user USER --application-database DATABASE
+  --application-password-file FILE
+
+Add-application-user options:
+  --model local|network --replica-set NAME
+  --admin-user USER --admin-password-file FILE
+  --application-user USER --application-database DATABASE
+  --application-password-file FILE
+  Network model also requires --member-host HOST --bind-address PRIVATE_IPV4,
+  --tls-ca-file FILE, and --tls-certificate-key-file FILE.
+
+Expose-network options:
+  --replica-set NAME
+  --admin-user USER --admin-password-file FILE
+  --application-user USER --application-database DATABASE
+  --bind-address PRIVATE_IPV4 --member-host TLS_DNS_NAME
+  --tls-certificate-key-file FILE --tls-ca-file FILE
+  --network-controls-confirmed
+
+Initialize is intentionally limited to a new, empty data directory and creates
+a loopback-only initialized single-node replica set. Existing data requires a
+reviewed migration. Expose-network converts an already secured local model to
+a TLS-required private listener; it never edits the host firewall.
+EOF
+}
+
+fail() {
+    printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2
+    exit 1
+}
+
+validate_source() {
+    setup_source=$1
+    [ -f "$setup_source" ] && [ ! -L "$setup_source" ] \
+        || fail "repository dependency must be a regular file: $setup_source"
+}
+
+validate_safe_name() {
+    setup_label=$1
+    setup_value=$2
+    [ -n "$setup_value" ] && [ "${#setup_value}" -le 64 ] \
+        || fail "$setup_label must contain 1 to 64 characters"
+    case "$setup_value" in
+        -* | *[!A-Za-z0-9_.@-]*) fail "invalid $setup_label: $setup_value" ;;
+    esac
+}
+
+validate_database_name() {
+    validate_safe_name "application database" "$APPLICATION_DATABASE"
+    case "$APPLICATION_DATABASE" in
+        admin | config | local)
+            fail "application database must not be a MongoDB system database: $APPLICATION_DATABASE"
+            ;;
+        *.*) fail "application database must not contain a period" ;;
+    esac
+}
+
+validate_replica_set() {
+    validate_safe_name "replica-set name" "$REPLICA_SET"
+    case "$REPLICA_SET" in
+        *.* | *@*) fail "replica-set name may contain only letters, numbers, underscores, and hyphens" ;;
+    esac
+}
+
+validate_absolute_path() {
+    setup_label=$1
+    setup_path=$2
+    case "$setup_path" in
+        /*) ;;
+        *) fail "$setup_label must be an absolute path" ;;
+    esac
+    case "$setup_path" in
+        *[!A-Za-z0-9_./-]*) fail "$setup_label contains unsupported characters: $setup_path" ;;
+    esac
+}
+
+validate_root_owned_parent_chain() {
+    parent_path=$(dirname -- "$1")
+    while :; do
+        [ -d "$parent_path" ] && [ ! -L "$parent_path" ] \
+            || fail "path parent must be a real directory: $parent_path"
+        parent_identity=$(stat -Lc '%U:%a' "$parent_path" 2>/dev/null) \
+            || fail "cannot inspect path parent: $parent_path"
+        parent_owner=${parent_identity%:*}
+        parent_mode=${parent_identity##*:}
+        [ "$parent_owner" = root ] || fail "path parent must be owned by root: $parent_path"
+        if [ "$((0$parent_mode & 0022))" -ne 0 ]; then
+            fail "path parent must not be writable by group or other: $parent_path"
+        fi
+        [ "$parent_path" != / ] || break
+        parent_path=$(dirname -- "$parent_path")
+    done
+}
+
+validate_ipv4_address() {
+    printf '%s\n' "$BIND_ADDRESS" | awk -F. '
+        NF != 4 { exit 1 }
+        {
+            for (octet_index = 1; octet_index <= 4; octet_index += 1) {
+                if ($octet_index !~ /^[0-9]+$/ || $octet_index < 0 || $octet_index > 255) {
+                    exit 1
+                }
+            }
+        }
+    ' || fail "--bind-address must be one explicit IPv4 address"
+    case "$BIND_ADDRESS" in
+        10.* | 192.168.*) ;;
+        172.*)
+            second_octet=$(printf '%s\n' "$BIND_ADDRESS" | awk -F. '{ print $2 }')
+            [ "$second_octet" -ge 16 ] && [ "$second_octet" -le 31 ] \
+                || fail "--bind-address must be an RFC 1918 private address"
+            ;;
+        *) fail "--bind-address must be an RFC 1918 private address" ;;
+    esac
+}
+
+validate_member_host() {
+    [ -n "$MEMBER_HOST" ] && [ "${#MEMBER_HOST}" -le 253 ] \
+        || fail "--member-host must contain 1 to 253 characters"
+    printf '%s\n' "$MEMBER_HOST" | awk -F. '
+        NF < 2 || $0 !~ /[A-Za-z]/ { exit 1 }
+        {
+            for (label_index = 1; label_index <= NF; label_index += 1) {
+                if ($label_index !~ /^[A-Za-z0-9-]+$/ \
+                    || $label_index !~ /^[A-Za-z0-9]/ \
+                    || $label_index !~ /[A-Za-z0-9]$/ \
+                    || length($label_index) > 63) {
+                    exit 1
+                }
+            }
+        }
+    ' || fail "--member-host must be a stable DNS name with at least two labels"
+}
+
+validate_password_file() {
+    password_label=$1
+    password_path=$2
+    validate_absolute_path "$password_label" "$password_path"
+    validate_root_owned_parent_chain "$password_path"
+    [ -f "$password_path" ] && [ ! -L "$password_path" ] \
+        || fail "$password_label must be a regular, non-symbolic-link file: $password_path"
+    password_identity=$(stat -Lc '%U:%G:%a:%h' "$password_path" 2>/dev/null) \
+        || fail "cannot inspect $password_label: $password_path"
+    [ "$password_identity" = root:root:600:1 ] \
+        || fail "$password_label must be a one-link root:root mode 0600 file"
+    awk 'NR > 1 { exit 1 }' "$password_path" \
+        || fail "$password_label must contain exactly one line"
+    [ -s "$password_path" ] || fail "$password_label must not be empty"
+}
+
+read_password() {
+    password_path=$1
+    password_value=$(cat -- "$password_path")
+    [ -n "$password_value" ] || fail "password file resolved to an empty value: $password_path"
+    [ "${#password_value}" -le 1024 ] \
+        || fail "password must not exceed 1024 characters: $password_path"
+    printf '%s' "$password_value"
+}
+
+validate_common_identity_selection() {
+    validate_replica_set
+    validate_safe_name "administrative user" "$ADMIN_USER"
+    validate_safe_name "application user" "$APPLICATION_USER"
+    validate_database_name
+    [ "$ADMIN_USER" != "$APPLICATION_USER" ] \
+        || fail "administrative and application users must be different"
+    validate_absolute_path "administrative password file" "$ADMIN_PASSWORD_FILE"
+}
+
+reject_initialize_only_options() {
+    [ -z "$MODEL$BIND_ADDRESS$MEMBER_HOST$TLS_CERTIFICATE_KEY_FILE$TLS_CA_FILE" ] \
+        || fail "network and model options do not apply to --phase initialize"
+    [ "$NETWORK_CONTROLS_CONFIRMED" = no ] \
+        || fail "--network-controls-confirmed applies only to --phase expose-network"
+}
+
+validate_selection() {
+    case "$PHASE" in
+        initialize)
+            validate_common_identity_selection
+            validate_absolute_path "application password file" "$APPLICATION_PASSWORD_FILE"
+            reject_initialize_only_options
+            ;;
+        add-application-user)
+            validate_common_identity_selection
+            validate_absolute_path "application password file" "$APPLICATION_PASSWORD_FILE"
+            case "$MODEL" in
+                local)
+                    [ -z "$MEMBER_HOST$TLS_CA_FILE" ] \
+                        || fail "network connection options do not apply to the local model"
+                    ;;
+                network)
+                    validate_member_host
+                    validate_ipv4_address
+                    validate_absolute_path "TLS CA file" "$TLS_CA_FILE"
+                    validate_absolute_path "TLS certificate/key file" "$TLS_CERTIFICATE_KEY_FILE"
+                    ;;
+                *) fail "--phase add-application-user requires --model local or --model network" ;;
+            esac
+            [ "$NETWORK_CONTROLS_CONFIRMED" = no ] \
+                || fail "--network-controls-confirmed applies only to --phase expose-network"
+            ;;
+        expose-network)
+            validate_common_identity_selection
+            [ -z "$APPLICATION_PASSWORD_FILE$MODEL" ] \
+                || fail "application password and model options do not apply to --phase expose-network"
+            validate_ipv4_address
+            validate_member_host
+            validate_absolute_path "TLS certificate/key file" "$TLS_CERTIFICATE_KEY_FILE"
+            validate_absolute_path "TLS CA file" "$TLS_CA_FILE"
+            [ "$NETWORK_CONTROLS_CONFIRMED" = yes ] \
+                || fail "--phase expose-network requires --network-controls-confirmed"
+            ;;
+        *) fail "select --phase initialize, add-application-user, or expose-network" ;;
+    esac
+}
+
+print_plan() {
+    case "$PHASE" in
+        initialize)
+            printf '1. Require MongoDB 8.0, an inactive and disabled service, and an empty %s.\n' "$DATA_DIRECTORY"
+            printf '2. Start a temporary loopback-only replica set named %s.\n' "$REPLICA_SET"
+            printf '3. Create administrative user %s and readWrite user %s on database %s without exposing passwords.\n' \
+                "$ADMIN_USER" "$APPLICATION_USER" "$APPLICATION_DATABASE"
+            printf '4. Install authorization, key-file authentication, disabled localhost bypass, and loopback-only binding.\n'
+            printf '5. Enable and restart mongod.service, then verify a writable primary and unauthenticated denial.\n'
+            ;;
+        add-application-user)
+            printf '1. Authenticate to the %s model with administrative user %s.\n' "$MODEL" "$ADMIN_USER"
+            printf '2. Refuse an existing user, then create %s with only readWrite on %s.\n' \
+                "$APPLICATION_USER" "$APPLICATION_DATABASE"
+            printf '3. Verify the exact application role and initialized replica set %s.\n' "$REPLICA_SET"
+            ;;
+        expose-network)
+            printf '1. Verify the secured local replica set %s and application user %s.\n' \
+                "$REPLICA_SET" "$APPLICATION_USER"
+            printf '2. Validate certificate chain and identity for %s and private bind address %s.\n' \
+                "$MEMBER_HOST" "$BIND_ADDRESS"
+            printf '3. Install a TLS-required listener on 127.0.0.1,%s; no firewall rules are changed.\n' "$BIND_ADDRESS"
+            printf '4. Advertise %s:%s as the sole replica-set member and verify it as a writable primary.\n' \
+                "$MEMBER_HOST" "$MONGODB_PORT"
+            printf '5. Require independent allowed-source and denied-source path evidence before acceptance.\n'
+            ;;
+    esac
+    printf 'Plan complete; no host changes were made and no password file was read.\n'
+}
+
+render_template() {
+    template_path=$1
+    output_path=$2
+    sed \
+        -e "s|@REPLICA_SET@|$REPLICA_SET|g" \
+        -e "s|@BIND_ADDRESS@|$BIND_ADDRESS|g" \
+        -e "s|@TLS_CERTIFICATE_KEY_FILE@|$TLS_CERTIFICATE_KEY_FILE|g" \
+        -e "s|@TLS_CA_FILE@|$TLS_CA_FILE|g" \
+        "$template_path" > "$output_path"
+    if grep -E '@[A-Z0-9_]+@' "$output_path" >/dev/null 2>&1; then
+        fail "rendered MongoDB configuration contains an unresolved token"
+    fi
+}
+
+validate_mongodb_runtime() {
+    for required_command in cat cmp cp find getenforce getent grep id install mktemp mongod mongosh openssl restorecon sed sleep stat systemctl; do
+        command -v "$required_command" >/dev/null 2>&1 \
+            || fail "required command not found: $required_command"
+    done
+    mongod --version 2>/dev/null | grep -Eq 'db version v8\.0\.' \
+        || fail "MongoDB 8.0 LTS is required"
+    [ "$(getenforce)" = Enforcing ] || fail "SELinux must be Enforcing"
+    id mongod >/dev/null 2>&1 || fail "mongod service account is missing"
+    systemctl cat mongod.service >/dev/null 2>&1 || fail "mongod.service is not installed"
+}
+
+validate_managed_path() {
+    setup_path=$1
+    if [ -e "$setup_path" ] || [ -L "$setup_path" ]; then
+        [ -f "$setup_path" ] && [ ! -L "$setup_path" ] \
+            || fail "managed target must be a regular, non-symbolic-link file: $setup_path"
+    fi
+}
+
+install_configuration() {
+    configuration_source=$1
+    install -o root -g root -m 0644 "$configuration_source" "$CONFIGURATION_PATH"
+    restorecon -F "$CONFIGURATION_PATH" >/dev/null
+}
+
+wait_for_local_ping() {
+    setup_attempt=0
+    while [ "$setup_attempt" -lt 60 ]; do
+        if mongosh --quiet --norc --host 127.0.0.1 --port "$MONGODB_PORT" \
+            --eval 'quit(db.getSiblingDB("admin").runCommand({ ping: 1 }).ok === 1 ? 0 : 1)' \
+            >/dev/null 2>&1
+        then
+            return 0
+        fi
+        sleep 1
+        setup_attempt=$((setup_attempt + 1))
+    done
+    fail "mongod did not accept a local connection within 60 seconds"
+}
+
+backup_configuration() {
+    if [ -f "$CONFIGURATION_PATH" ]; then
+        cp -p "$CONFIGURATION_PATH" "$TEMPORARY_DIRECTORY/original-mongod.conf"
+        ORIGINAL_CONFIGURATION_PRESENT=yes
+    fi
+}
+
+restore_original_configuration() {
+    if [ "$ORIGINAL_CONFIGURATION_PRESENT" = yes ]; then
+        install -o root -g root -m 0644 \
+            "$TEMPORARY_DIRECTORY/original-mongod.conf" "$CONFIGURATION_PATH"
+        restorecon -F "$CONFIGURATION_PATH" >/dev/null
+    fi
+}
+
+cleanup() {
+    admin_password=
+    application_password=
+    if [ "$ROLLBACK_REQUIRED" = yes ]; then
+        systemctl stop mongod.service >/dev/null 2>&1 || true
+        if [ "$PHASE" = expose-network ]; then
+            restore_original_configuration >/dev/null 2>&1 || true
+            if systemctl start mongod.service >/dev/null 2>&1; then
+                printf '%s: network transition failed; the verified local configuration was restored and restarted\n' \
+                    "$PROGRAM_NAME" >&2
+            else
+                printf '%s: network transition failed; the local configuration was restored but mongod.service remains stopped\n' \
+                    "$PROGRAM_NAME" >&2
+            fi
+        else
+            if [ "$BOOTSTRAP_ATTEMPTED" = yes ] \
+                && [ -f "$TEMPORARY_DIRECTORY/mongod-local.conf" ] \
+                && [ -f "$TEMPORARY_DIRECTORY/mongod.keyfile" ]; then
+                install -o mongod -g mongod -m 0400 \
+                    "$TEMPORARY_DIRECTORY/mongod.keyfile" "$KEY_FILE_PATH" >/dev/null 2>&1 || true
+                restorecon -F "$KEY_FILE_PATH" >/dev/null 2>&1 || true
+                install_configuration "$TEMPORARY_DIRECTORY/mongod-local.conf" >/dev/null 2>&1 || true
+            else
+                restore_original_configuration >/dev/null 2>&1 || true
+            fi
+            systemctl disable mongod.service >/dev/null 2>&1 || true
+            printf '%s: initialization failed; mongod.service was stopped and left disabled for reviewed recovery\n' \
+                "$PROGRAM_NAME" >&2
+        fi
+    fi
+    if [ -n "$TEMPORARY_DIRECTORY" ] && [ -d "$TEMPORARY_DIRECTORY" ]; then
+        rm -rf -- "$TEMPORARY_DIRECTORY"
+    fi
+}
+
+verify_local_model() {
+    "$VERIFIER" \
+        --model local \
+        --replica-set "$REPLICA_SET" \
+        --admin-user "$ADMIN_USER" \
+        --admin-password-file "$ADMIN_PASSWORD_FILE" \
+        --application-user "$APPLICATION_USER" \
+        --application-database "$APPLICATION_DATABASE"
+}
+
+verify_network_model() {
+    "$VERIFIER" \
+        --model network \
+        --replica-set "$REPLICA_SET" \
+        --admin-user "$ADMIN_USER" \
+        --admin-password-file "$ADMIN_PASSWORD_FILE" \
+        --application-user "$APPLICATION_USER" \
+        --application-database "$APPLICATION_DATABASE" \
+        --member-host "$MEMBER_HOST" \
+        --bind-address "$BIND_ADDRESS" \
+        --tls-ca-file "$TLS_CA_FILE" \
+        --tls-certificate-key-file "$TLS_CERTIFICATE_KEY_FILE"
+}
+
+initialize_new_replica_set() {
+    validate_mongodb_runtime
+    validate_password_file "administrative password file" "$ADMIN_PASSWORD_FILE"
+    validate_password_file "application password file" "$APPLICATION_PASSWORD_FILE"
+    systemctl is-active --quiet mongod.service \
+        && fail "mongod.service must be inactive before new initialization"
+    if systemctl is-enabled --quiet mongod.service 2>/dev/null; then
+        fail "mongod.service must be disabled before new initialization"
+    fi
+    [ -d "$DATA_DIRECTORY" ] && [ ! -L "$DATA_DIRECTORY" ] \
+        || fail "MongoDB data directory must be a real directory: $DATA_DIRECTORY"
+    [ -d "$LOG_DIRECTORY" ] && [ ! -L "$LOG_DIRECTORY" ] \
+        || fail "MongoDB log directory must be a real directory: $LOG_DIRECTORY"
+    if find "$DATA_DIRECTORY" -mindepth 1 -maxdepth 1 -print -quit | grep . >/dev/null 2>&1; then
+        fail "new initialization refuses a nonempty data directory: $DATA_DIRECTORY"
+    fi
+    validate_managed_path "$CONFIGURATION_PATH"
+    [ ! -e "$KEY_FILE_PATH" ] && [ ! -L "$KEY_FILE_PATH" ] \
+        || fail "new initialization refuses an existing key file: $KEY_FILE_PATH"
+
+    render_template "$BOOTSTRAP_TEMPLATE" "$TEMPORARY_DIRECTORY/mongod-bootstrap.conf"
+    render_template "$LOCAL_TEMPLATE" "$TEMPORARY_DIRECTORY/mongod-local.conf"
+    openssl rand -base64 756 > "$TEMPORARY_DIRECTORY/mongod.keyfile"
+    mongod --config "$TEMPORARY_DIRECTORY/mongod-bootstrap.conf" --outputConfig >/dev/null
+    mongod --config "$TEMPORARY_DIRECTORY/mongod-local.conf" --outputConfig >/dev/null
+    backup_configuration
+    install -d -o mongod -g mongod -m 0750 "$DATA_DIRECTORY" "$LOG_DIRECTORY"
+
+    ROLLBACK_REQUIRED=yes
+    install_configuration "$TEMPORARY_DIRECTORY/mongod-bootstrap.conf"
+    systemctl start mongod.service
+    wait_for_local_ping
+
+    admin_password=$(read_password "$ADMIN_PASSWORD_FILE")
+    application_password=$(read_password "$APPLICATION_PASSWORD_FILE")
+    BOOTSTRAP_ATTEMPTED=yes
+    env \
+        MONGODB_ADMIN_USER="$ADMIN_USER" \
+        MONGODB_ADMIN_PASSWORD="$admin_password" \
+        MONGODB_APPLICATION_USER="$APPLICATION_USER" \
+        MONGODB_APPLICATION_PASSWORD="$application_password" \
+        MONGODB_APPLICATION_DATABASE="$APPLICATION_DATABASE" \
+        MONGODB_REPLICA_SET="$REPLICA_SET" \
+        mongosh --quiet --norc --host 127.0.0.1 --port "$MONGODB_PORT" \
+        --file "$BOOTSTRAP_SCRIPT"
+    install -o mongod -g mongod -m 0400 \
+        "$TEMPORARY_DIRECTORY/mongod.keyfile" "$KEY_FILE_PATH"
+    restorecon -F "$KEY_FILE_PATH" >/dev/null
+    install_configuration "$TEMPORARY_DIRECTORY/mongod-local.conf"
+    systemctl enable mongod.service >/dev/null
+    systemctl restart mongod.service
+    verify_local_model
+    ROLLBACK_REQUIRED=no
+    printf 'Initialized and verified loopback-only single-node replica set %s.\n' "$REPLICA_SET"
+}
+
+add_application_user() {
+    validate_mongodb_runtime
+    validate_password_file "administrative password file" "$ADMIN_PASSWORD_FILE"
+    validate_password_file "application password file" "$APPLICATION_PASSWORD_FILE"
+    if [ "$MODEL" = network ]; then
+        [ -f "$TLS_CA_FILE" ] && [ ! -L "$TLS_CA_FILE" ] \
+            || fail "TLS CA file must be a regular, non-symbolic-link file: $TLS_CA_FILE"
+        validate_tls_server_identity
+    fi
+    admin_password=$(read_password "$ADMIN_PASSWORD_FILE")
+    application_password=$(read_password "$APPLICATION_PASSWORD_FILE")
+    if [ "$MODEL" = local ]; then
+        env \
+            MONGODB_ADMIN_USER="$ADMIN_USER" \
+            MONGODB_ADMIN_PASSWORD="$admin_password" \
+            MONGODB_APPLICATION_USER="$APPLICATION_USER" \
+            MONGODB_APPLICATION_PASSWORD="$application_password" \
+            MONGODB_APPLICATION_DATABASE="$APPLICATION_DATABASE" \
+            mongosh --quiet --norc --host 127.0.0.1 --port "$MONGODB_PORT" \
+            --file "$ADD_USER_SCRIPT"
+    else
+        env \
+            MONGODB_ADMIN_USER="$ADMIN_USER" \
+            MONGODB_ADMIN_PASSWORD="$admin_password" \
+            MONGODB_APPLICATION_USER="$APPLICATION_USER" \
+            MONGODB_APPLICATION_PASSWORD="$application_password" \
+            MONGODB_APPLICATION_DATABASE="$APPLICATION_DATABASE" \
+            mongosh --quiet --norc --host "$MEMBER_HOST" --port "$MONGODB_PORT" \
+            --tls --tlsCAFile "$TLS_CA_FILE" --file "$ADD_USER_SCRIPT"
+    fi
+
+    if [ "$MODEL" = local ]; then
+        verify_local_model
+    else
+        verify_network_model
+    fi
+    printf 'Created and verified application user %s on database %s.\n' \
+        "$APPLICATION_USER" "$APPLICATION_DATABASE"
+}
+
+validate_tls_server_identity() {
+    [ -f "$TLS_CERTIFICATE_KEY_FILE" ] && [ ! -L "$TLS_CERTIFICATE_KEY_FILE" ] \
+        || fail "TLS certificate/key file must be a regular, non-symbolic-link file"
+    [ -f "$TLS_CA_FILE" ] && [ ! -L "$TLS_CA_FILE" ] \
+        || fail "TLS CA file must be a regular, non-symbolic-link file"
+    validate_root_owned_parent_chain "$TLS_CERTIFICATE_KEY_FILE"
+    validate_root_owned_parent_chain "$TLS_CA_FILE"
+    [ "$(stat -Lc '%U:%G:%a:%h' "$TLS_CERTIFICATE_KEY_FILE")" = mongod:mongod:400:1 ] \
+        || fail "TLS certificate/key file must be a one-link mongod:mongod mode 0400 file"
+    [ "$(stat -Lc '%U:%G:%a:%h' "$TLS_CA_FILE")" = root:root:644:1 ] \
+        || fail "TLS CA file must be a one-link root:root mode 0644 file"
+    openssl verify -purpose sslserver -CAfile "$TLS_CA_FILE" \
+        "$TLS_CERTIFICATE_KEY_FILE" >/dev/null \
+        || fail "TLS server certificate does not validate against the selected CA"
+    openssl x509 -in "$TLS_CERTIFICATE_KEY_FILE" -pubkey -noout \
+        > "$TEMPORARY_DIRECTORY/tls-certificate-public-key.pem" \
+        || fail "cannot read the TLS server certificate"
+    openssl pkey -in "$TLS_CERTIFICATE_KEY_FILE" -passin pass: -pubout \
+        -out "$TEMPORARY_DIRECTORY/tls-private-public-key.pem" \
+        || fail "TLS server private key must be readable without a passphrase"
+    cmp -s \
+        "$TEMPORARY_DIRECTORY/tls-certificate-public-key.pem" \
+        "$TEMPORARY_DIRECTORY/tls-private-public-key.pem" \
+        || fail "TLS server certificate and private key do not match"
+    openssl x509 -in "$TLS_CERTIFICATE_KEY_FILE" -noout -checkhost "$MEMBER_HOST" >/dev/null \
+        || fail "TLS certificate does not cover member host $MEMBER_HOST"
+    openssl x509 -in "$TLS_CERTIFICATE_KEY_FILE" -noout -checkend 2592000 >/dev/null \
+        || fail "TLS server certificate expires within 30 days"
+}
+
+expose_network_model() {
+    validate_mongodb_runtime
+    validate_password_file "administrative password file" "$ADMIN_PASSWORD_FILE"
+    validate_tls_server_identity
+    getent ahostsv4 "$MEMBER_HOST" | awk -v expected="$BIND_ADDRESS" '$1 == expected { found = 1 } END { exit found ? 0 : 1 }' \
+        || fail "$MEMBER_HOST does not resolve locally to $BIND_ADDRESS"
+    verify_local_model
+
+    render_template "$NETWORK_TEMPLATE" "$TEMPORARY_DIRECTORY/mongod-network.conf"
+    mongod --config "$TEMPORARY_DIRECTORY/mongod-network.conf" --outputConfig >/dev/null
+    backup_configuration
+    ROLLBACK_REQUIRED=yes
+    install_configuration "$TEMPORARY_DIRECTORY/mongod-network.conf"
+    if ! systemctl restart mongod.service; then
+        fail "TLS network configuration failed to start"
+    fi
+
+    admin_password=$(read_password "$ADMIN_PASSWORD_FILE")
+    # From this point onward, retain the secure network configuration if a
+    # later check fails. Restoring loopback after rs.reconfig could strand the
+    # advertised member name.
+    ROLLBACK_REQUIRED=no
+    env \
+        MONGODB_ADMIN_USER="$ADMIN_USER" \
+        MONGODB_ADMIN_PASSWORD="$admin_password" \
+        MONGODB_MEMBER_HOST="$MEMBER_HOST:$MONGODB_PORT" \
+        mongosh --quiet --norc --host "$MEMBER_HOST" --port "$MONGODB_PORT" \
+        --tls --tlsCAFile "$TLS_CA_FILE" --file "$RECONFIGURE_SCRIPT"
+    verify_network_model
+    printf 'Exposed and verified TLS-required single-node replica set %s at %s:%s.\n' \
+        "$REPLICA_SET" "$MEMBER_HOST" "$MONGODB_PORT"
+    printf 'External allowed-source and denied-source path tests remain required.\n'
+}
+
+for setup_dependency in \
+    "$BOOTSTRAP_TEMPLATE" "$LOCAL_TEMPLATE" "$NETWORK_TEMPLATE" \
+    "$BOOTSTRAP_SCRIPT" "$ADD_USER_SCRIPT" "$RECONFIGURE_SCRIPT" "$VERIFIER"
+do
+    validate_source "$setup_dependency"
+done
+[ -x "$VERIFIER" ] || fail "verifier must be executable: $VERIFIER"
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --check)
+            [ "$MODE" = apply ] || fail "select exactly one mode"
+            MODE=check
+            shift
+            ;;
+        --plan)
+            [ "$MODE" = apply ] || fail "select exactly one mode"
+            MODE=plan
+            shift
+            ;;
+        --phase) [ "$#" -ge 2 ] || fail "--phase requires a value"; PHASE=$2; shift 2 ;;
+        --model) [ "$#" -ge 2 ] || fail "--model requires a value"; MODEL=$2; shift 2 ;;
+        --replica-set) [ "$#" -ge 2 ] || fail "--replica-set requires a value"; REPLICA_SET=$2; shift 2 ;;
+        --admin-user) [ "$#" -ge 2 ] || fail "--admin-user requires a value"; ADMIN_USER=$2; shift 2 ;;
+        --admin-password-file) [ "$#" -ge 2 ] || fail "--admin-password-file requires a value"; ADMIN_PASSWORD_FILE=$2; shift 2 ;;
+        --application-user) [ "$#" -ge 2 ] || fail "--application-user requires a value"; APPLICATION_USER=$2; shift 2 ;;
+        --application-database) [ "$#" -ge 2 ] || fail "--application-database requires a value"; APPLICATION_DATABASE=$2; shift 2 ;;
+        --application-password-file) [ "$#" -ge 2 ] || fail "--application-password-file requires a value"; APPLICATION_PASSWORD_FILE=$2; shift 2 ;;
+        --bind-address) [ "$#" -ge 2 ] || fail "--bind-address requires a value"; BIND_ADDRESS=$2; shift 2 ;;
+        --member-host) [ "$#" -ge 2 ] || fail "--member-host requires a value"; MEMBER_HOST=$2; shift 2 ;;
+        --tls-certificate-key-file) [ "$#" -ge 2 ] || fail "--tls-certificate-key-file requires a value"; TLS_CERTIFICATE_KEY_FILE=$2; shift 2 ;;
+        --tls-ca-file) [ "$#" -ge 2 ] || fail "--tls-ca-file requires a value"; TLS_CA_FILE=$2; shift 2 ;;
+        --network-controls-confirmed) NETWORK_CONTROLS_CONFIRMED=yes; shift ;;
+        --help | -h) usage; exit 0 ;;
+        *) fail "unknown argument: $1" ;;
+    esac
+done
+
+if [ "$MODE" = check ]; then
+    [ -z "$PHASE$MODEL$REPLICA_SET$ADMIN_USER$ADMIN_PASSWORD_FILE$APPLICATION_USER$APPLICATION_DATABASE$APPLICATION_PASSWORD_FILE$BIND_ADDRESS$MEMBER_HOST$TLS_CERTIFICATE_KEY_FILE$TLS_CA_FILE" ] \
+        && [ "$NETWORK_CONTROLS_CONFIRMED" = no ] \
+        || fail "--check does not accept deployment selections"
+    for template_path in "$BOOTSTRAP_TEMPLATE" "$LOCAL_TEMPLATE" "$NETWORK_TEMPLATE"; do
+        grep -F 'replSetName: @REPLICA_SET@' "$template_path" >/dev/null \
+            || fail "replica-set token is missing from template: $template_path"
+    done
+    grep -F 'mode: requireTLS' "$NETWORK_TEMPLATE" >/dev/null \
+        || fail "network template does not require TLS"
+    grep -F 'authorization: enabled' "$LOCAL_TEMPLATE" >/dev/null \
+        || fail "local template does not enable authorization"
+    printf 'Validated MongoDB setup sources and hardened templates.\n'
+    exit 0
+fi
+
+validate_selection
+if [ "$MODE" = plan ]; then
+    print_plan
+    exit 0
+fi
+
+[ "$(id -u)" -eq 0 ] || fail "run as root or use --plan"
+trap cleanup EXIT HUP INT TERM
+umask 077
+TEMPORARY_DIRECTORY=$(mktemp -d "${TMPDIR:-/tmp}/config-mongodb-setup.XXXXXX") \
+    || fail "cannot create a private setup directory"
+
+case "$PHASE" in
+    initialize) initialize_new_replica_set ;;
+    add-application-user) add_application_user ;;
+    expose-network) expose_network_model ;;
+esac

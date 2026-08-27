@@ -30,11 +30,12 @@ but only for explicitly trusted immediate peers.
 | systemd | **249** syntax floor; validated on Rocky Linux 9 and CentOS Stream 10 | Required for the service sandbox, including `ProtectProc` and `SocketBindDeny`. |
 | PHP-FPM | **PHP 8.3 or newer** with systemd and POSIX ACL support; OPcache for production | Required only for the optional per-site PHP-FPM service and configuration under `php-fpm/`. |
 | Certbot | A currently supported native package or the official Snap, selected per host | Required only for the included ACME renewal timer and its selected native or Snap payload. |
-| logrotate | A currently supported release | Required only when installing the included nginx file-log rotation policy. |
+| logrotate | A currently supported release | Required when installing the included nginx or MongoDB file-log rotation policy. |
 | fail2ban | A currently supported EPEL release | Required only for the optional intrusion-ban policy in `fail2ban/`. |
 | OpenSSH | A supported RHEL-family sshd with the stock `sshd_config.d` include | Required only for the `ssh/` drop-ins; RHEL 8-era sshd lacks the include and silently ignores them. |
 | ncurses terminfo | Vendor `ncurses` and `ncurses-base` packages with working `tic`, `infocmp`, and `xterm-256color` | Provides a terminal-generic compatibility floor and the tooling for reviewed user-local terminfo entries. |
 | Tailscale | Current stable RPM from Tailscale's official repository | Required only for tagged-server enrollment and Tailscale SSH under the explicit two-plane policy in `tailscale/`. |
+| MongoDB | **8.0 LTS** Community on EL9 x86_64 | Required only on database hosts. Both local and networked models are initialized single-node replica sets so transactions are available; one member does not provide high availability. |
 | rsync | **3.5.0 or newer** for restricted `rrsync` deployment identities | 3.5.0 adds the confinement contract needed to close CVE-2026-53783. `packages/rsync/` supplies an audited temporary EL9 rebuild while the vendor package lags. |
 | firewalld | A currently supported RHEL-family release | Required only for the `firewalld/` service definitions and reference zone. |
 | SELinux | Enforcing mode with the RHEL `httpd` policy | Expected on the supported platforms; do not disable it to deploy this baseline. |
@@ -200,6 +201,10 @@ TCP 443 so clients always have an HTTP/2 or HTTP/1.1 fallback.
   the host, plus a read-only startup and `PATH` integrity verifier.
 - `terminal/` installs and functionally verifies the generic terminfo tooling
   and standard `xterm-256color` fallback used by administrative sessions.
+- `mongodb/` installs MongoDB 8.0 LTS and provides guarded initialization,
+  least-privilege application-user creation, local and TLS-required networked
+  single-node replica-set models, and strict host verification. It is never
+  included automatically on an edge host.
 - `tailscale/` contains the official-repository installer and three-phase tagged
   server setup that keeps native deployment SSH on TCP 2356 while enabling
   Tailscale SSH on tailnet TCP 22 for explicitly named human accounts.

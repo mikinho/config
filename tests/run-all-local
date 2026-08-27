@@ -42,6 +42,9 @@ if command -v shellcheck >/dev/null 2>&1; then
         "$REPOSITORY_ROOT/firewalld/install" \
         "$REPOSITORY_ROOT/firewalld/setup" \
         "$REPOSITORY_ROOT/nginx/setup" \
+        "$REPOSITORY_ROOT/mongodb/install" \
+        "$REPOSITORY_ROOT/mongodb/setup" \
+        "$REPOSITORY_ROOT/mongodb/verify" \
         "$REPOSITORY_ROOT/packages/rsync/build-el9" \
         "$REPOSITORY_ROOT/selinux/apply-nginx-policy" \
         "$REPOSITORY_ROOT/selinux/install" \
@@ -64,8 +67,9 @@ if command -v shellcheck >/dev/null 2>&1; then
         "$REPOSITORY_ROOT/tests/health-verifiers.sh" \
         "$REPOSITORY_ROOT/tests/host-setup.sh" \
         "$REPOSITORY_ROOT/tests/nginx-runtime.sh" \
+        "$REPOSITORY_ROOT/tests/mongodb" \
         "$REPOSITORY_ROOT/tests/rsync-packaging.sh" \
-        "$REPOSITORY_ROOT/tests/run-all-local.sh" \
+        "$REPOSITORY_ROOT/tests/run-all-local" \
         "$REPOSITORY_ROOT/tests/shell-history.sh" \
         "$REPOSITORY_ROOT/tests/shell-prompt.sh" \
         "$REPOSITORY_ROOT/tests/shell-verifier.sh" \
@@ -116,6 +120,9 @@ step "Running generic terminal readiness tests..."
 
 step "Running Tailscale installer and setup tests..."
 "$REPOSITORY_ROOT/tests/tailscale.sh"
+
+step "Running MongoDB installer and initialized replica-set model tests..."
+"$REPOSITORY_ROOT/tests/mongodb"
 
 step "Running strict host and certificate healthcheck tests..."
 "$REPOSITORY_ROOT/tests/health-verifiers.sh"

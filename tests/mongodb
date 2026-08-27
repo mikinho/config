@@ -1,0 +1,227 @@
+#!/bin/sh
+
+set -eu
+
+PROGRAM_NAME=${0##*/}
+SCRIPT_DIRECTORY=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+REPOSITORY_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIRECTORY/.." && pwd)
+MONGODB_DIRECTORY=$REPOSITORY_ROOT/mongodb
+INSTALLER=$MONGODB_DIRECTORY/install
+SETUP=$MONGODB_DIRECTORY/setup
+VERIFIER=$MONGODB_DIRECTORY/verify
+TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/config-mongodb-tests.XXXXXX")
+
+cleanup() {
+    if [ -d "$TEST_ROOT" ]; then
+        rm -rf -- "$TEST_ROOT"
+    fi
+}
+
+fail() {
+    printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2
+    exit 1
+}
+
+assert_contains() {
+    checked_file=$1
+    expected_text=$2
+    grep -F -- "$expected_text" "$checked_file" >/dev/null \
+        || fail "$checked_file is missing: $expected_text"
+}
+
+expect_failure() {
+    expected_message=$1
+    shift
+    if "$@" > "$TEST_ROOT/command.stdout" 2> "$TEST_ROOT/command.stderr"; then
+        fail "command unexpectedly succeeded: $*"
+    fi
+    assert_contains "$TEST_ROOT/command.stderr" "$expected_message"
+}
+
+write_os_release() {
+    release_path=$1
+    release_id=$2
+    release_name=$3
+    release_version=$4
+    printf 'ID=%s\nPRETTY_NAME="%s"\nVERSION_ID="%s"\n' \
+        "$release_id" "$release_name" "$release_version" > "$release_path"
+}
+
+trap cleanup EXIT HUP INT TERM
+
+for entry_point in "$INSTALLER" "$SETUP" "$VERIFIER"; do
+    [ -x "$entry_point" ] || fail "entry point is not executable: $entry_point"
+    "$entry_point" --help >/dev/null
+    "$entry_point" --check >/dev/null
+done
+
+for javascript_source in \
+    "$MONGODB_DIRECTORY/bootstrap.js" \
+    "$MONGODB_DIRECTORY/add-application-user.js" \
+    "$MONGODB_DIRECTORY/reconfigure-member.js" \
+    "$MONGODB_DIRECTORY/verify-auth.js" \
+    "$MONGODB_DIRECTORY/verify-unauthenticated.js"
+do
+    [ -f "$javascript_source" ] && [ ! -L "$javascript_source" ] \
+        || fail "MongoDB JavaScript source is not a real file: $javascript_source"
+    if command -v node >/dev/null 2>&1; then
+        node --check "$javascript_source"
+    fi
+done
+
+write_os_release "$TEST_ROOT/rocky-9" rocky 'Rocky Linux 9.6' 9.6
+write_os_release "$TEST_ROOT/centos-stream-9" centos 'CentOS Stream 9' 9
+write_os_release "$TEST_ROOT/rocky-10" rocky 'Rocky Linux 10.1' 10.1
+
+for supported_release in rocky-9 centos-stream-9; do
+    "$INSTALLER" --plan --os-release "$TEST_ROOT/$supported_release" \
+        --architecture x86_64 > "$TEST_ROOT/$supported_release.plan"
+    assert_contains "$TEST_ROOT/$supported_release.plan" 'MongoDB package series: 8.0 LTS'
+    assert_contains "$TEST_ROOT/$supported_release.plan" \
+        '4B0752C1BCA238C0B4EE14DC41DE058A4E7DCA05'
+    assert_contains "$TEST_ROOT/$supported_release.plan" \
+        'https://repo.mongodb.org/yum/redhat/9/mongodb-org/8.0/x86_64/'
+    assert_contains "$TEST_ROOT/$supported_release.plan" \
+        'mongod.service would remain stopped and disabled'
+done
+
+expect_failure 'supported here only on EL9' \
+    "$INSTALLER" --plan --os-release "$TEST_ROOT/rocky-10" --architecture x86_64
+expect_failure 'supported here only on x86_64' \
+    "$INSTALLER" --plan --os-release "$TEST_ROOT/rocky-9" --architecture aarch64
+expect_failure '--architecture is accepted only with --plan' \
+    "$INSTALLER" --architecture x86_64
+
+"$SETUP" --plan --phase initialize \
+    --replica-set example_rs \
+    --admin-user database_admin \
+    --admin-password-file /root/database-admin.password \
+    --application-user example_app \
+    --application-database example_database \
+    --application-password-file /root/example-app.password \
+    > "$TEST_ROOT/initialize.plan"
+assert_contains "$TEST_ROOT/initialize.plan" \
+    'Start a temporary loopback-only replica set named example_rs.'
+assert_contains "$TEST_ROOT/initialize.plan" \
+    'Enable and restart mongod.service, then verify a writable primary and unauthenticated denial.'
+assert_contains "$TEST_ROOT/initialize.plan" \
+    'no password file was read'
+
+"$SETUP" --plan --phase add-application-user --model local \
+    --replica-set example_rs \
+    --admin-user database_admin \
+    --admin-password-file /root/database-admin.password \
+    --application-user second_app \
+    --application-database second_database \
+    --application-password-file /root/second-app.password \
+    > "$TEST_ROOT/add-local-user.plan"
+assert_contains "$TEST_ROOT/add-local-user.plan" \
+    'create second_app with only readWrite on second_database'
+
+"$SETUP" --plan --phase expose-network \
+    --replica-set example_rs \
+    --admin-user database_admin \
+    --admin-password-file /root/database-admin.password \
+    --application-user example_app \
+    --application-database example_database \
+    --bind-address 10.20.30.40 \
+    --member-host mongodb.internal.example \
+    --tls-certificate-key-file /etc/pki/mongodb/server.pem \
+    --tls-ca-file /etc/pki/mongodb/ca.pem \
+    --network-controls-confirmed \
+    > "$TEST_ROOT/expose-network.plan"
+assert_contains "$TEST_ROOT/expose-network.plan" \
+    'Install a TLS-required listener on 127.0.0.1,10.20.30.40'
+assert_contains "$TEST_ROOT/expose-network.plan" \
+    'Advertise mongodb.internal.example:27017 as the sole replica-set member'
+assert_contains "$TEST_ROOT/expose-network.plan" \
+    'allowed-source and denied-source path evidence'
+
+"$SETUP" --plan --phase add-application-user --model network \
+    --replica-set example_rs \
+    --admin-user database_admin \
+    --admin-password-file /root/database-admin.password \
+    --application-user second_app \
+    --application-database second_database \
+    --application-password-file /root/second-app.password \
+    --bind-address 10.20.30.40 \
+    --member-host mongodb.internal.example \
+    --tls-certificate-key-file /etc/pki/mongodb/server.pem \
+    --tls-ca-file /etc/pki/mongodb/ca.pem \
+    > "$TEST_ROOT/add-network-user.plan"
+assert_contains "$TEST_ROOT/add-network-user.plan" \
+    'Authenticate to the network model'
+
+expect_failure 'requires --network-controls-confirmed' \
+    "$SETUP" --plan --phase expose-network \
+    --replica-set example_rs \
+    --admin-user database_admin \
+    --admin-password-file /root/database-admin.password \
+    --application-user example_app \
+    --application-database example_database \
+    --bind-address 10.20.30.40 \
+    --member-host mongodb.internal.example \
+    --tls-certificate-key-file /etc/pki/mongodb/server.pem \
+    --tls-ca-file /etc/pki/mongodb/ca.pem
+expect_failure 'RFC 1918 private address' \
+    "$SETUP" --plan --phase expose-network \
+    --replica-set example_rs \
+    --admin-user database_admin \
+    --admin-password-file /root/database-admin.password \
+    --application-user example_app \
+    --application-database example_database \
+    --bind-address 203.0.113.10 \
+    --member-host mongodb.internal.example \
+    --tls-certificate-key-file /etc/pki/mongodb/server.pem \
+    --tls-ca-file /etc/pki/mongodb/ca.pem \
+    --network-controls-confirmed
+expect_failure 'stable DNS name with at least two labels' \
+    "$SETUP" --plan --phase expose-network \
+    --replica-set example_rs \
+    --admin-user database_admin \
+    --admin-password-file /root/database-admin.password \
+    --application-user example_app \
+    --application-database example_database \
+    --bind-address 10.20.30.40 \
+    --member-host 10.20.30.40 \
+    --tls-certificate-key-file /etc/pki/mongodb/server.pem \
+    --tls-ca-file /etc/pki/mongodb/ca.pem \
+    --network-controls-confirmed
+expect_failure 'must not be a MongoDB system database' \
+    "$SETUP" --plan --phase initialize \
+    --replica-set example_rs \
+    --admin-user database_admin \
+    --admin-password-file /root/database-admin.password \
+    --application-user example_app \
+    --application-database admin \
+    --application-password-file /root/example-app.password
+expect_failure 'does not accept deployment selections' \
+    "$SETUP" --check --phase initialize
+
+assert_contains "$MONGODB_DIRECTORY/templates/mongod-local.conf.in" \
+    '  bindIp: 127.0.0.1'
+assert_contains "$MONGODB_DIRECTORY/templates/mongod-local.conf.in" \
+    '  authorization: enabled'
+assert_contains "$MONGODB_DIRECTORY/templates/mongod-local.conf.in" \
+    '  logRotate: reopen'
+assert_contains "$MONGODB_DIRECTORY/templates/mongod-local.conf.in" \
+    '  enableLocalhostAuthBypass: false'
+assert_contains "$MONGODB_DIRECTORY/templates/mongod-network.conf.in" \
+    '    mode: requireTLS'
+assert_contains "$MONGODB_DIRECTORY/templates/mongod-network.conf.in" \
+    '    allowConnectionsWithoutCertificates: true'
+assert_contains "$MONGODB_DIRECTORY/templates/mongod-network.conf.in" \
+    '    allowInvalidCertificates: false'
+assert_contains "$MONGODB_DIRECTORY/templates/mongod-network.conf.in" \
+    '  replSetName: @REPLICA_SET@'
+assert_contains "$MONGODB_DIRECTORY/logrotate/mongodb" \
+    '            /usr/bin/systemctl kill --kill-who=main --signal=SIGUSR1 mongod.service'
+
+if grep -R -E -i 'private_web_host|private_database_host|private_application_a|private_application_b' "$MONGODB_DIRECTORY" >/dev/null 2>&1; then
+    fail 'generic MongoDB component contains deployment-specific identifiers'
+fi
+if grep -R -E -- '--password([ =]|$)' "$MONGODB_DIRECTORY" >/dev/null 2>&1; then
+    fail 'MongoDB component places a password in a command-line option'
+fi
+
+printf 'Validated MongoDB 8.0 installer, initialized replica-set setup plans, and deployment-model guards.\n'

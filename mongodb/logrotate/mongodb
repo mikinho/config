@@ -1,0 +1,17 @@
+/var/log/mongodb/mongod.log {
+    daily
+    maxsize 100M
+    rotate 14
+    dateext
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 mongod mongod
+    sharedscripts
+    postrotate
+        if /usr/bin/systemctl is-active --quiet mongod.service; then
+            /usr/bin/systemctl kill --kill-who=main --signal=SIGUSR1 mongod.service
+        fi
+    endscript
+}

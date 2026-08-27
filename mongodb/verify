@@ -1,0 +1,463 @@
+#!/bin/sh
+
+set -eu
+set -f
+
+PROGRAM_NAME=${0##*/}
+SCRIPT_DIRECTORY=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+SOURCE_DIRECTORY=$SCRIPT_DIRECTORY
+if [ ! -f "$SOURCE_DIRECTORY/verify-auth.js" ] \
+    && [ -d /usr/local/libexec/config-mongodb ]; then
+    SOURCE_DIRECTORY=/usr/local/libexec/config-mongodb
+fi
+AUTH_SCRIPT=$SOURCE_DIRECTORY/verify-auth.js
+UNAUTHENTICATED_SCRIPT=$SOURCE_DIRECTORY/verify-unauthenticated.js
+CONFIGURATION_PATH=/etc/mongod.conf
+KEY_FILE_PATH=/etc/mongod.keyfile
+DATA_DIRECTORY=/var/lib/mongo
+LOG_DIRECTORY=/var/log/mongodb
+LOGROTATE_PATH=/etc/logrotate.d/mongodb
+MONGODB_PORT=27017
+
+MODE=verify
+MODEL=
+REPLICA_SET=
+ADMIN_USER=
+ADMIN_PASSWORD_FILE=
+APPLICATION_USER=
+APPLICATION_DATABASE=
+MEMBER_HOST=
+BIND_ADDRESS=
+TLS_CA_FILE=
+TLS_CERTIFICATE_KEY_FILE=
+TEMPORARY_DIRECTORY=
+
+usage() {
+    cat <<EOF
+Usage:
+  $PROGRAM_NAME --check
+  sudo $PROGRAM_NAME --model local --replica-set NAME \
+      --admin-user USER --admin-password-file FILE \
+      --application-user USER --application-database DATABASE
+  sudo $PROGRAM_NAME --model network --replica-set NAME \
+      --admin-user USER --admin-password-file FILE \
+      --application-user USER --application-database DATABASE \
+      --member-host HOST --bind-address PRIVATE_IPV4 \
+      --tls-ca-file FILE --tls-certificate-key-file FILE
+
+Verifies MongoDB 8.0, an initialized writable single-node replica set,
+authentication and least-privilege application identity, configuration and
+filesystem protections, SELinux, listener scope, and TLS for the network
+model. Network source restriction still requires tests from allowed and denied
+hosts; a database host cannot prove every external path by itself.
+EOF
+}
+
+fail() {
+    printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2
+    exit 1
+}
+
+cleanup() {
+    admin_password=
+    if [ -n "$TEMPORARY_DIRECTORY" ] && [ -d "$TEMPORARY_DIRECTORY" ]; then
+        rm -rf -- "$TEMPORARY_DIRECTORY"
+    fi
+}
+
+validate_source() {
+    verify_source=$1
+    [ -f "$verify_source" ] && [ ! -L "$verify_source" ] \
+        || fail "repository dependency must be a regular file: $verify_source"
+}
+
+validate_safe_name() {
+    verify_label=$1
+    verify_value=$2
+    [ -n "$verify_value" ] && [ "${#verify_value}" -le 64 ] \
+        || fail "$verify_label must contain 1 to 64 characters"
+    case "$verify_value" in
+        -* | *[!A-Za-z0-9_.@-]*) fail "invalid $verify_label: $verify_value" ;;
+    esac
+}
+
+validate_absolute_path() {
+    verify_label=$1
+    verify_path=$2
+    case "$verify_path" in
+        /*) ;;
+        *) fail "$verify_label must be an absolute path" ;;
+    esac
+    case "$verify_path" in
+        *[!A-Za-z0-9_./-]*) fail "$verify_label contains unsupported characters: $verify_path" ;;
+    esac
+}
+
+validate_root_owned_parent_chain() {
+    parent_path=$(dirname -- "$1")
+    while :; do
+        [ -d "$parent_path" ] && [ ! -L "$parent_path" ] \
+            || fail "path parent must be a real directory: $parent_path"
+        parent_identity=$(stat -Lc '%U:%a' "$parent_path" 2>/dev/null) \
+            || fail "cannot inspect path parent: $parent_path"
+        parent_owner=${parent_identity%:*}
+        parent_mode=${parent_identity##*:}
+        [ "$parent_owner" = root ] || fail "path parent must be owned by root: $parent_path"
+        if [ "$((0$parent_mode & 0022))" -ne 0 ]; then
+            fail "path parent must not be writable by group or other: $parent_path"
+        fi
+        [ "$parent_path" != / ] || break
+        parent_path=$(dirname -- "$parent_path")
+    done
+}
+
+validate_member_host() {
+    [ -n "$MEMBER_HOST" ] && [ "${#MEMBER_HOST}" -le 253 ] \
+        || fail "--member-host must contain 1 to 253 characters"
+    printf '%s\n' "$MEMBER_HOST" | awk -F. '
+        NF < 2 || $0 !~ /[A-Za-z]/ { exit 1 }
+        {
+            for (label_index = 1; label_index <= NF; label_index += 1) {
+                if ($label_index !~ /^[A-Za-z0-9-]+$/ \
+                    || $label_index !~ /^[A-Za-z0-9]/ \
+                    || $label_index !~ /[A-Za-z0-9]$/ \
+                    || length($label_index) > 63) {
+                    exit 1
+                }
+            }
+        }
+    ' || fail "--member-host must be a stable DNS name with at least two labels"
+}
+
+validate_private_ipv4() {
+    printf '%s\n' "$BIND_ADDRESS" | awk -F. '
+        NF != 4 { exit 1 }
+        {
+            for (octet_index = 1; octet_index <= 4; octet_index += 1) {
+                if ($octet_index !~ /^[0-9]+$/ || $octet_index < 0 || $octet_index > 255) {
+                    exit 1
+                }
+            }
+        }
+    ' || fail "--bind-address must be one explicit IPv4 address"
+    case "$BIND_ADDRESS" in
+        10.* | 192.168.*) ;;
+        172.*)
+            second_octet=$(printf '%s\n' "$BIND_ADDRESS" | awk -F. '{ print $2 }')
+            [ "$second_octet" -ge 16 ] && [ "$second_octet" -le 31 ] \
+                || fail "--bind-address must be an RFC 1918 private address"
+            ;;
+        *) fail "--bind-address must be an RFC 1918 private address" ;;
+    esac
+}
+
+validate_password_file() {
+    validate_absolute_path "administrative password file" "$ADMIN_PASSWORD_FILE"
+    validate_root_owned_parent_chain "$ADMIN_PASSWORD_FILE"
+    [ -f "$ADMIN_PASSWORD_FILE" ] && [ ! -L "$ADMIN_PASSWORD_FILE" ] \
+        || fail "administrative password file must be a regular, non-symbolic-link file"
+    [ "$(stat -Lc '%U:%G:%a:%h' "$ADMIN_PASSWORD_FILE" 2>/dev/null)" = root:root:600:1 ] \
+        || fail "administrative password file must be a one-link root:root mode 0600 file"
+    awk 'NR > 1 { exit 1 }' "$ADMIN_PASSWORD_FILE" \
+        || fail "administrative password file must contain exactly one line"
+    [ -s "$ADMIN_PASSWORD_FILE" ] || fail "administrative password file must not be empty"
+}
+
+validate_selection() {
+    validate_safe_name "replica-set name" "$REPLICA_SET"
+    validate_safe_name "administrative user" "$ADMIN_USER"
+    validate_safe_name "application user" "$APPLICATION_USER"
+    validate_safe_name "application database" "$APPLICATION_DATABASE"
+    case "$APPLICATION_DATABASE" in
+        admin | config | local) fail "application database must not be a MongoDB system database" ;;
+        *.*) fail "application database must not contain a period" ;;
+    esac
+    case "$MODEL" in
+        local)
+            [ -z "$MEMBER_HOST$BIND_ADDRESS$TLS_CA_FILE$TLS_CERTIFICATE_KEY_FILE" ] \
+                || fail "network options do not apply to the local model"
+            ;;
+        network)
+            validate_member_host
+            validate_private_ipv4
+            validate_absolute_path "TLS CA file" "$TLS_CA_FILE"
+            validate_absolute_path "TLS certificate/key file" "$TLS_CERTIFICATE_KEY_FILE"
+            ;;
+        *) fail "select --model local or --model network" ;;
+    esac
+}
+
+require_command() {
+    command -v "$1" >/dev/null 2>&1 || fail "required command not found: $1"
+}
+
+require_identity() {
+    identity_path=$1
+    expected_identity=$2
+    [ -e "$identity_path" ] && [ ! -L "$identity_path" ] \
+        || fail "required path must exist and must not be a symbolic link: $identity_path"
+    actual_identity=$(stat -Lc '%U:%G:%a:%h' "$identity_path" 2>/dev/null) \
+        || fail "cannot inspect required path: $identity_path"
+    [ "$actual_identity" = "$expected_identity" ] \
+        || fail "$identity_path must be $expected_identity (found $actual_identity)"
+}
+
+require_configuration_line() {
+    expected_line=$1
+    line_count=$(grep -Fxc -- "$expected_line" "$CONFIGURATION_PATH" || true)
+    [ "$line_count" -eq 1 ] \
+        || fail "MongoDB configuration must contain exactly once: $expected_line"
+}
+
+read_admin_password() {
+    admin_password=$(cat -- "$ADMIN_PASSWORD_FILE")
+    [ -n "$admin_password" ] || fail "administrative password resolved to an empty value"
+    [ "${#admin_password}" -le 1024 ] || fail "administrative password exceeds 1024 characters"
+}
+
+run_unauthenticated_check() {
+    if [ "$MODEL" = local ]; then
+        mongosh --quiet --norc --host 127.0.0.1 --port "$MONGODB_PORT" \
+            --file "$UNAUTHENTICATED_SCRIPT"
+    else
+        mongosh --quiet --norc --host "$MEMBER_HOST" --port "$MONGODB_PORT" \
+            --tls --tlsCAFile "$TLS_CA_FILE" --file "$UNAUTHENTICATED_SCRIPT"
+    fi
+}
+
+run_authenticated_check() {
+    if [ "$MODEL" = local ]; then
+        env \
+            MONGODB_ADMIN_USER="$ADMIN_USER" \
+            MONGODB_ADMIN_PASSWORD="$admin_password" \
+            MONGODB_APPLICATION_USER="$APPLICATION_USER" \
+            MONGODB_APPLICATION_DATABASE="$APPLICATION_DATABASE" \
+            MONGODB_REPLICA_SET="$REPLICA_SET" \
+            MONGODB_MODEL="$MODEL" \
+            mongosh --quiet --norc --host 127.0.0.1 --port "$MONGODB_PORT" \
+            --file "$AUTH_SCRIPT"
+    else
+        env \
+            MONGODB_ADMIN_USER="$ADMIN_USER" \
+            MONGODB_ADMIN_PASSWORD="$admin_password" \
+            MONGODB_APPLICATION_USER="$APPLICATION_USER" \
+            MONGODB_APPLICATION_DATABASE="$APPLICATION_DATABASE" \
+            MONGODB_REPLICA_SET="$REPLICA_SET" \
+            MONGODB_MODEL="$MODEL" \
+            MONGODB_MEMBER_HOST="$MEMBER_HOST" \
+            MONGODB_BIND_ADDRESS="$BIND_ADDRESS" \
+            MONGODB_TLS_CA_FILE="$TLS_CA_FILE" \
+            MONGODB_TLS_CERTIFICATE_KEY_FILE="$TLS_CERTIFICATE_KEY_FILE" \
+            mongosh --quiet --norc --host "$MEMBER_HOST" --port "$MONGODB_PORT" \
+            --tls --tlsCAFile "$TLS_CA_FILE" --file "$AUTH_SCRIPT"
+    fi
+}
+
+verify_configuration() {
+    require_identity "$CONFIGURATION_PATH" root:root:644:1
+    require_configuration_line '  port: 27017'
+    require_configuration_line '  authorization: enabled'
+    require_configuration_line '  logRotate: reopen'
+    require_configuration_line '  keyFile: /etc/mongod.keyfile'
+    require_configuration_line '  javascriptEnabled: false'
+    require_configuration_line '  enableLocalhostAuthBypass: false'
+    require_configuration_line "  replSetName: $REPLICA_SET"
+    if [ "$MODEL" = local ]; then
+        require_configuration_line '  bindIp: 127.0.0.1'
+        if grep -F '  tls:' "$CONFIGURATION_PATH" >/dev/null 2>&1; then
+            fail "local model configuration unexpectedly contains a TLS listener block"
+        fi
+    else
+        require_configuration_line "  bindIp: 127.0.0.1,$BIND_ADDRESS"
+        require_configuration_line '    mode: requireTLS'
+        require_configuration_line "    certificateKeyFile: $TLS_CERTIFICATE_KEY_FILE"
+        require_configuration_line "    CAFile: $TLS_CA_FILE"
+        require_configuration_line '    allowConnectionsWithoutCertificates: true'
+        require_configuration_line '    allowInvalidCertificates: false'
+        require_configuration_line '    allowInvalidHostnames: false'
+        require_configuration_line '    disabledProtocols: TLS1_0,TLS1_1'
+    fi
+    mongod --config "$CONFIGURATION_PATH" --outputConfig \
+        > "$TEMPORARY_DIRECTORY/effective-config.yml"
+}
+
+verify_log_rotation() {
+    require_identity "$LOGROTATE_PATH" root:root:644:1
+    for logrotate_line in \
+        '/var/log/mongodb/mongod.log {' \
+        '    maxsize 100M' \
+        '    rotate 14' \
+        '    create 0640 mongod mongod' \
+        '            /usr/bin/systemctl kill --kill-who=main --signal=SIGUSR1 mongod.service'
+    do
+        line_count=$(grep -Fxc -- "$logrotate_line" "$LOGROTATE_PATH" || true)
+        [ "$line_count" -eq 1 ] \
+            || fail "MongoDB logrotate policy must contain exactly once: $logrotate_line"
+    done
+    matching_logrotate_policies=$(grep -RlF \
+        '/var/log/mongodb/mongod.log' /etc/logrotate.d 2>/dev/null || true)
+    [ "$matching_logrotate_policies" = "$LOGROTATE_PATH" ] \
+        || fail "MongoDB log path is managed by an unexpected or duplicate logrotate policy"
+    logrotate --debug "$LOGROTATE_PATH" >/dev/null 2>&1 \
+        || fail "MongoDB logrotate policy failed syntax validation"
+}
+
+verify_listener() {
+    listener_output=$(ss -H -lnt "sport = :$MONGODB_PORT") \
+        || fail "cannot inspect the MongoDB listener"
+    [ -n "$listener_output" ] || fail "MongoDB is not listening on TCP $MONGODB_PORT"
+    printf '%s\n' "$listener_output" | awk '$4 ~ /^127\.0\.0\.1:27017$/ { found = 1 } END { exit found ? 0 : 1 }' \
+        || fail "MongoDB is not listening on 127.0.0.1:$MONGODB_PORT"
+    if [ "$MODEL" = local ]; then
+        listener_count=$(printf '%s\n' "$listener_output" | awk 'NF { count += 1 } END { print count + 0 }')
+        [ "$listener_count" -eq 1 ] || fail "local model exposes an unexpected additional MongoDB listener"
+    else
+        printf '%s\n' "$listener_output" | awk -v expected="$BIND_ADDRESS:$MONGODB_PORT" \
+            '$4 == expected { found = 1 } END { exit found ? 0 : 1 }' \
+            || fail "MongoDB is not listening on $BIND_ADDRESS:$MONGODB_PORT"
+    fi
+}
+
+verify_tls_files() {
+    validate_root_owned_parent_chain "$TLS_CERTIFICATE_KEY_FILE"
+    validate_root_owned_parent_chain "$TLS_CA_FILE"
+    require_identity "$TLS_CERTIFICATE_KEY_FILE" mongod:mongod:400:1
+    require_identity "$TLS_CA_FILE" root:root:644:1
+    openssl verify -purpose sslserver -CAfile "$TLS_CA_FILE" \
+        "$TLS_CERTIFICATE_KEY_FILE" >/dev/null \
+        || fail "TLS server certificate does not validate against the configured CA"
+    openssl x509 -in "$TLS_CERTIFICATE_KEY_FILE" -pubkey -noout \
+        > "$TEMPORARY_DIRECTORY/tls-certificate-public-key.pem" \
+        || fail "cannot read the TLS server certificate"
+    openssl pkey -in "$TLS_CERTIFICATE_KEY_FILE" -passin pass: -pubout \
+        -out "$TEMPORARY_DIRECTORY/tls-private-public-key.pem" \
+        || fail "TLS server private key must be readable without a passphrase"
+    cmp -s \
+        "$TEMPORARY_DIRECTORY/tls-certificate-public-key.pem" \
+        "$TEMPORARY_DIRECTORY/tls-private-public-key.pem" \
+        || fail "TLS server certificate and private key do not match"
+    openssl x509 -in "$TLS_CERTIFICATE_KEY_FILE" -noout -checkhost "$MEMBER_HOST" >/dev/null \
+        || fail "TLS certificate does not cover $MEMBER_HOST"
+    openssl x509 -in "$TLS_CERTIFICATE_KEY_FILE" -noout -checkend 2592000 >/dev/null \
+        || fail "TLS server certificate expires within 30 days"
+}
+
+report_host_advisories() {
+    if [ -r /sys/kernel/mm/transparent_hugepage/enabled ] \
+        && grep -F '[never]' /sys/kernel/mm/transparent_hugepage/enabled >/dev/null 2>&1; then
+        fail "transparent huge pages are disabled; MongoDB 8.0 requires the reviewed THP policy"
+    fi
+    if [ -r /proc/sys/vm/zone_reclaim_mode ] \
+        && [ "$(cat /proc/sys/vm/zone_reclaim_mode)" != 0 ]; then
+        fail "vm.zone_reclaim_mode must be 0"
+    fi
+    if [ -r /proc/sys/vm/swappiness ]; then
+        swappiness=$(cat /proc/sys/vm/swappiness)
+        if [ "$swappiness" -gt 1 ] 2>/dev/null; then
+            printf 'Warning: vm.swappiness is %s; production guidance prefers 0 or 1.\n' "$swappiness" >&2
+        fi
+    fi
+    if command -v findmnt >/dev/null 2>&1; then
+        data_filesystem=$(findmnt -n -o FSTYPE --target "$DATA_DIRECTORY" 2>/dev/null || true)
+        case "$data_filesystem" in
+            xfs) ;;
+            ext4) printf 'Notice: ext4 is supported; XFS remains preferred for WiredTiger data.\n' >&2 ;;
+            '') printf 'Warning: could not identify the MongoDB data filesystem.\n' >&2 ;;
+            *) printf 'Warning: MongoDB data uses unreviewed filesystem %s.\n' "$data_filesystem" >&2 ;;
+        esac
+    fi
+}
+
+validate_source "$AUTH_SCRIPT"
+validate_source "$UNAUTHENTICATED_SCRIPT"
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --check)
+            [ "$MODE" = verify ] || fail "select exactly one mode"
+            MODE=check
+            shift
+            ;;
+        --model) [ "$#" -ge 2 ] || fail "--model requires a value"; MODEL=$2; shift 2 ;;
+        --replica-set) [ "$#" -ge 2 ] || fail "--replica-set requires a value"; REPLICA_SET=$2; shift 2 ;;
+        --admin-user) [ "$#" -ge 2 ] || fail "--admin-user requires a value"; ADMIN_USER=$2; shift 2 ;;
+        --admin-password-file) [ "$#" -ge 2 ] || fail "--admin-password-file requires a value"; ADMIN_PASSWORD_FILE=$2; shift 2 ;;
+        --application-user) [ "$#" -ge 2 ] || fail "--application-user requires a value"; APPLICATION_USER=$2; shift 2 ;;
+        --application-database) [ "$#" -ge 2 ] || fail "--application-database requires a value"; APPLICATION_DATABASE=$2; shift 2 ;;
+        --member-host) [ "$#" -ge 2 ] || fail "--member-host requires a value"; MEMBER_HOST=$2; shift 2 ;;
+        --bind-address) [ "$#" -ge 2 ] || fail "--bind-address requires a value"; BIND_ADDRESS=$2; shift 2 ;;
+        --tls-ca-file) [ "$#" -ge 2 ] || fail "--tls-ca-file requires a value"; TLS_CA_FILE=$2; shift 2 ;;
+        --tls-certificate-key-file) [ "$#" -ge 2 ] || fail "--tls-certificate-key-file requires a value"; TLS_CERTIFICATE_KEY_FILE=$2; shift 2 ;;
+        --help | -h) usage; exit 0 ;;
+        *) fail "unknown argument: $1" ;;
+    esac
+done
+
+if [ "$MODE" = check ]; then
+    [ -z "$MODEL$REPLICA_SET$ADMIN_USER$ADMIN_PASSWORD_FILE$APPLICATION_USER$APPLICATION_DATABASE$MEMBER_HOST$BIND_ADDRESS$TLS_CA_FILE$TLS_CERTIFICATE_KEY_FILE" ] \
+        || fail "--check does not accept deployment selections"
+    printf 'Validated MongoDB verification sources.\n'
+    exit 0
+fi
+
+validate_selection
+[ "$(id -u)" -eq 0 ] || fail "run as root"
+for verify_command in cmp env getenforce grep logrotate mongod mongosh openssl ps ss stat systemctl; do
+    require_command "$verify_command"
+done
+validate_password_file
+TEMPORARY_DIRECTORY=$(mktemp -d "${TMPDIR:-/tmp}/config-mongodb-verify.XXXXXX")
+umask 077
+trap cleanup EXIT HUP INT TERM
+
+mongod --version 2>/dev/null | grep -Eq 'db version v8\.0\.' \
+    || fail "MongoDB 8.0 LTS is required"
+systemctl is-enabled --quiet mongod.service || fail "mongod.service is not enabled"
+systemctl is-active --quiet mongod.service || fail "mongod.service is not active"
+open_file_limit=$(systemctl show mongod.service --property=LimitNOFILE --value)
+case "$open_file_limit" in
+    infinity) ;;
+    *[!0-9]* | '') fail "mongod.service has an invalid LimitNOFILE: ${open_file_limit:-missing}" ;;
+    *) [ "$open_file_limit" -ge 64000 ] || fail "mongod.service LimitNOFILE must be at least 64000" ;;
+esac
+[ "$(getenforce)" = Enforcing ] || fail "SELinux must be Enforcing"
+ps -eZ -o label=,comm= | awk '$2 == "mongod" && $1 ~ /:mongod_t:/ { found = 1 } END { exit found ? 0 : 1 }' \
+    || fail "running mongod process is not confined by mongod_t"
+
+require_identity "$KEY_FILE_PATH" mongod:mongod:400:1
+require_identity "$DATA_DIRECTORY" mongod:mongod:750:1
+require_identity "$LOG_DIRECTORY" mongod:mongod:750:1
+if [ -e "$LOG_DIRECTORY/mongod.log" ] || [ -L "$LOG_DIRECTORY/mongod.log" ]; then
+    require_identity "$LOG_DIRECTORY/mongod.log" mongod:mongod:640:1
+fi
+if find "$DATA_DIRECTORY" -xdev -type l -print -quit | grep . >/dev/null 2>&1; then
+    fail "MongoDB data directory contains a symbolic link"
+fi
+if find "$DATA_DIRECTORY" -xdev \( ! -user mongod -o ! -group mongod \) -print -quit \
+    | grep . >/dev/null 2>&1; then
+    fail "MongoDB data tree contains an object not owned by mongod:mongod"
+fi
+if find "$DATA_DIRECTORY" -xdev -perm /0007 -print -quit | grep . >/dev/null 2>&1; then
+    fail "MongoDB data tree grants permissions to other users"
+fi
+verify_configuration
+verify_log_rotation
+verify_listener
+if [ "$MODEL" = network ]; then
+    verify_tls_files
+fi
+
+run_unauthenticated_check
+read_admin_password
+run_authenticated_check
+report_host_advisories
+if command -v timedatectl >/dev/null 2>&1; then
+    [ "$(timedatectl show --property=NTPSynchronized --value 2>/dev/null)" = yes ] \
+        || fail "system time is not synchronized"
+fi
+
+printf 'Verified MongoDB %s initialized single-node replica set %s and application identity %s.\n' \
+    "$MODEL" "$REPLICA_SET" "$APPLICATION_USER"
+if [ "$MODEL" = network ]; then
+    printf 'Not verified locally: external source restriction; retain allowed-source and denied-source path evidence.\n'
+fi
