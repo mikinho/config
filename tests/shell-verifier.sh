@@ -62,6 +62,7 @@ mkdir -p \
 chmod 0700 "$OFFLINE_ROOT/home/admin" "$OFFLINE_ROOT/home/admin/.ssh"
 printf '%s\n' '# managed global profile' > "$OFFLINE_ROOT/etc/profile"
 printf '%s\n' '# managed global bashrc' > "$OFFLINE_ROOT/etc/bashrc"
+printf '%s\n' 'TEST' > "$OFFLINE_ROOT/etc/managed-environment"
 printf '%s\n' '# managed profile fragment' \
     > "$OFFLINE_ROOT/etc/profile.d/managed.sh"
 printf '%s\n' '# managed user bashrc' > "$OFFLINE_ROOT/home/admin/.bashrc"
@@ -71,6 +72,7 @@ printf 'admin:x:%s:%s:Admin:/home/admin:/bin/bash\n' \
 chmod 0644 \
     "$OFFLINE_ROOT/etc/profile" \
     "$OFFLINE_ROOT/etc/bashrc" \
+    "$OFFLINE_ROOT/etc/managed-environment" \
     "$OFFLINE_ROOT/etc/profile.d/managed.sh" \
     "$OFFLINE_ROOT/home/admin/.bashrc" \
     "$OFFLINE_ROOT/home/admin/.ssh/rc" \
@@ -81,6 +83,10 @@ run_audit >/dev/null
 chmod 0664 "$OFFLINE_ROOT/etc/profile"
 expect_failure 'global profile is group or world writable' run_audit
 chmod 0644 "$OFFLINE_ROOT/etc/profile"
+
+printf '%s\n' 'STAGING' > "$OFFLINE_ROOT/etc/managed-environment"
+expect_failure 'managed environment classification must be exactly' run_audit
+printf '%s\n' 'TEST' > "$OFFLINE_ROOT/etc/managed-environment"
 
 chmod 0664 "$OFFLINE_ROOT/home/admin/.bashrc"
 expect_failure 'startup file for admin is group or world writable' run_audit

@@ -237,6 +237,8 @@ printf '%s\n' \
 chmod 0755 "$TEST_ROOT/shell-bin/bash" "$TEST_ROOT/shell-bin/stat"
 : > "$TEST_ROOT/shell-history-policy.sh"
 : > "$TEST_ROOT/shell-umask-policy.sh"
+: > "$TEST_ROOT/shell-prompt-policy.sh"
+printf '%s\n' 'TEST' > "$TEST_ROOT/managed-environment"
 shell_history_function=$(extract_function check_shell_history "$HOST_VERIFIER")
 for tested_shell_policy in valid invalid; do
     shell_history_result=$(PATH="$TEST_ROOT/shell-bin:$PATH" \
@@ -244,6 +246,8 @@ for tested_shell_policy in valid invalid; do
 FAILED_CHECKS=0
 SHELL_HISTORY_POLICY=$TEST_ROOT/shell-history-policy.sh
 SHELL_UMASK_POLICY=$TEST_ROOT/shell-umask-policy.sh
+SHELL_PROMPT_POLICY=$TEST_ROOT/shell-prompt-policy.sh
+SHELL_ENVIRONMENT=$TEST_ROOT/managed-environment
 fail_msg() { FAILED_CHECKS=\$((FAILED_CHECKS + 1)); }
 pass_msg() { :; }
 $shell_history_function

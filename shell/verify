@@ -143,9 +143,20 @@ audit_global_startup() {
     profile_path=$(root_path /etc/profile)
     bashrc_path=$(root_path /etc/bashrc)
     profile_directory=$(root_path /etc/profile.d)
+    environment_path=$(root_path /etc/managed-environment)
 
     audit_owned_file "$profile_path" "$TRUSTED_ROOT_UID" "global profile"
     audit_owned_file "$bashrc_path" "$TRUSTED_ROOT_UID" "global Bash startup file"
+    audit_owned_file \
+        "$environment_path" "$TRUSTED_ROOT_UID" "managed environment classification"
+    if [ -f "$environment_path" ] && [ ! -L "$environment_path" ]; then
+        if awk 'NR == 1 && /^(PROD|TEST|DEV)$/ { valid = 1 }
+            END { exit !(NR == 1 && valid) }' "$environment_path"; then
+            pass_check "managed environment classification is exact"
+        else
+            fail_check "managed environment classification must be exactly PROD, TEST, or DEV"
+        fi
+    fi
     audit_owned_directory \
         "$profile_directory" "$TRUSTED_ROOT_UID" "global profile fragment directory"
 

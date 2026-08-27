@@ -4,13 +4,17 @@ set -eu
 
 PROGRAM_NAME=${0##*/}
 SCRIPT_DIRECTORY=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+PROMPT_SOURCE=$SCRIPT_DIRECTORY/profile.d/70-managed-environment-prompt.sh
 UMASK_SOURCE=$SCRIPT_DIRECTORY/profile.d/80-admin-umask.sh
 HISTORY_SOURCE=$SCRIPT_DIRECTORY/profile.d/90-no-persistent-history.sh
 TARGET_DIRECTORY=/etc/profile.d
+ENVIRONMENT_TARGET=/etc/managed-environment
+PROMPT_TARGET=$TARGET_DIRECTORY/70-managed-environment-prompt.sh
 UMASK_TARGET=$TARGET_DIRECTORY/80-admin-umask.sh
 HISTORY_TARGET=$TARGET_DIRECTORY/90-no-persistent-history.sh
 
 MODE=apply
+ENVIRONMENT=
 REPLACED_POLICY=
 SCRATCH_DIRECTORY=
 ROLLBACK_REQUIRED=no
@@ -19,13 +23,17 @@ usage() {
     cat <<EOF
 Usage:
   $PROGRAM_NAME --check
-  $PROGRAM_NAME --plan [--replace /etc/profile.d/OLD.sh]
-  sudo $PROGRAM_NAME [--replace /etc/profile.d/OLD.sh]
+  $PROGRAM_NAME --plan --environment PROD|TEST|DEV \
+      [--replace /etc/profile.d/OLD.sh]
+  sudo $PROGRAM_NAME --environment PROD|TEST|DEV \
+      [--replace /etc/profile.d/OLD.sh]
 
 Installs the interactive Bash policies that enforce an administrative umask of
-at least 027 and retain history only for the active session. Existing history
-files are not removed; review their retention separately. --replace atomically
-retires one explicitly named legacy history fragment after validating its path.
+at least 027, retain history only for the active session, and show a trusted
+host classification in the prompt. --environment is required rather than
+guessing from the hostname. Existing history files are not removed; review
+their retention separately. --replace atomically retires one explicitly named
+legacy history fragment after validating its path.
 EOF
 }
 
@@ -35,14 +43,22 @@ fail() {
 }
 
 validate_source() {
-    for policy_source in "$UMASK_SOURCE" "$HISTORY_SOURCE"; do
+    for policy_source in "$PROMPT_SOURCE" "$UMASK_SOURCE" "$HISTORY_SOURCE"; do
         [ -f "$policy_source" ] && [ ! -L "$policy_source" ] \
             || fail "repository source must be a regular file: $policy_source"
     done
     command -v bash >/dev/null 2>&1 \
         || fail "bash is required to validate the shell policy"
-    bash --noprofile --norc -n "$UMASK_SOURCE" "$HISTORY_SOURCE" \
+    bash --noprofile --norc -n \
+        "$PROMPT_SOURCE" "$UMASK_SOURCE" "$HISTORY_SOURCE" \
         || fail "repository shell policies failed Bash syntax validation"
+
+    bash --noprofile --norc -c '
+        PS1=unchanged
+        . "$1"
+        [ "$PS1" = unchanged ]
+    ' sh "$PROMPT_SOURCE" \
+        || fail "repository prompt policy changed a non-interactive shell"
 
     bash --noprofile --norc -c '
         umask 0022
@@ -91,12 +107,25 @@ validate_target() {
         || fail "cannot inspect shell policy target: $TARGET_DIRECTORY"
     [ "$target_directory_identity" = root:root:755 ] \
         || fail "$TARGET_DIRECTORY must be owned by root:root with mode 0755"
-    for policy_target in "$UMASK_TARGET" "$HISTORY_TARGET"; do
+    for policy_target in \
+        "$ENVIRONMENT_TARGET" \
+        "$PROMPT_TARGET" \
+        "$UMASK_TARGET" \
+        "$HISTORY_TARGET"
+    do
         if [ -e "$policy_target" ] || [ -L "$policy_target" ]; then
             [ -f "$policy_target" ] && [ ! -L "$policy_target" ] \
                 || fail "shell policy target must be a regular file: $policy_target"
         fi
     done
+}
+
+validate_environment() {
+    case "$ENVIRONMENT" in
+        PROD | TEST | DEV) ;;
+        '') fail "--environment PROD|TEST|DEV is required" ;;
+        *) fail "unsupported managed environment: $ENVIRONMENT" ;;
+    esac
 }
 
 validate_replacement_path() {
@@ -113,6 +142,7 @@ validate_replacement_path() {
         *) fail "replacement must name one .sh file directly under /etc/profile.d" ;;
     esac
     [ "$REPLACED_POLICY" != "$UMASK_TARGET" ] \
+        && [ "$REPLACED_POLICY" != "$PROMPT_TARGET" ] \
         && [ "$REPLACED_POLICY" != "$HISTORY_TARGET" ] \
         || fail "replacement policy must differ from the managed targets"
 }
@@ -153,6 +183,8 @@ restore_file() {
 
 rollback_policy() {
     [ -n "$SCRATCH_DIRECTORY" ] && [ -d "$SCRATCH_DIRECTORY" ] || return 0
+    restore_file "$ENVIRONMENT_TARGET" managed-environment
+    restore_file "$PROMPT_TARGET" managed-prompt.sh
     restore_file "$UMASK_TARGET" managed-umask.sh
     restore_file "$HISTORY_TARGET" managed-history.sh
     if [ -n "$REPLACED_POLICY" ]; then
@@ -175,7 +207,8 @@ trap cleanup EXIT HUP INT TERM
 validate_login_behavior() {
     # Expand history variables inside the clean child shells, not this setup.
     # shellcheck disable=SC2016
-    env -u HISTFILE -u HISTSIZE -u HISTFILESIZE bash -lic '
+    env -u HISTFILE -u HISTSIZE -u HISTFILESIZE \
+        "EXPECTED_MANAGED_ENVIRONMENT=$ENVIRONMENT" bash -lic '
         [ "${HISTFILE:-}" = /dev/null ] || exit 1
         [ "${HISTSIZE:-0}" -gt 0 ] 2>/dev/null || exit 1
         readonly -p HISTFILE >/dev/null 2>&1 || exit 1
@@ -183,6 +216,14 @@ validate_login_behavior() {
         managed_login_umask=${managed_login_umask#0}
         [ "$((8#$managed_login_umask & 8#027))" -eq "$((8#027))" ] || exit 1
         unset managed_login_umask
+        managed_expected_prompt_path="\\u@\\h:\\w"
+        case "$PS1" in
+            *"[$EXPECTED_MANAGED_ENVIRONMENT"*"$managed_expected_prompt_path"*) ;;
+            *) exit 1 ;;
+        esac
+        if [ "$EXPECTED_MANAGED_ENVIRONMENT" = PROD ] && [ "$EUID" -eq 0 ]; then
+            case "$PS1" in *'[PROD ROOT]'*) ;; *) exit 1 ;; esac
+        fi
         bash -ic "
             [ \"\${HISTFILE:-}\" = /dev/null ] || exit 1
             [ \"\${HISTSIZE:-0}\" -gt 0 ] 2>/dev/null || exit 1
@@ -196,7 +237,7 @@ validate_login_behavior() {
 
 install_policy() {
     [ "$(id -u)" -eq 0 ] || fail "run as root or use --plan"
-    for required_command in bash cmp cp env install mktemp rm stat; do
+    for required_command in bash cmp cp env install mktemp rm stat wc; do
         command -v "$required_command" >/dev/null 2>&1 \
             || fail "required command not found: $required_command"
     done
@@ -204,6 +245,8 @@ install_policy() {
     validate_replaced_policy
 
     SCRATCH_DIRECTORY=$(mktemp -d "${TMPDIR:-/tmp}/config-shell-setup.XXXXXX")
+    backup_file "$ENVIRONMENT_TARGET" managed-environment
+    backup_file "$PROMPT_TARGET" managed-prompt.sh
     backup_file "$UMASK_TARGET" managed-umask.sh
     backup_file "$HISTORY_TARGET" managed-history.sh
     if [ -n "$REPLACED_POLICY" ]; then
@@ -213,12 +256,22 @@ install_policy() {
     if [ -n "$REPLACED_POLICY" ]; then
         rm -f -- "$REPLACED_POLICY"
     fi
+    printf '%s\n' "$ENVIRONMENT" > "$SCRATCH_DIRECTORY/managed-environment.new"
+    install -o root -g root -m 0644 \
+        "$SCRATCH_DIRECTORY/managed-environment.new" "$ENVIRONMENT_TARGET"
+    install -o root -g root -m 0644 "$PROMPT_SOURCE" "$PROMPT_TARGET"
     install -o root -g root -m 0644 "$UMASK_SOURCE" "$UMASK_TARGET"
     install -o root -g root -m 0644 "$HISTORY_SOURCE" "$HISTORY_TARGET"
     if command -v restorecon >/dev/null 2>&1; then
-        restorecon -F "$UMASK_TARGET" "$HISTORY_TARGET"
+        restorecon -F \
+            "$ENVIRONMENT_TARGET" \
+            "$PROMPT_TARGET" \
+            "$UMASK_TARGET" \
+            "$HISTORY_TARGET"
     fi
     for policy_pair in \
+        "$SCRATCH_DIRECTORY/managed-environment.new:$ENVIRONMENT_TARGET" \
+        "$PROMPT_SOURCE:$PROMPT_TARGET" \
         "$UMASK_SOURCE:$UMASK_TARGET" \
         "$HISTORY_SOURCE:$HISTORY_TARGET"
     do
@@ -233,6 +286,9 @@ install_policy() {
     done
     validate_login_behavior
     ROLLBACK_REQUIRED=no
+    printf 'Installed managed host classification: %s (%s)\n' \
+        "$ENVIRONMENT_TARGET" "$ENVIRONMENT"
+    printf 'Installed environment-aware Bash prompt: %s\n' "$PROMPT_TARGET"
     printf 'Installed administrative Bash umask policy: %s\n' "$UMASK_TARGET"
     printf 'Installed non-persistent Bash history policy: %s\n' "$HISTORY_TARGET"
     if [ -n "$REPLACED_POLICY" ]; then
@@ -252,6 +308,12 @@ while [ "$#" -gt 0 ]; do
             MODE=plan
             shift
             ;;
+        --environment)
+            [ "$#" -ge 2 ] || fail "--environment requires PROD, TEST, or DEV"
+            [ -z "$ENVIRONMENT" ] || fail "--environment may be specified only once"
+            ENVIRONMENT=$2
+            shift 2
+            ;;
         --replace)
             [ "$#" -ge 2 ] || fail "--replace requires a profile path"
             [ -z "$REPLACED_POLICY" ] || fail "--replace may be specified only once"
@@ -267,8 +329,8 @@ while [ "$#" -gt 0 ]; do
 done
 
 validate_source
-if [ "$MODE" = check ] && [ -n "$REPLACED_POLICY" ]; then
-    fail "--check does not accept --replace"
+if [ "$MODE" = check ] && { [ -n "$REPLACED_POLICY" ] || [ -n "$ENVIRONMENT" ]; }; then
+    fail "--check does not accept deployment selections"
 fi
 if [ -n "$REPLACED_POLICY" ]; then
     validate_replacement_path
@@ -276,22 +338,29 @@ fi
 
 case "$MODE" in
     check)
-        printf 'Validated administrative Bash umask and history policy behavior.\n'
+        printf 'Validated environment prompt, administrative umask, and history behavior.\n'
         ;;
     plan)
+        validate_environment
         if [ -n "$REPLACED_POLICY" ]; then
             printf '+ backup %s for rollback\n' "$REPLACED_POLICY"
             printf '+ rm -f -- %s\n' "$REPLACED_POLICY"
         fi
+        printf '+ write exact classification %s to %s as root:root mode 0644\n' \
+            "$ENVIRONMENT" "$ENVIRONMENT_TARGET"
+        printf '+ install -o root -g root -m 0644 %s %s\n' \
+            "$PROMPT_SOURCE" "$PROMPT_TARGET"
         printf '+ install -o root -g root -m 0644 %s %s\n' \
             "$UMASK_SOURCE" "$UMASK_TARGET"
         printf '+ install -o root -g root -m 0644 %s %s\n' \
             "$HISTORY_SOURCE" "$HISTORY_TARGET"
-        printf '+ restorecon -F %s %s\n' "$UMASK_TARGET" "$HISTORY_TARGET"
-        printf '+ bash -lic <verify umask and non-persistent history>\n'
+        printf '+ restorecon -F %s %s %s %s\n' \
+            "$ENVIRONMENT_TARGET" "$PROMPT_TARGET" "$UMASK_TARGET" "$HISTORY_TARGET"
+        printf '+ bash -lic <verify environment prompt, umask, and history>\n'
         printf 'Plan complete; no host changes were made.\n'
         ;;
     apply)
+        validate_environment
         install_policy
         ;;
 esac

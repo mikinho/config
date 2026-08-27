@@ -1,0 +1,85 @@
+#!/bin/sh
+# The extracted prompt function intentionally contains Bash prompt escapes.
+# shellcheck disable=SC2016
+
+set -eu
+
+PROGRAM_NAME=${0##*/}
+SCRIPT_DIRECTORY=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+REPOSITORY_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIRECTORY/.." && pwd)
+PROMPT_SOURCE=$REPOSITORY_ROOT/shell/profile.d/70-managed-environment-prompt.sh
+TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/config-shell-prompt.XXXXXX")
+TEST_UID=$(id -u)
+
+cleanup() {
+    if [ -d "$TEST_ROOT" ]; then
+        rm -rf -- "$TEST_ROOT"
+    fi
+}
+
+fail() {
+    printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2
+    exit 1
+}
+
+assert_prompt() {
+    environment_file=$1
+    expected_tag=$2
+    function_source=$(sed -n \
+        '/^managed_configure_environment_prompt() {/,/^}/p' \
+        "$PROMPT_SOURCE")
+    prompt_value=$(TERM=dumb bash --noprofile --norc -c "
+$function_source
+managed_configure_environment_prompt \"\$1\" \"\$2\"
+printf '%s\\n' \"\$PS1\"
+" sh "$environment_file" "$TEST_UID")
+    case "$prompt_value" in
+        "$expected_tag "*'\u@\h:\w$ '*) ;;
+        *) fail "unexpected prompt for $environment_file: $prompt_value" ;;
+    esac
+}
+
+trap cleanup EXIT HUP INT TERM
+
+[ -f "$PROMPT_SOURCE" ] && [ ! -L "$PROMPT_SOURCE" ] \
+    || fail "prompt policy source is not a regular file"
+bash --noprofile --norc -n "$PROMPT_SOURCE"
+grep -F 'managed_configure_environment_prompt /etc/managed-environment 0' \
+    "$PROMPT_SOURCE" >/dev/null \
+    || fail "prompt policy does not use the root-owned classification path"
+grep -F '[PROD ROOT]' "$PROMPT_SOURCE" >/dev/null \
+    || fail "prompt policy lacks the explicit production-root warning"
+
+for managed_environment in PROD TEST DEV; do
+    environment_file=$TEST_ROOT/$managed_environment
+    printf '%s\n' "$managed_environment" > "$environment_file"
+    chmod 0644 "$environment_file"
+    assert_prompt "$environment_file" "[$managed_environment]"
+done
+
+invalid_file=$TEST_ROOT/invalid
+printf '%s\n' 'STAGING' > "$invalid_file"
+chmod 0644 "$invalid_file"
+assert_prompt "$invalid_file" '[UNTRUSTED]'
+
+multiline_file=$TEST_ROOT/multiline
+printf '%s\n' 'PROD' 'TEST' > "$multiline_file"
+chmod 0644 "$multiline_file"
+assert_prompt "$multiline_file" '[UNTRUSTED]'
+
+unsafe_mode_file=$TEST_ROOT/unsafe-mode
+printf '%s\n' 'PROD' > "$unsafe_mode_file"
+chmod 0664 "$unsafe_mode_file"
+assert_prompt "$unsafe_mode_file" '[UNTRUSTED]'
+
+ln -s "$TEST_ROOT/PROD" "$TEST_ROOT/symlink"
+assert_prompt "$TEST_ROOT/symlink" '[UNTRUSTED]'
+
+bash --noprofile --norc -c '
+    PS1=unchanged
+    . "$1"
+    [ "$PS1" = unchanged ]
+' sh "$PROMPT_SOURCE" \
+    || fail "prompt policy changed a non-interactive Bash shell"
+
+printf 'Validated trusted environment prompt behavior and failure state.\n'

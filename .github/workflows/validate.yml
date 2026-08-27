@@ -442,12 +442,13 @@ jobs:
               /workspace/deploy/setup-host \
                 --plan \
                 --profile edge-direct \
+                --environment TEST \
                 --ssh-phase prepare \
                 --authorized-key-ready \
                 --ignore-ip 192.0.2.0/24 \
                 > /tmp/edge-direct.plan
               grep --fixed-strings \
-                "Host setup: profile=edge-direct, topology=direct, ssh-phase=prepare" \
+                "Host setup: profile=edge-direct, environment=TEST, topology=direct, ssh-phase=prepare" \
                 /tmp/edge-direct.plan
               grep --fixed-strings \
                 "Fail2ban setup: topology=direct, ssh-phase=prepare" \
@@ -455,12 +456,13 @@ jobs:
               /workspace/deploy/setup-host \
                 --plan \
                 --profile edge-proxied \
+                --environment PROD \
                 --ssh-phase none \
                 --ignore-ip 2001:db8::/32 \
                 --certbot-backend snap \
                 > /tmp/edge-proxied.plan
               grep --fixed-strings \
-                "Host setup: profile=edge-proxied, topology=proxied, ssh-phase=none" \
+                "Host setup: profile=edge-proxied, environment=PROD, topology=proxied, ssh-phase=none" \
                 /tmp/edge-proxied.plan
               grep --fixed-strings \
                 "Fail2ban setup: topology=proxied, ssh-phase=final" \

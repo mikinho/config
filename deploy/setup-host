@@ -24,6 +24,7 @@ HOST_VERIFIER=$REPOSITORY_ROOT/deploy/verify-deployment
 
 MODE=apply
 PROFILE=
+ENVIRONMENT=
 TOPOLOGY=
 ZONE=public
 SSH_PHASE=
@@ -40,12 +41,14 @@ usage() {
 Usage:
   $PROGRAM_NAME --check
   $PROGRAM_NAME --plan --profile edge-direct|edge-proxied \\
-      --ssh-phase prepare|finalize|none --ignore-ip CIDR [--ignore-ip CIDR ...] \\
+      --environment PROD|TEST|DEV --ssh-phase prepare|finalize|none \\
+      --ignore-ip CIDR [--ignore-ip CIDR ...] \\
       [--authorized-key-ready] [--console-confirmed] \\
       [--certbot-backend native|snap] [--zone NAME] [--quic-bpf] \\
       [--os-release FILE]
   sudo $PROGRAM_NAME --profile edge-direct|edge-proxied \\
-      --ssh-phase prepare|finalize|none --ignore-ip CIDR [--ignore-ip CIDR ...] \\
+      --environment PROD|TEST|DEV --ssh-phase prepare|finalize|none \\
+      --ignore-ip CIDR [--ignore-ip CIDR ...] \\
       [--authorized-key-ready] [--console-confirmed] \\
       [--certbot-backend native|snap] [--zone NAME] [--quic-bpf]
 
@@ -54,6 +57,8 @@ Applies the standard edge-host components in dependency order. The reviewed
 keeps ports 22 and 2356 available; rerun with finalize only after proving a
 new key-authenticated 2356 session. 'none' leaves SSH untouched and assumes it
 is already finalized. The selected profile controls Fail2ban nginx jails.
+--environment is a required operator assertion stored as the trusted shell
+prompt classification; it is never inferred from the hostname.
 EOF
 }
 
@@ -78,6 +83,7 @@ validate_dependencies() {
         "$SSH_INSTALL" \
         "$SSH_SETUP" \
         "$SHELL_SETUP" \
+        "$SHELL_VERIFY" \
         "$NGINX_SETUP" \
         "$CERTBOT_SETUP" \
         "$FAIL2BAN_INSTALL" \
@@ -140,6 +146,11 @@ append_ignore_ip() {
 
 validate_selection() {
     load_profile
+    case "$ENVIRONMENT" in
+        PROD | TEST | DEV) ;;
+        '') fail "--environment is required" ;;
+        *) fail "unsupported managed environment: $ENVIRONMENT" ;;
+    esac
     case "$SSH_PHASE" in
         prepare)
             [ "$AUTHORIZED_KEY_READY" = yes ] \
@@ -186,9 +197,9 @@ run_ssh_setup() {
 
 run_shell_setup() {
     if [ "$MODE" = plan ]; then
-        "$SHELL_SETUP" --plan
+        "$SHELL_SETUP" --plan --environment "$ENVIRONMENT"
     else
-        "$SHELL_SETUP"
+        "$SHELL_SETUP" --environment "$ENVIRONMENT"
     fi
 }
 
@@ -322,6 +333,12 @@ while [ "$#" -gt 0 ]; do
             CONSOLE_CONFIRMED=yes
             shift
             ;;
+        --environment)
+            [ "$#" -ge 2 ] || fail "--environment requires PROD, TEST, or DEV"
+            [ -z "$ENVIRONMENT" ] || fail "--environment may be specified only once"
+            ENVIRONMENT=$2
+            shift 2
+            ;;
         --ignore-ip)
             [ "$#" -ge 2 ] || fail "--ignore-ip requires a CIDR"
             append_ignore_ip "$2"
@@ -367,7 +384,7 @@ done
 
 validate_dependencies
 if [ "$MODE" = check ]; then
-    [ -z "$PROFILE$SSH_PHASE$IGNORE_IPS" ] \
+    [ -z "$PROFILE$ENVIRONMENT$SSH_PHASE$IGNORE_IPS" ] \
         || fail "--check does not accept host-selection options"
     validate_all_profiles
     "$SELINUX_INSTALL" --check >/dev/null
@@ -387,8 +404,8 @@ fi
 
 validate_selection
 preflight_selection
-printf 'Host setup: profile=%s, topology=%s, ssh-phase=%s, certbot=%s, zone=%s\n' \
-    "$PROFILE" "$TOPOLOGY" "$SSH_PHASE" "$CERTBOT_BACKEND" "$ZONE"
+printf 'Host setup: profile=%s, environment=%s, topology=%s, ssh-phase=%s, certbot=%s, zone=%s\n' \
+    "$PROFILE" "$ENVIRONMENT" "$TOPOLOGY" "$SSH_PHASE" "$CERTBOT_BACKEND" "$ZONE"
 run_host_setup
 if [ "$MODE" = plan ]; then
     printf 'Host plan complete; no host changes were made.\n'

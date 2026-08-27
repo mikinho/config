@@ -11,6 +11,7 @@ TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/config-shell-history.XXXXXX")
 SHELL_SETUP=$REPOSITORY_ROOT/shell/setup
 POLICY_SOURCE=$REPOSITORY_ROOT/shell/profile.d/90-no-persistent-history.sh
 UMASK_SOURCE=$REPOSITORY_ROOT/shell/profile.d/80-admin-umask.sh
+PROMPT_SOURCE=$REPOSITORY_ROOT/shell/profile.d/70-managed-environment-prompt.sh
 
 cleanup() {
     if [ -d "$TEST_ROOT" ]; then
@@ -40,35 +41,53 @@ trap cleanup EXIT HUP INT TERM
     || fail "shell policy source is not a regular file"
 [ -f "$UMASK_SOURCE" ] && [ ! -L "$UMASK_SOURCE" ] \
     || fail "umask policy source is not a regular file"
+[ -f "$PROMPT_SOURCE" ] && [ ! -L "$PROMPT_SOURCE" ] \
+    || fail "prompt policy source is not a regular file"
 
 "$SHELL_SETUP" --help >/dev/null
 "$SHELL_SETUP" --check >/dev/null
-"$SHELL_SETUP" --plan > "$TEST_ROOT/setup.plan"
+"$SHELL_SETUP" --plan --environment TEST > "$TEST_ROOT/setup.plan"
 grep -F -- '/etc/profile.d/90-no-persistent-history.sh' \
     "$TEST_ROOT/setup.plan" >/dev/null \
     || fail "shell setup plan omitted the managed target"
 grep -F -- '/etc/profile.d/80-admin-umask.sh' \
     "$TEST_ROOT/setup.plan" >/dev/null \
     || fail "shell setup plan omitted the umask target"
-"$SHELL_SETUP" --plan --replace /etc/profile.d/00-legacy-history.sh \
+grep -F -- '/etc/profile.d/70-managed-environment-prompt.sh' \
+    "$TEST_ROOT/setup.plan" >/dev/null \
+    || fail "shell setup plan omitted the prompt target"
+grep -F -- '/etc/managed-environment' "$TEST_ROOT/setup.plan" >/dev/null \
+    || fail "shell setup plan omitted the environment classification"
+"$SHELL_SETUP" --plan --environment TEST \
+    --replace /etc/profile.d/00-legacy-history.sh \
     > "$TEST_ROOT/replacement.plan"
 grep -F -- 'rm -f -- /etc/profile.d/00-legacy-history.sh' \
     "$TEST_ROOT/replacement.plan" >/dev/null \
     || fail "shell setup replacement plan omitted the legacy target"
 expect_failure \
     'replacement must name one .sh file directly under /etc/profile.d' \
-    "$SHELL_SETUP" --plan --replace /tmp/legacy-history.sh
+    "$SHELL_SETUP" --plan --environment TEST --replace /tmp/legacy-history.sh
 expect_failure \
     'replacement must name one .sh file directly under /etc/profile.d' \
-    "$SHELL_SETUP" --plan --replace /etc/profile.d/nested/legacy-history.sh
+    "$SHELL_SETUP" --plan --environment TEST \
+    --replace /etc/profile.d/nested/legacy-history.sh
 expect_failure \
     'replacement policy must differ from the managed targets' \
-    "$SHELL_SETUP" --plan \
+    "$SHELL_SETUP" --plan --environment TEST \
     --replace /etc/profile.d/90-no-persistent-history.sh
 expect_failure \
     'replacement policy must differ from the managed targets' \
-    "$SHELL_SETUP" --plan \
+    "$SHELL_SETUP" --plan --environment TEST \
     --replace /etc/profile.d/80-admin-umask.sh
+expect_failure \
+    '--environment PROD|TEST|DEV is required' \
+    "$SHELL_SETUP" --plan
+expect_failure \
+    'unsupported managed environment' \
+    "$SHELL_SETUP" --plan --environment STAGING
+expect_failure \
+    '--check does not accept deployment selections' \
+    "$SHELL_SETUP" --check --environment TEST
 
 bash --noprofile --norc -c '
     umask 0022
@@ -120,6 +139,8 @@ chmod 0755 "$fixture_root/shell/setup"
 ln -s /etc/passwd \
     "$fixture_root/shell/profile.d/90-no-persistent-history.sh"
 cp "$UMASK_SOURCE" "$fixture_root/shell/profile.d/80-admin-umask.sh"
+cp "$PROMPT_SOURCE" \
+    "$fixture_root/shell/profile.d/70-managed-environment-prompt.sh"
 expect_failure \
     'repository source must be a regular file' \
     "$fixture_root/shell/setup" --check

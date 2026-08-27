@@ -194,9 +194,9 @@ TCP 443 so clients always have an HTTP/2 or HTTP/1.1 fallback.
 - `ssh/` contains the OpenSSH installer and lockout-safe, two-phase setup for
   the repository `sshd_config.d` hardening drop-ins.
 - `shell/` contains the interactive Bash policies that enforce a restrictive
-  administrative umask and retain current-session recall while preventing
-  command history from persisting on the host, plus a read-only startup and
-  `PATH` integrity verifier.
+  administrative umask, display a trusted host classification, and retain
+  current-session recall while preventing command history from persisting on
+  the host, plus a read-only startup and `PATH` integrity verifier.
 - `tailscale/` contains the official-repository installer and three-phase tagged
   server setup that keeps native deployment SSH on TCP 2356 while enabling
   Tailscale SSH on tailnet TCP 22 for explicitly named human accounts.
@@ -216,7 +216,9 @@ balancer is the immediate peer. The profile controls Fail2ban nginx-jail
 activation; proxied hosts still retain the SSH jail. At least one trusted
 administrative CIDR is always required.
 
-Standard host setup installs the shell policies at
+Standard host setup requires an explicit `PROD`, `TEST`, or `DEV`
+classification, stores it in `/etc/managed-environment`, and installs the shell
+policies at `/etc/profile.d/70-managed-environment-prompt.sh`,
 `/etc/profile.d/80-admin-umask.sh` and
 `/etc/profile.d/90-no-persistent-history.sh`. Existing `.bash_history` files
 are not deleted automatically; their retention or removal is a separate,
@@ -231,12 +233,14 @@ first SSH transition:
 deploy/setup-host \
     --plan \
     --profile edge-direct \
+    --environment PROD \
     --ssh-phase prepare \
     --authorized-key-ready \
     --ignore-ip 192.0.2.0/24
 
 sudo deploy/setup-host \
     --profile edge-direct \
+    --environment PROD \
     --ssh-phase prepare \
     --authorized-key-ready \
     --ignore-ip 192.0.2.0/24

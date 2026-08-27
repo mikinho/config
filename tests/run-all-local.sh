@@ -48,6 +48,7 @@ if command -v shellcheck >/dev/null 2>&1; then
         "$REPOSITORY_ROOT/selinux/setup" \
         "$REPOSITORY_ROOT/shell/setup" \
         "$REPOSITORY_ROOT/shell/verify" \
+        "$REPOSITORY_ROOT/shell/profile.d/70-managed-environment-prompt.sh" \
         "$REPOSITORY_ROOT/shell/profile.d/80-admin-umask.sh" \
         "$REPOSITORY_ROOT/shell/profile.d/90-no-persistent-history.sh" \
         "$REPOSITORY_ROOT/ssh/install" \
@@ -64,6 +65,7 @@ if command -v shellcheck >/dev/null 2>&1; then
         "$REPOSITORY_ROOT/tests/rsync-packaging.sh" \
         "$REPOSITORY_ROOT/tests/run-all-local.sh" \
         "$REPOSITORY_ROOT/tests/shell-history.sh" \
+        "$REPOSITORY_ROOT/tests/shell-prompt.sh" \
         "$REPOSITORY_ROOT/tests/shell-verifier.sh" \
         "$REPOSITORY_ROOT/tests/tailscale.sh"
     printf 'ShellCheck passed with 0 warnings.\n'
@@ -99,6 +101,9 @@ step "Running component and host setup tests..."
 
 step "Running interactive shell history tests..."
 "$REPOSITORY_ROOT/tests/shell-history.sh"
+
+step "Running trusted environment prompt tests..."
+"$REPOSITORY_ROOT/tests/shell-prompt.sh"
 
 step "Running shell startup and PATH integrity tests..."
 "$REPOSITORY_ROOT/tests/shell-verifier.sh"

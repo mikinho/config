@@ -184,13 +184,16 @@ expect_failure \
     '--phase prepare requires --authorized-key-ready' \
     "$SSH_SETUP" --plan --phase prepare
 
-"$SHELL_SETUP" --plan > "$TEST_ROOT/shell.plan"
+"$SHELL_SETUP" --plan --environment TEST > "$TEST_ROOT/shell.plan"
+assert_contains "$TEST_ROOT/shell.plan" '/etc/managed-environment'
+assert_contains "$TEST_ROOT/shell.plan" \
+    '/etc/profile.d/70-managed-environment-prompt.sh'
 assert_contains "$TEST_ROOT/shell.plan" \
     '/etc/profile.d/80-admin-umask.sh'
 assert_contains "$TEST_ROOT/shell.plan" \
     '/etc/profile.d/90-no-persistent-history.sh'
 assert_contains "$TEST_ROOT/shell.plan" \
-    'verify umask and non-persistent history'
+    'verify environment prompt, umask, and history'
 
 "$NGINX_SETUP" --plan > "$TEST_ROOT/nginx.plan"
 assert_contains "$TEST_ROOT/nginx.plan" '--add-service=nginx'
@@ -206,13 +209,14 @@ assert_not_contains "$TEST_ROOT/nginx.plan" 'zones/public.xml'
 "$HOST_SETUP" \
     --plan \
     --profile edge-direct \
+    --environment TEST \
     --ssh-phase prepare \
     --authorized-key-ready \
     --ignore-ip 192.0.2.0/24 \
     --os-release "$TEST_ROOT/etc/os-release" \
     > "$TEST_ROOT/host-direct.plan"
 assert_contains "$TEST_ROOT/host-direct.plan" \
-    'Host setup: profile=edge-direct, topology=direct, ssh-phase=prepare'
+    'Host setup: profile=edge-direct, environment=TEST, topology=direct, ssh-phase=prepare'
 assert_contains "$TEST_ROOT/host-direct.plan" \
     'Fail2ban setup: topology=direct, ssh-phase=prepare'
 assert_contains "$TEST_ROOT/host-direct.plan" \
@@ -227,6 +231,7 @@ assert_not_contains "$TEST_ROOT/host-direct.plan" 'zones/public.xml'
 "$HOST_SETUP" \
     --plan \
     --profile edge-proxied \
+    --environment PROD \
     --ssh-phase finalize \
     --console-confirmed \
     --ignore-ip 2001:db8::/32 \
@@ -234,7 +239,7 @@ assert_not_contains "$TEST_ROOT/host-direct.plan" 'zones/public.xml'
     --os-release "$TEST_ROOT/centos-stream-10" \
     > "$TEST_ROOT/host-proxied.plan"
 assert_contains "$TEST_ROOT/host-proxied.plan" \
-    'Host setup: profile=edge-proxied, topology=proxied, ssh-phase=finalize'
+    'Host setup: profile=edge-proxied, environment=PROD, topology=proxied, ssh-phase=finalize'
 assert_contains "$TEST_ROOT/host-proxied.plan" \
     'Fail2ban setup: topology=proxied, ssh-phase=final'
 assert_contains "$TEST_ROOT/host-proxied.plan" 'backend: snap'
@@ -242,13 +247,14 @@ assert_contains "$TEST_ROOT/host-proxied.plan" 'backend: snap'
 "$HOST_SETUP" \
     --plan \
     --profile edge-proxied \
+    --environment DEV \
     --ssh-phase none \
     --ignore-ip 2001:db8::/32 \
     --certbot-backend snap \
     --os-release "$TEST_ROOT/centos-stream-10" \
     > "$TEST_ROOT/host-proxied-no-ssh.plan"
 assert_contains "$TEST_ROOT/host-proxied-no-ssh.plan" \
-    'Host setup: profile=edge-proxied, topology=proxied, ssh-phase=none'
+    'Host setup: profile=edge-proxied, environment=DEV, topology=proxied, ssh-phase=none'
 assert_contains "$TEST_ROOT/host-proxied-no-ssh.plan" \
     'Fail2ban setup: topology=proxied, ssh-phase=final'
 assert_contains "$TEST_ROOT/host-proxied-no-ssh.plan" \
@@ -259,6 +265,7 @@ expect_failure \
     "$HOST_SETUP" \
     --plan \
     --profile edge-direct \
+    --environment TEST \
     --ssh-phase prepare \
     --ignore-ip 192.0.2.0/24 \
     --os-release "$TEST_ROOT/rocky-9"
@@ -267,6 +274,7 @@ expect_failure \
     "$HOST_SETUP" \
     --plan \
     --profile arbitrary \
+    --environment TEST \
     --ssh-phase none \
     --ignore-ip 192.0.2.0/24 \
     --os-release "$TEST_ROOT/rocky-9"
@@ -275,8 +283,26 @@ expect_failure \
     "$HOST_SETUP" \
     --plan \
     --profile edge-direct \
+    --environment TEST \
     --ssh-phase none \
     --ignore-ip '*/24' \
+    --os-release "$TEST_ROOT/rocky-9"
+expect_failure \
+    '--environment is required' \
+    "$HOST_SETUP" \
+    --plan \
+    --profile edge-direct \
+    --ssh-phase none \
+    --ignore-ip 192.0.2.0/24 \
+    --os-release "$TEST_ROOT/rocky-9"
+expect_failure \
+    'unsupported managed environment' \
+    "$HOST_SETUP" \
+    --plan \
+    --profile edge-direct \
+    --environment STAGING \
+    --ssh-phase none \
+    --ignore-ip 192.0.2.0/24 \
     --os-release "$TEST_ROOT/rocky-9"
 
 fixture_root=$TEST_ROOT/repository

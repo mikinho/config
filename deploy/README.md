@@ -80,14 +80,17 @@ the repository services but never installs `firewalld/zones/public.xml` or
 removes unrelated allowances.
 
 The exact reviewed nginx tree and supported `/usr/sbin/nginx` binary must be
-installed first. The same plan installs the repository's no-persistent-history
-Bash policy without deleting any existing history files. Preview a complete
-first-pass plan with:
+installed first. The same plan installs the repository's interactive Bash
+baseline without deleting existing history files. The required `--environment`
+value becomes the trusted prompt classification; select it from the deployment
+record rather than inferring it from the hostname. Preview a complete first-pass
+plan with:
 
 ```sh
 deploy/setup-host \
     --plan \
     --profile edge-direct \
+    --environment PROD \
     --ssh-phase prepare \
     --authorized-key-ready \
     --ignore-ip 192.0.2.0/24
@@ -103,6 +106,7 @@ Apply preparation as root while retaining the existing SSH session:
 ```sh
 sudo deploy/setup-host \
     --profile edge-direct \
+    --environment PROD \
     --ssh-phase prepare \
     --authorized-key-ready \
     --ignore-ip 192.0.2.0/24
@@ -122,11 +126,13 @@ session, preview and apply finalization:
 deploy/setup-host \
     --plan \
     --profile edge-direct \
+    --environment PROD \
     --ssh-phase finalize \
     --ignore-ip 192.0.2.0/24
 
 sudo deploy/setup-host \
     --profile edge-direct \
+    --environment PROD \
     --ssh-phase finalize \
     --ignore-ip 192.0.2.0/24
 ```

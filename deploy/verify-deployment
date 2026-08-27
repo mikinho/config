@@ -24,6 +24,8 @@ CERTBOT_SNAP_RUNNER_DROPIN=/etc/systemd/system/certbot.timer.d/10-snap-runner.co
 CERTBOT_SNAP_NGINX_DROPIN=/etc/systemd/system/snap.certbot.renew.service.d/10-nginx.conf
 FAIL2BAN_POLICY=/etc/fail2ban/jail.d/90-baseline.local
 SELINUX_CONFIG=/etc/selinux/config
+SHELL_ENVIRONMENT=/etc/managed-environment
+SHELL_PROMPT_POLICY=/etc/profile.d/70-managed-environment-prompt.sh
 SHELL_UMASK_POLICY=/etc/profile.d/80-admin-umask.sh
 SHELL_HISTORY_POLICY=/etc/profile.d/90-no-persistent-history.sh
 
@@ -33,9 +35,9 @@ Usage:
   $PROGRAM_NAME [OPTIONS]
 
 Non-destructive host post-deployment verification. Validates installed Nginx,
-managed certificates, systemd units, shell policies, OpenSSH, Fail2ban,
-firewalld, synchronized time, SELinux policy, QUIC kernel buffers, and runtime
-socket permissions.
+managed certificates, systemd units, trusted shell classification and policies,
+OpenSSH, Fail2ban, firewalld, synchronized time, SELinux policy, QUIC kernel
+buffers, and runtime socket permissions.
 
 Options:
   --backend BACKEND   Certbot renewal backend: 'auto' (default), 'native', or 'snap'
@@ -404,7 +406,12 @@ check_shell_history() {
         fail_msg "stat is unavailable for shell policy verification"
         return
     fi
-    for shell_policy in "$SHELL_UMASK_POLICY" "$SHELL_HISTORY_POLICY"; do
+    for shell_policy in \
+        "$SHELL_ENVIRONMENT" \
+        "$SHELL_PROMPT_POLICY" \
+        "$SHELL_UMASK_POLICY" \
+        "$SHELL_HISTORY_POLICY"
+    do
         if [ ! -f "$shell_policy" ] || [ -L "$shell_policy" ]; then
             fail_msg "managed shell policy is missing or unsafe: $shell_policy"
             return
@@ -416,6 +423,19 @@ check_shell_history() {
             fail_msg "shell policy has unsafe ownership or mode: $shell_policy (${policy_identity:-unknown})"
         fi
     done
+    if ! command -v awk >/dev/null 2>&1; then
+        fail_msg "awk is unavailable for managed environment verification"
+        return
+    fi
+    if managed_environment=$(awk '
+        NR == 1 && /^(PROD|TEST|DEV)$/ { value = $0 }
+        END { if (NR == 1 && value != "") print value; else exit 1 }
+    ' "$SHELL_ENVIRONMENT" 2>/dev/null); then
+        pass_msg "managed environment is $managed_environment"
+    else
+        fail_msg "managed environment must contain exactly PROD, TEST, or DEV"
+        return
+    fi
     if ! command -v bash >/dev/null 2>&1; then
         fail_msg "bash is unavailable for shell policy verification"
         return
@@ -426,13 +446,22 @@ check_shell_history() {
     fi
     # Expand history variables inside the clean child shells, not this verifier.
     # shellcheck disable=SC2016
-    if env -u HISTFILE -u HISTSIZE -u HISTFILESIZE bash -lic '
+    if env -u HISTFILE -u HISTSIZE -u HISTFILESIZE \
+        "EXPECTED_MANAGED_ENVIRONMENT=$managed_environment" bash -lic '
         [ "${HISTFILE:-}" = /dev/null ] || exit 1
         [ "${HISTSIZE:-0}" -gt 0 ] 2>/dev/null || exit 1
         readonly -p HISTFILE >/dev/null 2>&1 || exit 1
         managed_verify_umask=$(umask)
         managed_verify_umask=${managed_verify_umask#0}
         [ "$((8#$managed_verify_umask & 8#027))" -eq "$((8#027))" ] || exit 1
+        managed_expected_prompt_path="\\u@\\h:\\w"
+        case "$PS1" in
+            *"[$EXPECTED_MANAGED_ENVIRONMENT"*"$managed_expected_prompt_path"*) ;;
+            *) exit 1 ;;
+        esac
+        if [ "$EXPECTED_MANAGED_ENVIRONMENT" = PROD ]; then
+            case "$PS1" in *'[PROD ROOT]'*) ;; *) exit 1 ;; esac
+        fi
         bash -ic "
             [ \"\${HISTFILE:-}\" = /dev/null ] || exit 1
             [ \"\${HISTSIZE:-0}\" -gt 0 ] 2>/dev/null || exit 1
@@ -441,7 +470,7 @@ check_shell_history() {
             [ \"\$((8#\$managed_verify_child_umask & 8#027))\" -eq \"\$((8#027))\" ]
         " >/dev/null 2>&1
     ' >/dev/null 2>&1; then
-        pass_msg "Bash logins use a restrictive umask and non-persistent history"
+        pass_msg "Bash logins show the managed environment and enforce shell policies"
     else
         fail_msg "Bash login umask or history policy is not effective in interactive shells"
     fi
