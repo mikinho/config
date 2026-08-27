@@ -1,3 +1,9 @@
+# mongodb/templates/mongod-local.conf.in
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
 systemLog:
   destination: file
   logAppend: true

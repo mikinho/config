@@ -1,7 +1,9 @@
 # nginx/sites/sample_node.conf.example
+
 #
 # Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
 #
+
 # Copy this file to sites/sample_node.conf after replacing the example domains,
 # certificate paths, and sample_node site tag. Keep the primary domain first:
 # includes/redir.conf redirects every other listed name to $server_name.

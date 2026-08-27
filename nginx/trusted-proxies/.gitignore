@@ -1,3 +1,9 @@
+# nginx/trusted-proxies/.gitignore
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
 # Trusted proxy ranges are deployment-specific and may expose infrastructure.
 # Keep this placeholder so nginx/trusted-proxies exists in a fresh checkout.
 *

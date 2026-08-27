@@ -1,3 +1,9 @@
+# shell/profile.d/70-managed-environment-prompt.sh
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
 # shellcheck shell=bash
 # Managed by the config repository shell baseline.
 # Display a trusted host classification without executing the classification file.

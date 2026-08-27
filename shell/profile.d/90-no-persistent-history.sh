@@ -1,3 +1,9 @@
+# shell/profile.d/90-no-persistent-history.sh
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
 # shellcheck shell=sh
 # Managed by the config repository shell baseline.
 # Keep interactive history in memory, but never persist it on this host.

@@ -1,3 +1,9 @@
+# .gitignore
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
 # macOS metadata
 .DS_Store
 .AppleDouble

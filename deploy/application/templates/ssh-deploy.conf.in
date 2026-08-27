@@ -1,3 +1,9 @@
+# deploy/application/templates/ssh-deploy.conf.in
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
 # Root-owned OpenSSH policy for the restricted deployment account.
 
 Match User @@DEPLOY_USER@@

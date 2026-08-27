@@ -1,9 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
+
+<!-- firewalld/services/ssh-hardened.xml -->
+
 <!--
-  firewalld/services/ssh-hardened.xml
-
   Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+-->
 
+<!--
   OpenSSH on the baseline's non-default port from
   ssh/sshd_config.d/40-baseline-port.conf; change the two together. Named
   distinctly from the built-in ssh service so both can be enabled during a

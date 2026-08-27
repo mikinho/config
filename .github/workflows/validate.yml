@@ -1,3 +1,9 @@
+# .github/workflows/validate.yml
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
 name: Validate configuration
 
 on:

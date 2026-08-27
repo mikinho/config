@@ -1,3 +1,9 @@
+# .github/dependabot.yml
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
 version: 2
 
 updates:

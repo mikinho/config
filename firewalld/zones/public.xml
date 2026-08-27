@@ -1,9 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
+
+<!-- firewalld/zones/public.xml -->
+
 <!--
-  firewalld/zones/public.xml
-
   Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+-->
 
+<!--
   Reference public zone for baseline hosts: exactly the product services plus
   DHCPv6 client addressing. A zone file replaces the host's zone completely -
   review it against the host's actual services, and never install it before

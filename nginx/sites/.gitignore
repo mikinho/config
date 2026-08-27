@@ -1,3 +1,9 @@
+# nginx/sites/.gitignore
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
 # Site definitions normally contain deployment-specific hostnames and paths.
 # Keep only deliberately force-added public examples and repository defaults.
 *

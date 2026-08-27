@@ -1,3 +1,9 @@
+# selinux/nginx_quic_bpf.te
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
 module nginx_quic_bpf 1.2;
 
 # Optional: SELinux policy module for the quic-bpf deployment profile.

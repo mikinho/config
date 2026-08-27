@@ -1,0 +1,158 @@
+#!/usr/bin/env sh
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
+set -eu
+
+PROGRAM_NAME=${0##*/}
+SCRIPT_DIRECTORY=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+REPOSITORY_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIRECTORY/.." && pwd)
+SCAN_LIST=$(mktemp "${TMPDIR:-/tmp}/config-config-conventions.XXXXXX")
+AUTHOR_LINE='Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho'
+CONFIGURATION_COUNT=0
+
+cleanup() {
+    if [ -f "$SCAN_LIST" ]; then
+        rm -f -- "$SCAN_LIST"
+    fi
+}
+
+fail() {
+    printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2
+    exit 1
+}
+
+read_line() {
+    line_number=$1
+    checked_file=$2
+    sed -n "${line_number}p" "$checked_file"
+}
+
+assert_hash_header() {
+    checked_file=$1
+    relative_file=$2
+
+    [ "$(read_line 1 "$checked_file")" = "# $relative_file" ] \
+        || fail "configuration filename header is missing or incorrect: $relative_file"
+    [ -z "$(read_line 2 "$checked_file")" ] \
+        || fail "configuration filename header lacks a following blank line: $relative_file"
+    [ "$(read_line 3 "$checked_file")" = '#' ] \
+        || fail "configuration author block has an invalid opening marker: $relative_file"
+    [ "$(read_line 4 "$checked_file")" = "# $AUTHOR_LINE" ] \
+        || fail "configuration author block is missing or inconsistent: $relative_file"
+    [ "$(read_line 5 "$checked_file")" = '#' ] \
+        || fail "configuration author block has an invalid closing marker: $relative_file"
+    [ -z "$(read_line 6 "$checked_file")" ] \
+        || fail "configuration author block lacks a following blank line: $relative_file"
+}
+
+assert_semicolon_header() {
+    checked_file=$1
+    relative_file=$2
+
+    [ "$(read_line 1 "$checked_file")" = "; $relative_file" ] \
+        || fail "PHP-FPM filename header is missing or incorrect: $relative_file"
+    [ -z "$(read_line 2 "$checked_file")" ] \
+        || fail "PHP-FPM filename header lacks a following blank line: $relative_file"
+    [ "$(read_line 3 "$checked_file")" = ';' ] \
+        || fail "PHP-FPM author block has an invalid opening marker: $relative_file"
+    [ "$(read_line 4 "$checked_file")" = "; $AUTHOR_LINE" ] \
+        || fail "PHP-FPM author block is missing or inconsistent: $relative_file"
+    [ "$(read_line 5 "$checked_file")" = ';' ] \
+        || fail "PHP-FPM author block has an invalid closing marker: $relative_file"
+    [ -z "$(read_line 6 "$checked_file")" ] \
+        || fail "PHP-FPM author block lacks a following blank line: $relative_file"
+}
+
+assert_xml_header() {
+    checked_file=$1
+    relative_file=$2
+
+    [ "$(read_line 1 "$checked_file")" = '<?xml version="1.0" encoding="utf-8"?>' ] \
+        || fail "firewalld XML declaration is missing or inconsistent: $relative_file"
+    [ -z "$(read_line 2 "$checked_file")" ] \
+        || fail "firewalld XML declaration lacks a following blank line: $relative_file"
+    [ "$(read_line 3 "$checked_file")" = "<!-- $relative_file -->" ] \
+        || fail "firewalld filename header is missing or incorrect: $relative_file"
+    [ -z "$(read_line 4 "$checked_file")" ] \
+        || fail "firewalld filename header lacks a following blank line: $relative_file"
+    [ "$(read_line 5 "$checked_file")" = '<!--' ] \
+        || fail "firewalld author block has an invalid opening marker: $relative_file"
+    [ "$(read_line 6 "$checked_file")" = "  $AUTHOR_LINE" ] \
+        || fail "firewalld author block is missing or inconsistent: $relative_file"
+    [ "$(read_line 7 "$checked_file")" = '-->' ] \
+        || fail "firewalld author block has an invalid closing marker: $relative_file"
+    [ -z "$(read_line 8 "$checked_file")" ] \
+        || fail "firewalld author block lacks a following blank line: $relative_file"
+
+    python3 -c \
+        'import sys; import xml.etree.ElementTree as element_tree; element_tree.parse(sys.argv[1])' \
+        "$checked_file" \
+        || fail "firewalld XML is not well formed: $relative_file"
+}
+
+validate_json() {
+    checked_file=$1
+    relative_file=$2
+
+    python3 -m json.tool "$checked_file" >/dev/null \
+        || fail "comment-free JSON configuration is invalid: $relative_file"
+}
+
+trap cleanup EXIT HUP INT TERM
+
+git -C "$REPOSITORY_ROOT" ls-files --cached --others --exclude-standard \
+    > "$SCAN_LIST"
+
+while IFS= read -r relative_file; do
+    checked_file=$REPOSITORY_ROOT/$relative_file
+    [ -f "$checked_file" ] || continue
+    configuration_style=
+
+    case $relative_file in
+        firewalld/services/*.xml | firewalld/zones/*.xml)
+            configuration_style='xml'
+            ;;
+        php-fpm/pool/*.conf | php-fpm/sites/*.conf)
+            configuration_style='semicolon'
+            ;;
+        deploy/application/profile.schema.json | deploy/application/profiles/*.json)
+            configuration_style='json'
+            ;;
+        .gitattributes | .gitignore | \
+        .github/*.yml | \
+        deploy/application/templates/*.in | \
+        deploy/host-profiles/*.profile | deploy/profiles/*.profile | \
+        fail2ban/filter.d/*.conf | fail2ban/jail.local | fail2ban/templates/*.in | \
+        logrotate/nginx | mongodb/logrotate/* | mongodb/templates/*.conf.in | \
+        nginx/nginx.conf | nginx/includes/*.conf | nginx/sites/*.conf | \
+        nginx/sites/*.conf.example | nginx/sites/.gitignore | \
+        nginx/stubs/*.conf | \
+        nginx/trusted-proxies/.gitignore | nginx/upstreams/.gitignore | \
+        packages/rsync/rsync.spec | packages/rsync/rsyncd.conf | \
+        selinux/*.te | shell/profile.d/*.sh | ssh/sshd_config.d/*.conf | \
+        ssh/transitions/*.conf | sysctl/*.conf | \
+        systemd/system/*.service | systemd/system/*.timer | systemd/system/*/*.conf)
+            configuration_style='hash'
+            ;;
+    esac
+
+    [ -n "$configuration_style" ] || continue
+    if [ "$(read_line 1 "$checked_file" | cut -c 1-2)" = '#!' ]; then
+        continue
+    fi
+
+    CONFIGURATION_COUNT=$((CONFIGURATION_COUNT + 1))
+    case $configuration_style in
+        hash) assert_hash_header "$checked_file" "$relative_file" ;;
+        semicolon) assert_semicolon_header "$checked_file" "$relative_file" ;;
+        xml) assert_xml_header "$checked_file" "$relative_file" ;;
+        json) validate_json "$checked_file" "$relative_file" ;;
+        *) fail "internal error: unsupported configuration style: $configuration_style" ;;
+    esac
+done < "$SCAN_LIST"
+
+printf 'Validated headers and syntax boundaries for %s configuration assets.\n' \
+    "$CONFIGURATION_COUNT"

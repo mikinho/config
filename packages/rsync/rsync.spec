@@ -1,3 +1,9 @@
+# packages/rsync/rsync.spec
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
 %global _hardened_build 1
 
 Summary: A fast, versatile remote and local file-copying tool

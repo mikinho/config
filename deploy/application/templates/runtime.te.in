@@ -1,3 +1,9 @@
+# deploy/application/templates/runtime.te.in
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
 module @@SELINUX_MODULE@@ 1.0;
 
 require {

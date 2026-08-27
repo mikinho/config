@@ -1,3 +1,9 @@
+# deploy/application/templates/live.service.in
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
 [Unit]
 Description=Managed Node application @@APPLICATION_TAG@@
 Requires=@@RECOVERY_SERVICE@@

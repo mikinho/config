@@ -1,3 +1,9 @@
+# deploy/application/templates/finalizer.service.in
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
 [Unit]
 Description=Finalize @@APPLICATION_TAG@@ deployment
 After=network-online.target

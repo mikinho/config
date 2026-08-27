@@ -1,3 +1,9 @@
+# deploy/application/templates/ssh-maintenance.conf.in
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
 # Fail-closed guard installed while deployment policy is being reconciled.
 DenyUsers @@DEPLOY_USER@@
 

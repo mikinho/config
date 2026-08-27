@@ -1,9 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
+
+<!-- firewalld/services/nginx.xml -->
+
 <!--
-  firewalld/services/nginx.xml
-
   Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+-->
 
+<!--
   The nginx baseline's complete edge exposure: TCP 80 for the HTTPS redirect
   and ACME HTTP-01 challenges, TCP 443 for HTTP/1.1 and HTTP/2, and UDP 443
   for HTTP/3 QUIC. Declared as one product service so a zone enables or

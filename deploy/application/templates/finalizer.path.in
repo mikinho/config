@@ -1,3 +1,9 @@
+# deploy/application/templates/finalizer.path.in
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
 [Unit]
 Description=Watch for the @@APPLICATION_TAG@@ deployment sentinel
 Wants=@@RECOVERY_SERVICE@@

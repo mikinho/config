@@ -1,3 +1,9 @@
+# deploy/application/templates/candidate@.service.in
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
 [Unit]
 Description=Isolated preflight for @@APPLICATION_TAG@@ release %I
 After=network-online.target

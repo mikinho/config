@@ -1,3 +1,9 @@
+# .github/workflows/dependency-review.yml
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
 name: Review dependencies
 
 on:

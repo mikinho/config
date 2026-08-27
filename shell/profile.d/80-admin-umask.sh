@@ -1,3 +1,9 @@
+# shell/profile.d/80-admin-umask.sh
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
 # shellcheck shell=bash
 # Managed by the config repository shell baseline.
 # Prevent interactive administrators from creating world-accessible files.

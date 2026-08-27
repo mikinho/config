@@ -1,3 +1,9 @@
+# deploy/application/templates/failure@.service.in
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
 [Unit]
 Description=Record failure of @@APPLICATION_TAG@@ deployment unit %i
 
