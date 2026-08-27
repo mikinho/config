@@ -538,7 +538,9 @@ class CoreRendererTests(unittest.TestCase):
             live = (bundle / "systemd/example_node_app.service").read_text()
             self.assertIn("Requires=example_deploy-recover.service", live)
             self.assertIn("WorkingDirectory=/opt/example_node_app/current", live)
-            self.assertIn("IPAddressDeny=127.0.0.0/8 ::1/128", live)
+            self.assertIn("IPAddressAllow=127.0.0.53/32", live)
+            self.assertIn("IPAddressDeny=localhost", live)
+            self.assertNotIn("IPAddressAllow=0.0.0.0/0", live)
             self.assertIn("SocketBindDeny=any", live)
             self.assertIn("MemoryHigh=805306368", live)
             self.assertIn("MemoryMax=1073741824", live)
@@ -600,9 +602,8 @@ class CoreRendererTests(unittest.TestCase):
                 "systemd/example_node_app-candidate@.service",
             ):
                 unit = (bundle / relative_path).read_text()
-                self.assertIn("IPAddressAllow=0.0.0.0/0 ::/0", unit)
-                self.assertIn("IPAddressDeny=any", unit)
-                self.assertNotIn("IPAddressDeny=127.0.0.0/8", unit)
+                self.assertNotIn("IPAddressAllow=", unit)
+                self.assertNotIn("IPAddressDeny=", unit)
 
     def test_installer_is_fail_closed_and_verifier_is_non_mutating(self) -> None:
         """Setup arms ingress denial first and only the verifier performs reads."""

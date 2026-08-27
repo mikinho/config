@@ -1,0 +1,8 @@
+mongodb-org|8.0.29-1.el9.x86_64|mongodb-org-8.0.29-1.el9.x86_64.rpm|39aa038c21fb826712095016ba2360a353869a8d48b017b5e88c2cb5e0affad2
+mongodb-org-database|8.0.29-1.el9.x86_64|mongodb-org-database-8.0.29-1.el9.x86_64.rpm|2845deb50f2fef219b899b8dbd2d23b4cc9b94c8e3f217f42f28a376c2a44fa4
+mongodb-org-server|8.0.29-1.el9.x86_64|mongodb-org-server-8.0.29-1.el9.x86_64.rpm|fc5173fd95faa013db0146d7da709df80d71a19971669f2c847395c78a140221
+mongodb-org-mongos|8.0.29-1.el9.x86_64|mongodb-org-mongos-8.0.29-1.el9.x86_64.rpm|1cd768241535273ec7d3bc1a482d5f12f48951aba6735f6ff370cb7fc962a6ef
+mongodb-org-tools|8.0.29-1.el9.x86_64|mongodb-org-tools-8.0.29-1.el9.x86_64.rpm|967453889b03853964fd8e30059391ebdee7033a1aa84874276688ee7ce585aa
+mongodb-org-database-tools-extra|8.0.29-1.el9.x86_64|mongodb-org-database-tools-extra-8.0.29-1.el9.x86_64.rpm|cf71a05b4bffbdbb117a8b16a3470ce1c718ff73455da6577a7765d4b060a91f
+mongodb-mongosh|2.10.0-1.el8.x86_64|mongodb-mongosh-2.10.0.x86_64.rpm|9c7ab76e7cfadda279b69546ed12e7fbbcdad93044be811d73570e4d9212a5d9
+mongodb-database-tools|100.18.0-1.x86_64|mongodb-database-tools-100.18.0-1.x86_64.rpm|958782dd62a2a1f76e8d9813868dd9dbcd4521a00cbfa157d8c71dd502656096

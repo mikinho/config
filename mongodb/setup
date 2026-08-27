@@ -9,6 +9,7 @@ set -f
 
 PROGRAM_NAME=${0##*/}
 SCRIPT_DIRECTORY=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+REPOSITORY_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIRECTORY/.." && pwd)
 TEMPLATE_DIRECTORY=$SCRIPT_DIRECTORY/templates
 BOOTSTRAP_TEMPLATE=$TEMPLATE_DIRECTORY/mongod-bootstrap.conf.in
 LOCAL_TEMPLATE=$TEMPLATE_DIRECTORY/mongod-local.conf.in
@@ -17,6 +18,8 @@ BOOTSTRAP_SCRIPT=$SCRIPT_DIRECTORY/bootstrap.js
 ADD_USER_SCRIPT=$SCRIPT_DIRECTORY/add-application-user.js
 RECONFIGURE_SCRIPT=$SCRIPT_DIRECTORY/reconfigure-member.js
 VERIFIER=$SCRIPT_DIRECTORY/verify
+BUNDLE_METADATA=$REPOSITORY_ROOT/BUNDLE-METADATA
+BUNDLE_CHECKSUMS=$REPOSITORY_ROOT/SHA256SUMS
 
 CONFIGURATION_PATH=/etc/mongod.conf
 KEY_FILE_PATH=/etc/mongod.keyfile
@@ -72,6 +75,7 @@ Expose-network options:
   --replica-set NAME
   --admin-user USER --admin-password-file FILE
   --application-user USER --application-database DATABASE
+  --application-password-file FILE
   --bind-address PRIVATE_IPV4 --member-host TLS_DNS_NAME
   --tls-certificate-key-file FILE --tls-ca-file FILE
   --network-controls-confirmed
@@ -92,6 +96,63 @@ validate_source() {
     setup_source=$1
     [ -f "$setup_source" ] && [ ! -L "$setup_source" ] \
         || fail "repository dependency must be a regular file: $setup_source"
+}
+
+validate_execution_bundle() {
+    for bundle_command in awk find grep sha256sum stat; do
+        command -v "$bundle_command" >/dev/null 2>&1 \
+            || fail "required bundle-validation command not found: $bundle_command"
+    done
+    [ -d "$REPOSITORY_ROOT" ] && [ ! -L "$REPOSITORY_ROOT" ] \
+        || fail "deployment bundle root must be a real directory"
+    bundle_parent=$REPOSITORY_ROOT
+    while :; do
+        bundle_parent_identity=$(stat -Lc '%U:%G:%a' "$bundle_parent" 2>/dev/null) \
+            || fail "cannot inspect deployment bundle parent: $bundle_parent"
+        bundle_parent_owner=${bundle_parent_identity%%:*}
+        bundle_parent_remainder=${bundle_parent_identity#*:}
+        bundle_parent_group=${bundle_parent_remainder%%:*}
+        bundle_parent_mode=${bundle_parent_identity##*:}
+        [ "$bundle_parent_owner:$bundle_parent_group" = root:root ] \
+            || fail "deployment bundle parent must be root:root: $bundle_parent"
+        if [ "$((0$bundle_parent_mode & 0022))" -ne 0 ]; then
+            fail "deployment bundle parent must not be writable by group or other: $bundle_parent"
+        fi
+        [ "$bundle_parent" = / ] || [ "$bundle_parent" = /root ] || {
+            bundle_parent=$(dirname -- "$bundle_parent")
+            continue
+        }
+        break
+    done
+    bundle_unsafe_entry=$(find "$REPOSITORY_ROOT" -xdev \
+        \( -type l -o \( ! -type d ! -type f \) \
+           -o ! -user root -o ! -group root -o -perm /022 \
+           -o \( -type f ! -links 1 \) \) -print -quit)
+    [ -z "$bundle_unsafe_entry" ] \
+        || fail "unsafe deployment bundle entry: $bundle_unsafe_entry"
+    [ "$(stat -Lc '%U:%G:%a:%h' "$BUNDLE_METADATA" 2>/dev/null)" = root:root:644:1 ] \
+        || fail "deployment bundle metadata must be a one-link root:root mode 0644 file"
+    [ "$(stat -Lc '%U:%G:%a:%h' "$BUNDLE_CHECKSUMS" 2>/dev/null)" = root:root:644:1 ] \
+        || fail "deployment bundle checksums must be a one-link root:root mode 0644 file"
+    grep -Eq '^sourceRevision=[0-9a-f]{40}$' "$BUNDLE_METADATA" \
+        || fail "deployment bundle metadata has no exact Git source revision"
+    for bundle_required_path in \
+        BUNDLE-METADATA mongodb/setup mongodb/verify \
+        mongodb/bootstrap.js mongodb/add-application-user.js \
+        mongodb/reconfigure-member.js mongodb/verify-auth.js \
+        mongodb/verify-application.js mongodb/verify-unauthenticated.js \
+        mongodb/packages-8.0.29.manifest \
+        mongodb/templates/mongod-bootstrap.conf.in \
+        mongodb/templates/mongod-local.conf.in \
+        mongodb/templates/mongod-network.conf.in
+    do
+        awk -v expected="$bundle_required_path" \
+            '$1 ~ /^[0-9a-f]{64}$/ && $2 == expected { matches += 1 } \
+             END { exit matches == 1 ? 0 : 1 }' "$BUNDLE_CHECKSUMS" \
+            || fail "deployment bundle checksum manifest must contain exactly: $bundle_required_path"
+    done
+    (cd "$REPOSITORY_ROOT" && sha256sum --strict --check SHA256SUMS >/dev/null) \
+        || fail "deployment bundle checksum verification failed"
 }
 
 validate_safe_name() {
@@ -261,8 +322,9 @@ validate_selection() {
             ;;
         expose-network)
             validate_common_identity_selection
-            [ -z "$APPLICATION_PASSWORD_FILE$MODEL" ] \
-                || fail "application password and model options do not apply to --phase expose-network"
+            validate_absolute_path "application password file" "$APPLICATION_PASSWORD_FILE"
+            [ -z "$MODEL" ] \
+                || fail "model options do not apply to --phase expose-network"
             validate_ipv4_address
             validate_member_host
             validate_absolute_path "TLS certificate/key file" "$TLS_CERTIFICATE_KEY_FILE"
@@ -319,7 +381,7 @@ render_template() {
 }
 
 validate_mongodb_runtime() {
-    for required_command in cat cmp cp find getenforce getent grep id install mktemp mongod mongosh openssl restorecon sed sleep stat systemctl; do
+    for required_command in cat cmp cp find getenforce getent grep id install mktemp mongod mongosh openssl restorecon sed sleep sort stat systemctl; do
         command -v "$required_command" >/dev/null 2>&1 \
             || fail "required command not found: $required_command"
     done
@@ -416,7 +478,8 @@ verify_local_model() {
         --admin-user "$ADMIN_USER" \
         --admin-password-file "$ADMIN_PASSWORD_FILE" \
         --application-user "$APPLICATION_USER" \
-        --application-database "$APPLICATION_DATABASE"
+        --application-database "$APPLICATION_DATABASE" \
+        --application-password-file "$APPLICATION_PASSWORD_FILE"
 }
 
 verify_network_model() {
@@ -427,6 +490,7 @@ verify_network_model() {
         --admin-password-file "$ADMIN_PASSWORD_FILE" \
         --application-user "$APPLICATION_USER" \
         --application-database "$APPLICATION_DATABASE" \
+        --application-password-file "$APPLICATION_PASSWORD_FILE" \
         --member-host "$MEMBER_HOST" \
         --bind-address "$BIND_ADDRESS" \
         --tls-ca-file "$TLS_CA_FILE" \
@@ -562,9 +626,13 @@ validate_tls_server_identity() {
 expose_network_model() {
     validate_mongodb_runtime
     validate_password_file "administrative password file" "$ADMIN_PASSWORD_FILE"
+    validate_password_file "application password file" "$APPLICATION_PASSWORD_FILE"
     validate_tls_server_identity
-    getent ahostsv4 "$MEMBER_HOST" | awk -v expected="$BIND_ADDRESS" '$1 == expected { found = 1 } END { exit found ? 0 : 1 }' \
-        || fail "$MEMBER_HOST does not resolve locally to $BIND_ADDRESS"
+    resolved_member_addresses=$(getent ahostsv4 "$MEMBER_HOST" \
+        | awk '$1 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ { print $1 }' \
+        | sort -u)
+    [ "$resolved_member_addresses" = "$BIND_ADDRESS" ] \
+        || fail "$MEMBER_HOST must resolve locally to exactly $BIND_ADDRESS"
     verify_local_model
 
     render_template "$NETWORK_TEMPLATE" "$TEMPORARY_DIRECTORY/mongod-network.conf"
@@ -654,6 +722,7 @@ if [ "$MODE" = plan ]; then
 fi
 
 [ "$(id -u)" -eq 0 ] || fail "run as root or use --plan"
+validate_execution_bundle
 trap cleanup EXIT HUP INT TERM
 umask 077
 TEMPORARY_DIRECTORY=$(mktemp -d "${TMPDIR:-/tmp}/config-mongodb-setup.XXXXXX") \

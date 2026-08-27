@@ -64,10 +64,13 @@ design. Do not add an arbiter merely to claim an odd vote count.
 `mongodb/install`:
 
 - accepts only RHEL, Rocky Linux, or CentOS Stream 9 on x86_64;
+- installs the reviewed MongoDB 8.0.29 package set plus fixed `mongosh` and
+  database-tools NEVRAs, with a recorded SHA-256 for every MongoDB RPM;
 - pins MongoDB's complete server-key fingerprint
   `4B0752C1BCA238C0B4EE14DC41DE058A4E7DCA05`;
-- installs only the MongoDB 8.0 repository and refuses an enabled competing
-  `mongodb-org` repository;
+- verifies every downloaded RPM with `rpmkeys` and its `RSAHEADER` key ID;
+- installs the MongoDB 8.0 repository disabled and refuses an enabled
+  competing `mongodb-org` repository, preventing an unreviewed patch advance;
 - refuses an already installed non-8.0 server;
 - refuses package changes while `mongod.service` is active;
 - installs a root-owned verifier; and
@@ -76,17 +79,34 @@ design. Do not add an arbiter merely to claim an odd vote count.
   patch maintenance.
 
 This component intentionally selects the LTS release line, not a rapid release.
+The exact reviewed baseline is 8.0.29; repository packages whose release notes
+have not been published are not candidates merely because repository metadata
+contains them. Updating the baseline requires release-note review plus updates
+to every NEVRA and RPM SHA-256 in the installer and verifier.
 Review the [MongoDB lifecycle schedule](https://www.mongodb.com/legal/support-policy/lifecycles)
 before advancing the series. Minor and patch upgrades still require a current
 backup, release-note review, an application maintenance decision, and the same
 post-upgrade verification.
 
-Review the plan on the target host before installation:
+Privileged entry points refuse a user-writable checkout. Build only from a
+clean Git revision, copy the resulting directory into a protected root-owned
+location on the target, then verify and run that same staged directory:
 
 ```sh
-mongodb/install --plan
-sudo mongodb/install
+mongodb/build-bundle --output /tmp/config-mongodb-REVISION
+sudo install -d -o root -g root -m 0755 /root/config-mongodb-REVISION
+sudo cp -a /tmp/config-mongodb-REVISION/. /root/config-mongodb-REVISION/
+sudo chown -R root:root /root/config-mongodb-REVISION
+sudo chmod -R go-w /root/config-mongodb-REVISION
+sudo /root/config-mongodb-REVISION/mongodb/install --check-bundle
+sudo /root/config-mongodb-REVISION/mongodb/install --plan
+sudo /root/config-mongodb-REVISION/mongodb/install
 ```
+
+Replace `REVISION` with the full source revision printed by the builder. Retain
+`BUNDLE-METADATA` and `SHA256SUMS` with change evidence. `install` and `setup`
+verify ownership, parent permissions, entry types, file link counts, the exact
+Git revision field, and all recorded payload digests before making host changes.
 
 ## Credential boundary
 
@@ -198,6 +218,7 @@ mongodb/setup --plan \
     --admin-password-file /root/mongodb-admin.password \
     --application-user APP_USER \
     --application-database APP_DATABASE \
+    --application-password-file /root/mongodb-app.password \
     --bind-address PRIVATE_IPV4 \
     --member-host mongodb.internal.example \
     --tls-certificate-key-file /etc/pki/mongodb/server.pem \
@@ -245,9 +266,12 @@ MongoDB-supported migration path.
 
 Run the installed verifier on the database host after setup, certificate
 renewal, package maintenance, firewall work, and any user or configuration
-change. It checks the initialized primary, exact roles, unauthenticated denial,
-listener scope, TLS, file identities, service state, MongoDB 8.0 series, and
-the `mongod_t` SELinux domain.
+change. It checks the initialized primary, exact roles and SHA-256-only
+mechanisms, authenticates as the application identity against its own database,
+proves an allowed application-database read and a denied administrative read,
+checks unauthenticated denial, listener scope, unique DNS resolution, TLS, file
+identities, service state, the exact reviewed MongoDB package set, and the
+`mongod_t` SELinux domain.
 
 The verifier reports but does not automatically change host-wide tuning. XFS
 is preferred for WiredTiger; ext4 is supported. MongoDB 8.0 expects transparent

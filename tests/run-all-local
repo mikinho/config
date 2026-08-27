@@ -47,6 +47,7 @@ if command -v shellcheck >/dev/null 2>&1; then
         "$REPOSITORY_ROOT/firewalld/setup" \
         "$REPOSITORY_ROOT/nginx/setup" \
         "$REPOSITORY_ROOT/mongodb/install" \
+        "$REPOSITORY_ROOT/mongodb/build-bundle" \
         "$REPOSITORY_ROOT/mongodb/setup" \
         "$REPOSITORY_ROOT/mongodb/verify" \
         "$REPOSITORY_ROOT/packages/rsync/build-el9" \
@@ -66,12 +67,14 @@ if command -v shellcheck >/dev/null 2>&1; then
         "$REPOSITORY_ROOT/terminal/verify" \
         "$REPOSITORY_ROOT/tests/certbot-installer" \
         "$REPOSITORY_ROOT/tests/certbot-issue" \
+        "$REPOSITORY_ROOT/tests/config-conventions" \
         "$REPOSITORY_ROOT/tests/deploy-renderers" \
         "$REPOSITORY_ROOT/tests/fail2ban-installer" \
         "$REPOSITORY_ROOT/tests/health-verifiers" \
         "$REPOSITORY_ROOT/tests/host-setup" \
         "$REPOSITORY_ROOT/tests/nginx-runtime" \
         "$REPOSITORY_ROOT/tests/mongodb" \
+        "$REPOSITORY_ROOT/tests/mongodb-el9" \
         "$REPOSITORY_ROOT/tests/rsync-packaging" \
         "$REPOSITORY_ROOT/tests/run-all-local" \
         "$REPOSITORY_ROOT/tests/script-conventions" \
@@ -90,6 +93,9 @@ step "Validating deployment profile assignments..."
 
 step "Validating repository script conventions..."
 "$REPOSITORY_ROOT/tests/script-conventions"
+
+step "Validating repository configuration conventions..."
+"$REPOSITORY_ROOT/tests/config-conventions"
 
 step "Validating gold application deployment profiles..."
 python3 "$REPOSITORY_ROOT/tests/application-deployment-standard.py"

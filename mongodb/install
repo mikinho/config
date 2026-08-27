@@ -13,19 +13,26 @@ REPOSITORY_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIRECTORY/.." && pwd)
 PLATFORM_LIBRARY=$REPOSITORY_ROOT/deploy/lib/platform.sh
 VERIFIER_SOURCE=$SCRIPT_DIRECTORY/verify
 AUTH_SOURCE=$SCRIPT_DIRECTORY/verify-auth.js
+APPLICATION_AUTH_SOURCE=$SCRIPT_DIRECTORY/verify-application.js
 UNAUTHENTICATED_SOURCE=$SCRIPT_DIRECTORY/verify-unauthenticated.js
 LOGROTATE_SOURCE=$SCRIPT_DIRECTORY/logrotate/mongodb
+PACKAGE_MANIFEST_SOURCE=$SCRIPT_DIRECTORY/packages-8.0.29.manifest
+BUNDLE_METADATA=$REPOSITORY_ROOT/BUNDLE-METADATA
+BUNDLE_CHECKSUMS=$REPOSITORY_ROOT/SHA256SUMS
 
 MONGODB_SERIES=8.0
+MONGODB_VERSION=8.0.29
 MONGODB_KEY_URL=https://pgp.mongodb.com/server-8.0.asc
 MONGODB_KEY_FINGERPRINT=4B0752C1BCA238C0B4EE14DC41DE058A4E7DCA05
 MONGODB_KEY_ID=41DE058A4E7DCA05
+MONGODB_REPOSITORY_BASE_URL=https://repo.mongodb.org/yum/redhat/9/mongodb-org/8.0/x86_64
 REPOSITORY_DIRECTORY=/etc/yum.repos.d
 REPOSITORY_TARGET=$REPOSITORY_DIRECTORY/mongodb-org-8.0.repo
 KEY_TARGET=/etc/pki/rpm-gpg/MONGODB-SERVER-8.0
 VERIFIER_TARGET=/usr/local/bin/verify-mongodb
 VERIFIER_LIBRARY_DIRECTORY=/usr/local/libexec/config-mongodb
 LOGROTATE_TARGET=/etc/logrotate.d/mongodb
+PACKAGE_MANIFEST_TARGET=$VERIFIER_LIBRARY_DIRECTORY/packages-8.0.29.manifest
 
 MODE=install
 OS_RELEASE_FILE=/etc/os-release
@@ -40,6 +47,7 @@ Usage:
   $PROGRAM_NAME
   $PROGRAM_NAME --plan [--os-release FILE] [--architecture x86_64]
   $PROGRAM_NAME --check
+  sudo $PROGRAM_NAME --check-bundle
 
 Installs MongoDB Community $MONGODB_SERIES LTS from MongoDB's official EL9
 repository after pinning and verifying the full signing-key fingerprint. It
@@ -79,23 +87,81 @@ validate_source() {
         || fail "repository dependency must be a regular file: $install_source"
 }
 
+mongodb_package_manifest() {
+    cat -- "$PACKAGE_MANIFEST_SOURCE"
+}
+
+validate_execution_bundle() {
+    for bundle_command in awk find grep sha256sum stat; do
+        command -v "$bundle_command" >/dev/null 2>&1 \
+            || fail "required bundle-validation command not found: $bundle_command"
+    done
+    [ -d "$REPOSITORY_ROOT" ] && [ ! -L "$REPOSITORY_ROOT" ] \
+        || fail "deployment bundle root must be a real directory"
+    bundle_parent=$REPOSITORY_ROOT
+    while :; do
+        bundle_parent_identity=$(stat -Lc '%U:%G:%a' "$bundle_parent" 2>/dev/null) \
+            || fail "cannot inspect deployment bundle parent: $bundle_parent"
+        bundle_parent_owner=${bundle_parent_identity%%:*}
+        bundle_parent_remainder=${bundle_parent_identity#*:}
+        bundle_parent_group=${bundle_parent_remainder%%:*}
+        bundle_parent_mode=${bundle_parent_identity##*:}
+        [ "$bundle_parent_owner:$bundle_parent_group" = root:root ] \
+            || fail "deployment bundle parent must be root:root: $bundle_parent"
+        if [ "$((0$bundle_parent_mode & 0022))" -ne 0 ]; then
+            fail "deployment bundle parent must not be writable by group or other: $bundle_parent"
+        fi
+        [ "$bundle_parent" = / ] || [ "$bundle_parent" = /root ] || {
+            bundle_parent=$(dirname -- "$bundle_parent")
+            continue
+        }
+        break
+    done
+    bundle_unsafe_entry=$(find "$REPOSITORY_ROOT" -xdev \
+        \( -type l -o \( ! -type d ! -type f \) \
+           -o ! -user root -o ! -group root -o -perm /022 \
+           -o \( -type f ! -links 1 \) \) -print -quit)
+    [ -z "$bundle_unsafe_entry" ] \
+        || fail "unsafe deployment bundle entry: $bundle_unsafe_entry"
+    [ "$(stat -Lc '%U:%G:%a:%h' "$BUNDLE_METADATA" 2>/dev/null)" = root:root:644:1 ] \
+        || fail "deployment bundle metadata must be a one-link root:root mode 0644 file"
+    [ "$(stat -Lc '%U:%G:%a:%h' "$BUNDLE_CHECKSUMS" 2>/dev/null)" = root:root:644:1 ] \
+        || fail "deployment bundle checksums must be a one-link root:root mode 0644 file"
+    grep -Eq '^sourceRevision=[0-9a-f]{40}$' "$BUNDLE_METADATA" \
+        || fail "deployment bundle metadata has no exact Git source revision"
+    for bundle_required_path in \
+        BUNDLE-METADATA deploy/lib/platform.sh mongodb/install mongodb/verify \
+        mongodb/verify-auth.js mongodb/verify-application.js \
+        mongodb/verify-unauthenticated.js mongodb/logrotate/mongodb \
+        mongodb/packages-8.0.29.manifest
+    do
+        awk -v expected="$bundle_required_path" \
+            '$1 ~ /^[0-9a-f]{64}$/ && $2 == expected { matches += 1 } \
+             END { exit matches == 1 ? 0 : 1 }' "$BUNDLE_CHECKSUMS" \
+            || fail "deployment bundle checksum manifest must contain exactly: $bundle_required_path"
+    done
+    (cd "$REPOSITORY_ROOT" && sha256sum --strict --check SHA256SUMS >/dev/null) \
+        || fail "deployment bundle checksum verification failed"
+}
+
 for install_source in \
-    "$PLATFORM_LIBRARY" "$VERIFIER_SOURCE" "$AUTH_SOURCE" \
-    "$UNAUTHENTICATED_SOURCE" "$LOGROTATE_SOURCE"
+    "$PLATFORM_LIBRARY" "$VERIFIER_SOURCE" "$AUTH_SOURCE" "$APPLICATION_AUTH_SOURCE" \
+    "$UNAUTHENTICATED_SOURCE" "$LOGROTATE_SOURCE" "$PACKAGE_MANIFEST_SOURCE"
 do
     validate_source "$install_source"
 done
 [ -x "$VERIFIER_SOURCE" ] || fail "verifier must be executable: $VERIFIER_SOURCE"
-
-# shellcheck disable=SC1090,SC1091
-. "$PLATFORM_LIBRARY"
-OS_RELEASE_FILE=$PLATFORM_DEFAULT_OS_RELEASE
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --check)
             [ "$MODE" = install ] || fail "select exactly one mode"
             MODE=check
+            shift
+            ;;
+        --check-bundle)
+            [ "$MODE" = install ] || fail "select exactly one mode"
+            MODE=bundle-check
             shift
             ;;
         --plan)
@@ -121,6 +187,24 @@ while [ "$#" -gt 0 ]; do
         *) fail "unknown argument: $1" ;;
     esac
 done
+
+if [ "$MODE" != plan ] && [ "$OS_RELEASE_OVERRIDDEN" = yes ]; then
+    fail "--os-release is accepted only with --plan"
+fi
+if [ "$MODE" != plan ] && [ -n "$ARCHITECTURE_OVERRIDE" ]; then
+    fail "--architecture is accepted only with --plan"
+fi
+if [ "$MODE" = install ] || [ "$MODE" = bundle-check ]; then
+    [ "$(id -u)" -eq 0 ] || fail "run as root or use --plan"
+    validate_execution_bundle
+fi
+if [ "$MODE" = bundle-check ]; then
+    printf 'Validated root-owned immutable MongoDB deployment bundle.\n'
+    exit 0
+fi
+
+# shellcheck disable=SC1090,SC1091
+. "$PLATFORM_LIBRARY"
 
 if [ "$MODE" = check ]; then
     [ "$OS_RELEASE_OVERRIDDEN" = no ] && [ -z "$ARCHITECTURE_OVERRIDE" ] \
@@ -148,6 +232,7 @@ fi
 printf 'MongoDB installation target: %s (%s)\n' \
     "$PLATFORM_OS_LABEL" "$PLATFORM_OS_ARCHITECTURE"
 printf 'MongoDB package series: %s LTS\n' "$MONGODB_SERIES"
+printf 'Reviewed MongoDB package release: %s\n' "$MONGODB_VERSION"
 
 if [ "$MODE" = plan ]; then
     platform_print_command dnf install --assumeyes ca-certificates curl gnupg2 logrotate
@@ -156,10 +241,13 @@ if [ "$MODE" = plan ]; then
     printf '+ verify OpenPGP fingerprint %s\n' "$MONGODB_KEY_FINGERPRINT"
     platform_print_command install -o root -g root -m 0644 \
         /tmp/MONGODB-SERVER-8.0 "$KEY_TARGET"
-    printf '+ install exact %s with baseurl https://repo.mongodb.org/yum/redhat/9/mongodb-org/8.0/x86_64/\n' \
-        "$REPOSITORY_TARGET"
+    printf '+ install disabled exact %s with baseurl %s/\n' \
+        "$REPOSITORY_TARGET" "$MONGODB_REPOSITORY_BASE_URL"
+    printf '+ import verified signing key into the RPM database\n'
+    printf '+ download, SHA-256 check, and rpmkeys verify these exact packages:\n'
+    mongodb_package_manifest | awk -F'|' '{ printf "  %s-%s\n", $1, $2 }'
+    printf '+ install the verified local RPM files and reject package substitution\n'
     printf '+ reject every enabled competing mongodb-org repository\n'
-    platform_print_command dnf install --assumeyes mongodb-org
     platform_print_command install -o root -g root -m 0644 \
         "$LOGROTATE_SOURCE" "$LOGROTATE_TARGET"
     platform_print_command install -o root -g root -m 0755 \
@@ -168,8 +256,7 @@ if [ "$MODE" = plan ]; then
     exit 0
 fi
 
-[ "$(id -u)" -eq 0 ] || fail "run as root or use --plan"
-for required_command in awk cmp dnf grep install mktemp rpm stat systemctl; do
+for required_command in awk cmp dnf grep install mktemp rpm rpmkeys sha256sum stat systemctl; do
     command -v "$required_command" >/dev/null 2>&1 \
         || fail "required command not found: $required_command"
 done
@@ -231,8 +318,8 @@ cat > "$TEMPORARY_DIRECTORY/mongodb-org-8.0.repo" <<EOF
 name=MongoDB Repository
 baseurl=https://repo.mongodb.org/yum/redhat/9/mongodb-org/8.0/x86_64/
 gpgcheck=1
-enabled=1
 gpgkey=file://$KEY_TARGET
+enabled=0
 EOF
 install -o root -g root -m 0644 \
     "$TEMPORARY_DIRECTORY/mongodb-org-8.0.repo" "$REPOSITORY_TARGET"
@@ -242,12 +329,39 @@ competing_repositories=$(dnf -q repolist --enabled 2>/dev/null \
 [ -z "$competing_repositories" ] \
     || fail "disable reviewed competing MongoDB repositories before continuing: $competing_repositories"
 
-dnf install --assumeyes mongodb-org
-mongod --version 2>/dev/null | grep -Eq 'db version v8\.0\.' \
-    || fail "installed mongod is not from the $MONGODB_SERIES LTS series"
-installed_signature=$(rpm -q --qf '%{SIGPGP:pgpsig}\n' mongodb-org-server 2>/dev/null || true)
-printf '%s\n' "$installed_signature" | grep -qi "$MONGODB_KEY_ID" \
-    || fail "mongodb-org-server RPM signature does not identify the pinned MongoDB key"
+rpm --import "$KEY_TARGET"
+install -d -m 0700 "$TEMPORARY_DIRECTORY/rpms"
+set --
+while IFS='|' read -r package_name package_nevra package_filename package_sha256; do
+    [ -n "$package_name" ] || continue
+    package_path=$TEMPORARY_DIRECTORY/rpms/$package_filename
+    curl --fail --location --silent --show-error \
+        --output "$package_path" "$MONGODB_REPOSITORY_BASE_URL/RPMS/$package_filename"
+    printf '%s  %s\n' "$package_sha256" "$package_path" \
+        | sha256sum --check --status - \
+        || fail "MongoDB RPM SHA-256 mismatch: $package_filename"
+    rpmkeys --checksig "$package_path" >/dev/null 2>&1 \
+        || fail "MongoDB RPM signature verification failed: $package_filename"
+    package_signature=$(rpm -qp --qf '%{RSAHEADER:pgpsig}\n' "$package_path" 2>/dev/null || true)
+    printf '%s\n' "$package_signature" | grep -qi "Key ID $MONGODB_KEY_ID" \
+        || fail "MongoDB RPM signature does not identify the pinned key: $package_filename"
+    set -- "$@" "$package_path"
+done <<EOF
+$(mongodb_package_manifest)
+EOF
+[ "$#" -eq 8 ] || fail "reviewed MongoDB package manifest is incomplete"
+dnf install --assumeyes "$@"
+
+while IFS='|' read -r package_name package_nevra package_filename package_sha256; do
+    [ -n "$package_name" ] || continue
+    installed_nevra=$(rpm -q --qf '%{VERSION}-%{RELEASE}.%{ARCH}\n' "$package_name" 2>/dev/null || true)
+    [ "$installed_nevra" = "$package_nevra" ] \
+        || fail "$package_name must be installed as $package_nevra (found ${installed_nevra:-missing})"
+done <<EOF
+$(mongodb_package_manifest)
+EOF
+mongod --version 2>/dev/null | grep -Eq 'db version v8\.0\.29([.-]|$)' \
+    || fail "installed mongod is not the reviewed $MONGODB_VERSION release"
 install -o root -g root -m 0644 "$LOGROTATE_SOURCE" "$LOGROTATE_TARGET"
 logrotate --debug "$LOGROTATE_TARGET" >/dev/null 2>&1 \
     || fail "installed MongoDB logrotate policy failed syntax validation"
@@ -262,7 +376,9 @@ fi
 validate_root_directory "$VERIFIER_LIBRARY_DIRECTORY"
 for verifier_library_target in \
     "$VERIFIER_LIBRARY_DIRECTORY/verify-auth.js" \
-    "$VERIFIER_LIBRARY_DIRECTORY/verify-unauthenticated.js"
+    "$VERIFIER_LIBRARY_DIRECTORY/verify-application.js" \
+    "$VERIFIER_LIBRARY_DIRECTORY/verify-unauthenticated.js" \
+    "$PACKAGE_MANIFEST_TARGET"
 do
     if [ -e "$verifier_library_target" ] || [ -L "$verifier_library_target" ]; then
         [ -f "$verifier_library_target" ] && [ ! -L "$verifier_library_target" ] \
@@ -271,15 +387,23 @@ do
 done
 install -o root -g root -m 0644 "$AUTH_SOURCE" "$VERIFIER_LIBRARY_DIRECTORY/verify-auth.js"
 install -o root -g root -m 0644 \
+    "$APPLICATION_AUTH_SOURCE" "$VERIFIER_LIBRARY_DIRECTORY/verify-application.js"
+install -o root -g root -m 0644 \
     "$UNAUTHENTICATED_SOURCE" "$VERIFIER_LIBRARY_DIRECTORY/verify-unauthenticated.js"
+install -o root -g root -m 0644 "$PACKAGE_MANIFEST_SOURCE" "$PACKAGE_MANIFEST_TARGET"
 install -o root -g root -m 0755 "$VERIFIER_SOURCE" "$VERIFIER_TARGET"
 cmp -s "$VERIFIER_SOURCE" "$VERIFIER_TARGET" \
     || fail "installed MongoDB verifier differs from repository source"
 cmp -s "$AUTH_SOURCE" "$VERIFIER_LIBRARY_DIRECTORY/verify-auth.js" \
     || fail "installed authenticated verifier library differs from repository source"
+cmp -s "$APPLICATION_AUTH_SOURCE" \
+    "$VERIFIER_LIBRARY_DIRECTORY/verify-application.js" \
+    || fail "installed application verifier library differs from repository source"
 cmp -s "$UNAUTHENTICATED_SOURCE" \
     "$VERIFIER_LIBRARY_DIRECTORY/verify-unauthenticated.js" \
     || fail "installed unauthenticated verifier library differs from repository source"
+cmp -s "$PACKAGE_MANIFEST_SOURCE" "$PACKAGE_MANIFEST_TARGET" \
+    || fail "installed package manifest differs from repository source"
 "$VERIFIER_TARGET" --check >/dev/null
 
 if systemctl is-active --quiet mongod.service 2>/dev/null; then

@@ -11,8 +11,10 @@ SCRIPT_DIRECTORY=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 REPOSITORY_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIRECTORY/.." && pwd)
 MONGODB_DIRECTORY=$REPOSITORY_ROOT/mongodb
 INSTALLER=$MONGODB_DIRECTORY/install
+BUNDLE_BUILDER=$MONGODB_DIRECTORY/build-bundle
 SETUP=$MONGODB_DIRECTORY/setup
 VERIFIER=$MONGODB_DIRECTORY/verify
+EL9_TEST=$SCRIPT_DIRECTORY/mongodb-el9
 TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/config-mongodb-tests.XXXXXX")
 
 cleanup() {
@@ -73,7 +75,7 @@ trap cleanup EXIT HUP INT TERM
 
 assert_mongodb_logrotate_header
 
-for entry_point in "$INSTALLER" "$SETUP" "$VERIFIER"; do
+for entry_point in "$BUNDLE_BUILDER" "$INSTALLER" "$SETUP" "$VERIFIER" "$EL9_TEST"; do
     [ -x "$entry_point" ] || fail "entry point is not executable: $entry_point"
     "$entry_point" --help >/dev/null
     "$entry_point" --check >/dev/null
@@ -83,6 +85,7 @@ for javascript_source in \
     "$MONGODB_DIRECTORY/bootstrap.js" \
     "$MONGODB_DIRECTORY/add-application-user.js" \
     "$MONGODB_DIRECTORY/reconfigure-member.js" \
+    "$MONGODB_DIRECTORY/verify-application.js" \
     "$MONGODB_DIRECTORY/verify-auth.js" \
     "$MONGODB_DIRECTORY/verify-unauthenticated.js"
 do
@@ -101,10 +104,15 @@ for supported_release in rocky-9 centos-stream-9; do
     "$INSTALLER" --plan --os-release "$TEST_ROOT/$supported_release" \
         --architecture x86_64 > "$TEST_ROOT/$supported_release.plan"
     assert_contains "$TEST_ROOT/$supported_release.plan" 'MongoDB package series: 8.0 LTS'
+    assert_contains "$TEST_ROOT/$supported_release.plan" 'Reviewed MongoDB package release: 8.0.29'
     assert_contains "$TEST_ROOT/$supported_release.plan" \
         '4B0752C1BCA238C0B4EE14DC41DE058A4E7DCA05'
     assert_contains "$TEST_ROOT/$supported_release.plan" \
         'https://repo.mongodb.org/yum/redhat/9/mongodb-org/8.0/x86_64/'
+    assert_contains "$TEST_ROOT/$supported_release.plan" \
+        'mongodb-org-server-8.0.29-1.el9.x86_64'
+    assert_contains "$TEST_ROOT/$supported_release.plan" \
+        'mongodb-mongosh-2.10.0-1.el8.x86_64'
     assert_contains "$TEST_ROOT/$supported_release.plan" \
         'mongod.service would remain stopped and disabled'
 done
@@ -115,6 +123,25 @@ expect_failure 'supported here only on x86_64' \
     "$INSTALLER" --plan --os-release "$TEST_ROOT/rocky-9" --architecture aarch64
 expect_failure '--architecture is accepted only with --plan' \
     "$INSTALLER" --architecture x86_64
+
+mkdir -p "$TEST_ROOT/bundle-source/deploy"
+cp -R "$REPOSITORY_ROOT/deploy/lib" "$TEST_ROOT/bundle-source/deploy/lib"
+cp -R "$MONGODB_DIRECTORY" "$TEST_ROOT/bundle-source/mongodb"
+git -C "$TEST_ROOT/bundle-source" init -q
+git -C "$TEST_ROOT/bundle-source" add deploy mongodb
+git -C "$TEST_ROOT/bundle-source" \
+    -c commit.gpgsign=false -c user.name='Config Tests' -c user.email='config-tests@example.invalid' \
+    commit -qm 'test: create clean bundle source'
+"$TEST_ROOT/bundle-source/mongodb/build-bundle" \
+    --output "$TEST_ROOT/built-bundle" > "$TEST_ROOT/build-bundle.stdout"
+assert_contains "$TEST_ROOT/built-bundle/BUNDLE-METADATA" 'schemaVersion=1'
+assert_contains "$TEST_ROOT/built-bundle/BUNDLE-METADATA" 'mongodbVersion=8.0.29'
+(cd "$TEST_ROOT/built-bundle" && sha256sum --strict --check SHA256SUMS >/dev/null) \
+    || fail 'built MongoDB deployment bundle failed checksum verification'
+printf '\nDirty source sentinel.\n' >> "$TEST_ROOT/bundle-source/mongodb/README.md"
+expect_failure 'refusing to build from a dirty worktree' \
+    "$TEST_ROOT/bundle-source/mongodb/build-bundle" \
+    --output "$TEST_ROOT/dirty-bundle"
 
 "$SETUP" --plan --phase initialize \
     --replica-set example_rs \
@@ -148,6 +175,7 @@ assert_contains "$TEST_ROOT/add-local-user.plan" \
     --admin-password-file /root/database-admin.password \
     --application-user example_app \
     --application-database example_database \
+    --application-password-file /root/example-app.password \
     --bind-address 10.20.30.40 \
     --member-host mongodb.internal.example \
     --tls-certificate-key-file /etc/pki/mongodb/server.pem \
@@ -183,6 +211,7 @@ expect_failure 'requires --network-controls-confirmed' \
     --admin-password-file /root/database-admin.password \
     --application-user example_app \
     --application-database example_database \
+    --application-password-file /root/example-app.password \
     --bind-address 10.20.30.40 \
     --member-host mongodb.internal.example \
     --tls-certificate-key-file /etc/pki/mongodb/server.pem \
@@ -194,6 +223,7 @@ expect_failure 'RFC 1918 private address' \
     --admin-password-file /root/database-admin.password \
     --application-user example_app \
     --application-database example_database \
+    --application-password-file /root/example-app.password \
     --bind-address 203.0.113.10 \
     --member-host mongodb.internal.example \
     --tls-certificate-key-file /etc/pki/mongodb/server.pem \
@@ -206,6 +236,7 @@ expect_failure 'stable DNS name with at least two labels' \
     --admin-password-file /root/database-admin.password \
     --application-user example_app \
     --application-database example_database \
+    --application-password-file /root/example-app.password \
     --bind-address 10.20.30.40 \
     --member-host 10.20.30.40 \
     --tls-certificate-key-file /etc/pki/mongodb/server.pem \
@@ -240,6 +271,15 @@ assert_contains "$MONGODB_DIRECTORY/templates/mongod-network.conf.in" \
     '  replSetName: @REPLICA_SET@'
 assert_contains "$MONGODB_DIRECTORY/logrotate/mongodb" \
     '            /usr/bin/systemctl kill --kill-who=main --signal=SIGUSR1 mongod.service'
+assert_contains "$INSTALLER" '%{RSAHEADER:pgpsig}'
+assert_contains "$INSTALLER" 'rpmkeys --checksig'
+assert_contains "$INSTALLER" 'enabled=0'
+assert_contains "$INSTALLER" 'Validated root-owned immutable MongoDB deployment bundle.'
+# shellcheck disable=SC2016
+assert_contains "$VERIFIER" 'require_directory_identity "$DATA_DIRECTORY" mongod:mongod:750'
+if grep -F '%{SIGPGP:pgpsig}' "$INSTALLER" >/dev/null 2>&1; then
+    fail 'MongoDB installer still uses the empty SIGPGP field'
+fi
 
 if grep -R -E -i 'private_web_host|private_database_host|private_application_a|private_application_b' "$MONGODB_DIRECTORY" >/dev/null 2>&1; then
     fail 'generic MongoDB component contains deployment-specific identifiers'

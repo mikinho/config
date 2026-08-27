@@ -151,10 +151,10 @@ def network_policy(profile: ApplicationProfile) -> str:
     """Render the reviewed outbound and loopback policy for systemd units."""
 
     if profile.runtime.allow_loopback:
-        return "IPAddressAllow=0.0.0.0/0 ::/0\nIPAddressDeny=any"
+        return ""
     return (
-        "IPAddressAllow=0.0.0.0/0 ::/0 127.0.0.53/32\n"
-        "IPAddressDeny=127.0.0.0/8 ::1/128"
+        "IPAddressAllow=127.0.0.53/32\n"
+        "IPAddressDeny=localhost"
     )
 
 

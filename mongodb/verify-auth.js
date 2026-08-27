@@ -35,6 +35,17 @@
     if (JSON.stringify(normalizedRoles) !== JSON.stringify(expectedAdminRoles)) {
         throw new Error("The administrative user does not have exactly clusterAdmin and userAdminAnyDatabase.");
     }
+    const administrativeUsers = adminDatabase.runCommand({
+        usersInfo: { user: process.env.MONGODB_ADMIN_USER, db: "admin" },
+        showCredentials: false,
+    });
+    if (
+        administrativeUsers.ok !== 1 ||
+        administrativeUsers.users.length !== 1 ||
+        JSON.stringify(administrativeUsers.users[0].mechanisms) !== JSON.stringify(["SCRAM-SHA-256"])
+    ) {
+        throw new Error("The administrative user must use only SCRAM-SHA-256.");
+    }
 
     const hello = adminDatabase.runCommand({ hello: 1 });
     if (hello.ok !== 1 || hello.setName !== process.env.MONGODB_REPLICA_SET || hello.isWritablePrimary !== true) {
@@ -111,5 +122,8 @@
         roles[0].db !== applicationDatabase
     ) {
         throw new Error("The application user does not have exactly readWrite on its own database.");
+    }
+    if (JSON.stringify(users.users[0].mechanisms) !== JSON.stringify(["SCRAM-SHA-256"])) {
+        throw new Error("The application user must use only SCRAM-SHA-256.");
     }
 })();
