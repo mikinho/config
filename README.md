@@ -195,7 +195,8 @@ TCP 443 so clients always have an HTTP/2 or HTTP/1.1 fallback.
   the repository `sshd_config.d` hardening drop-ins.
 - `shell/` contains the interactive Bash policies that enforce a restrictive
   administrative umask and retain current-session recall while preventing
-  command history from persisting on the host.
+  command history from persisting on the host, plus a read-only startup and
+  `PATH` integrity verifier.
 - `tailscale/` contains the official-repository installer and three-phase tagged
   server setup that keeps native deployment SSH on TCP 2356 while enabling
   Tailscale SSH on tailnet TCP 22 for explicitly named human accounts.

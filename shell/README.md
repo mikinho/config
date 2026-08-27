@@ -82,3 +82,32 @@ bash -lic 'printf "HISTFILE=%s HISTSIZE=%s\n" "$HISTFILE" "$HISTSIZE"'
 
 Expect `HISTFILE=/dev/null`, a positive `HISTSIZE`, and a umask of `0027` or a
 stricter value.
+
+## Integrity audit
+
+`shell/verify` is a read-only audit of the shell startup trust boundary. It
+checks `/etc/profile`, `/etc/bashrc`, `/etc/profile.d` and its entries, selected
+accounts' Bash and SSH startup files, and every component of the supplied
+`PATH`. Files and directories must not be symbolic links or group/world
+writable. Global startup files and PATH directories must be owned by root;
+user startup files may be owned by that account or root. PATH may not contain
+empty, current-directory, relative, missing, or unsafe components, and every
+ancestor back to the filesystem root is checked.
+
+Run from a root login to audit root's effective administrative PATH. When
+invoked through `sudo`, root and `SUDO_USER` are selected automatically:
+
+```sh
+sudo shell/verify
+```
+
+Select accounts explicitly when commissioning a host:
+
+```sh
+sudo shell/verify --user root --user deploy
+```
+
+`--path VALUE` audits an exact alternate PATH without changing how the verifier
+finds its own tools. `--root DIRECTORY` audits an offline filesystem tree and
+maps expected root ownership to the owner of that tree; its accounts are read
+from `DIRECTORY/etc/passwd`.

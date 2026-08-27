@@ -1,0 +1,445 @@
+#!/bin/sh
+
+set -eu
+set -f
+
+PROGRAM_NAME=${0##*/}
+MODE=verify
+SYSTEM_ROOT=/
+ROOT_PREFIX=
+TRUSTED_ROOT_UID=0
+AUDITED_PATH=${PATH:-}
+PATH_OVERRIDDEN=no
+USERS_TO_AUDIT=
+FAILED_CHECKS=0
+
+usage() {
+    cat <<EOF
+Usage:
+  $PROGRAM_NAME [--user USER]... [--path VALUE]
+  $PROGRAM_NAME --root DIRECTORY [--user USER]... [--path VALUE]
+  $PROGRAM_NAME --check
+
+Performs a read-only audit of the RHEL-family interactive shell trust boundary:
+/etc/profile, /etc/bashrc, /etc/profile.d entries, selected users' Bash startup
+files, and every directory and ancestor in PATH. Root and the invoking sudo user
+are checked by default; use repeatable --user options to select exact accounts.
+
+--root audits an offline filesystem tree. In that mode, ownership expected to
+be root is mapped to the owner of DIRECTORY, and accounts come from
+DIRECTORY/etc/passwd. --path replaces the PATH value being audited without
+changing the verifier's command lookup path.
+EOF
+}
+
+fail() {
+    printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2
+    exit 1
+}
+
+fail_check() {
+    printf '[FAIL] %s\n' "$*" >&2
+    FAILED_CHECKS=$((FAILED_CHECKS + 1))
+}
+
+pass_check() {
+    printf '[PASS] %s\n' "$*"
+}
+
+add_user() {
+    requested_user=$1
+    case "$requested_user" in
+        '' | -* | *[!A-Za-z0-9._-]*) fail "invalid account name: $requested_user" ;;
+    esac
+    case "
+$USERS_TO_AUDIT
+" in
+        *"
+$requested_user
+"*) return ;;
+    esac
+    USERS_TO_AUDIT=$USERS_TO_AUDIT${USERS_TO_AUDIT:+"
+"}$requested_user
+}
+
+root_path() {
+    absolute_path=$1
+    case "$absolute_path" in
+        /*) ;;
+        *) fail "internal path is not absolute: $absolute_path" ;;
+    esac
+    printf '%s%s\n' "$ROOT_PREFIX" "$absolute_path"
+}
+
+stat_identity() {
+    identity_path=$1
+    stat -Lc '%u:%a' "$identity_path" 2>/dev/null \
+        || stat -Lf '%u:%Lp' "$identity_path" 2>/dev/null
+}
+
+mode_is_not_group_or_world_writable() {
+    checked_mode=$1
+    case "$checked_mode" in
+        *[!0-7]* | '') return 1 ;;
+    esac
+    [ "$((0$checked_mode & 0022))" -eq 0 ]
+}
+
+audit_owned_file() {
+    audited_file=$1
+    expected_uid=$2
+    description=$3
+    alternate_uid=${4:-}
+
+    if [ ! -f "$audited_file" ] || [ -L "$audited_file" ]; then
+        fail_check "$description must be a regular non-symlink file: $audited_file"
+        return
+    fi
+    file_identity=$(stat_identity "$audited_file" 2>/dev/null || true)
+    file_uid=${file_identity%%:*}
+    file_mode=${file_identity#*:}
+    if [ -z "$file_identity" ] || [ "$file_mode" = "$file_identity" ]; then
+        fail_check "cannot inspect $description: $audited_file"
+        return
+    fi
+    if [ "$file_uid" != "$expected_uid" ] \
+        && { [ -z "$alternate_uid" ] || [ "$file_uid" != "$alternate_uid" ]; }; then
+        fail_check "$description has unsafe owner UID $file_uid: $audited_file"
+    elif ! mode_is_not_group_or_world_writable "$file_mode"; then
+        fail_check "$description is group or world writable (mode $file_mode): $audited_file"
+    else
+        pass_check "$description ownership and mode are safe: $audited_file"
+    fi
+}
+
+audit_owned_directory() {
+    audited_directory=$1
+    expected_uid=$2
+    description=$3
+    alternate_uid=${4:-}
+
+    if [ ! -d "$audited_directory" ] || [ -L "$audited_directory" ]; then
+        fail_check "$description must be a real directory: $audited_directory"
+        return
+    fi
+    directory_identity=$(stat_identity "$audited_directory" 2>/dev/null || true)
+    directory_uid=${directory_identity%%:*}
+    directory_mode=${directory_identity#*:}
+    if [ -z "$directory_identity" ] || [ "$directory_mode" = "$directory_identity" ]; then
+        fail_check "cannot inspect $description: $audited_directory"
+        return
+    fi
+    if [ "$directory_uid" != "$expected_uid" ] \
+        && { [ -z "$alternate_uid" ] || [ "$directory_uid" != "$alternate_uid" ]; }; then
+        fail_check "$description has unsafe owner UID $directory_uid: $audited_directory"
+    elif ! mode_is_not_group_or_world_writable "$directory_mode"; then
+        fail_check "$description is group or world writable (mode $directory_mode): $audited_directory"
+    else
+        pass_check "$description ownership and mode are safe: $audited_directory"
+    fi
+}
+
+audit_global_startup() {
+    profile_path=$(root_path /etc/profile)
+    bashrc_path=$(root_path /etc/bashrc)
+    profile_directory=$(root_path /etc/profile.d)
+
+    audit_owned_file "$profile_path" "$TRUSTED_ROOT_UID" "global profile"
+    audit_owned_file "$bashrc_path" "$TRUSTED_ROOT_UID" "global Bash startup file"
+    audit_owned_directory \
+        "$profile_directory" "$TRUSTED_ROOT_UID" "global profile fragment directory"
+
+    if [ ! -d "$profile_directory" ] || [ -L "$profile_directory" ]; then
+        return
+    fi
+    set +f
+    for profile_entry in \
+        "$profile_directory"/* \
+        "$profile_directory"/.[!.]* \
+        "$profile_directory"/..?*
+    do
+        if [ ! -e "$profile_entry" ] && [ ! -L "$profile_entry" ]; then
+            continue
+        fi
+        if [ -f "$profile_entry" ] && [ ! -L "$profile_entry" ]; then
+            audit_owned_file \
+                "$profile_entry" "$TRUSTED_ROOT_UID" "global profile fragment"
+        elif [ -d "$profile_entry" ] && [ ! -L "$profile_entry" ]; then
+            audit_owned_directory \
+                "$profile_entry" "$TRUSTED_ROOT_UID" "global profile subdirectory"
+        else
+            fail_check "global profile entry has an unsafe type: $profile_entry"
+        fi
+    done
+    set -f
+}
+
+offline_passwd_entry() {
+    account_name=$1
+    passwd_file=$(root_path /etc/passwd)
+    [ -f "$passwd_file" ] && [ ! -L "$passwd_file" ] || return 1
+    awk -F: -v account="$account_name" '$1 == account { print }' "$passwd_file"
+}
+
+lookup_passwd_entry() {
+    account_name=$1
+    if [ "$SYSTEM_ROOT" = / ]; then
+        getent passwd "$account_name" 2>/dev/null
+    else
+        offline_passwd_entry "$account_name"
+    fi
+}
+
+audit_user_startup() {
+    account_name=$1
+    passwd_entry=$(lookup_passwd_entry "$account_name" || true)
+    if [ -z "$passwd_entry" ]; then
+        fail_check "account does not exist: $account_name"
+        return
+    fi
+    case "$passwd_entry" in
+        *"
+"*)
+            fail_check "account lookup is ambiguous: $account_name"
+            return
+            ;;
+    esac
+
+    account_uid=$(printf '%s\n' "$passwd_entry" | cut -d: -f3)
+    account_home=$(printf '%s\n' "$passwd_entry" | cut -d: -f6)
+    case "$account_uid" in
+        '' | *[!0-9]*)
+            fail_check "account has an invalid UID: $account_name"
+            return
+            ;;
+    esac
+    case "$account_home" in
+        /) fail_check "refusing to treat / as an account home: $account_name"; return ;;
+        /*) ;;
+        *) fail_check "account has a non-absolute home: $account_name"; return ;;
+    esac
+
+    physical_home=$(root_path "$account_home")
+    audit_owned_directory \
+        "$physical_home" "$account_uid" "account home for $account_name" \
+        "$TRUSTED_ROOT_UID"
+    if [ ! -d "$physical_home" ] || [ -L "$physical_home" ]; then
+        return
+    fi
+
+    for startup_name in \
+        .bash_profile \
+        .bash_login \
+        .profile \
+        .bashrc \
+        .bash_logout
+    do
+        startup_path=$physical_home/$startup_name
+        if [ -e "$startup_path" ] || [ -L "$startup_path" ]; then
+            audit_owned_file \
+                "$startup_path" "$account_uid" \
+                "startup file for $account_name" "$TRUSTED_ROOT_UID"
+        fi
+    done
+
+    ssh_directory=$physical_home/.ssh
+    if [ -e "$ssh_directory" ] || [ -L "$ssh_directory" ]; then
+        audit_owned_directory \
+            "$ssh_directory" "$account_uid" \
+            "SSH directory for $account_name" "$TRUSTED_ROOT_UID"
+        ssh_rc=$ssh_directory/rc
+        if [ -e "$ssh_rc" ] || [ -L "$ssh_rc" ]; then
+            audit_owned_file \
+                "$ssh_rc" "$account_uid" \
+                "SSH startup file for $account_name" "$TRUSTED_ROOT_UID"
+        fi
+    fi
+}
+
+path_is_inside_root() {
+    candidate_path=$1
+    if [ "$SYSTEM_ROOT" = / ]; then
+        return 0
+    fi
+    case "$candidate_path" in
+        "$SYSTEM_ROOT" | "$SYSTEM_ROOT"/*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+audit_resolved_path_chain() {
+    chain_path=$1
+    component_label=$2
+    while :; do
+        if ! path_is_inside_root "$chain_path"; then
+            fail_check "PATH resolution escaped the audited root for $component_label: $chain_path"
+            return
+        fi
+        audit_owned_directory \
+            "$chain_path" "$TRUSTED_ROOT_UID" "PATH trust directory"
+        [ "$chain_path" = "$SYSTEM_ROOT" ] && return
+        chain_parent=${chain_path%/*}
+        [ -n "$chain_parent" ] || chain_parent=/
+        [ "$chain_parent" != "$chain_path" ] || return
+        chain_path=$chain_parent
+    done
+}
+
+audit_path_component() {
+    path_component=$1
+    case "$path_component" in
+        .) fail_check "PATH contains the current directory entry: ."; return ;;
+        /*) ;;
+        *) fail_check "PATH contains a relative component: $path_component"; return ;;
+    esac
+
+    physical_component=$(root_path "$path_component")
+    resolved_component=$(readlink -f -- "$physical_component" 2>/dev/null || true)
+    if [ -z "$resolved_component" ] || [ ! -d "$resolved_component" ]; then
+        fail_check "PATH component does not resolve to a directory: $path_component"
+        return
+    fi
+    audit_resolved_path_chain "$resolved_component" "$path_component"
+
+    lexical_path=$physical_component
+    while [ "$lexical_path" != "$SYSTEM_ROOT" ]; do
+        lexical_parent=${lexical_path%/*}
+        [ -n "$lexical_parent" ] || lexical_parent=/
+        [ "$lexical_parent" != "$lexical_path" ] || break
+        resolved_parent=$(readlink -f -- "$lexical_parent" 2>/dev/null || true)
+        if [ -z "$resolved_parent" ] || [ ! -d "$resolved_parent" ]; then
+            fail_check "PATH parent does not resolve to a directory: $lexical_parent"
+            return
+        fi
+        audit_resolved_path_chain "$resolved_parent" "$path_component"
+        lexical_path=$lexical_parent
+    done
+}
+
+audit_path() {
+    if [ -z "$AUDITED_PATH" ]; then
+        fail_check "PATH is empty"
+        return
+    fi
+    case "$AUDITED_PATH" in
+        *"
+"*) fail_check "PATH contains a newline"; return ;;
+    esac
+    case ":$AUDITED_PATH:" in
+        *::* ) fail_check "PATH contains an empty component"; return ;;
+    esac
+
+    original_ifs=$IFS
+    IFS=:
+    # Globbing is disabled globally, so components are retained literally.
+    # shellcheck disable=SC2086
+    set -- $AUDITED_PATH
+    IFS=$original_ifs
+    for path_component do
+        audit_path_component "$path_component"
+    done
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --check)
+            [ "$MODE" = verify ] || fail "select exactly one mode"
+            MODE=check
+            shift
+            ;;
+        --root)
+            [ "$#" -ge 2 ] || fail "--root requires a directory"
+            [ "$SYSTEM_ROOT" = / ] || fail "--root may be specified only once"
+            SYSTEM_ROOT=$2
+            shift 2
+            ;;
+        --user)
+            [ "$#" -ge 2 ] || fail "--user requires an account name"
+            add_user "$2"
+            shift 2
+            ;;
+        --path)
+            [ "$#" -ge 2 ] || fail "--path requires a value"
+            [ "$PATH_OVERRIDDEN" = no ] || fail "--path may be specified only once"
+            AUDITED_PATH=$2
+            PATH_OVERRIDDEN=yes
+            shift 2
+            ;;
+        --help | -h)
+            usage
+            exit 0
+            ;;
+        *) fail "unknown argument: $1" ;;
+    esac
+done
+
+if [ "$MODE" = check ]; then
+    [ "$SYSTEM_ROOT" = / ] \
+        && [ -z "$USERS_TO_AUDIT" ] \
+        && [ "$PATH_OVERRIDDEN" = no ] \
+        || fail "--check does not accept audit selections"
+    [ -f "$0" ] && [ ! -L "$0" ] \
+        || fail "verifier source must be a regular file: $0"
+    sh -n "$0" || fail "verifier failed shell syntax validation"
+    printf 'Validated shell integrity verifier source.\n'
+    exit 0
+fi
+
+case "$SYSTEM_ROOT" in
+    /*) ;;
+    *) fail "--root must be an absolute path" ;;
+esac
+[ -d "$SYSTEM_ROOT" ] && [ ! -L "$SYSTEM_ROOT" ] \
+    || fail "audited root must be a real directory: $SYSTEM_ROOT"
+command -v readlink >/dev/null 2>&1 \
+    || fail "required command not found: readlink"
+SYSTEM_ROOT=$(readlink -f -- "$SYSTEM_ROOT" 2>/dev/null) \
+    || fail "cannot resolve audited root"
+SYSTEM_ROOT=${SYSTEM_ROOT%/}
+[ -n "$SYSTEM_ROOT" ] || SYSTEM_ROOT=/
+[ "$SYSTEM_ROOT" = / ] || ROOT_PREFIX=$SYSTEM_ROOT
+
+for required_command in awk cut getent readlink stat; do
+    if [ "$SYSTEM_ROOT" != / ] && [ "$required_command" = getent ]; then
+        continue
+    fi
+    command -v "$required_command" >/dev/null 2>&1 \
+        || fail "required command not found: $required_command"
+done
+
+root_identity=$(stat_identity "$SYSTEM_ROOT" 2>/dev/null || true)
+TRUSTED_ROOT_UID=${root_identity%%:*}
+case "$TRUSTED_ROOT_UID" in
+    '' | *[!0-9]*) fail "cannot determine trusted owner of audited root" ;;
+esac
+if [ "$SYSTEM_ROOT" = / ] && [ "$TRUSTED_ROOT_UID" != 0 ]; then
+    fail "live filesystem root is not owned by UID 0"
+fi
+
+if [ -z "$USERS_TO_AUDIT" ]; then
+    if [ "$(id -u)" -eq 0 ]; then
+        add_user root
+        if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then
+            add_user "$SUDO_USER"
+        fi
+    else
+        add_user "$(id -un)"
+    fi
+fi
+
+audit_global_startup
+original_ifs=$IFS
+IFS='
+'
+for account_name in $USERS_TO_AUDIT; do
+    audit_user_startup "$account_name"
+done
+IFS=$original_ifs
+audit_path
+
+if [ "$FAILED_CHECKS" -ne 0 ]; then
+    printf '%s: shell integrity audit failed with %s finding(s)\n' \
+        "$PROGRAM_NAME" "$FAILED_CHECKS" >&2
+    exit 1
+fi
+printf 'Shell integrity audit passed for selected accounts and PATH.\n'

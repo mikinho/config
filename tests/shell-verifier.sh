@@ -1,0 +1,121 @@
+#!/bin/sh
+
+set -eu
+
+PROGRAM_NAME=${0##*/}
+SCRIPT_DIRECTORY=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+REPOSITORY_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIRECTORY/.." && pwd)
+SHELL_VERIFIER=$REPOSITORY_ROOT/shell/verify
+TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/config-shell-verifier.XXXXXX")
+OFFLINE_ROOT=$TEST_ROOT/offline-root
+TEST_UID=$(id -u)
+
+cleanup() {
+    if [ -d "$TEST_ROOT" ]; then
+        rm -rf -- "$TEST_ROOT"
+    fi
+}
+
+fail() {
+    printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2
+    exit 1
+}
+
+expect_failure() {
+    expected_message=$1
+    shift
+    if "$@" >"$TEST_ROOT/command.stdout" 2>"$TEST_ROOT/command.stderr"; then
+        fail "command unexpectedly succeeded: $*"
+    fi
+    grep -F -- "$expected_message" "$TEST_ROOT/command.stderr" >/dev/null \
+        || fail "command failed without expected message: $expected_message"
+}
+
+run_audit() {
+    "$SHELL_VERIFIER" \
+        --root "$OFFLINE_ROOT" \
+        --user admin \
+        --path /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+}
+
+trap cleanup EXIT HUP INT TERM
+
+[ -x "$SHELL_VERIFIER" ] || fail "shell verifier is not executable"
+"$SHELL_VERIFIER" --help >/dev/null
+"$SHELL_VERIFIER" --check >/dev/null
+expect_failure \
+    '--check does not accept audit selections' \
+    "$SHELL_VERIFIER" --check --user root
+expect_failure \
+    'invalid account name' \
+    "$SHELL_VERIFIER" --user '../root'
+
+mkdir -p \
+    "$OFFLINE_ROOT/etc/profile.d" \
+    "$OFFLINE_ROOT/home/admin/.ssh" \
+    "$OFFLINE_ROOT/usr/local/sbin" \
+    "$OFFLINE_ROOT/usr/local/bin" \
+    "$OFFLINE_ROOT/usr/sbin" \
+    "$OFFLINE_ROOT/usr/bin" \
+    "$OFFLINE_ROOT/sbin" \
+    "$OFFLINE_ROOT/bin"
+chmod 0700 "$OFFLINE_ROOT/home/admin" "$OFFLINE_ROOT/home/admin/.ssh"
+printf '%s\n' '# managed global profile' > "$OFFLINE_ROOT/etc/profile"
+printf '%s\n' '# managed global bashrc' > "$OFFLINE_ROOT/etc/bashrc"
+printf '%s\n' '# managed profile fragment' \
+    > "$OFFLINE_ROOT/etc/profile.d/managed.sh"
+printf '%s\n' '# managed user bashrc' > "$OFFLINE_ROOT/home/admin/.bashrc"
+printf '%s\n' '# managed SSH startup' > "$OFFLINE_ROOT/home/admin/.ssh/rc"
+printf 'admin:x:%s:%s:Admin:/home/admin:/bin/bash\n' \
+    "$TEST_UID" "$TEST_UID" > "$OFFLINE_ROOT/etc/passwd"
+chmod 0644 \
+    "$OFFLINE_ROOT/etc/profile" \
+    "$OFFLINE_ROOT/etc/bashrc" \
+    "$OFFLINE_ROOT/etc/profile.d/managed.sh" \
+    "$OFFLINE_ROOT/home/admin/.bashrc" \
+    "$OFFLINE_ROOT/home/admin/.ssh/rc" \
+    "$OFFLINE_ROOT/etc/passwd"
+
+run_audit >/dev/null
+
+chmod 0664 "$OFFLINE_ROOT/etc/profile"
+expect_failure 'global profile is group or world writable' run_audit
+chmod 0644 "$OFFLINE_ROOT/etc/profile"
+
+chmod 0664 "$OFFLINE_ROOT/home/admin/.bashrc"
+expect_failure 'startup file for admin is group or world writable' run_audit
+chmod 0644 "$OFFLINE_ROOT/home/admin/.bashrc"
+
+chmod 0777 "$OFFLINE_ROOT/usr/local/bin"
+expect_failure 'PATH trust directory is group or world writable' run_audit
+chmod 0755 "$OFFLINE_ROOT/usr/local/bin"
+
+expect_failure \
+    'PATH contains an empty component' \
+    "$SHELL_VERIFIER" --root "$OFFLINE_ROOT" --user admin --path '/usr/bin::/bin'
+expect_failure \
+    'PATH contains the current directory entry' \
+    "$SHELL_VERIFIER" --root "$OFFLINE_ROOT" --user admin --path '/usr/bin:.:/bin'
+expect_failure \
+    'PATH contains a relative component' \
+    "$SHELL_VERIFIER" --root "$OFFLINE_ROOT" --user admin --path 'bin:/usr/bin'
+expect_failure \
+    'PATH component does not resolve to a directory' \
+    "$SHELL_VERIFIER" --root "$OFFLINE_ROOT" --user admin --path '/missing:/usr/bin'
+
+ln -s /etc/passwd "$OFFLINE_ROOT/etc/profile.d/unsafe.sh"
+expect_failure 'global profile entry has an unsafe type' run_audit
+rm -f -- "$OFFLINE_ROOT/etc/profile.d/unsafe.sh"
+
+rm -f -- "$OFFLINE_ROOT/home/admin/.bashrc"
+ln -s /etc/passwd "$OFFLINE_ROOT/home/admin/.bashrc"
+expect_failure 'startup file for admin must be a regular non-symlink file' run_audit
+
+fixture_root=$TEST_ROOT/repository
+mkdir -p "$fixture_root/shell"
+ln -s "$SHELL_VERIFIER" "$fixture_root/shell/verify"
+expect_failure \
+    'verifier source must be a regular file' \
+    "$fixture_root/shell/verify" --check
+
+printf 'Validated shell startup and PATH integrity audit boundaries.\n'

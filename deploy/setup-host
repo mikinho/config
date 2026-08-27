@@ -15,6 +15,7 @@ FIREWALL_SETUP=$REPOSITORY_ROOT/firewalld/setup
 SSH_INSTALL=$REPOSITORY_ROOT/ssh/install
 SSH_SETUP=$REPOSITORY_ROOT/ssh/setup
 SHELL_SETUP=$REPOSITORY_ROOT/shell/setup
+SHELL_VERIFY=$REPOSITORY_ROOT/shell/verify
 NGINX_SETUP=$REPOSITORY_ROOT/nginx/setup
 CERTBOT_SETUP=$REPOSITORY_ROOT/certbot/setup
 FAIL2BAN_INSTALL=$REPOSITORY_ROOT/fail2ban/install
@@ -253,6 +254,7 @@ preflight_selection() {
     "$FIREWALL_INSTALL" --check >/dev/null
     "$SSH_INSTALL" --check >/dev/null
     "$SHELL_SETUP" --check >/dev/null
+    "$SHELL_VERIFY" --check >/dev/null
     "$NGINX_SETUP" --check >/dev/null
     "$CERTBOT_SETUP" --check >/dev/null
     "$FAIL2BAN_INSTALL" --check >/dev/null
