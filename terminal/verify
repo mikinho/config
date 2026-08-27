@@ -1,0 +1,109 @@
+#!/bin/sh
+
+set -eu
+set -f
+
+PROGRAM_NAME=${0##*/}
+TERMINFO_ENTRY=xterm-256color
+MODE=verify
+TEMPORARY_DIRECTORY=
+
+usage() {
+    cat <<EOF
+Usage:
+  $PROGRAM_NAME
+  $PROGRAM_NAME --check
+
+Verifies that tic and infocmp are available and that the system
+xterm-256color definition can be exported, compiled into an isolated terminfo
+database, and read back from that database. The verifier changes no host
+configuration.
+EOF
+}
+
+fail() {
+    printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2
+    exit 1
+}
+
+cleanup() {
+    if [ -n "$TEMPORARY_DIRECTORY" ] && [ -d "$TEMPORARY_DIRECTORY" ]; then
+        rm -rf -- "$TEMPORARY_DIRECTORY"
+    fi
+}
+
+require_command() {
+    terminal_command=$1
+    command -v "$terminal_command" >/dev/null 2>&1 \
+        || fail "required command not found: $terminal_command"
+}
+
+entry_header_exists() {
+    terminal_source=$1
+
+    grep -e "^$TERMINFO_ENTRY|" -e "^$TERMINFO_ENTRY," \
+        "$terminal_source" >/dev/null 2>&1
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --check)
+            [ "$MODE" = verify ] || fail "select exactly one mode"
+            MODE=check
+            shift
+            ;;
+        --help | -h)
+            usage
+            exit 0
+            ;;
+        *) fail "unknown argument: $1" ;;
+    esac
+done
+
+if [ "$MODE" = check ]; then
+    printf 'Validated terminal readiness verifier source.\n'
+    exit 0
+fi
+
+for required_command in find grep infocmp mkdir mktemp rm tic; do
+    require_command "$required_command"
+done
+
+umask 077
+TEMPORARY_DIRECTORY=$(mktemp -d \
+    "${TMPDIR:-/tmp}/config-terminal-readiness.XXXXXX") \
+    || fail "cannot create a temporary verification directory"
+trap cleanup EXIT HUP INT TERM
+
+source_file=$TEMPORARY_DIRECTORY/$TERMINFO_ENTRY.src
+compiled_directory=$TEMPORARY_DIRECTORY/compiled
+round_trip_file=$TEMPORARY_DIRECTORY/$TERMINFO_ENTRY.round-trip.src
+
+if ! infocmp -x "$TERMINFO_ENTRY" > "$source_file"; then
+    fail "terminfo entry is unavailable: $TERMINFO_ENTRY"
+fi
+entry_header_exists "$source_file" \
+    || fail "infocmp returned an unexpected entry for $TERMINFO_ENTRY"
+
+mkdir "$compiled_directory" \
+    || fail "cannot create the isolated terminfo database"
+if ! tic -x -o "$compiled_directory" "$source_file"; then
+    fail "tic could not compile the $TERMINFO_ENTRY definition"
+fi
+
+compiled_entry=$(find "$compiled_directory" \
+    -type f -name "$TERMINFO_ENTRY" -print)
+[ -n "$compiled_entry" ] \
+    || fail "tic did not publish the compiled $TERMINFO_ENTRY entry"
+
+if ! TERMINFO="$compiled_directory" \
+    TERMINFO_DIRS="$compiled_directory" \
+    infocmp -x "$TERMINFO_ENTRY" > "$round_trip_file"
+then
+    fail "infocmp could not read the isolated $TERMINFO_ENTRY entry"
+fi
+entry_header_exists "$round_trip_file" \
+    || fail "the isolated terminfo database returned an unexpected entry"
+
+printf 'Terminal readiness verified: tic and infocmp round-tripped %s.\n' \
+    "$TERMINFO_ENTRY"

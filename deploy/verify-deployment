@@ -28,6 +28,7 @@ SHELL_ENVIRONMENT=/etc/managed-environment
 SHELL_PROMPT_POLICY=/etc/profile.d/70-managed-environment-prompt.sh
 SHELL_UMASK_POLICY=/etc/profile.d/80-admin-umask.sh
 SHELL_HISTORY_POLICY=/etc/profile.d/90-no-persistent-history.sh
+TERMINAL_VERIFIER=/usr/local/bin/verify-terminal-readiness
 
 usage() {
     cat <<EOF
@@ -36,8 +37,8 @@ Usage:
 
 Non-destructive host post-deployment verification. Validates installed Nginx,
 managed certificates, systemd units, trusted shell classification and policies,
-OpenSSH, Fail2ban, firewalld, synchronized time, SELinux policy, QUIC kernel
-buffers, and runtime socket permissions.
+terminal readiness, OpenSSH, Fail2ban, firewalld, synchronized time, SELinux
+policy, QUIC kernel buffers, and runtime socket permissions.
 
 Options:
   --backend BACKEND   Certbot renewal backend: 'auto' (default), 'native', or 'snap'
@@ -476,6 +477,32 @@ check_shell_history() {
     fi
 }
 
+check_terminal_readiness() {
+    printf 'Checking generic terminal readiness...\n'
+    if [ ! -f "$TERMINAL_VERIFIER" ] \
+        || [ -L "$TERMINAL_VERIFIER" ] \
+        || [ ! -x "$TERMINAL_VERIFIER" ]; then
+        fail_msg "terminal verifier is missing or unsafe: $TERMINAL_VERIFIER"
+        return
+    fi
+    if ! command -v stat >/dev/null 2>&1; then
+        fail_msg "stat is unavailable for terminal verifier inspection"
+        return
+    fi
+    terminal_verifier_identity=$(stat -Lc '%U:%G:%a' \
+        "$TERMINAL_VERIFIER" 2>/dev/null || true)
+    if [ "$terminal_verifier_identity" != root:root:755 ]; then
+        fail_msg "terminal verifier has unsafe ownership or mode: $TERMINAL_VERIFIER (${terminal_verifier_identity:-unknown})"
+        return
+    fi
+    if terminal_verifier_output=$("$TERMINAL_VERIFIER" 2>&1); then
+        pass_msg "tic, infocmp, and xterm-256color are operational"
+        info_msg "$terminal_verifier_output"
+    else
+        fail_msg "generic terminal readiness verification failed: $terminal_verifier_output"
+    fi
+}
+
 check_ssh_hardening() {
     printf 'Checking OpenSSH configuration...\n'
     if ! command -v sshd >/dev/null 2>&1; then
@@ -836,6 +863,7 @@ check_clock_synchronization
 check_systemd_services
 check_certificate_health
 check_shell_history
+check_terminal_readiness
 check_ssh_hardening
 check_firewalld
 check_fail2ban

@@ -15,6 +15,8 @@ SELINUX_INSTALL=$REPOSITORY_ROOT/selinux/install
 SELINUX_SETUP=$REPOSITORY_ROOT/selinux/setup
 SSH_INSTALL=$REPOSITORY_ROOT/ssh/install
 SSH_SETUP=$REPOSITORY_ROOT/ssh/setup
+TERMINAL_INSTALL=$REPOSITORY_ROOT/terminal/install
+TERMINAL_VERIFY=$REPOSITORY_ROOT/terminal/verify
 SHELL_SETUP=$REPOSITORY_ROOT/shell/setup
 NGINX_SETUP=$REPOSITORY_ROOT/nginx/setup
 CERTBOT_SETUP=$REPOSITORY_ROOT/certbot/setup
@@ -77,6 +79,8 @@ for setup_entrypoint in \
     "$SELINUX_SETUP" \
     "$SSH_INSTALL" \
     "$SSH_SETUP" \
+    "$TERMINAL_INSTALL" \
+    "$TERMINAL_VERIFY" \
     "$SHELL_SETUP" \
     "$NGINX_SETUP" \
     "$CERTBOT_SETUP" \
@@ -97,7 +101,8 @@ for platform_installer in \
     "$FAIL2BAN_INSTALL" \
     "$FIREWALL_INSTALL" \
     "$SELINUX_INSTALL" \
-    "$SSH_INSTALL"
+    "$SSH_INSTALL" \
+    "$TERMINAL_INSTALL"
 do
     "$platform_installer" --plan --os-release "$TEST_ROOT/etc/os-release" \
         > "$TEST_ROOT/$(basename "${platform_installer%/*}")-rocky.plan"
@@ -113,6 +118,8 @@ assert_contains "$TEST_ROOT/selinux-rocky.plan" \
     'policycoreutils-python-utils'
 assert_contains "$TEST_ROOT/ssh-rocky.plan" \
     'dnf install --assumeyes openssh-server'
+assert_contains "$TEST_ROOT/terminal-rocky.plan" \
+    'dnf install --assumeyes ncurses ncurses-base'
 
 "$FAIL2BAN_SETUP" \
     --output "$TEST_ROOT/fail2ban-direct" \
@@ -217,6 +224,8 @@ assert_not_contains "$TEST_ROOT/nginx.plan" 'zones/public.xml'
     > "$TEST_ROOT/host-direct.plan"
 assert_contains "$TEST_ROOT/host-direct.plan" \
     'Host setup: profile=edge-direct, environment=TEST, topology=direct, ssh-phase=prepare'
+assert_contains "$TEST_ROOT/host-direct.plan" \
+    'dnf install --assumeyes ncurses ncurses-base'
 assert_contains "$TEST_ROOT/host-direct.plan" \
     'Fail2ban setup: topology=direct, ssh-phase=prepare'
 assert_contains "$TEST_ROOT/host-direct.plan" \

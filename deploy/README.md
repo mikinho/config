@@ -83,8 +83,10 @@ The exact reviewed nginx tree and supported `/usr/sbin/nginx` binary must be
 installed first. The same plan installs the repository's interactive Bash
 baseline without deleting existing history files. The required `--environment`
 value becomes the trusted prompt classification; select it from the deployment
-record rather than inferring it from the hostname. Preview a complete first-pass
-plan with:
+record rather than inferring it from the hostname. It also installs and
+functionally verifies the generic `tic`, `infocmp`, and `xterm-256color`
+terminal floor without installing any client emulator. Preview a complete
+first-pass plan with:
 
 ```sh
 deploy/setup-host \
@@ -176,10 +178,10 @@ sudo deploy/install-host-tools
 `verify-deployment` performs a non-destructive, root-only audit of live host
 state, asserting Nginx version and configuration, certificate validity,
 synchronized time, active systemd units, non-persistent Bash history with
-same-session recall, OpenSSH phase and authentication restrictions, Fail2ban
-runtime and topology policy, services in the selected firewalld zone, SELinux
-Enforcing mode and port labels, QUIC buffer limits, and per-site PHP-FPM socket
-permissions.
+same-session recall, generic terminal readiness, OpenSSH phase and
+authentication restrictions, Fail2ban runtime and topology policy, services
+in the selected firewalld zone, SELinux Enforcing mode and port labels, QUIC
+buffer limits, and per-site PHP-FPM socket permissions.
 
 ```sh
 # Auto-detect the installed Certbot backend (recommended):

@@ -55,6 +55,8 @@ if command -v shellcheck >/dev/null 2>&1; then
         "$REPOSITORY_ROOT/ssh/setup" \
         "$REPOSITORY_ROOT/tailscale/install" \
         "$REPOSITORY_ROOT/tailscale/setup" \
+        "$REPOSITORY_ROOT/terminal/install" \
+        "$REPOSITORY_ROOT/terminal/verify" \
         "$REPOSITORY_ROOT/tests/certbot-installer.sh" \
         "$REPOSITORY_ROOT/tests/certbot-issue.sh" \
         "$REPOSITORY_ROOT/tests/deploy-renderers.sh" \
@@ -67,6 +69,7 @@ if command -v shellcheck >/dev/null 2>&1; then
         "$REPOSITORY_ROOT/tests/shell-history.sh" \
         "$REPOSITORY_ROOT/tests/shell-prompt.sh" \
         "$REPOSITORY_ROOT/tests/shell-verifier.sh" \
+        "$REPOSITORY_ROOT/tests/terminal-readiness.sh" \
         "$REPOSITORY_ROOT/tests/tailscale.sh"
     printf 'ShellCheck passed with 0 warnings.\n'
 else
@@ -107,6 +110,9 @@ step "Running trusted environment prompt tests..."
 
 step "Running shell startup and PATH integrity tests..."
 "$REPOSITORY_ROOT/tests/shell-verifier.sh"
+
+step "Running generic terminal readiness tests..."
+"$REPOSITORY_ROOT/tests/terminal-readiness.sh"
 
 step "Running Tailscale installer and setup tests..."
 "$REPOSITORY_ROOT/tests/tailscale.sh"

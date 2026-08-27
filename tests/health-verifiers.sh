@@ -260,6 +260,37 @@ printf '%s\\n' \"\$FAILED_CHECKS\"
     esac
 done
 
+mkdir -p "$TEST_ROOT/terminal-bin"
+printf '%s\n' \
+    '#!/bin/sh' \
+    '[ "${MOCK_TERMINAL_READY:-yes}" = yes ]' \
+    > "$TEST_ROOT/terminal-bin/verify-terminal-readiness"
+printf '%s\n' \
+    '#!/bin/sh' \
+    'printf "root:root:755\n"' \
+    > "$TEST_ROOT/terminal-bin/stat"
+chmod 0755 \
+    "$TEST_ROOT/terminal-bin/verify-terminal-readiness" \
+    "$TEST_ROOT/terminal-bin/stat"
+terminal_function=$(extract_function check_terminal_readiness "$HOST_VERIFIER")
+for tested_terminal_state in yes no; do
+    terminal_result=$(PATH="$TEST_ROOT/terminal-bin:$PATH" \
+        MOCK_TERMINAL_READY="$tested_terminal_state" sh -c "
+FAILED_CHECKS=0
+TERMINAL_VERIFIER=$TEST_ROOT/terminal-bin/verify-terminal-readiness
+fail_msg() { FAILED_CHECKS=\$((FAILED_CHECKS + 1)); }
+pass_msg() { :; }
+info_msg() { :; }
+$terminal_function
+check_terminal_readiness >/dev/null
+printf '%s\\n' \"\$FAILED_CHECKS\"
+")
+    case "$tested_terminal_state:$terminal_result" in
+        yes:0 | no:1) ;;
+        *) fail "$tested_terminal_state terminal readiness recorded $terminal_result failures" ;;
+    esac
+done
+
 mkdir -p "$TEST_ROOT/ssh-bin"
 printf '%s\n' \
     '#!/bin/sh' \

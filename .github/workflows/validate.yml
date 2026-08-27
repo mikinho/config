@@ -438,6 +438,7 @@ jobs:
                 grep --fixed-strings "backend: native"
               /workspace/certbot/install --plan --backend snap |
                 grep --fixed-strings "backend: snap"
+              /workspace/terminal/install
               dnf install --assumeyes logrotate python3 shadow-utils systemd
               /workspace/deploy/setup-host \
                 --plan \

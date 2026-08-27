@@ -33,6 +33,7 @@ but only for explicitly trusted immediate peers.
 | logrotate | A currently supported release | Required only when installing the included nginx file-log rotation policy. |
 | fail2ban | A currently supported EPEL release | Required only for the optional intrusion-ban policy in `fail2ban/`. |
 | OpenSSH | A supported RHEL-family sshd with the stock `sshd_config.d` include | Required only for the `ssh/` drop-ins; RHEL 8-era sshd lacks the include and silently ignores them. |
+| ncurses terminfo | Vendor `ncurses` and `ncurses-base` packages with working `tic`, `infocmp`, and `xterm-256color` | Provides a terminal-generic compatibility floor and the tooling for reviewed user-local terminfo entries. |
 | Tailscale | Current stable RPM from Tailscale's official repository | Required only for tagged-server enrollment and Tailscale SSH under the explicit two-plane policy in `tailscale/`. |
 | rsync | **3.5.0 or newer** for restricted `rrsync` deployment identities | 3.5.0 adds the confinement contract needed to close CVE-2026-53783. `packages/rsync/` supplies an audited temporary EL9 rebuild while the vendor package lags. |
 | firewalld | A currently supported RHEL-family release | Required only for the `firewalld/` service definitions and reference zone. |
@@ -197,6 +198,8 @@ TCP 443 so clients always have an HTTP/2 or HTTP/1.1 fallback.
   administrative umask, display a trusted host classification, and retain
   current-session recall while preventing command history from persisting on
   the host, plus a read-only startup and `PATH` integrity verifier.
+- `terminal/` installs and functionally verifies the generic terminfo tooling
+  and standard `xterm-256color` fallback used by administrative sessions.
 - `tailscale/` contains the official-repository installer and three-phase tagged
   server setup that keeps native deployment SSH on TCP 2356 while enabling
   Tailscale SSH on tailnet TCP 22 for explicitly named human accounts.
@@ -224,6 +227,11 @@ policies at `/etc/profile.d/70-managed-environment-prompt.sh`,
 are not deleted automatically; their retention or removal is a separate,
 destructive decision. See [`shell/README.md`](shell/README.md) for the privacy
 boundary and validation contract.
+
+The same setup installs the vendor `ncurses` and `ncurses-base` packages and
+round-trips `xterm-256color` through an isolated terminfo database. It does not
+install a client terminal emulator or force `TERM`; see
+[`terminal/README.md`](terminal/README.md) for that server/client boundary.
 
 The reviewed nginx tree must already exist at `/etc/nginx`. The orchestrator
 never renders or overwrites it. Review a non-mutating plan before applying the

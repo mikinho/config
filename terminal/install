@@ -1,0 +1,145 @@
+#!/bin/sh
+
+set -eu
+
+PROGRAM_NAME=${0##*/}
+SCRIPT_DIRECTORY=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+REPOSITORY_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIRECTORY/.." && pwd)
+PLATFORM_LIBRARY=$REPOSITORY_ROOT/deploy/lib/platform.sh
+TERMINAL_VERIFIER=$SCRIPT_DIRECTORY/verify
+TARGET_DIRECTORY=/usr/local/bin
+INSTALLED_VERIFIER=$TARGET_DIRECTORY/verify-terminal-readiness
+
+validate_source() {
+    terminal_source=$1
+    [ -f "$terminal_source" ] && [ ! -L "$terminal_source" ] \
+        || {
+            printf '%s: dependency must be a regular file: %s\n' \
+                "$PROGRAM_NAME" "$terminal_source" >&2
+            exit 1
+        }
+}
+
+validate_source "$PLATFORM_LIBRARY"
+validate_source "$TERMINAL_VERIFIER"
+[ -x "$TERMINAL_VERIFIER" ] || {
+    printf '%s: verifier must be executable: %s\n' \
+        "$PROGRAM_NAME" "$TERMINAL_VERIFIER" >&2
+    exit 1
+}
+
+# shellcheck disable=SC1090,SC1091
+. "$PLATFORM_LIBRARY"
+
+MODE=install
+OS_RELEASE_FILE=$PLATFORM_DEFAULT_OS_RELEASE
+OS_RELEASE_OVERRIDDEN=no
+
+usage() {
+    cat <<EOF
+Usage:
+  $PROGRAM_NAME
+  $PROGRAM_NAME --plan [--os-release FILE]
+  $PROGRAM_NAME --check
+
+Installs the RHEL-family vendor packages that provide tic, infocmp, and the
+xterm-256color terminfo entry, then runs a functional readiness check. It does
+not install terminal-emulator-specific definitions or change TERM.
+EOF
+}
+
+fail() {
+    printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2
+    exit 1
+}
+
+validate_target_directory() {
+    [ -d "$TARGET_DIRECTORY" ] && [ ! -L "$TARGET_DIRECTORY" ] \
+        || fail "target must be a real directory: $TARGET_DIRECTORY"
+    target_identity=$(stat -Lc '%U:%G:%a' "$TARGET_DIRECTORY" 2>/dev/null) \
+        || fail "cannot inspect target directory: $TARGET_DIRECTORY"
+    [ "$target_identity" = root:root:755 ] \
+        || fail "$TARGET_DIRECTORY must be owned by root:root with mode 0755"
+}
+
+install_verifier() {
+    [ ! -L "$INSTALLED_VERIFIER" ] \
+        || fail "refusing symbolic-link target: $INSTALLED_VERIFIER"
+    if [ -e "$INSTALLED_VERIFIER" ]; then
+        [ -f "$INSTALLED_VERIFIER" ] \
+            || fail "verifier target is not a regular file: $INSTALLED_VERIFIER"
+    fi
+    install -o root -g root -m 0755 \
+        "$TERMINAL_VERIFIER" "$INSTALLED_VERIFIER"
+    cmp -s "$TERMINAL_VERIFIER" "$INSTALLED_VERIFIER" \
+        || fail "installed verifier differs from repository source"
+    [ "$(stat -Lc '%U:%G:%a' "$INSTALLED_VERIFIER")" = root:root:755 ] \
+        || fail "installed verifier has unsafe ownership or mode"
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --check)
+            [ "$MODE" = install ] || fail "select exactly one mode"
+            MODE=check
+            shift
+            ;;
+        --plan)
+            [ "$MODE" = install ] || fail "select exactly one mode"
+            MODE=plan
+            shift
+            ;;
+        --os-release)
+            [ "$#" -ge 2 ] || fail "--os-release requires a file"
+            OS_RELEASE_FILE=$2
+            OS_RELEASE_OVERRIDDEN=yes
+            shift 2
+            ;;
+        --help | -h)
+            usage
+            exit 0
+            ;;
+        *) fail "unknown argument: $1" ;;
+    esac
+done
+
+if [ "$MODE" = check ]; then
+    [ "$OS_RELEASE_OVERRIDDEN" = no ] \
+        || fail "--os-release is accepted only with --plan"
+    "$TERMINAL_VERIFIER" --check >/dev/null
+    printf 'Validated terminal installer, verifier, and shared platform source.\n'
+    exit 0
+fi
+
+if [ "$OS_RELEASE_OVERRIDDEN" = yes ] && [ "$MODE" != plan ]; then
+    fail "--os-release is accepted only with --plan"
+fi
+
+platform_detect_supported_os "$OS_RELEASE_FILE"
+printf 'Terminal readiness target: %s (%s)\n' \
+    "$PLATFORM_OS_LABEL" "$PLATFORM_OS_ARCHITECTURE"
+
+if [ "$MODE" = install ]; then
+    [ "$(id -u)" -eq 0 ] || fail "run as root or use --plan"
+    for required_command in cmp dnf install stat; do
+        command -v "$required_command" >/dev/null 2>&1 \
+            || fail "required command not found: $required_command"
+    done
+    validate_target_directory
+fi
+
+# Consumed by the sourced platform library.
+# shellcheck disable=SC2034
+PLATFORM_MODE=$MODE
+platform_run dnf install --assumeyes ncurses ncurses-base
+
+if [ "$MODE" = plan ]; then
+    platform_print_command install -o root -g root -m 0755 \
+        "$TERMINAL_VERIFIER" "$INSTALLED_VERIFIER"
+    platform_print_command "$INSTALLED_VERIFIER"
+    printf 'Plan complete; no host changes were made.\n'
+else
+    install_verifier
+    "$INSTALLED_VERIFIER"
+    printf 'Installed and verified generic terminal readiness.\n'
+fi
