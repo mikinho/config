@@ -397,14 +397,26 @@ if [ -n "$MAXMEMORY_MIB" ]; then
 fi
 
 systemctl show redis.service \
-    --property=NoNewPrivileges --property=ProtectSystem --property=IPAddressDeny \
+    --property=NoNewPrivileges --property=ProtectSystem \
     > "$TEMPORARY_DIRECTORY/systemd.properties"
 grep -Fx 'NoNewPrivileges=yes' "$TEMPORARY_DIRECTORY/systemd.properties" >/dev/null \
     || fail "effective Redis unit must enable NoNewPrivileges"
 grep -Fx 'ProtectSystem=strict' "$TEMPORARY_DIRECTORY/systemd.properties" >/dev/null \
     || fail "effective Redis unit must set ProtectSystem=strict"
-grep -F 'IPAddressDeny=' "$TEMPORARY_DIRECTORY/systemd.properties" | grep -F 'any' >/dev/null \
-    || fail "effective Redis unit must default-deny IP addresses"
+effective_ip_deny=$(systemctl show redis.service --property=IPAddressDeny --value)
+effective_default_deny=yes
+case "$effective_ip_deny" in
+    any) ;;
+    *)
+        for required_network in '0.0.0.0/0' '::/0'; do
+            printf '%s\n' "$effective_ip_deny" | tr ' ' '\n' \
+                | grep -Fx "$required_network" >/dev/null \
+                || effective_default_deny=no
+        done
+        ;;
+esac
+[ "$effective_default_deny" = yes ] \
+    || fail "effective Redis unit must default-deny IPv4 and IPv6 addresses"
 
 [ "$(sysctl -n vm.overcommit_memory 2>/dev/null)" = 1 ] \
     || fail "vm.overcommit_memory must be 1"

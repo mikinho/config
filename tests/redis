@@ -275,6 +275,7 @@ assert_contains "$REDIS_DIRECTORY/lib/common.sh" '-vadd -vcard -vdim -vemb'
 assert_contains "$REDIS_DIRECTORY/lib/common.sh" '+eval +eval_ro +evalsha +evalsha_ro'
 assert_contains "$REDIS_DIRECTORY/lib/common.sh" '+client|info'
 assert_contains "$VERIFIER" 'ps -e -o label= -o comm='
+assert_contains "$VERIFIER" "for required_network in '0.0.0.0/0' '::/0'"
 if grep -F 'ps -eZ -o label=,comm=' "$VERIFIER" >/dev/null; then
     fail 'Redis verifier uses a procps-incompatible SELinux process query'
 fi
