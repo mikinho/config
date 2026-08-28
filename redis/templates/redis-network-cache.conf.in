@@ -12,7 +12,7 @@ tcp-backlog 511
 timeout 0
 tcp-keepalive 300
 unixsocket /run/redis/redis.sock
-unixsocketperm 0770
+unixsocketperm 0700
 
 tls-cert-file @TLS_CERTIFICATE_FILE@
 tls-key-file @TLS_PRIVATE_KEY_FILE@

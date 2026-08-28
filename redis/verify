@@ -219,7 +219,7 @@ ps -e -o label= -o comm= 2>/dev/null \
 [ "$(stat -Lc '%U:%G:%a' /run/redis 2>/dev/null)" = redis:redis:750 ] \
     || fail "Redis runtime directory must be redis:redis mode 0750"
 [ "$(stat -Lc '%U:%G:%a' "$REDIS_SOCKET" 2>/dev/null)" = redis:redis:700 ] \
-    || fail "Redis Unix socket must be redis:redis mode 0700 after systemd umask"
+    || fail "Redis Unix socket must be redis:redis mode 0700"
 
 if [ "$MODEL" = network ]; then
     if [ -z "$BIND_ADDRESS" ]; then

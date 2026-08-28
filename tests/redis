@@ -252,6 +252,7 @@ do
     assert_contains "$local_template" 'protected-mode yes'
     assert_contains "$local_template" 'databases 1'
     assert_contains "$local_template" 'disable-thp yes'
+    assert_contains "$local_template" 'unixsocketperm 0700'
 done
 assert_contains "$REDIS_DIRECTORY/templates/redis-local-cache.conf.in" 'save ""'
 assert_contains "$REDIS_DIRECTORY/templates/redis-local-cache.conf.in" 'appendonly no'
@@ -266,6 +267,7 @@ do
     assert_contains "$network_template" 'tls-port 6379'
     assert_contains "$network_template" 'tls-protocols "TLSv1.2 TLSv1.3"'
     assert_contains "$network_template" 'disable-thp yes'
+    assert_contains "$network_template" 'unixsocketperm 0700'
 done
 assert_contains "$REDIS_DIRECTORY/templates/redis.service.conf.in" 'IPAddressDeny=any'
 assert_contains "$REDIS_DIRECTORY/lib/common.sh" '-keys -scan -randomkey -dbsize'
