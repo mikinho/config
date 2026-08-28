@@ -275,8 +275,15 @@ assert_contains "$INSTALLER" '%{RSAHEADER:pgpsig}'
 assert_contains "$INSTALLER" 'rpmkeys --checksig'
 assert_contains "$INSTALLER" 'enabled=0'
 assert_contains "$INSTALLER" 'Validated root-owned immutable MongoDB deployment bundle.'
+assert_contains "$SETUP" 'TLS_MINIMUM_REMAINING_SECONDS=172800'
+assert_contains "$SETUP" 'TLS server certificate expires within 48 hours'
+assert_contains "$VERIFIER" 'TLS_MINIMUM_REMAINING_SECONDS=172800'
+assert_contains "$VERIFIER" 'TLS server certificate expires within 48 hours'
 # shellcheck disable=SC2016
 assert_contains "$VERIFIER" 'require_directory_identity "$DATA_DIRECTORY" mongod:mongod:750'
+if grep -F 'checkend 2592000' "$SETUP" "$VERIFIER" >/dev/null 2>&1; then
+    fail 'MongoDB TLS validation still requires an impossible 30-day margin'
+fi
 if grep -F '%{SIGPGP:pgpsig}' "$INSTALLER" >/dev/null 2>&1; then
     fail 'MongoDB installer still uses the empty SIGPGP field'
 fi

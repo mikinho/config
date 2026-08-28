@@ -195,8 +195,10 @@ controls before exposing a listener:
    address.
 2. A CA-issued server certificate whose SAN covers that name, stored with its
    matching, unencrypted private key in one `mongod:mongod` mode `0400` PEM
-   file. Filesystem protection replaces an interactive passphrase because
-   systemd must start unattended.
+   file. The certificate must have more than 48 hours of validity remaining.
+   Filesystem protection replaces an interactive passphrase because systemd
+   must start unattended. Short-lived certificates require automated renewal
+   early enough to preserve that 48-hour acceptance margin.
 3. The public CA chain in one `root:root` mode `0644` file.
 4. Persistent firewall or upstream controls allowing TCP 27017 only from the
    exact application-host sources. Do not enable a broad `mongodb` service,

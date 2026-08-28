@@ -26,6 +26,7 @@ KEY_FILE_PATH=/etc/mongod.keyfile
 DATA_DIRECTORY=/var/lib/mongo
 LOG_DIRECTORY=/var/log/mongodb
 MONGODB_PORT=27017
+TLS_MINIMUM_REMAINING_SECONDS=172800
 
 MODE=apply
 PHASE=
@@ -619,8 +620,9 @@ validate_tls_server_identity() {
         || fail "TLS server certificate and private key do not match"
     openssl x509 -in "$TLS_CERTIFICATE_KEY_FILE" -noout -checkhost "$MEMBER_HOST" >/dev/null \
         || fail "TLS certificate does not cover member host $MEMBER_HOST"
-    openssl x509 -in "$TLS_CERTIFICATE_KEY_FILE" -noout -checkend 2592000 >/dev/null \
-        || fail "TLS server certificate expires within 30 days"
+    openssl x509 -in "$TLS_CERTIFICATE_KEY_FILE" -noout \
+        -checkend "$TLS_MINIMUM_REMAINING_SECONDS" >/dev/null \
+        || fail "TLS server certificate expires within 48 hours"
 }
 
 expose_network_model() {

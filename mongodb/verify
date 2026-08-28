@@ -24,6 +24,7 @@ DATA_DIRECTORY=/var/lib/mongo
 LOG_DIRECTORY=/var/log/mongodb
 LOGROTATE_PATH=/etc/logrotate.d/mongodb
 MONGODB_PORT=27017
+TLS_MINIMUM_REMAINING_SECONDS=172800
 
 MODE=verify
 MODEL=
@@ -409,8 +410,9 @@ verify_tls_files() {
         || fail "TLS server certificate and private key do not match"
     openssl x509 -in "$TLS_CERTIFICATE_KEY_FILE" -noout -checkhost "$MEMBER_HOST" >/dev/null \
         || fail "TLS certificate does not cover $MEMBER_HOST"
-    openssl x509 -in "$TLS_CERTIFICATE_KEY_FILE" -noout -checkend 2592000 >/dev/null \
-        || fail "TLS server certificate expires within 30 days"
+    openssl x509 -in "$TLS_CERTIFICATE_KEY_FILE" -noout \
+        -checkend "$TLS_MINIMUM_REMAINING_SECONDS" >/dev/null \
+        || fail "TLS server certificate expires within 48 hours"
 }
 
 report_host_advisories() {
