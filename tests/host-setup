@@ -123,7 +123,7 @@ assert_contains "$TEST_ROOT/selinux-rocky.plan" \
 assert_contains "$TEST_ROOT/ssh-rocky.plan" \
     'dnf install --assumeyes openssh-server'
 assert_contains "$TEST_ROOT/terminal-rocky.plan" \
-    'dnf install --assumeyes ncurses ncurses-base'
+    'dnf install --assumeyes diffutils ncurses ncurses-base'
 
 "$FAIL2BAN_SETUP" \
     --output "$TEST_ROOT/fail2ban-direct" \
@@ -229,7 +229,7 @@ assert_not_contains "$TEST_ROOT/nginx.plan" 'zones/public.xml'
 assert_contains "$TEST_ROOT/host-direct.plan" \
     'Host setup: profile=edge-direct, environment=TEST, topology=direct, ssh-phase=prepare'
 assert_contains "$TEST_ROOT/host-direct.plan" \
-    'dnf install --assumeyes ncurses ncurses-base'
+    'dnf install --assumeyes diffutils ncurses ncurses-base'
 assert_contains "$TEST_ROOT/host-direct.plan" \
     'Fail2ban setup: topology=direct, ssh-phase=prepare'
 assert_contains "$TEST_ROOT/host-direct.plan" \

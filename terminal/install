@@ -125,7 +125,7 @@ printf 'Terminal readiness target: %s (%s)\n' \
 
 if [ "$MODE" = install ]; then
     [ "$(id -u)" -eq 0 ] || fail "run as root or use --plan"
-    for required_command in cmp dnf install stat; do
+    for required_command in dnf install stat; do
         command -v "$required_command" >/dev/null 2>&1 \
             || fail "required command not found: $required_command"
     done
@@ -135,7 +135,12 @@ fi
 # Consumed by the sourced platform library.
 # shellcheck disable=SC2034
 PLATFORM_MODE=$MODE
-platform_run dnf install --assumeyes ncurses ncurses-base
+platform_run dnf install --assumeyes diffutils ncurses ncurses-base
+
+if [ "$MODE" = install ]; then
+    command -v cmp >/dev/null 2>&1 \
+        || fail "required command not found after package installation: cmp"
+fi
 
 if [ "$MODE" = plan ]; then
     platform_print_command install -o root -g root -m 0755 \

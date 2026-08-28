@@ -80,7 +80,7 @@ for supported_release in rocky-9 rhel-10 centos-stream-10; do
         --os-release "$TEST_ROOT/$supported_release" \
         > "$TEST_ROOT/$supported_release.plan"
     assert_contains "$TEST_ROOT/$supported_release.plan" \
-        'dnf install --assumeyes ncurses ncurses-base'
+        'dnf install --assumeyes diffutils ncurses ncurses-base'
     assert_contains "$TEST_ROOT/$supported_release.plan" \
         '/usr/local/bin/verify-terminal-readiness'
 done

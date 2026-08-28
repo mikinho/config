@@ -11,7 +11,9 @@ provide:
 On RHEL, Rocky Linux, and CentOS Stream 9 or 10, those interfaces are supplied
 by the vendor `ncurses` and `ncurses-base` packages. Package release numbers
 remain vendor-managed; the installer intentionally uses stable package names
-instead of pinning an upstream ncurses version.
+instead of pinning an upstream ncurses version. The same transaction installs
+vendor `diffutils` so the installer can use `cmp` to verify that the published
+host verifier exactly matches the reviewed repository source.
 
 ## Scope
 
