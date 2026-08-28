@@ -606,6 +606,7 @@ validate_tls_server_identity() {
     [ "$(stat -Lc '%U:%G:%a:%h' "$TLS_CA_FILE")" = root:root:644:1 ] \
         || fail "TLS CA file must be a one-link root:root mode 0644 file"
     openssl verify -purpose sslserver -CAfile "$TLS_CA_FILE" \
+        -untrusted "$TLS_CERTIFICATE_KEY_FILE" \
         "$TLS_CERTIFICATE_KEY_FILE" >/dev/null \
         || fail "TLS server certificate does not validate against the selected CA"
     openssl x509 -in "$TLS_CERTIFICATE_KEY_FILE" -pubkey -noout \

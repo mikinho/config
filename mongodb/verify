@@ -396,6 +396,7 @@ verify_tls_files() {
     require_regular_file_identity "$TLS_CERTIFICATE_KEY_FILE" mongod:mongod:400:1
     require_regular_file_identity "$TLS_CA_FILE" root:root:644:1
     openssl verify -purpose sslserver -CAfile "$TLS_CA_FILE" \
+        -untrusted "$TLS_CERTIFICATE_KEY_FILE" \
         "$TLS_CERTIFICATE_KEY_FILE" >/dev/null \
         || fail "TLS server certificate does not validate against the configured CA"
     openssl x509 -in "$TLS_CERTIFICATE_KEY_FILE" -pubkey -noout \

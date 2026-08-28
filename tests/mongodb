@@ -277,8 +277,10 @@ assert_contains "$INSTALLER" 'enabled=0'
 assert_contains "$INSTALLER" 'Validated root-owned immutable MongoDB deployment bundle.'
 assert_contains "$SETUP" 'TLS_MINIMUM_REMAINING_SECONDS=172800'
 assert_contains "$SETUP" 'TLS server certificate expires within 48 hours'
+assert_contains "$SETUP" "-untrusted \"\$TLS_CERTIFICATE_KEY_FILE\""
 assert_contains "$VERIFIER" 'TLS_MINIMUM_REMAINING_SECONDS=172800'
 assert_contains "$VERIFIER" 'TLS server certificate expires within 48 hours'
+assert_contains "$VERIFIER" "-untrusted \"\$TLS_CERTIFICATE_KEY_FILE\""
 # shellcheck disable=SC2016
 assert_contains "$VERIFIER" 'require_directory_identity "$DATA_DIRECTORY" mongod:mongod:750'
 if grep -F 'checkend 2592000' "$SETUP" "$VERIFIER" >/dev/null 2>&1; then
