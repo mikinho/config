@@ -36,6 +36,7 @@ but only for explicitly trusted immediate peers.
 | ncurses terminfo | Vendor `ncurses` and `ncurses-base` packages with working `tic`, `infocmp`, and `xterm-256color` | Provides a terminal-generic compatibility floor and the tooling for reviewed user-local terminfo entries. |
 | Tailscale | Current stable RPM from Tailscale's official repository | Required only for tagged-server enrollment and Tailscale SSH under the explicit two-plane policy in `tailscale/`. |
 | MongoDB | **8.0 LTS** Community on EL9 x86_64 | Required only on database hosts. Both local and networked models are initialized single-node replica sets so transactions are available; one member does not provide high availability. |
+| Redis | **8.2.9 extended release** Open Source on Rocky Linux 9 x86_64 | Required only on Redis hosts. The local model is loopback-only; the restricted-network model is TLS-only on one private address and exact application sources. Both are single-server availability models. |
 | rsync | **3.5.0 or newer** for restricted `rrsync` deployment identities | 3.5.0 adds the confinement contract needed to close CVE-2026-53783. `packages/rsync/` supplies an audited temporary EL9 rebuild while the vendor package lags. |
 | firewalld | A currently supported RHEL-family release | Required only for the `firewalld/` service definitions and reference zone. |
 | SELinux | Enforcing mode with the RHEL `httpd` policy | Expected on the supported platforms; do not disable it to deploy this baseline. |
@@ -205,6 +206,11 @@ TCP 443 so clients always have an HTTP/2 or HTTP/1.1 fallback.
   least-privilege application-user creation, local and TLS-required networked
   single-node replica-set models, and strict host verification. It is never
   included automatically on an edge host.
+- `redis/` installs the reviewed Redis 8.2 extended release and provides
+  guarded initialization, namespaced least-privilege ACL users, a loopback-only
+  local model, a TLS-only exact-source restricted-network model, immutable
+  deployment bundles, strict runtime verification, and a reproducible PDF
+  security handoff. It is never included automatically on an edge host.
 - `tailscale/` contains the official-repository installer and three-phase tagged
   server setup that keeps native deployment SSH on TCP 2356 while enabling
   Tailscale SSH on tailnet TCP 22 for explicitly named human accounts.

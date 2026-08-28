@@ -1,0 +1,104 @@
+#!/usr/bin/env sh
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
+# Opt-in behavioral checks for controls that macOS and static render tests
+# cannot prove. The transient units are collected immediately after they exit.
+
+set -eu
+set -f
+
+PROGRAM_NAME=${0##*/}
+MODE=run
+LOOPBACK_PORT=6379
+TEST_OUTPUT=
+
+usage() {
+    cat <<EOF
+Usage:
+  $PROGRAM_NAME --check
+  sudo $PROGRAM_NAME [--loopback-port PORT]
+
+Requires an EL9 host with the reviewed Redis RPM and a reachable loopback test
+listener. It verifies the RPM RSA header and exercises the systemd exact-source
+IPAddressAllow/deny behavior used by the restricted-network standard.
+EOF
+}
+
+fail() {
+    printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2
+    exit 1
+}
+
+cleanup() {
+    if [ -n "$TEST_OUTPUT" ] && [ -f "$TEST_OUTPUT" ]; then
+        rm -f -- "$TEST_OUTPUT"
+    fi
+}
+
+validate_port() {
+    case "$LOOPBACK_PORT" in
+        '' | *[!0-9]*) fail "--loopback-port must be an integer" ;;
+    esac
+    [ "$LOOPBACK_PORT" -ge 1 ] && [ "$LOOPBACK_PORT" -le 65535 ] \
+        || fail "--loopback-port must be between 1 and 65535"
+}
+
+run_connection_test() {
+    unit_name=$1
+    shift
+    systemd-run --quiet --wait --collect --unit "$unit_name" "$@" \
+        /usr/bin/timeout 3 /usr/bin/bash -c \
+        "exec 3<>/dev/tcp/127.0.0.1/$LOOPBACK_PORT" \
+        > "$TEST_OUTPUT" 2>&1
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --check) MODE=check; shift ;;
+        --loopback-port)
+            [ "$#" -ge 2 ] || fail "--loopback-port requires a value"
+            LOOPBACK_PORT=$2
+            shift 2
+            ;;
+        --help | -h) usage; exit 0 ;;
+        *) fail "unknown argument: $1" ;;
+    esac
+done
+
+validate_port
+if [ "$MODE" = check ]; then
+    printf 'Validated opt-in EL9 Redis and systemd behavioral test inputs.\n'
+    exit 0
+fi
+
+[ "$(id -u)" -eq 0 ] || fail "run as root"
+[ -f /etc/os-release ] || fail "cannot identify the operating system"
+# shellcheck disable=SC1091
+. /etc/os-release
+[ "${VERSION_ID%%.*}" = 9 ] || fail "EL9 is required"
+for required_command in grep rpm systemd-run timeout; do
+    command -v "$required_command" >/dev/null 2>&1 \
+        || fail "required command not found: $required_command"
+done
+
+installed_signature=$(rpm -q --qf '%{RSAHEADER:pgpsig}\n' redis 2>/dev/null || true)
+printf '%s\n' "$installed_signature" | grep -qi 'Key ID 5F4349D6BF53AA0C' \
+    || fail "installed Redis RSA header does not identify the reviewed key"
+
+TEST_OUTPUT=$(mktemp "${TMPDIR:-/tmp}/config-redis-el9.XXXXXX")
+trap cleanup EXIT HUP INT TERM
+unit_suffix=$$
+run_connection_test "config-redis-control-$unit_suffix.service" \
+    || fail "loopback control connection to port $LOOPBACK_PORT failed"
+run_connection_test "config-redis-universal-allow-$unit_suffix.service" \
+    -p 'IPAddressAllow=0.0.0.0/0 ::/0' -p IPAddressDeny=localhost \
+    || fail "systemd did not apply documented allow-before-deny precedence"
+if run_connection_test "config-redis-loopback-deny-$unit_suffix.service" \
+    -p IPAddressAllow=127.0.0.53/32 -p IPAddressDeny=localhost; then
+    fail "systemd exact-source policy did not block the connection"
+fi
+
+printf 'Validated EL9 Redis RSAHEADER and privileged systemd address policy behavior.\n'

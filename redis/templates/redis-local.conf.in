@@ -1,0 +1,60 @@
+# redis/templates/redis-local.conf.in
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
+bind 127.0.0.1
+protected-mode yes
+port 6379
+tls-port 0
+tcp-backlog 511
+timeout 0
+tcp-keepalive 300
+unixsocket /run/redis/redis.sock
+unixsocketperm 0770
+
+daemonize no
+supervised systemd
+pidfile /run/redis/redis-server.pid
+loglevel notice
+logfile ""
+always-show-logo no
+
+databases 1
+aclfile /etc/redis/users.acl
+acl-pubsub-default resetchannels
+acllog-max-len 128
+enable-protected-configs no
+enable-debug-command no
+enable-module-command no
+
+maxclients 10000
+maxmemory @MAXMEMORY_MIB@mb
+maxmemory-policy noeviction
+maxmemory-samples 5
+
+stop-writes-on-bgsave-error yes
+rdbcompression yes
+rdbchecksum yes
+dbfilename dump.rdb
+dir /var/lib/redis
+save 3600 1
+save 300 100
+save 60 10000
+
+appendonly yes
+appendfilename "appendonly.aof"
+appenddirname "appendonlydir"
+appendfsync everysec
+no-appendfsync-on-rewrite no
+auto-aof-rewrite-percentage 100
+auto-aof-rewrite-min-size 64mb
+aof-load-truncated yes
+aof-use-rdb-preamble yes
+aof-timestamp-enabled no
+
+slowlog-log-slower-than -1
+slowlog-max-len 128
+latency-monitor-threshold 100
+notify-keyspace-events ""

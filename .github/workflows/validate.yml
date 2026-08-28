@@ -152,6 +152,32 @@ jobs:
             exit 1
           fi
 
+  redis-package:
+    name: Redis 8.2.9 package and ACL on Rocky Linux 9
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Verify exact RPM and exercise the restricted ACL
+        run: |
+          redis_image=rockylinux:9
+          docker pull "$redis_image"
+          redis_image_reference=$(
+            docker image inspect \
+              --format '{{ index .RepoDigests 0 }}' \
+              "$redis_image"
+          )
+          test -n "$redis_image_reference"
+          docker run --rm \
+            --volume "$PWD:/workspace:ro" \
+            "$redis_image_reference" \
+            /workspace/tests/redis-package-el9
+
   rsync-package:
     name: rsync 3.5.0 package on CentOS Stream 9
     runs-on: ubuntu-24.04

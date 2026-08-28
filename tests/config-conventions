@@ -127,6 +127,7 @@ while IFS= read -r relative_file; do
         deploy/host-profiles/*.profile | deploy/profiles/*.profile | \
         fail2ban/filter.d/*.conf | fail2ban/jail.local | fail2ban/templates/*.in | \
         logrotate/nginx | mongodb/logrotate/* | mongodb/templates/*.conf.in | \
+        redis/templates/*.conf.in | \
         nginx/nginx.conf | nginx/includes/*.conf | nginx/sites/*.conf | \
         nginx/sites/*.conf.example | nginx/sites/.gitignore | \
         nginx/stubs/*.conf | \

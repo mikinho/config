@@ -1,0 +1,408 @@
+#!/usr/bin/env sh
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
+set -eu
+set -f
+
+PROGRAM_NAME=${0##*/}
+SCRIPT_DIRECTORY=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+if [ -f "$SCRIPT_DIRECTORY/lib/common.sh" ]; then
+    POLICY_DIRECTORY=$SCRIPT_DIRECTORY
+else
+    POLICY_DIRECTORY=/usr/local/libexec/config-redis
+fi
+COMMON_LIBRARY=$POLICY_DIRECTORY/lib/common.sh
+if [ ! -f "$COMMON_LIBRARY" ]; then
+    COMMON_LIBRARY=$POLICY_DIRECTORY/common.sh
+fi
+LOCAL_TEMPLATE=$POLICY_DIRECTORY/templates/redis-local.conf.in
+NETWORK_TEMPLATE=$POLICY_DIRECTORY/templates/redis-network.conf.in
+SYSTEMD_TEMPLATE=$POLICY_DIRECTORY/templates/redis.service.conf.in
+PACKAGE_MANIFEST=$POLICY_DIRECTORY/packages-8.2.9.manifest
+
+CONFIGURATION_PATH=/etc/redis/redis.conf
+ACL_PATH=/etc/redis/users.acl
+SYSTEMD_POLICY_PATH=/etc/systemd/system/redis.service.d/10-config-security.conf
+DATA_DIRECTORY=/var/lib/redis
+REDIS_SOCKET=/run/redis/redis.sock
+
+MODE=verify
+MODEL=
+ADMIN_USER=
+ADMIN_PASSWORD_FILE=
+APPLICATION_USER=
+APPLICATION_PASSWORD_FILE=
+APPLICATION_KEY_PREFIX=
+APPLICATION_CHANNEL_PREFIX=
+MAXMEMORY_MIB=
+BIND_ADDRESS=
+SERVER_HOST=
+TLS_CERTIFICATE_FILE=
+TLS_PRIVATE_KEY_FILE=
+TLS_CA_FILE=
+ALLOWED_CLIENT_FILE=
+TEMPORARY_DIRECTORY=
+
+usage() {
+    cat <<EOF
+Usage:
+  $PROGRAM_NAME --check
+  sudo $PROGRAM_NAME --model local OPTIONS
+  sudo $PROGRAM_NAME --model network OPTIONS
+
+Required verification options:
+  --admin-user USER --admin-password-file FILE
+  --application-user USER --application-password-file FILE
+  --application-key-prefix PREFIX --application-channel-prefix PREFIX
+
+For an exact configuration comparison, also supply --maxmemory-mib MIB.
+Network verification requires --server-host HOST and --tls-ca-file FILE.
+Exact network-policy comparison additionally uses --bind-address,
+--tls-certificate-file, --tls-private-key-file, and --allowed-client-file.
+EOF
+}
+
+fail() {
+    printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2
+    exit 1
+}
+
+cleanup() {
+    if [ -n "$TEMPORARY_DIRECTORY" ] && [ -d "$TEMPORARY_DIRECTORY" ]; then
+        rm -rf -- "$TEMPORARY_DIRECTORY"
+    fi
+}
+
+validate_source() {
+    verify_source=$1
+    [ -f "$verify_source" ] && [ ! -L "$verify_source" ] \
+        || fail "verification policy dependency must be a regular file: $verify_source"
+}
+
+for verify_source in \
+    "$COMMON_LIBRARY" "$LOCAL_TEMPLATE" "$NETWORK_TEMPLATE" \
+    "$SYSTEMD_TEMPLATE" "$PACKAGE_MANIFEST"
+do
+    validate_source "$verify_source"
+done
+
+# shellcheck disable=SC1090
+. "$COMMON_LIBRARY"
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --check) MODE=check; shift ;;
+        --model) MODEL=${2:?--model requires a value}; shift 2 ;;
+        --admin-user) ADMIN_USER=${2:?--admin-user requires a value}; shift 2 ;;
+        --admin-password-file) ADMIN_PASSWORD_FILE=${2:?--admin-password-file requires a value}; shift 2 ;;
+        --application-user) APPLICATION_USER=${2:?--application-user requires a value}; shift 2 ;;
+        --application-password-file) APPLICATION_PASSWORD_FILE=${2:?--application-password-file requires a value}; shift 2 ;;
+        --application-key-prefix) APPLICATION_KEY_PREFIX=${2:?--application-key-prefix requires a value}; shift 2 ;;
+        --application-channel-prefix) APPLICATION_CHANNEL_PREFIX=${2:?--application-channel-prefix requires a value}; shift 2 ;;
+        --maxmemory-mib) MAXMEMORY_MIB=${2:?--maxmemory-mib requires a value}; shift 2 ;;
+        --bind-address) BIND_ADDRESS=${2:?--bind-address requires a value}; shift 2 ;;
+        --server-host) SERVER_HOST=${2:?--server-host requires a value}; shift 2 ;;
+        --tls-certificate-file) TLS_CERTIFICATE_FILE=${2:?--tls-certificate-file requires a value}; shift 2 ;;
+        --tls-private-key-file) TLS_PRIVATE_KEY_FILE=${2:?--tls-private-key-file requires a value}; shift 2 ;;
+        --tls-ca-file) TLS_CA_FILE=${2:?--tls-ca-file requires a value}; shift 2 ;;
+        --allowed-client-file) ALLOWED_CLIENT_FILE=${2:?--allowed-client-file requires a value}; shift 2 ;;
+        --help | -h) usage; exit 0 ;;
+        *) fail "unknown argument: $1" ;;
+    esac
+done
+
+if [ "$MODE" = check ]; then
+    [ -z "$MODEL$ADMIN_USER$ADMIN_PASSWORD_FILE$APPLICATION_USER$APPLICATION_PASSWORD_FILE$APPLICATION_KEY_PREFIX$APPLICATION_CHANNEL_PREFIX$MAXMEMORY_MIB$BIND_ADDRESS$SERVER_HOST$TLS_CERTIFICATE_FILE$TLS_PRIVATE_KEY_FILE$TLS_CA_FILE$ALLOWED_CLIENT_FILE" ] \
+        || fail "--check does not accept verification options"
+    grep -F '@MAXMEMORY_MIB@' "$LOCAL_TEMPLATE" >/dev/null \
+        || fail "local Redis template is missing maxmemory placeholder"
+    grep -F 'port 0' "$NETWORK_TEMPLATE" >/dev/null \
+        || fail "network Redis template must disable plaintext TCP"
+    grep -F '@IP_ADDRESS_ALLOW@' "$SYSTEMD_TEMPLATE" >/dev/null \
+        || fail "systemd template is missing its address-policy placeholder"
+    awk -F'|' 'NF == 4 && $1 == "redis" && $2 == "8.2.9-1.x86_64" \
+        && $3 == "redis-8.2.9-1.x86_64.rpm" \
+        && $4 ~ /^[0-9a-f]{64}$/ { valid += 1 } \
+        END { exit valid == 1 ? 0 : 1 }' "$PACKAGE_MANIFEST" \
+        || fail "Redis package manifest is invalid"
+    printf 'Validated Redis verifier policy sources.\n'
+    exit 0
+fi
+
+[ "$(id -u)" -eq 0 ] || fail "runtime verification must run as root"
+case "$MODEL" in
+    local) ;;
+    network)
+        redis_validate_server_host "$SERVER_HOST"
+        redis_validate_absolute_path "TLS CA file" "$TLS_CA_FILE"
+        ;;
+    *) fail "--model must be local or network" ;;
+esac
+redis_validate_safe_name "administrative user" "$ADMIN_USER"
+redis_validate_safe_name "application user" "$APPLICATION_USER"
+[ "$ADMIN_USER" != "$APPLICATION_USER" ] \
+    || fail "administrative and application users must be different"
+redis_validate_prefix "application key prefix" "$APPLICATION_KEY_PREFIX"
+redis_validate_prefix "application channel prefix" "$APPLICATION_CHANNEL_PREFIX"
+redis_validate_password_file "administrative password file" "$ADMIN_PASSWORD_FILE"
+redis_validate_password_file "application password file" "$APPLICATION_PASSWORD_FILE"
+if [ -n "$MAXMEMORY_MIB" ]; then
+    redis_validate_maxmemory_mib "$MAXMEMORY_MIB"
+fi
+if [ -n "$BIND_ADDRESS" ]; then
+    redis_validate_private_ipv4 "--bind-address" "$BIND_ADDRESS"
+fi
+if [ -n "$ALLOWED_CLIENT_FILE" ]; then
+    redis_validate_absolute_path "allowed-client file" "$ALLOWED_CLIENT_FILE"
+    [ -f "$ALLOWED_CLIENT_FILE" ] && [ ! -L "$ALLOWED_CLIENT_FILE" ] \
+        || fail "allowed-client file must be a regular, non-symbolic-link file"
+    allowed_client_count=0
+    while IFS= read -r allowed_client_address; do
+        [ -n "$allowed_client_address" ] \
+            || fail "allowed-client file must not contain blank lines"
+        redis_validate_private_ipv4 "allowed-client address" "$allowed_client_address"
+        allowed_client_count=$((allowed_client_count + 1))
+    done < "$ALLOWED_CLIENT_FILE"
+    [ "$(sort -u "$ALLOWED_CLIENT_FILE" | wc -l | tr -d ' ')" -eq "$allowed_client_count" ] \
+        || fail "allowed-client file must contain unique addresses"
+    if [ "$MODEL" = network ]; then
+        [ "$allowed_client_count" -gt 0 ] \
+            || fail "network model requires at least one allowed-client address"
+    fi
+fi
+
+for required_command in awk cmp getenforce grep openssl ps redis-cli redis-server rpm sha256sum sort ss stat sysctl systemctl tail tr wc; do
+    command -v "$required_command" >/dev/null 2>&1 \
+        || fail "required verification command not found: $required_command"
+done
+[ "$(getenforce)" = Enforcing ] || fail "SELinux must be Enforcing"
+redis-server --version 2>/dev/null | grep -Eq 'v=8\.2\.9([[:space:]]|$)' \
+    || fail "exact Redis 8.2.9 is required"
+installed_nevra=$(rpm -q --qf '%{VERSION}-%{RELEASE}.%{ARCH}\n' redis 2>/dev/null || true)
+[ "$installed_nevra" = 8.2.9-1.x86_64 ] \
+    || fail "redis must be installed as 8.2.9-1.x86_64"
+installed_signature=$(rpm -q --qf '%{RSAHEADER:pgpsig}\n' redis 2>/dev/null || true)
+printf '%s\n' "$installed_signature" | grep -qi 'Key ID 5F4349D6BF53AA0C' \
+    || fail "installed Redis RSA header does not identify the pinned signing key"
+systemctl is-enabled --quiet redis.service \
+    || fail "redis.service must be enabled"
+systemctl is-active --quiet redis.service \
+    || fail "redis.service must be active"
+ps -eZ -o label=,comm= 2>/dev/null \
+    | awk '$1 ~ /:redis_t:/ && $2 == "redis-server" { found = 1 } \
+        END { exit found ? 0 : 1 }' \
+    || fail "Redis server process must run in the redis_t SELinux domain"
+
+[ "$(stat -Lc '%U:%G:%a:%h' "$CONFIGURATION_PATH" 2>/dev/null)" = root:redis:640:1 ] \
+    || fail "Redis configuration must be a one-link root:redis mode 0640 file"
+[ "$(stat -Lc '%U:%G:%a:%h' "$ACL_PATH" 2>/dev/null)" = root:redis:640:1 ] \
+    || fail "Redis ACL must be a one-link root:redis mode 0640 file"
+[ "$(stat -Lc '%U:%G:%a:%h' "$SYSTEMD_POLICY_PATH" 2>/dev/null)" = root:root:644:1 ] \
+    || fail "Redis systemd policy must be a one-link root:root mode 0644 file"
+[ "$(stat -Lc '%U:%G:%a' "$DATA_DIRECTORY" 2>/dev/null)" = redis:redis:750 ] \
+    || fail "Redis data directory must be redis:redis mode 0750"
+[ "$(stat -Lc '%U:%G:%a' /var/log/redis 2>/dev/null)" = redis:redis:750 ] \
+    || fail "Redis log directory must be redis:redis mode 0750"
+[ "$(stat -Lc '%U:%G:%a' /run/redis 2>/dev/null)" = redis:redis:750 ] \
+    || fail "Redis runtime directory must be redis:redis mode 0750"
+[ "$(stat -Lc '%U:%G:%a' "$REDIS_SOCKET" 2>/dev/null)" = redis:redis:700 ] \
+    || fail "Redis Unix socket must be redis:redis mode 0700 after systemd umask"
+
+if [ "$MODEL" = network ]; then
+    if [ -z "$BIND_ADDRESS" ]; then
+        BIND_ADDRESS=$(awk '$1 == "bind" { for (index = 2; index <= NF; index += 1) \
+            if ($index != "127.0.0.1") { print $index; exit } }' "$CONFIGURATION_PATH")
+        redis_validate_private_ipv4 "configured bind address" "$BIND_ADDRESS"
+    fi
+    if [ -z "$TLS_CERTIFICATE_FILE" ]; then
+        TLS_CERTIFICATE_FILE=$(awk '$1 == "tls-cert-file" { print $2; exit }' "$CONFIGURATION_PATH")
+    fi
+    if [ -z "$TLS_PRIVATE_KEY_FILE" ]; then
+        TLS_PRIVATE_KEY_FILE=$(awk '$1 == "tls-key-file" { print $2; exit }' "$CONFIGURATION_PATH")
+    fi
+    redis_validate_absolute_path "configured TLS certificate file" "$TLS_CERTIFICATE_FILE"
+    redis_validate_absolute_path "configured TLS private-key file" "$TLS_PRIVATE_KEY_FILE"
+fi
+
+TEMPORARY_DIRECTORY=$(mktemp -d "${TMPDIR:-/tmp}/config-redis-verify.XXXXXX")
+umask 077
+trap cleanup EXIT HUP INT TERM
+
+if [ -n "$MAXMEMORY_MIB" ]; then
+    if [ "$MODEL" = local ]; then
+        redis_render_configuration local "$LOCAL_TEMPLATE" \
+            "$TEMPORARY_DIRECTORY/redis.conf" "$MAXMEMORY_MIB"
+    else
+        [ -n "$BIND_ADDRESS$TLS_CERTIFICATE_FILE$TLS_PRIVATE_KEY_FILE" ] \
+            || fail "exact network comparison requires bind address and TLS certificate/key paths"
+        redis_render_configuration network "$NETWORK_TEMPLATE" \
+            "$TEMPORARY_DIRECTORY/redis.conf" "$MAXMEMORY_MIB" "$BIND_ADDRESS" \
+            "$TLS_CERTIFICATE_FILE" "$TLS_PRIVATE_KEY_FILE" "$TLS_CA_FILE"
+    fi
+    cmp -s "$TEMPORARY_DIRECTORY/redis.conf" "$CONFIGURATION_PATH" \
+        || fail "Redis configuration differs from the selected standard"
+fi
+
+if [ "$MODEL" = local ] && [ -z "$ALLOWED_CLIENT_FILE" ]; then
+    ALLOWED_CLIENT_FILE=$TEMPORARY_DIRECTORY/allowed-clients
+    : > "$ALLOWED_CLIENT_FILE"
+fi
+if [ -n "$ALLOWED_CLIENT_FILE" ]; then
+    redis_render_systemd_policy "$SYSTEMD_TEMPLATE" "$ALLOWED_CLIENT_FILE" \
+        "$TEMPORARY_DIRECTORY/systemd.conf"
+    cmp -s "$TEMPORARY_DIRECTORY/systemd.conf" "$SYSTEMD_POLICY_PATH" \
+        || fail "Redis systemd network policy differs from the selected standard"
+fi
+
+admin_password=$(redis_read_password "$ADMIN_PASSWORD_FILE")
+application_password=$(redis_read_password "$APPLICATION_PASSWORD_FILE")
+admin_hash=$(redis_password_hash "$admin_password")
+application_hash=$(redis_password_hash "$application_password")
+redis_admin_acl_line "$ADMIN_USER" "$admin_hash" > "$TEMPORARY_DIRECTORY/admin.line"
+redis_application_acl_line "$APPLICATION_USER" "$application_hash" \
+    "$APPLICATION_KEY_PREFIX" "$APPLICATION_CHANNEL_PREFIX" \
+    > "$TEMPORARY_DIRECTORY/application.line"
+grep -Fx 'user default off' "$ACL_PATH" >/dev/null \
+    || fail "default Redis user must be disabled"
+[ "$(grep -Fxc 'user default off' "$ACL_PATH")" -eq 1 ] \
+    || fail "default Redis user must have exactly one managed ACL line"
+grep -Fxf "$TEMPORARY_DIRECTORY/admin.line" "$ACL_PATH" >/dev/null \
+    || fail "administrative ACL does not match the supplied identity and secret"
+[ "$(awk -v user="$ADMIN_USER" '$1 == "user" && $2 == user { count += 1 } \
+    END { print count + 0 }' "$ACL_PATH")" -eq 1 ] \
+    || fail "administrative user must have exactly one managed ACL line"
+grep -Fxf "$TEMPORARY_DIRECTORY/application.line" "$ACL_PATH" >/dev/null \
+    || fail "application ACL does not match the supplied identity, prefixes, and secret"
+[ "$(awk -v user="$APPLICATION_USER" '$1 == "user" && $2 == user { count += 1 } \
+    END { print count + 0 }' "$ACL_PATH")" -eq 1 ] \
+    || fail "application user must have exactly one managed ACL line"
+
+redis_cli_admin() {
+    if [ "$MODEL" = local ]; then
+        REDISCLI_AUTH=$admin_password redis-cli --no-auth-warning \
+            --user "$ADMIN_USER" -s "$REDIS_SOCKET" "$@"
+    else
+        REDISCLI_AUTH=$admin_password redis-cli --no-auth-warning --tls \
+            --cacert "$TLS_CA_FILE" --sni "$SERVER_HOST" --host "$SERVER_HOST" \
+            --port 6379 --user "$ADMIN_USER" "$@"
+    fi
+}
+
+redis_cli_application() {
+    if [ "$MODEL" = local ]; then
+        REDISCLI_AUTH=$application_password redis-cli --no-auth-warning \
+            --user "$APPLICATION_USER" -s "$REDIS_SOCKET" "$@"
+    else
+        REDISCLI_AUTH=$application_password redis-cli --no-auth-warning --tls \
+            --cacert "$TLS_CA_FILE" --sni "$SERVER_HOST" --host "$SERVER_HOST" \
+            --port 6379 --user "$APPLICATION_USER" "$@"
+    fi
+}
+
+redis_cli_unauthenticated() {
+    if [ "$MODEL" = local ]; then
+        redis-cli -s "$REDIS_SOCKET" "$@"
+    else
+        redis-cli --tls --cacert "$TLS_CA_FILE" --sni "$SERVER_HOST" \
+            --host "$SERVER_HOST" --port 6379 "$@"
+    fi
+}
+
+redis_cli_admin PING 2>/dev/null | grep -Fx PONG >/dev/null \
+    || fail "administrative authentication failed"
+redis_cli_application PING 2>/dev/null | grep -Fx PONG >/dev/null \
+    || fail "application authentication failed"
+redis_cli_unauthenticated PING 2>&1 | grep -F 'NOAUTH' >/dev/null \
+    || fail "unauthenticated Redis command was not denied"
+
+verification_key=$APPLICATION_KEY_PREFIX:config-standard-verification
+outside_key=config-standard-outside-prefix
+verification_channel=$APPLICATION_CHANNEL_PREFIX:config-standard-verification
+redis_cli_application SET "$verification_key" verified 2>/dev/null \
+    | grep -Fx OK >/dev/null \
+    || fail "application cannot write its allowed key prefix"
+[ "$(redis_cli_application GET "$verification_key" 2>/dev/null)" = verified ] \
+    || fail "application cannot read its allowed key prefix"
+[ "$(redis_cli_application EVAL 'return redis.call("GET", KEYS[1])' 1 "$verification_key" 2>/dev/null)" = verified ] \
+    || fail "application Lua operation failed within its allowed key prefix"
+redis_cli_application PUBLISH "$verification_channel" verification 2>/dev/null \
+    | grep -Eq '^[0-9]+$' \
+    || fail "application cannot publish to its allowed channel prefix"
+outside_result=$(redis_cli_application SET "$outside_key" denied 2>&1 || true)
+printf '%s\n' "$outside_result" | grep -F 'NOPERM' >/dev/null \
+    || fail "application write outside its key prefix was not denied"
+config_result=$(redis_cli_application CONFIG GET '*' 2>&1 || true)
+printf '%s\n' "$config_result" | grep -F 'NOPERM' >/dev/null \
+    || fail "application administrative command was not denied"
+keys_result=$(redis_cli_application KEYS '*' 2>&1 || true)
+printf '%s\n' "$keys_result" | grep -F 'NOPERM' >/dev/null \
+    || fail "application whole-database key enumeration was not denied"
+select_result=$(redis_cli_application SELECT 0 2>&1 || true)
+printf '%s\n' "$select_result" | grep -F 'NOPERM' >/dev/null \
+    || fail "application logical-database selection was not denied"
+redis_cli_application DEL "$verification_key" >/dev/null 2>&1 \
+    || fail "application could not remove its verification key"
+
+module_names=$(redis_cli_admin INFO MODULES 2>/dev/null \
+    | awk -F'[=,]' '/^module:name=/ { print $2 }' | sort -u)
+case "$module_names" in
+    '' | vectorset) ;;
+    *) fail "unapproved loadable Redis module is active: $module_names" ;;
+esac
+[ "$(redis_cli_admin CONFIG GET databases 2>/dev/null | tail -n 1)" = 1 ] \
+    || fail "Redis must expose exactly one logical database"
+[ "$(redis_cli_admin CONFIG GET maxmemory-policy 2>/dev/null | tail -n 1)" = noeviction ] \
+    || fail "Redis maxmemory-policy must be noeviction"
+[ "$(redis_cli_admin CONFIG GET appendonly 2>/dev/null | tail -n 1)" = yes ] \
+    || fail "Redis AOF persistence must be enabled"
+[ "$(redis_cli_admin CONFIG GET appendfsync 2>/dev/null | tail -n 1)" = everysec ] \
+    || fail "Redis AOF fsync policy must be everysec"
+if [ -n "$MAXMEMORY_MIB" ]; then
+    expected_maxmemory_bytes=$((MAXMEMORY_MIB * 1024 * 1024))
+    [ "$(redis_cli_admin CONFIG GET maxmemory 2>/dev/null | tail -n 1)" = "$expected_maxmemory_bytes" ] \
+        || fail "active Redis maxmemory differs from the selected standard"
+fi
+
+systemctl show redis.service \
+    --property=NoNewPrivileges --property=ProtectSystem --property=IPAddressDeny \
+    > "$TEMPORARY_DIRECTORY/systemd.properties"
+grep -Fx 'NoNewPrivileges=yes' "$TEMPORARY_DIRECTORY/systemd.properties" >/dev/null \
+    || fail "effective Redis unit must enable NoNewPrivileges"
+grep -Fx 'ProtectSystem=strict' "$TEMPORARY_DIRECTORY/systemd.properties" >/dev/null \
+    || fail "effective Redis unit must set ProtectSystem=strict"
+grep -F 'IPAddressDeny=' "$TEMPORARY_DIRECTORY/systemd.properties" | grep -F 'any' >/dev/null \
+    || fail "effective Redis unit must default-deny IP addresses"
+
+[ "$(sysctl -n vm.overcommit_memory 2>/dev/null)" = 1 ] \
+    || fail "vm.overcommit_memory must be 1"
+grep -F '[never]' /sys/kernel/mm/transparent_hugepage/enabled >/dev/null \
+    || fail "Transparent Huge Pages must be disabled"
+
+listener_output=$(ss -H -ltn 2>/dev/null)
+redis_tcp_listeners=$(printf '%s\n' "$listener_output" \
+    | awk '$4 ~ /:6379$/ { print $4 }' | sort -u)
+case "$MODEL" in
+    local)
+        [ "$redis_tcp_listeners" = 127.0.0.1:6379 ] \
+            || fail "local Redis must have only the 127.0.0.1:6379 TCP listener"
+        ;;
+    network)
+        expected_listeners=$(printf '127.0.0.1:6379\n%s:6379\n' "$BIND_ADDRESS" | sort -u)
+        [ "$redis_tcp_listeners" = "$expected_listeners" ] \
+            || fail "network Redis must listen only on loopback and the selected private address"
+        plaintext_result=$(redis-cli --host "$SERVER_HOST" --port 6379 PING 2>&1 || true)
+        printf '%s\n' "$plaintext_result" | grep -Fx PONG >/dev/null \
+            && fail "network Redis unexpectedly accepted plaintext TCP"
+        openssl x509 -checkhost "$SERVER_HOST" -noout -in "$TLS_CERTIFICATE_FILE" >/dev/null \
+            || fail "active TLS certificate does not identify the selected DNS name"
+        ;;
+esac
+
+printf 'Verified Redis %s security model, ACL boundaries, persistence, tuning, and listener scope.\n' \
+    "$MODEL"
+if [ "$MODEL" = network ]; then
+    printf 'External allowed-source and denied-source firewall path evidence must be recorded separately.\n'
+fi

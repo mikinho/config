@@ -1,0 +1,149 @@
+#!/usr/bin/env sh
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
+# Opt-in package integrity and runtime test for a disposable Rocky Linux 9
+# environment. It installs the exact reviewed RPM and must not run on a host
+# whose package state must be preserved.
+
+set -eu
+set -f
+
+PROGRAM_NAME=${0##*/}
+SCRIPT_DIRECTORY=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+REPOSITORY_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIRECTORY/.." && pwd)
+PACKAGE_MANIFEST=$REPOSITORY_ROOT/redis/packages-8.2.9.manifest
+RUNTIME_TEST=$SCRIPT_DIRECTORY/redis-runtime
+REDIS_KEY_URL=https://packages.redis.io/gpg
+REDIS_KEY_FINGERPRINT=54318FA4052D1E61A6B6F7BB5F4349D6BF53AA0C
+REDIS_KEY_ID=5F4349D6BF53AA0C
+REDIS_REPOSITORY_BASE_URL=https://packages.redis.io/rpm/rockylinux9
+REPOSITORY_PATH=/etc/yum.repos.d/config-redis-ci.repo
+MODE=run
+TEST_ROOT=
+
+usage() {
+    cat <<EOF
+Usage:
+  $PROGRAM_NAME --check
+  sudo $PROGRAM_NAME
+
+The run mode is destructive to package state and is intended only for a fresh,
+disposable Rocky Linux 9 x86-64 CI container. It verifies the official key,
+exact RPM digest and signature, current 8.2-series repository release, installed
+NEVRA, and the Redis runtime ACL contract.
+EOF
+}
+
+fail() {
+    printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2
+    exit 1
+}
+
+cleanup() {
+    if [ -n "$TEST_ROOT" ] && [ -d "$TEST_ROOT" ]; then
+        rm -rf -- "$TEST_ROOT"
+    fi
+    if [ -f "$REPOSITORY_PATH" ] && [ ! -L "$REPOSITORY_PATH" ]; then
+        rm -f -- "$REPOSITORY_PATH"
+    fi
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --check) MODE=check; shift ;;
+        --help | -h) usage; exit 0 ;;
+        *) fail "unknown argument: $1" ;;
+    esac
+done
+
+[ -f "$PACKAGE_MANIFEST" ] && [ ! -L "$PACKAGE_MANIFEST" ] \
+    || fail "Redis package manifest must be a regular file"
+[ -x "$RUNTIME_TEST" ] || fail "Redis runtime test must be executable"
+manifest_record=$(cat -- "$PACKAGE_MANIFEST")
+IFS='|' read -r package_name package_nevra package_filename package_sha256 <<EOF
+$manifest_record
+EOF
+if [ "$package_name" != redis ] \
+    || [ "$package_nevra" != 8.2.9-1.x86_64 ] \
+    || [ "$package_filename" != redis-8.2.9-1.x86_64.rpm ] \
+    || ! printf '%s\n' "$package_sha256" | grep -Eq '^[0-9a-f]{64}$'
+then
+    fail "Redis package manifest does not identify the reviewed RPM"
+fi
+
+if [ "$MODE" = check ]; then
+    "$RUNTIME_TEST" --check >/dev/null
+    printf 'Validated opt-in Rocky Linux 9 Redis package-test inputs.\n'
+    exit 0
+fi
+
+[ "$(id -u)" -eq 0 ] || fail "run as root in a disposable CI container"
+[ -f /etc/os-release ] || fail "cannot identify the operating system"
+# shellcheck disable=SC1091
+. /etc/os-release
+[ "$ID" = rocky ] && [ "${VERSION_ID%%.*}" = 9 ] \
+    || fail "run mode requires Rocky Linux 9"
+[ "$(uname -m)" = x86_64 ] || fail "run mode requires x86_64"
+for required_command in dnf mktemp rm; do
+    command -v "$required_command" >/dev/null 2>&1 \
+        || fail "required package-test command not found: $required_command"
+done
+[ ! -e "$REPOSITORY_PATH" ] && [ ! -L "$REPOSITORY_PATH" ] \
+    || fail "refusing to overwrite repository path: $REPOSITORY_PATH"
+
+TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/config-redis-package.XXXXXX")
+trap cleanup EXIT HUP INT TERM
+umask 077
+
+dnf install --assumeyes ca-certificates curl-minimal dnf-plugins-core gnupg2 openssl
+for required_command in awk curl gpg grep rpm rpmkeys sha256sum sort tail; do
+    command -v "$required_command" >/dev/null 2>&1 \
+        || fail "installed package-test command not found: $required_command"
+done
+curl --fail --location --silent --show-error \
+    --output "$TEST_ROOT/REDIS-OFFICIAL" "$REDIS_KEY_URL"
+primary_fingerprints=$(gpg --batch --with-colons --show-keys \
+    "$TEST_ROOT/REDIS-OFFICIAL" 2>/dev/null \
+    | awk -F: '$1 == "pub" { primary = 1; next } \
+        primary && $1 == "fpr" { print toupper($10); primary = 0 }')
+[ "$primary_fingerprints" = "$REDIS_KEY_FINGERPRINT" ] \
+    || fail "official key file does not contain only the pinned primary fingerprint"
+
+package_path=$TEST_ROOT/$package_filename
+curl --fail --location --silent --show-error \
+    --output "$package_path" \
+    "$REDIS_REPOSITORY_BASE_URL/amd64/$package_filename"
+printf '%s  %s\n' "$package_sha256" "$package_path" \
+    | sha256sum --check --strict
+rpm --import "$TEST_ROOT/REDIS-OFFICIAL"
+rpmkeys --checksig "$package_path" >/dev/null
+rpm -qp --qf '%{RSAHEADER:pgpsig}\n' "$package_path" \
+    | grep -qi "Key ID $REDIS_KEY_ID" \
+    || fail "reviewed RPM header does not identify the pinned signing key"
+
+cat > "$REPOSITORY_PATH" <<EOF
+[config-redis-ci]
+name=Redis official Rocky Linux 9 repository
+baseurl=$REDIS_REPOSITORY_BASE_URL/
+enabled=1
+gpgcheck=1
+gpgkey=file://$TEST_ROOT/REDIS-OFFICIAL
+EOF
+latest_82=$(dnf --quiet --disablerepo='*' --enablerepo=config-redis-ci \
+    repoquery --latest-limit 1 \
+    --queryformat '%{version}-%{release}.%{arch}' 'redis-8.2*' \
+    | sort --version-sort | tail -n 1)
+[ "$latest_82" = "$package_nevra" ] \
+    || fail "reviewed Redis 8.2 package is stale; repository reports ${latest_82:-none}"
+
+dnf install --assumeyes "$package_path"
+installed_nevra=$(rpm -q --qf '%{VERSION}-%{RELEASE}.%{ARCH}\n' redis)
+[ "$installed_nevra" = "$package_nevra" ] \
+    || fail "installed Redis NEVRA differs from the reviewed package"
+redis-server --version 2>/dev/null | grep -Eq 'v=8\.2\.9([[:space:]]|$)' \
+    || fail "installed Redis binary is not 8.2.9"
+"$RUNTIME_TEST"
+printf 'Validated the current official Redis 8.2.9 RPM and runtime ACL on Rocky Linux 9.\n'

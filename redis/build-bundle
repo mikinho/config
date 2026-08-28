@@ -1,0 +1,169 @@
+#!/usr/bin/env sh
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
+set -eu
+set -f
+
+PROGRAM_NAME=${0##*/}
+SCRIPT_DIRECTORY=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+REPOSITORY_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIRECTORY/.." && pwd)
+
+MODE=build
+OUTPUT_DIRECTORY=
+STAGING_DIRECTORY=
+
+usage() {
+    cat <<EOF
+Usage:
+  $PROGRAM_NAME --output ABSOLUTE_DIRECTORY
+  $PROGRAM_NAME --check
+
+Builds a deterministic Redis deployment directory from one clean Git
+revision. The result must be copied to a reviewed root-owned, non-writable
+location before redis/install or redis/setup is run with sudo.
+EOF
+}
+
+fail() {
+    printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2
+    exit 1
+}
+
+cleanup() {
+    if [ -n "$STAGING_DIRECTORY" ] && [ -d "$STAGING_DIRECTORY" ]; then
+        rm -rf -- "$STAGING_DIRECTORY"
+    fi
+}
+
+bundle_files() {
+    cat <<'EOF'
+deploy/lib/platform.sh
+redis/README.md
+redis/install
+redis/lib/common.sh
+redis/packages-8.2.9.manifest
+redis/setup
+redis/templates/redis-local.conf.in
+redis/templates/redis-network.conf.in
+redis/templates/redis.service.conf.in
+redis/verify
+EOF
+}
+
+validate_sources() {
+    for required_command in chmod find git grep install mkdir mktemp mv rm sha256sum stat; do
+        command -v "$required_command" >/dev/null 2>&1 \
+            || fail "required command not found: $required_command"
+    done
+    git -C "$REPOSITORY_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+        || fail "repository root is not a Git worktree: $REPOSITORY_ROOT"
+    while IFS= read -r relative_path; do
+        [ -f "$REPOSITORY_ROOT/$relative_path" ] \
+            && [ ! -L "$REPOSITORY_ROOT/$relative_path" ] \
+            || fail "bundle source must be a regular, non-symbolic-link file: $relative_path"
+        [ "$(stat -f '%l' "$REPOSITORY_ROOT/$relative_path" 2>/dev/null \
+            || stat -c '%h' "$REPOSITORY_ROOT/$relative_path" 2>/dev/null)" -eq 1 ] \
+            || fail "bundle source must have exactly one hard link: $relative_path"
+    done <<EOF
+$(bundle_files)
+EOF
+}
+
+install_payload() {
+    relative_path=$1
+    source_path=$REPOSITORY_ROOT/$relative_path
+    target_path=$STAGING_DIRECTORY/$relative_path
+    target_parent=$(dirname -- "$target_path")
+    mkdir -p "$target_parent"
+    chmod 0755 "$target_parent"
+    case "$relative_path" in
+        redis/install | redis/setup | redis/verify) payload_mode=0755 ;;
+        *) payload_mode=0644 ;;
+    esac
+    install -m "$payload_mode" "$source_path" "$target_path"
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --check)
+            [ "$MODE" = build ] && [ -z "$OUTPUT_DIRECTORY" ] \
+                || fail "select exactly one mode"
+            MODE=check
+            shift
+            ;;
+        --output)
+            [ "$#" -ge 2 ] || fail "--output requires a directory"
+            [ "$MODE" = build ] && [ -z "$OUTPUT_DIRECTORY" ] \
+                || fail "--output may be supplied exactly once"
+            OUTPUT_DIRECTORY=$2
+            shift 2
+            ;;
+        --help | -h)
+            usage
+            exit 0
+            ;;
+        *) fail "unknown argument: $1" ;;
+    esac
+done
+
+validate_sources
+if [ "$MODE" = check ]; then
+    [ -z "$OUTPUT_DIRECTORY" ] || fail "--check does not accept --output"
+    printf 'Validated Redis immutable-bundle builder sources.\n'
+    exit 0
+fi
+
+[ -n "$OUTPUT_DIRECTORY" ] || fail "--output is required"
+case "$OUTPUT_DIRECTORY" in
+    /*) ;;
+    *) fail "--output must be an absolute directory path" ;;
+esac
+[ ! -e "$OUTPUT_DIRECTORY" ] && [ ! -L "$OUTPUT_DIRECTORY" ] \
+    || fail "output path already exists: $OUTPUT_DIRECTORY"
+output_parent=$(dirname -- "$OUTPUT_DIRECTORY")
+[ -d "$output_parent" ] && [ ! -L "$output_parent" ] \
+    || fail "output parent must be a real directory: $output_parent"
+
+dirty_paths=$(git -C "$REPOSITORY_ROOT" status --porcelain=v1 --untracked-files=all)
+[ -z "$dirty_paths" ] \
+    || fail "refusing to build from a dirty worktree; commit or remove every change first"
+source_revision=$(git -C "$REPOSITORY_ROOT" rev-parse --verify 'HEAD^{commit}')
+printf '%s\n' "$source_revision" | grep -Eq '^[0-9a-f]{40}$' \
+    || fail "Git did not return one exact SHA-1 source revision"
+
+STAGING_DIRECTORY=$(mktemp -d "$output_parent/.config-redis-bundle.XXXXXX") \
+    || fail "cannot create bundle staging directory"
+trap cleanup EXIT HUP INT TERM
+chmod 0755 "$STAGING_DIRECTORY"
+while IFS= read -r relative_path; do
+    install_payload "$relative_path"
+done <<EOF
+$(bundle_files)
+EOF
+find "$STAGING_DIRECTORY" -type d -exec chmod 0755 {} +
+
+cat > "$STAGING_DIRECTORY/BUNDLE-METADATA" <<EOF
+schemaVersion=1
+sourceRevision=$source_revision
+redisVersion=8.2.9
+EOF
+chmod 0644 "$STAGING_DIRECTORY/BUNDLE-METADATA"
+(
+    cd "$STAGING_DIRECTORY"
+    sha256sum BUNDLE-METADATA
+    bundle_files | while IFS= read -r relative_path; do
+        sha256sum "$relative_path"
+    done
+) > "$STAGING_DIRECTORY/SHA256SUMS"
+chmod 0644 "$STAGING_DIRECTORY/SHA256SUMS"
+(cd "$STAGING_DIRECTORY" && sha256sum --strict --check SHA256SUMS >/dev/null) \
+    || fail "generated bundle failed checksum self-verification"
+
+mv "$STAGING_DIRECTORY" "$OUTPUT_DIRECTORY"
+STAGING_DIRECTORY=
+printf 'Built Redis deployment bundle %s from revision %s.\n' \
+    "$OUTPUT_DIRECTORY" "$source_revision"
+printf 'Stage it as root:root with directories 0755 and files non-writable before privileged use.\n'

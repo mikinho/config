@@ -50,6 +50,11 @@ if command -v shellcheck >/dev/null 2>&1; then
         "$REPOSITORY_ROOT/mongodb/build-bundle" \
         "$REPOSITORY_ROOT/mongodb/setup" \
         "$REPOSITORY_ROOT/mongodb/verify" \
+        "$REPOSITORY_ROOT/redis/install" \
+        "$REPOSITORY_ROOT/redis/build-bundle" \
+        "$REPOSITORY_ROOT/redis/setup" \
+        "$REPOSITORY_ROOT/redis/verify" \
+        "$REPOSITORY_ROOT/redis/lib/common.sh" \
         "$REPOSITORY_ROOT/packages/rsync/build-el9" \
         "$REPOSITORY_ROOT/selinux/apply-nginx-policy" \
         "$REPOSITORY_ROOT/selinux/install" \
@@ -75,6 +80,10 @@ if command -v shellcheck >/dev/null 2>&1; then
         "$REPOSITORY_ROOT/tests/nginx-runtime" \
         "$REPOSITORY_ROOT/tests/mongodb" \
         "$REPOSITORY_ROOT/tests/mongodb-el9" \
+        "$REPOSITORY_ROOT/tests/redis" \
+        "$REPOSITORY_ROOT/tests/redis-el9" \
+        "$REPOSITORY_ROOT/tests/redis-runtime" \
+        "$REPOSITORY_ROOT/tests/redis-package-el9" \
         "$REPOSITORY_ROOT/tests/rsync-packaging" \
         "$REPOSITORY_ROOT/tests/run-all-local" \
         "$REPOSITORY_ROOT/tests/script-conventions" \
@@ -137,6 +146,9 @@ step "Running Tailscale installer and setup tests..."
 
 step "Running MongoDB installer and initialized replica-set model tests..."
 "$REPOSITORY_ROOT/tests/mongodb"
+
+step "Running Redis installer and single-server security model tests..."
+"$REPOSITORY_ROOT/tests/redis"
 
 step "Running strict host and certificate healthcheck tests..."
 "$REPOSITORY_ROOT/tests/health-verifiers"

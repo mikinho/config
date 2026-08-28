@@ -1,0 +1,598 @@
+#!/usr/bin/env sh
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
+set -eu
+set -f
+
+PROGRAM_NAME=${0##*/}
+SCRIPT_DIRECTORY=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+REPOSITORY_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIRECTORY/.." && pwd)
+COMMON_LIBRARY=$SCRIPT_DIRECTORY/lib/common.sh
+LOCAL_TEMPLATE=$SCRIPT_DIRECTORY/templates/redis-local.conf.in
+NETWORK_TEMPLATE=$SCRIPT_DIRECTORY/templates/redis-network.conf.in
+SYSTEMD_TEMPLATE=$SCRIPT_DIRECTORY/templates/redis.service.conf.in
+VERIFIER=$SCRIPT_DIRECTORY/verify
+BUNDLE_METADATA=$REPOSITORY_ROOT/BUNDLE-METADATA
+BUNDLE_CHECKSUMS=$REPOSITORY_ROOT/SHA256SUMS
+
+CONFIGURATION_PATH=/etc/redis/redis.conf
+ACL_PATH=/etc/redis/users.acl
+SYSTEMD_DIRECTORY=/etc/systemd/system/redis.service.d
+SYSTEMD_POLICY_PATH=$SYSTEMD_DIRECTORY/10-config-security.conf
+DATA_DIRECTORY=/var/lib/redis
+LOG_DIRECTORY=/var/log/redis
+RUNTIME_DIRECTORY=/run/redis
+REDIS_SOCKET=$RUNTIME_DIRECTORY/redis.sock
+
+MODE=apply
+PHASE=
+MODEL=
+ADMIN_USER=
+ADMIN_PASSWORD_FILE=
+APPLICATION_USER=
+APPLICATION_PASSWORD_FILE=
+APPLICATION_KEY_PREFIX=
+APPLICATION_CHANNEL_PREFIX=
+MAXMEMORY_MIB=
+BIND_ADDRESS=
+SERVER_HOST=
+TLS_CERTIFICATE_FILE=
+TLS_PRIVATE_KEY_FILE=
+TLS_CA_FILE=
+ALLOWED_CLIENT_FILE=
+ALLOWED_CLIENT_COUNT=0
+NETWORK_CONTROLS_CONFIRMED=no
+TEMPORARY_DIRECTORY=
+ROLLBACK_CONFIGURATION=no
+ROLLBACK_ACL=no
+ROLLBACK_SYSTEMD=no
+SERVICE_WAS_ENABLED=no
+
+usage() {
+    cat <<EOF
+Usage:
+  $PROGRAM_NAME --check
+  $PROGRAM_NAME --plan --phase initialize OPTIONS
+  sudo $PROGRAM_NAME --phase initialize OPTIONS
+  $PROGRAM_NAME --plan --phase add-application-user --model local|network OPTIONS
+  sudo $PROGRAM_NAME --phase add-application-user --model local|network OPTIONS
+  $PROGRAM_NAME --plan --phase expose-network OPTIONS
+  sudo $PROGRAM_NAME --phase expose-network OPTIONS
+
+Initialize options:
+  --model local
+  --admin-user USER --admin-password-file FILE
+  --application-user USER --application-password-file FILE
+  --application-key-prefix PREFIX --application-channel-prefix PREFIX
+  --maxmemory-mib MIB
+
+Add-application-user options:
+  --model local|network
+  --admin-user USER --admin-password-file FILE
+  --application-user USER --application-password-file FILE
+  --application-key-prefix PREFIX --application-channel-prefix PREFIX
+  Network verification also requires --server-host HOST and --tls-ca-file FILE.
+
+Expose-network options:
+  --admin-user USER --admin-password-file FILE
+  --application-user USER --application-password-file FILE
+  --application-key-prefix PREFIX --application-channel-prefix PREFIX
+  --maxmemory-mib MIB --bind-address PRIVATE_IPV4 --server-host DNS_NAME
+  --tls-certificate-file FILE --tls-private-key-file FILE --tls-ca-file FILE
+  --allowed-client-address PRIVATE_IPV4 (repeat for every exact application host)
+  --network-controls-confirmed
+
+Initialization is limited to an empty data directory and a disabled service.
+The restricted-network transition requires private DNS, a server certificate,
+TLS-only Redis, exact client addresses, and independent host/cloud firewall
+evidence. This command does not modify external firewalls or DNS.
+EOF
+}
+
+fail() {
+    printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2
+    exit 1
+}
+
+cleanup() {
+    if [ -n "$TEMPORARY_DIRECTORY" ] && [ -d "$TEMPORARY_DIRECTORY" ]; then
+        rm -rf -- "$TEMPORARY_DIRECTORY"
+    fi
+    if [ -n "$ALLOWED_CLIENT_FILE" ] && [ -f "$ALLOWED_CLIENT_FILE" ]; then
+        rm -f -- "$ALLOWED_CLIENT_FILE"
+    fi
+}
+
+rollback() {
+    [ "$MODE" = apply ] || return 0
+    if [ "$ROLLBACK_CONFIGURATION" = yes ]; then
+        if [ -f "$TEMPORARY_DIRECTORY/original.redis.conf" ]; then
+            install -o root -g redis -m 0640 \
+                "$TEMPORARY_DIRECTORY/original.redis.conf" "$CONFIGURATION_PATH"
+        else
+            rm -f -- "$CONFIGURATION_PATH"
+        fi
+    fi
+    if [ "$ROLLBACK_ACL" = yes ]; then
+        if [ -f "$TEMPORARY_DIRECTORY/original.users.acl" ]; then
+            install -o root -g redis -m 0640 \
+                "$TEMPORARY_DIRECTORY/original.users.acl" "$ACL_PATH"
+        else
+            rm -f -- "$ACL_PATH"
+        fi
+    fi
+    if [ "$ROLLBACK_SYSTEMD" = yes ]; then
+        if [ -f "$TEMPORARY_DIRECTORY/original.systemd.conf" ]; then
+            install -o root -g root -m 0644 \
+                "$TEMPORARY_DIRECTORY/original.systemd.conf" "$SYSTEMD_POLICY_PATH"
+        else
+            rm -f -- "$SYSTEMD_POLICY_PATH"
+        fi
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+    systemctl stop redis.service >/dev/null 2>&1 || true
+    if [ "$PHASE" != initialize ] && [ -f "$CONFIGURATION_PATH" ]; then
+        systemctl start redis.service >/dev/null 2>&1 || true
+    elif [ "$SERVICE_WAS_ENABLED" = no ]; then
+        systemctl disable redis.service >/dev/null 2>&1 || true
+    fi
+}
+
+handle_exit() {
+    exit_status=$1
+    trap - EXIT HUP INT TERM
+    if [ "$exit_status" -ne 0 ]; then
+        rollback
+    fi
+    cleanup
+    exit "$exit_status"
+}
+
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+
+validate_source() {
+    setup_source=$1
+    [ -f "$setup_source" ] && [ ! -L "$setup_source" ] \
+        || fail "repository dependency must be a regular file: $setup_source"
+}
+
+validate_execution_bundle() {
+    for bundle_command in awk find grep sha256sum stat; do
+        command -v "$bundle_command" >/dev/null 2>&1 \
+            || fail "required bundle-validation command not found: $bundle_command"
+    done
+    [ -d "$REPOSITORY_ROOT" ] && [ ! -L "$REPOSITORY_ROOT" ] \
+        || fail "deployment bundle root must be a real directory"
+    bundle_parent=$REPOSITORY_ROOT
+    while :; do
+        bundle_parent_identity=$(stat -Lc '%U:%G:%a' "$bundle_parent" 2>/dev/null) \
+            || fail "cannot inspect deployment bundle parent: $bundle_parent"
+        bundle_parent_owner=${bundle_parent_identity%%:*}
+        bundle_parent_remainder=${bundle_parent_identity#*:}
+        bundle_parent_group=${bundle_parent_remainder%%:*}
+        bundle_parent_mode=${bundle_parent_identity##*:}
+        [ "$bundle_parent_owner:$bundle_parent_group" = root:root ] \
+            || fail "deployment bundle parent must be root:root: $bundle_parent"
+        if [ "$((0$bundle_parent_mode & 0022))" -ne 0 ]; then
+            fail "deployment bundle parent must not be writable by group or other: $bundle_parent"
+        fi
+        [ "$bundle_parent" = / ] || [ "$bundle_parent" = /root ] || {
+            bundle_parent=$(dirname -- "$bundle_parent")
+            continue
+        }
+        break
+    done
+    bundle_unsafe_entry=$(find "$REPOSITORY_ROOT" -xdev \
+        \( -type l -o \( ! -type d ! -type f \) \
+           -o ! -user root -o ! -group root -o -perm /022 \
+           -o \( -type f ! -links 1 \) \) -print -quit)
+    [ -z "$bundle_unsafe_entry" ] \
+        || fail "unsafe deployment bundle entry: $bundle_unsafe_entry"
+    [ "$(stat -Lc '%U:%G:%a:%h' "$BUNDLE_METADATA" 2>/dev/null)" = root:root:644:1 ] \
+        || fail "deployment bundle metadata must be a one-link root:root mode 0644 file"
+    [ "$(stat -Lc '%U:%G:%a:%h' "$BUNDLE_CHECKSUMS" 2>/dev/null)" = root:root:644:1 ] \
+        || fail "deployment bundle checksums must be a one-link root:root mode 0644 file"
+    grep -Eq '^sourceRevision=[0-9a-f]{40}$' "$BUNDLE_METADATA" \
+        || fail "deployment bundle metadata has no exact Git source revision"
+    for bundle_required_path in \
+        BUNDLE-METADATA redis/setup redis/verify redis/lib/common.sh \
+        redis/templates/redis-local.conf.in \
+        redis/templates/redis-network.conf.in \
+        redis/templates/redis.service.conf.in
+    do
+        awk -v expected="$bundle_required_path" \
+            '$1 ~ /^[0-9a-f]{64}$/ && $2 == expected { matches += 1 } \
+             END { exit matches == 1 ? 0 : 1 }' "$BUNDLE_CHECKSUMS" \
+            || fail "deployment bundle checksum manifest must contain exactly: $bundle_required_path"
+    done
+    (cd "$REPOSITORY_ROOT" && sha256sum --strict --check SHA256SUMS >/dev/null) \
+        || fail "deployment bundle checksum verification failed"
+}
+
+for setup_source in \
+    "$COMMON_LIBRARY" "$LOCAL_TEMPLATE" "$NETWORK_TEMPLATE" \
+    "$SYSTEMD_TEMPLATE" "$VERIFIER"
+do
+    validate_source "$setup_source"
+done
+
+# shellcheck disable=SC1090
+. "$COMMON_LIBRARY"
+
+allowed_client_append() {
+    allowed_address=$1
+    redis_validate_private_ipv4 "--allowed-client-address" "$allowed_address"
+    printf '%s\n' "$allowed_address" >> "$ALLOWED_CLIENT_FILE"
+    ALLOWED_CLIENT_COUNT=$((ALLOWED_CLIENT_COUNT + 1))
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --check)
+            [ "$MODE" = apply ] || fail "select exactly one mode"
+            MODE=check
+            shift
+            ;;
+        --plan)
+            [ "$MODE" = apply ] || fail "select exactly one mode"
+            MODE=plan
+            shift
+            ;;
+        --phase) PHASE=${2:?--phase requires a value}; shift 2 ;;
+        --model) MODEL=${2:?--model requires a value}; shift 2 ;;
+        --admin-user) ADMIN_USER=${2:?--admin-user requires a value}; shift 2 ;;
+        --admin-password-file) ADMIN_PASSWORD_FILE=${2:?--admin-password-file requires a value}; shift 2 ;;
+        --application-user) APPLICATION_USER=${2:?--application-user requires a value}; shift 2 ;;
+        --application-password-file) APPLICATION_PASSWORD_FILE=${2:?--application-password-file requires a value}; shift 2 ;;
+        --application-key-prefix) APPLICATION_KEY_PREFIX=${2:?--application-key-prefix requires a value}; shift 2 ;;
+        --application-channel-prefix) APPLICATION_CHANNEL_PREFIX=${2:?--application-channel-prefix requires a value}; shift 2 ;;
+        --maxmemory-mib) MAXMEMORY_MIB=${2:?--maxmemory-mib requires a value}; shift 2 ;;
+        --bind-address) BIND_ADDRESS=${2:?--bind-address requires a value}; shift 2 ;;
+        --server-host) SERVER_HOST=${2:?--server-host requires a value}; shift 2 ;;
+        --tls-certificate-file) TLS_CERTIFICATE_FILE=${2:?--tls-certificate-file requires a value}; shift 2 ;;
+        --tls-private-key-file) TLS_PRIVATE_KEY_FILE=${2:?--tls-private-key-file requires a value}; shift 2 ;;
+        --tls-ca-file) TLS_CA_FILE=${2:?--tls-ca-file requires a value}; shift 2 ;;
+        --allowed-client-address)
+            [ "$#" -ge 2 ] || fail "--allowed-client-address requires a value"
+            if [ -z "$ALLOWED_CLIENT_FILE" ]; then
+                ALLOWED_CLIENT_FILE=$(mktemp "${TMPDIR:-/tmp}/config-redis-clients.XXXXXX")
+            fi
+            allowed_client_append "$2"
+            shift 2
+            ;;
+        --network-controls-confirmed) NETWORK_CONTROLS_CONFIRMED=yes; shift ;;
+        --help | -h) usage; exit 0 ;;
+        *) fail "unknown argument: $1" ;;
+    esac
+done
+
+if [ "$MODE" = check ]; then
+    [ -z "$PHASE$MODEL$ADMIN_USER$ADMIN_PASSWORD_FILE$APPLICATION_USER$APPLICATION_PASSWORD_FILE$APPLICATION_KEY_PREFIX$APPLICATION_CHANNEL_PREFIX$MAXMEMORY_MIB$BIND_ADDRESS$SERVER_HOST$TLS_CERTIFICATE_FILE$TLS_PRIVATE_KEY_FILE$TLS_CA_FILE" ] \
+        || fail "--check does not accept setup options"
+    [ "$ALLOWED_CLIENT_COUNT" -eq 0 ] \
+        || fail "--check does not accept --allowed-client-address"
+    "$VERIFIER" --check >/dev/null
+    printf 'Validated Redis setup sources.\n'
+    exit 0
+fi
+
+redis_validate_safe_name "administrative user" "$ADMIN_USER"
+redis_validate_safe_name "application user" "$APPLICATION_USER"
+[ "$ADMIN_USER" != "$APPLICATION_USER" ] \
+    || fail "administrative and application users must be different"
+redis_validate_prefix "application key prefix" "$APPLICATION_KEY_PREFIX"
+redis_validate_prefix "application channel prefix" "$APPLICATION_CHANNEL_PREFIX"
+redis_validate_absolute_path "administrative password file" "$ADMIN_PASSWORD_FILE"
+redis_validate_absolute_path "application password file" "$APPLICATION_PASSWORD_FILE"
+
+case "$PHASE" in
+    initialize)
+        [ "$MODEL" = local ] || fail "--phase initialize requires --model local"
+        redis_validate_maxmemory_mib "$MAXMEMORY_MIB"
+        [ -z "$BIND_ADDRESS$SERVER_HOST$TLS_CERTIFICATE_FILE$TLS_PRIVATE_KEY_FILE$TLS_CA_FILE" ] \
+            || fail "network options do not apply to --phase initialize"
+        [ "$ALLOWED_CLIENT_COUNT" -eq 0 ] \
+            || fail "--allowed-client-address applies only to --phase expose-network"
+        [ "$NETWORK_CONTROLS_CONFIRMED" = no ] \
+            || fail "--network-controls-confirmed applies only to --phase expose-network"
+        ;;
+    add-application-user)
+        case "$MODEL" in
+            local)
+                [ -z "$SERVER_HOST$TLS_CA_FILE" ] \
+                    || fail "network verification options do not apply to the local model"
+                ;;
+            network)
+                redis_validate_server_host "$SERVER_HOST"
+                redis_validate_absolute_path "TLS CA file" "$TLS_CA_FILE"
+                ;;
+            *) fail "--phase add-application-user requires --model local or --model network" ;;
+        esac
+        [ -z "$MAXMEMORY_MIB$BIND_ADDRESS$TLS_CERTIFICATE_FILE$TLS_PRIVATE_KEY_FILE" ] \
+            || fail "configuration options do not apply to --phase add-application-user"
+        [ "$ALLOWED_CLIENT_COUNT" -eq 0 ] \
+            || fail "--allowed-client-address applies only to --phase expose-network"
+        [ "$NETWORK_CONTROLS_CONFIRMED" = no ] \
+            || fail "--network-controls-confirmed applies only to --phase expose-network"
+        ;;
+    expose-network)
+        [ -z "$MODEL" ] || fail "--model does not apply to --phase expose-network"
+        redis_validate_maxmemory_mib "$MAXMEMORY_MIB"
+        redis_validate_private_ipv4 "--bind-address" "$BIND_ADDRESS"
+        redis_validate_server_host "$SERVER_HOST"
+        redis_validate_absolute_path "TLS certificate file" "$TLS_CERTIFICATE_FILE"
+        redis_validate_absolute_path "TLS private-key file" "$TLS_PRIVATE_KEY_FILE"
+        redis_validate_absolute_path "TLS CA file" "$TLS_CA_FILE"
+        [ "$ALLOWED_CLIENT_COUNT" -gt 0 ] \
+            || fail "--phase expose-network requires at least one --allowed-client-address"
+        [ "$(sort -u "$ALLOWED_CLIENT_FILE" | wc -l | tr -d ' ')" -eq "$ALLOWED_CLIENT_COUNT" ] \
+            || fail "every --allowed-client-address must be unique"
+        [ "$NETWORK_CONTROLS_CONFIRMED" = yes ] \
+            || fail "--phase expose-network requires --network-controls-confirmed"
+        ;;
+    *) fail "select --phase initialize, add-application-user, or expose-network" ;;
+esac
+
+if [ "$MODE" = plan ]; then
+    case "$PHASE" in
+        initialize)
+            printf '1. Require Redis %s, an inactive and disabled service, and an empty %s.\n' \
+                8.2 "$DATA_DIRECTORY"
+            printf '2. Install a loopback-only listener plus a root/redis Unix socket; plaintext never leaves the host.\n'
+            printf '3. Disable the default user and create hashed ACL users %s and %s.\n' \
+                "$ADMIN_USER" "$APPLICATION_USER"
+            printf '4. Restrict %s to keys %s:* and Pub/Sub channels %s:*; deny administrative and whole-database commands.\n' \
+                "$APPLICATION_USER" "$APPLICATION_KEY_PREFIX" "$APPLICATION_CHANNEL_PREFIX"
+            printf '5. Set maxmemory=%s MiB, noeviction, AOF everysec, RDB snapshots, and hardened systemd controls.\n' \
+                "$MAXMEMORY_MIB"
+            printf '6. Enable, start, and verify authentication, authorization boundaries, persistence, and listener scope.\n'
+            ;;
+        add-application-user)
+            printf '1. Require the secured %s model and authenticate administrative user %s.\n' \
+                "$MODEL" "$ADMIN_USER"
+            printf '2. Add %s only if absent, with keys %s:* and channels %s:*.\n' \
+                "$APPLICATION_USER" "$APPLICATION_KEY_PREFIX" "$APPLICATION_CHANNEL_PREFIX"
+            printf '3. Load the ACL atomically and verify allowed operations plus denied cross-prefix and administrative access.\n'
+            ;;
+        expose-network)
+            printf '1. Verify the secured local model and existing application ACL for %s.\n' \
+                "$APPLICATION_USER"
+            printf '2. Validate certificate chain, private key, private DNS identity %s, and bind address %s.\n' \
+                "$SERVER_HOST" "$BIND_ADDRESS"
+            printf '3. Replace plaintext TCP with TLS-only port 6379 on 127.0.0.1,%s.\n' \
+                "$BIND_ADDRESS"
+            printf '4. Restrict the systemd network policy to localhost plus %s exact application address(es).\n' \
+                "$ALLOWED_CLIENT_COUNT"
+            printf '5. Require independent allowed-source and denied-source firewall path evidence before acceptance.\n'
+            ;;
+    esac
+    printf 'Plan complete; no host changes were made and no password file was read.\n'
+    [ -n "$ALLOWED_CLIENT_FILE" ] && rm -f -- "$ALLOWED_CLIENT_FILE"
+    exit 0
+fi
+
+[ "$(id -u)" -eq 0 ] || fail "run as root or use --plan"
+validate_execution_bundle
+for required_command in awk cmp find getenforce getent grep id install mktemp openssl redis-cli redis-server restorecon runuser sha256sum sort stat systemctl; do
+    command -v "$required_command" >/dev/null 2>&1 \
+        || fail "required command not found: $required_command"
+done
+redis-server --version 2>/dev/null | grep -Eq 'v=8\.2\.9([[:space:]]|$)' \
+    || fail "exact Redis 8.2.9 is required"
+[ "$(getenforce)" = Enforcing ] || fail "SELinux must be Enforcing"
+id redis >/dev/null 2>&1 || fail "redis service account is missing"
+systemctl cat redis.service >/dev/null 2>&1 || fail "redis.service is not installed"
+redis_validate_password_file "administrative password file" "$ADMIN_PASSWORD_FILE"
+redis_validate_password_file "application password file" "$APPLICATION_PASSWORD_FILE"
+
+TEMPORARY_DIRECTORY=$(mktemp -d "${TMPDIR:-/tmp}/config-redis-setup.XXXXXX")
+umask 077
+trap 'handle_exit $?' EXIT
+trap 'exit 1' HUP INT TERM
+if systemctl is-enabled --quiet redis.service 2>/dev/null; then
+    SERVICE_WAS_ENABLED=yes
+fi
+
+admin_password=$(redis_read_password "$ADMIN_PASSWORD_FILE")
+application_password=$(redis_read_password "$APPLICATION_PASSWORD_FILE")
+admin_hash=$(redis_password_hash "$admin_password")
+application_hash=$(redis_password_hash "$application_password")
+[ "$admin_hash" != "$application_hash" ] \
+    || fail "administrative and application passwords must be different"
+
+install -d -o root -g redis -m 0750 /etc/redis
+install -d -o redis -g redis -m 0750 "$DATA_DIRECTORY" "$LOG_DIRECTORY" "$RUNTIME_DIRECTORY"
+install -d -o root -g root -m 0755 "$SYSTEMD_DIRECTORY"
+
+if [ -f "$CONFIGURATION_PATH" ] && [ ! -L "$CONFIGURATION_PATH" ]; then
+    cp -p -- "$CONFIGURATION_PATH" "$TEMPORARY_DIRECTORY/original.redis.conf"
+fi
+if [ -f "$ACL_PATH" ] && [ ! -L "$ACL_PATH" ]; then
+    cp -p -- "$ACL_PATH" "$TEMPORARY_DIRECTORY/original.users.acl"
+fi
+if [ -f "$SYSTEMD_POLICY_PATH" ] && [ ! -L "$SYSTEMD_POLICY_PATH" ]; then
+    cp -p -- "$SYSTEMD_POLICY_PATH" "$TEMPORARY_DIRECTORY/original.systemd.conf"
+fi
+
+redis_cli_admin() {
+    REDISCLI_AUTH=$admin_password redis-cli --no-auth-warning \
+        --user "$ADMIN_USER" -s "$REDIS_SOCKET" "$@"
+}
+
+wait_for_authenticated_ping() {
+    wait_attempt=0
+    while [ "$wait_attempt" -lt 60 ]; do
+        if redis_cli_admin PING 2>/dev/null | grep -Fx PONG >/dev/null; then
+            return 0
+        fi
+        sleep 1
+        wait_attempt=$((wait_attempt + 1))
+    done
+    return 1
+}
+
+case "$PHASE" in
+    initialize)
+        systemctl is-active --quiet redis.service 2>/dev/null \
+            && fail "initialization requires redis.service to be inactive"
+        systemctl is-enabled --quiet redis.service 2>/dev/null \
+            && fail "initialization requires redis.service to be disabled"
+        [ -z "$(find "$DATA_DIRECTORY" -mindepth 1 -maxdepth 1 -print -quit)" ] \
+            || fail "initialization requires an empty data directory: $DATA_DIRECTORY"
+
+        printf 'user default off\n' > "$TEMPORARY_DIRECTORY/users.acl"
+        redis_admin_acl_line "$ADMIN_USER" "$admin_hash" >> "$TEMPORARY_DIRECTORY/users.acl"
+        redis_application_acl_line "$APPLICATION_USER" "$application_hash" \
+            "$APPLICATION_KEY_PREFIX" "$APPLICATION_CHANNEL_PREFIX" \
+            >> "$TEMPORARY_DIRECTORY/users.acl"
+        redis_render_configuration local "$LOCAL_TEMPLATE" \
+            "$TEMPORARY_DIRECTORY/redis.conf" "$MAXMEMORY_MIB"
+        : > "$TEMPORARY_DIRECTORY/allowed-clients"
+        redis_render_systemd_policy "$SYSTEMD_TEMPLATE" \
+            "$TEMPORARY_DIRECTORY/allowed-clients" "$TEMPORARY_DIRECTORY/systemd.conf"
+
+        install -o root -g redis -m 0640 "$TEMPORARY_DIRECTORY/users.acl" "$ACL_PATH"
+        ROLLBACK_ACL=yes
+        install -o root -g redis -m 0640 "$TEMPORARY_DIRECTORY/redis.conf" "$CONFIGURATION_PATH"
+        ROLLBACK_CONFIGURATION=yes
+        install -o root -g root -m 0644 "$TEMPORARY_DIRECTORY/systemd.conf" "$SYSTEMD_POLICY_PATH"
+        ROLLBACK_SYSTEMD=yes
+        restorecon -RF /etc/redis "$DATA_DIRECTORY" "$LOG_DIRECTORY" "$RUNTIME_DIRECTORY" >/dev/null
+        systemctl daemon-reload
+        systemctl enable redis.service >/dev/null
+        systemctl start redis.service
+        wait_for_authenticated_ping \
+            || fail "Redis did not accept the configured administrative credentials"
+        ;;
+    add-application-user)
+        systemctl is-active --quiet redis.service 2>/dev/null \
+            || fail "redis.service must be active before adding an application user"
+        [ -f "$ACL_PATH" ] && [ ! -L "$ACL_PATH" ] \
+            || fail "managed ACL file is missing: $ACL_PATH"
+        redis_cli_admin PING 2>/dev/null | grep -Fx PONG >/dev/null \
+            || fail "administrative Redis authentication failed"
+        existing_application_users=$(awk -v user="$APPLICATION_USER" \
+            '$1 == "user" && $2 == user { count += 1 } \
+             END { print count + 0 }' "$ACL_PATH")
+        [ "$existing_application_users" -eq 0 ] \
+            || fail "application user already exists: $APPLICATION_USER"
+        cp -p -- "$ACL_PATH" "$TEMPORARY_DIRECTORY/new.users.acl"
+        redis_application_acl_line "$APPLICATION_USER" "$application_hash" \
+            "$APPLICATION_KEY_PREFIX" "$APPLICATION_CHANNEL_PREFIX" \
+            >> "$TEMPORARY_DIRECTORY/new.users.acl"
+        install -o root -g redis -m 0640 "$TEMPORARY_DIRECTORY/new.users.acl" "$ACL_PATH"
+        ROLLBACK_ACL=yes
+        restorecon -F "$ACL_PATH" >/dev/null
+        redis_cli_admin ACL LOAD >/dev/null \
+            || fail "Redis rejected the updated ACL file"
+        ;;
+    expose-network)
+        systemctl is-active --quiet redis.service 2>/dev/null \
+            || fail "redis.service must be active before network exposure"
+        redis_cli_admin PING 2>/dev/null | grep -Fx PONG >/dev/null \
+            || fail "the secured local model and administrative credentials are required"
+        for tls_path in "$TLS_CERTIFICATE_FILE" "$TLS_PRIVATE_KEY_FILE" "$TLS_CA_FILE"; do
+            [ -f "$tls_path" ] && [ ! -L "$tls_path" ] \
+                || fail "TLS input must be a regular, non-symbolic-link file: $tls_path"
+            redis_validate_root_owned_parent_chain "$tls_path"
+        done
+        [ "$(stat -Lc '%U:%G:%a:%h' "$TLS_PRIVATE_KEY_FILE" 2>/dev/null)" = root:redis:640:1 ] \
+            || fail "TLS private key must be a one-link root:redis mode 0640 file"
+        certificate_identity=$(stat -Lc '%U:%G:%a:%h' "$TLS_CERTIFICATE_FILE" 2>/dev/null)
+        case "$certificate_identity" in
+            root:root:644:1 | root:redis:640:1) ;;
+            *) fail "TLS certificate must be root:root 0644 or root:redis 0640 with one link" ;;
+        esac
+        ca_identity=$(stat -Lc '%U:%G:%a:%h' "$TLS_CA_FILE" 2>/dev/null)
+        case "$ca_identity" in
+            root:root:644:1 | root:redis:640:1) ;;
+            *) fail "TLS CA file must be root:root 0644 or root:redis 0640 with one link" ;;
+        esac
+        runuser -u redis -- test -r "$TLS_CERTIFICATE_FILE" \
+            || fail "Redis service account cannot read TLS certificate file"
+        runuser -u redis -- test -r "$TLS_PRIVATE_KEY_FILE" \
+            || fail "Redis service account cannot read TLS private-key file"
+        runuser -u redis -- test -r "$TLS_CA_FILE" \
+            || fail "Redis service account cannot read TLS CA file"
+        openssl verify -CAfile "$TLS_CA_FILE" "$TLS_CERTIFICATE_FILE" >/dev/null \
+            || fail "TLS certificate chain verification failed"
+        openssl x509 -checkhost "$SERVER_HOST" -noout -in "$TLS_CERTIFICATE_FILE" >/dev/null \
+            || fail "TLS certificate does not identify --server-host"
+        openssl x509 -checkend 2592000 -noout -in "$TLS_CERTIFICATE_FILE" >/dev/null \
+            || fail "TLS certificate expires within 30 days"
+        certificate_key=$(openssl x509 -in "$TLS_CERTIFICATE_FILE" -pubkey -noout \
+            | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum | awk '{ print $1 }')
+        private_key=$(openssl pkey -in "$TLS_PRIVATE_KEY_FILE" -pubout -outform DER 2>/dev/null \
+            | sha256sum | awk '{ print $1 }')
+        [ "$certificate_key" = "$private_key" ] \
+            || fail "TLS certificate and private key do not match"
+        resolved_server_addresses=$(getent ahostsv4 "$SERVER_HOST" \
+            | awk '{ print $1 }' | sort -u)
+        [ "$resolved_server_addresses" = "$BIND_ADDRESS" ] \
+            || fail "--server-host must resolve only to --bind-address"
+
+        redis_render_configuration network "$NETWORK_TEMPLATE" \
+            "$TEMPORARY_DIRECTORY/redis.conf" "$MAXMEMORY_MIB" "$BIND_ADDRESS" \
+            "$TLS_CERTIFICATE_FILE" "$TLS_PRIVATE_KEY_FILE" "$TLS_CA_FILE"
+        sort -u "$ALLOWED_CLIENT_FILE" > "$TEMPORARY_DIRECTORY/allowed-clients"
+        redis_render_systemd_policy "$SYSTEMD_TEMPLATE" \
+            "$TEMPORARY_DIRECTORY/allowed-clients" "$TEMPORARY_DIRECTORY/systemd.conf"
+        install -o root -g redis -m 0640 "$TEMPORARY_DIRECTORY/redis.conf" "$CONFIGURATION_PATH"
+        ROLLBACK_CONFIGURATION=yes
+        install -o root -g root -m 0644 "$TEMPORARY_DIRECTORY/systemd.conf" "$SYSTEMD_POLICY_PATH"
+        ROLLBACK_SYSTEMD=yes
+        restorecon -F "$CONFIGURATION_PATH" "$SYSTEMD_POLICY_PATH" >/dev/null
+        systemctl daemon-reload
+        systemctl restart redis.service
+        wait_attempt=0
+        while [ "$wait_attempt" -lt 60 ]; do
+            if REDISCLI_AUTH=$admin_password redis-cli --no-auth-warning --tls \
+                --cacert "$TLS_CA_FILE" --sni "$SERVER_HOST" --host "$SERVER_HOST" \
+                --port 6379 --user "$ADMIN_USER" PING 2>/dev/null \
+                | grep -Fx PONG >/dev/null
+            then
+                break
+            fi
+            wait_attempt=$((wait_attempt + 1))
+            sleep 1
+        done
+        [ "$wait_attempt" -lt 60 ] \
+            || fail "Redis TLS endpoint did not accept the configured credentials"
+        ;;
+esac
+
+verification_model=$MODEL
+if [ "$PHASE" = expose-network ]; then
+    verification_model=network
+fi
+set -- "$VERIFIER" --model "$verification_model" \
+    --admin-user "$ADMIN_USER" --admin-password-file "$ADMIN_PASSWORD_FILE" \
+    --application-user "$APPLICATION_USER" \
+    --application-password-file "$APPLICATION_PASSWORD_FILE" \
+    --application-key-prefix "$APPLICATION_KEY_PREFIX" \
+    --application-channel-prefix "$APPLICATION_CHANNEL_PREFIX"
+if [ "$PHASE" = initialize ]; then
+    set -- "$@" --maxmemory-mib "$MAXMEMORY_MIB"
+elif [ "$PHASE" = expose-network ]; then
+    set -- "$@" --maxmemory-mib "$MAXMEMORY_MIB" \
+        --bind-address "$BIND_ADDRESS" --server-host "$SERVER_HOST" \
+        --tls-certificate-file "$TLS_CERTIFICATE_FILE" \
+        --tls-private-key-file "$TLS_PRIVATE_KEY_FILE" --tls-ca-file "$TLS_CA_FILE" \
+        --allowed-client-file "$TEMPORARY_DIRECTORY/allowed-clients"
+elif [ "$MODEL" = network ]; then
+    set -- "$@" --server-host "$SERVER_HOST" --tls-ca-file "$TLS_CA_FILE"
+fi
+"$@"
+
+ROLLBACK_CONFIGURATION=no
+ROLLBACK_ACL=no
+ROLLBACK_SYSTEMD=no
+trap - HUP INT TERM
+printf 'Applied and verified Redis phase %s.\n' "$PHASE"
+if [ "$PHASE" = expose-network ]; then
+    printf 'Acceptance remains pending until allowed-source and denied-source firewall path tests are recorded.\n'
+fi

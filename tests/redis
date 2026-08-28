@@ -1,0 +1,244 @@
+#!/usr/bin/env sh
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
+set -eu
+set -f
+
+PROGRAM_NAME=${0##*/}
+SCRIPT_DIRECTORY=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+REPOSITORY_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIRECTORY/.." && pwd)
+REDIS_DIRECTORY=$REPOSITORY_ROOT/redis
+INSTALLER=$REDIS_DIRECTORY/install
+BUNDLE_BUILDER=$REDIS_DIRECTORY/build-bundle
+SETUP=$REDIS_DIRECTORY/setup
+VERIFIER=$REDIS_DIRECTORY/verify
+EL9_TEST=$SCRIPT_DIRECTORY/redis-el9
+RUNTIME_TEST=$SCRIPT_DIRECTORY/redis-runtime
+PACKAGE_TEST=$SCRIPT_DIRECTORY/redis-package-el9
+PDF_BUILDER=$REDIS_DIRECTORY/build-security-standard-pdf.py
+TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/config-redis-tests.XXXXXX")
+
+cleanup() {
+    if [ -d "$TEST_ROOT" ]; then
+        rm -rf -- "$TEST_ROOT"
+    fi
+}
+
+fail() {
+    printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2
+    exit 1
+}
+
+assert_contains() {
+    checked_file=$1
+    expected_text=$2
+    grep -F -- "$expected_text" "$checked_file" >/dev/null \
+        || fail "$checked_file is missing: $expected_text"
+}
+
+expect_failure() {
+    expected_message=$1
+    shift
+    if "$@" > "$TEST_ROOT/command.stdout" 2> "$TEST_ROOT/command.stderr"; then
+        fail "command unexpectedly succeeded: $*"
+    fi
+    assert_contains "$TEST_ROOT/command.stderr" "$expected_message"
+}
+
+write_os_release() {
+    release_path=$1
+    release_id=$2
+    release_name=$3
+    release_version=$4
+    printf 'ID=%s\nPRETTY_NAME="%s"\nVERSION_ID="%s"\n' \
+        "$release_id" "$release_name" "$release_version" > "$release_path"
+}
+
+trap cleanup EXIT HUP INT TERM
+
+for entry_point in \
+    "$BUNDLE_BUILDER" "$INSTALLER" "$SETUP" "$VERIFIER" \
+    "$EL9_TEST" "$RUNTIME_TEST" "$PACKAGE_TEST"
+do
+    [ -x "$entry_point" ] || fail "entry point is not executable: $entry_point"
+    "$entry_point" --help >/dev/null
+    "$entry_point" --check >/dev/null
+done
+[ -x "$PDF_BUILDER" ] || fail "PDF builder is not executable: $PDF_BUILDER"
+PYTHONPYCACHEPREFIX=$TEST_ROOT/pycache python3 -m py_compile "$PDF_BUILDER"
+"$PDF_BUILDER" --check >/dev/null
+
+write_os_release "$TEST_ROOT/rocky-9" rocky 'Rocky Linux 9.6' 9.6
+write_os_release "$TEST_ROOT/centos-stream-9" centos 'CentOS Stream 9' 9
+write_os_release "$TEST_ROOT/rocky-10" rocky 'Rocky Linux 10.1' 10.1
+
+"$INSTALLER" --plan --os-release "$TEST_ROOT/rocky-9" \
+    --architecture x86_64 > "$TEST_ROOT/rocky-9.plan"
+assert_contains "$TEST_ROOT/rocky-9.plan" 'Redis package series: 8.2 extended release'
+assert_contains "$TEST_ROOT/rocky-9.plan" 'Reviewed Redis package release: 8.2.9'
+assert_contains "$TEST_ROOT/rocky-9.plan" \
+    '54318FA4052D1E61A6B6F7BB5F4349D6BF53AA0C'
+assert_contains "$TEST_ROOT/rocky-9.plan" \
+    'https://packages.redis.io/rpm/rockylinux9/'
+assert_contains "$TEST_ROOT/rocky-9.plan" 'redis-8.2.9-1.x86_64'
+assert_contains "$TEST_ROOT/rocky-9.plan" \
+    'redis.service would remain stopped and disabled'
+
+expect_failure 'supported here only on Rocky Linux 9' \
+    "$INSTALLER" --plan --os-release "$TEST_ROOT/centos-stream-9" --architecture x86_64
+expect_failure 'supported here only on Rocky Linux 9' \
+    "$INSTALLER" --plan --os-release "$TEST_ROOT/rocky-10" --architecture x86_64
+expect_failure 'supported here only on x86_64' \
+    "$INSTALLER" --plan --os-release "$TEST_ROOT/rocky-9" --architecture aarch64
+expect_failure '--architecture is accepted only with --plan' \
+    "$INSTALLER" --architecture x86_64
+
+mkdir -p "$TEST_ROOT/bundle-source/deploy"
+cp -R "$REPOSITORY_ROOT/deploy/lib" "$TEST_ROOT/bundle-source/deploy/lib"
+cp -R "$REDIS_DIRECTORY" "$TEST_ROOT/bundle-source/redis"
+git -C "$TEST_ROOT/bundle-source" init -q
+git -C "$TEST_ROOT/bundle-source" add deploy redis
+git -C "$TEST_ROOT/bundle-source" \
+    -c commit.gpgsign=false -c user.name='Config Tests' -c user.email='config-tests@example.invalid' \
+    commit -qm 'test: create clean bundle source'
+"$TEST_ROOT/bundle-source/redis/build-bundle" \
+    --output "$TEST_ROOT/built-bundle" > "$TEST_ROOT/build-bundle.stdout"
+assert_contains "$TEST_ROOT/built-bundle/BUNDLE-METADATA" 'schemaVersion=1'
+assert_contains "$TEST_ROOT/built-bundle/BUNDLE-METADATA" 'redisVersion=8.2.9'
+(cd "$TEST_ROOT/built-bundle" && sha256sum --strict --check SHA256SUMS >/dev/null) \
+    || fail 'built Redis deployment bundle failed checksum verification'
+printf '\nDirty source sentinel.\n' >> "$TEST_ROOT/bundle-source/redis/README.md"
+expect_failure 'refusing to build from a dirty worktree' \
+    "$TEST_ROOT/bundle-source/redis/build-bundle" \
+    --output "$TEST_ROOT/dirty-bundle"
+
+"$SETUP" --plan --phase initialize --model local \
+    --admin-user redis_admin \
+    --admin-password-file /root/redis-admin.password \
+    --application-user example_app \
+    --application-password-file /root/example-app.password \
+    --application-key-prefix example_app \
+    --application-channel-prefix example_app \
+    --maxmemory-mib 1024 > "$TEST_ROOT/initialize.plan"
+assert_contains "$TEST_ROOT/initialize.plan" \
+    'Install a loopback-only listener plus a root/redis Unix socket'
+assert_contains "$TEST_ROOT/initialize.plan" \
+    'Restrict example_app to keys example_app:* and Pub/Sub channels example_app:*'
+assert_contains "$TEST_ROOT/initialize.plan" \
+    'no password file was read'
+
+"$SETUP" --plan --phase add-application-user --model local \
+    --admin-user redis_admin \
+    --admin-password-file /root/redis-admin.password \
+    --application-user second_app \
+    --application-password-file /root/second-app.password \
+    --application-key-prefix second_app \
+    --application-channel-prefix second_app > "$TEST_ROOT/add-local.plan"
+assert_contains "$TEST_ROOT/add-local.plan" \
+    'Add second_app only if absent, with keys second_app:* and channels second_app:*'
+
+"$SETUP" --plan --phase add-application-user --model network \
+    --admin-user redis_admin \
+    --admin-password-file /root/redis-admin.password \
+    --application-user second_app \
+    --application-password-file /root/second-app.password \
+    --application-key-prefix second_app \
+    --application-channel-prefix second_app \
+    --server-host redis.internal.example \
+    --tls-ca-file /etc/pki/redis/ca-chain.crt > "$TEST_ROOT/add-network.plan"
+assert_contains "$TEST_ROOT/add-network.plan" \
+    'Require the secured network model'
+
+"$SETUP" --plan --phase expose-network \
+    --admin-user redis_admin \
+    --admin-password-file /root/redis-admin.password \
+    --application-user example_app \
+    --application-password-file /root/example-app.password \
+    --application-key-prefix example_app \
+    --application-channel-prefix example_app \
+    --maxmemory-mib 1024 \
+    --bind-address 10.20.30.40 \
+    --server-host redis.internal.example \
+    --tls-certificate-file /etc/pki/redis/server.crt \
+    --tls-private-key-file /etc/pki/redis/server.key \
+    --tls-ca-file /etc/pki/redis/ca-chain.crt \
+    --allowed-client-address 10.20.30.21 \
+    --allowed-client-address 10.20.30.22 \
+    --network-controls-confirmed > "$TEST_ROOT/expose-network.plan"
+assert_contains "$TEST_ROOT/expose-network.plan" \
+    'Replace plaintext TCP with TLS-only port 6379 on 127.0.0.1,10.20.30.40'
+assert_contains "$TEST_ROOT/expose-network.plan" \
+    'Restrict the systemd network policy to localhost plus 2 exact application address(es)'
+assert_contains "$TEST_ROOT/expose-network.plan" \
+    'allowed-source and denied-source firewall path evidence'
+
+expect_failure 'requires --network-controls-confirmed' \
+    "$SETUP" --plan --phase expose-network \
+    --admin-user redis_admin \
+    --admin-password-file /root/redis-admin.password \
+    --application-user example_app \
+    --application-password-file /root/example-app.password \
+    --application-key-prefix example_app \
+    --application-channel-prefix example_app \
+    --maxmemory-mib 1024 \
+    --bind-address 10.20.30.40 \
+    --server-host redis.internal.example \
+    --tls-certificate-file /etc/pki/redis/server.crt \
+    --tls-private-key-file /etc/pki/redis/server.key \
+    --tls-ca-file /etc/pki/redis/ca-chain.crt \
+    --allowed-client-address 10.20.30.21
+expect_failure 'RFC 1918 private address' \
+    "$SETUP" --plan --phase expose-network \
+    --admin-user redis_admin \
+    --admin-password-file /root/redis-admin.password \
+    --application-user example_app \
+    --application-password-file /root/example-app.password \
+    --application-key-prefix example_app \
+    --application-channel-prefix example_app \
+    --maxmemory-mib 1024 \
+    --bind-address 203.0.113.40 \
+    --server-host redis.internal.example \
+    --tls-certificate-file /etc/pki/redis/server.crt \
+    --tls-private-key-file /etc/pki/redis/server.key \
+    --tls-ca-file /etc/pki/redis/ca-chain.crt \
+    --allowed-client-address 10.20.30.21 \
+    --network-controls-confirmed
+expect_failure 'must be unique' \
+    "$SETUP" --plan --phase expose-network \
+    --admin-user redis_admin \
+    --admin-password-file /root/redis-admin.password \
+    --application-user example_app \
+    --application-password-file /root/example-app.password \
+    --application-key-prefix example_app \
+    --application-channel-prefix example_app \
+    --maxmemory-mib 1024 \
+    --bind-address 10.20.30.40 \
+    --server-host redis.internal.example \
+    --tls-certificate-file /etc/pki/redis/server.crt \
+    --tls-private-key-file /etc/pki/redis/server.key \
+    --tls-ca-file /etc/pki/redis/ca-chain.crt \
+    --allowed-client-address 10.20.30.21 \
+    --allowed-client-address 10.20.30.21 \
+    --network-controls-confirmed
+
+assert_contains "$REDIS_DIRECTORY/templates/redis-local.conf.in" 'bind 127.0.0.1'
+assert_contains "$REDIS_DIRECTORY/templates/redis-local.conf.in" 'protected-mode yes'
+assert_contains "$REDIS_DIRECTORY/templates/redis-local.conf.in" 'databases 1'
+assert_contains "$REDIS_DIRECTORY/templates/redis-local.conf.in" 'appendfsync everysec'
+assert_contains "$REDIS_DIRECTORY/templates/redis-local.conf.in" 'maxmemory-policy noeviction'
+assert_contains "$REDIS_DIRECTORY/templates/redis-network.conf.in" 'port 0'
+assert_contains "$REDIS_DIRECTORY/templates/redis-network.conf.in" 'tls-port 6379'
+assert_contains "$REDIS_DIRECTORY/templates/redis-network.conf.in" 'tls-protocols "TLSv1.2 TLSv1.3"'
+assert_contains "$REDIS_DIRECTORY/templates/redis.service.conf.in" 'IPAddressDeny=any'
+assert_contains "$REDIS_DIRECTORY/lib/common.sh" '-keys -scan -randomkey -dbsize'
+assert_contains "$REDIS_DIRECTORY/lib/common.sh" '-vadd -vcard -vdim -vemb'
+assert_contains "$REDIS_DIRECTORY/lib/common.sh" '+eval +eval_ro +evalsha +evalsha_ro'
+
+if grep -Eri 'private_organization|private_application_a|private_application_b|private_redis_host|private_web_host|tailscale' "$REDIS_DIRECTORY"; then
+    fail 'public Redis standard contains a client-specific identifier'
+fi
+
+printf 'Validated Redis installer, bundle, plans, templates, and client-neutral boundaries.\n'

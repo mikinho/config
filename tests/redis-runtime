@@ -1,0 +1,173 @@
+#!/usr/bin/env sh
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
+# Portable runtime smoke test for the Redis template and ACL contract. CI runs
+# this against the exact reviewed Rocky Linux RPM; local suites use --check.
+
+set -eu
+set -f
+
+PROGRAM_NAME=${0##*/}
+SCRIPT_DIRECTORY=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+REPOSITORY_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIRECTORY/.." && pwd)
+COMMON_LIBRARY=$REPOSITORY_ROOT/redis/lib/common.sh
+LOCAL_TEMPLATE=$REPOSITORY_ROOT/redis/templates/redis-local.conf.in
+MODE=run
+TEST_ROOT=
+REDIS_SOCKET=
+ADMIN_PASSWORD='runtime-admin-0123456789-abcdef-0123456789'
+APPLICATION_PASSWORD='runtime-application-0123456789-abcdef-0123456789'
+
+usage() {
+    cat <<EOF
+Usage:
+  $PROGRAM_NAME --check
+  $PROGRAM_NAME
+
+Runs one isolated Unix-socket-only Redis process, exercises the managed ACL,
+and removes all transient data. Redis 8.x and redis-cli are required.
+EOF
+}
+
+fail() {
+    printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2
+    if [ -n "$TEST_ROOT" ] && [ -f "$TEST_ROOT/redis.log" ]; then
+        sed -n '1,160p' "$TEST_ROOT/redis.log" >&2
+    fi
+    exit 1
+}
+
+cleanup() {
+    if [ -n "$REDIS_SOCKET" ] && [ -S "$REDIS_SOCKET" ]; then
+        REDISCLI_AUTH=$ADMIN_PASSWORD redis-cli --no-auth-warning \
+            -s "$REDIS_SOCKET" --user runtime_admin \
+            SHUTDOWN NOSAVE >/dev/null 2>&1 || true
+    fi
+    if [ -n "$TEST_ROOT" ] && [ -d "$TEST_ROOT" ]; then
+        rm -rf -- "$TEST_ROOT"
+    fi
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --check) MODE=check; shift ;;
+        --help | -h) usage; exit 0 ;;
+        *) fail "unknown argument: $1" ;;
+    esac
+done
+
+[ -f "$COMMON_LIBRARY" ] && [ ! -L "$COMMON_LIBRARY" ] \
+    || fail "Redis common library must be a regular file"
+[ -f "$LOCAL_TEMPLATE" ] && [ ! -L "$LOCAL_TEMPLATE" ] \
+    || fail "Redis local template must be a regular file"
+
+# shellcheck disable=SC1090
+. "$COMMON_LIBRARY"
+
+if [ "$MODE" = check ]; then
+    printf 'Validated Redis runtime smoke-test sources.\n'
+    exit 0
+fi
+
+for required_command in awk grep mktemp redis-cli redis-server rm sed sha256sum sleep sort tail; do
+    command -v "$required_command" >/dev/null 2>&1 \
+        || fail "required runtime-test command not found: $required_command"
+done
+redis-server --version 2>/dev/null | grep -Eq 'v=8\.[0-9]+\.' \
+    || fail "Redis 8.x is required"
+
+TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/config-redis-runtime.XXXXXX")
+REDIS_SOCKET=$TEST_ROOT/redis.sock
+trap cleanup EXIT HUP INT TERM
+umask 077
+
+redis_render_configuration local "$LOCAL_TEMPLATE" "$TEST_ROOT/redis.conf" 64
+sed \
+    -e "s|dir /var/lib/redis|dir $TEST_ROOT|" \
+    -e "s|aclfile /etc/redis/users.acl|aclfile $TEST_ROOT/users.acl|" \
+    -e "s|unixsocket /run/redis/redis.sock|unixsocket $REDIS_SOCKET|" \
+    -e 's|port 6379|port 0|' \
+    "$TEST_ROOT/redis.conf" > "$TEST_ROOT/redis.runtime.conf"
+
+admin_hash=$(redis_password_hash "$ADMIN_PASSWORD")
+application_hash=$(redis_password_hash "$APPLICATION_PASSWORD")
+printf 'user default off\n' > "$TEST_ROOT/users.acl"
+redis_admin_acl_line runtime_admin "$admin_hash" >> "$TEST_ROOT/users.acl"
+redis_application_acl_line runtime_app "$application_hash" runtime_app runtime_app \
+    >> "$TEST_ROOT/users.acl"
+
+redis-server "$TEST_ROOT/redis.runtime.conf" \
+    --daemonize yes \
+    --supervised no \
+    --pidfile "$TEST_ROOT/redis.pid" \
+    --logfile "$TEST_ROOT/redis.log"
+
+runtime_attempt=0
+while [ "$runtime_attempt" -lt 50 ] && [ ! -S "$REDIS_SOCKET" ]; do
+    sleep 0.1
+    runtime_attempt=$((runtime_attempt + 1))
+done
+[ -S "$REDIS_SOCKET" ] || fail "Redis runtime socket was not created"
+
+redis_cli_admin() {
+    REDISCLI_AUTH=$ADMIN_PASSWORD redis-cli --no-auth-warning \
+        -s "$REDIS_SOCKET" --user runtime_admin "$@"
+}
+
+redis_cli_application() {
+    REDISCLI_AUTH=$APPLICATION_PASSWORD redis-cli --no-auth-warning \
+        -s "$REDIS_SOCKET" --user runtime_app "$@"
+}
+
+redis_cli_admin PING | grep -Fx PONG >/dev/null \
+    || fail "administrative authentication failed"
+redis_cli_application SET runtime_app:key verified | grep -Fx OK >/dev/null \
+    || fail "application write failed"
+[ "$(redis_cli_application EVAL 'return redis.call("GET", KEYS[1])' \
+    1 runtime_app:key)" = verified ] \
+    || fail "application Lua read failed"
+redis_cli_application PUBLISH runtime_app:channel verified \
+    | grep -Eq '^[0-9]+$' \
+    || fail "application publish failed"
+
+redis-cli -s "$REDIS_SOCKET" PING 2>&1 | grep -F NOAUTH >/dev/null \
+    || fail "default user is not disabled"
+redis_cli_application SET outside:key denied 2>&1 | grep -F NOPERM >/dev/null \
+    || fail "cross-prefix write was not denied"
+redis_cli_application KEYS '*' 2>&1 | grep -F NOPERM >/dev/null \
+    || fail "whole-database key enumeration was not denied"
+redis_cli_application CONFIG GET '*' 2>&1 | grep -F NOPERM >/dev/null \
+    || fail "application CONFIG was not denied"
+redis_cli_application SELECT 0 2>&1 | grep -F NOPERM >/dev/null \
+    || fail "logical-database selection was not denied"
+redis_cli_application VADD runtime_app:vectors VALUES 2 1 2 element 2>&1 \
+    | grep -F NOPERM >/dev/null \
+    || fail "vector-set command was not denied"
+module_command_result=$(redis_cli_admin MODULE LOAD /config-standard-not-present.so 2>&1 || true)
+printf '%s\n' "$module_command_result" \
+    | grep -Eiq 'module command.*not allowed|unknown command.*module' \
+    || fail "runtime MODULE command is not disabled: $module_command_result"
+debug_command_result=$(redis_cli_admin DEBUG HELP 2>&1 || true)
+printf '%s\n' "$debug_command_result" \
+    | grep -Eiq 'debug command.*not allowed|unknown command.*debug' \
+    || fail "runtime DEBUG command is not disabled: $debug_command_result"
+
+module_names=$(redis_cli_admin INFO MODULES \
+    | awk -F'[=,]' '/^module:name=/ { print $2 }' | sort -u)
+case "$module_names" in
+    '' | vectorset) ;;
+    *) fail "unapproved loadable module is active: $module_names" ;;
+esac
+[ "$(redis_cli_admin CONFIG GET databases | tail -n 1)" = 1 ] \
+    || fail "runtime does not expose exactly one logical database"
+[ "$(redis_cli_admin CONFIG GET maxmemory-policy | tail -n 1)" = noeviction ] \
+    || fail "runtime maxmemory policy is not noeviction"
+[ "$(redis_cli_admin CONFIG GET appendonly | tail -n 1)" = yes ] \
+    || fail "runtime AOF is not enabled"
+redis_cli_application DEL runtime_app:key >/dev/null \
+    || fail "application cleanup failed"
+
+printf 'Validated Redis 8.x template parsing, authentication, ACL boundaries, and persistence policy.\n'
