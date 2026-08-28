@@ -11,8 +11,10 @@ PROGRAM_NAME=${0##*/}
 SCRIPT_DIRECTORY=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 REPOSITORY_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIRECTORY/.." && pwd)
 COMMON_LIBRARY=$SCRIPT_DIRECTORY/lib/common.sh
-LOCAL_TEMPLATE=$SCRIPT_DIRECTORY/templates/redis-local.conf.in
-NETWORK_TEMPLATE=$SCRIPT_DIRECTORY/templates/redis-network.conf.in
+LOCAL_CACHE_TEMPLATE=$SCRIPT_DIRECTORY/templates/redis-local-cache.conf.in
+LOCAL_DURABLE_TEMPLATE=$SCRIPT_DIRECTORY/templates/redis-local-durable.conf.in
+NETWORK_CACHE_TEMPLATE=$SCRIPT_DIRECTORY/templates/redis-network-cache.conf.in
+NETWORK_DURABLE_TEMPLATE=$SCRIPT_DIRECTORY/templates/redis-network-durable.conf.in
 SYSTEMD_TEMPLATE=$SCRIPT_DIRECTORY/templates/redis.service.conf.in
 VERIFIER=$SCRIPT_DIRECTORY/verify
 BUNDLE_METADATA=$REPOSITORY_ROOT/BUNDLE-METADATA
@@ -30,6 +32,7 @@ REDIS_SOCKET=$RUNTIME_DIRECTORY/redis.sock
 MODE=apply
 PHASE=
 MODEL=
+DATA_PROFILE=
 ADMIN_USER=
 ADMIN_PASSWORD_FILE=
 APPLICATION_USER=
@@ -63,20 +66,21 @@ Usage:
   sudo $PROGRAM_NAME --phase expose-network OPTIONS
 
 Initialize options:
-  --model local
+  --model local --data-profile cache|durable
   --admin-user USER --admin-password-file FILE
   --application-user USER --application-password-file FILE
   --application-key-prefix PREFIX --application-channel-prefix PREFIX
   --maxmemory-mib MIB
 
 Add-application-user options:
-  --model local|network
+  --model local|network --data-profile cache|durable
   --admin-user USER --admin-password-file FILE
   --application-user USER --application-password-file FILE
   --application-key-prefix PREFIX --application-channel-prefix PREFIX
   Network verification also requires --server-host HOST and --tls-ca-file FILE.
 
 Expose-network options:
+  --data-profile cache|durable
   --admin-user USER --admin-password-file FILE
   --application-user USER --application-password-file FILE
   --application-key-prefix PREFIX --application-channel-prefix PREFIX
@@ -200,8 +204,10 @@ validate_execution_bundle() {
         || fail "deployment bundle metadata has no exact Git source revision"
     for bundle_required_path in \
         BUNDLE-METADATA redis/setup redis/verify redis/lib/common.sh \
-        redis/templates/redis-local.conf.in \
-        redis/templates/redis-network.conf.in \
+        redis/templates/redis-local-cache.conf.in \
+        redis/templates/redis-local-durable.conf.in \
+        redis/templates/redis-network-cache.conf.in \
+        redis/templates/redis-network-durable.conf.in \
         redis/templates/redis.service.conf.in
     do
         awk -v expected="$bundle_required_path" \
@@ -214,7 +220,8 @@ validate_execution_bundle() {
 }
 
 for setup_source in \
-    "$COMMON_LIBRARY" "$LOCAL_TEMPLATE" "$NETWORK_TEMPLATE" \
+    "$COMMON_LIBRARY" "$LOCAL_CACHE_TEMPLATE" "$LOCAL_DURABLE_TEMPLATE" \
+    "$NETWORK_CACHE_TEMPLATE" "$NETWORK_DURABLE_TEMPLATE" \
     "$SYSTEMD_TEMPLATE" "$VERIFIER"
 do
     validate_source "$setup_source"
@@ -244,6 +251,7 @@ while [ "$#" -gt 0 ]; do
             ;;
         --phase) PHASE=${2:?--phase requires a value}; shift 2 ;;
         --model) MODEL=${2:?--model requires a value}; shift 2 ;;
+        --data-profile) DATA_PROFILE=${2:?--data-profile requires a value}; shift 2 ;;
         --admin-user) ADMIN_USER=${2:?--admin-user requires a value}; shift 2 ;;
         --admin-password-file) ADMIN_PASSWORD_FILE=${2:?--admin-password-file requires a value}; shift 2 ;;
         --application-user) APPLICATION_USER=${2:?--application-user requires a value}; shift 2 ;;
@@ -271,7 +279,7 @@ while [ "$#" -gt 0 ]; do
 done
 
 if [ "$MODE" = check ]; then
-    [ -z "$PHASE$MODEL$ADMIN_USER$ADMIN_PASSWORD_FILE$APPLICATION_USER$APPLICATION_PASSWORD_FILE$APPLICATION_KEY_PREFIX$APPLICATION_CHANNEL_PREFIX$MAXMEMORY_MIB$BIND_ADDRESS$SERVER_HOST$TLS_CERTIFICATE_FILE$TLS_PRIVATE_KEY_FILE$TLS_CA_FILE" ] \
+    [ -z "$PHASE$MODEL$DATA_PROFILE$ADMIN_USER$ADMIN_PASSWORD_FILE$APPLICATION_USER$APPLICATION_PASSWORD_FILE$APPLICATION_KEY_PREFIX$APPLICATION_CHANNEL_PREFIX$MAXMEMORY_MIB$BIND_ADDRESS$SERVER_HOST$TLS_CERTIFICATE_FILE$TLS_PRIVATE_KEY_FILE$TLS_CA_FILE" ] \
         || fail "--check does not accept setup options"
     [ "$ALLOWED_CLIENT_COUNT" -eq 0 ] \
         || fail "--check does not accept --allowed-client-address"
@@ -288,6 +296,7 @@ redis_validate_prefix "application key prefix" "$APPLICATION_KEY_PREFIX"
 redis_validate_prefix "application channel prefix" "$APPLICATION_CHANNEL_PREFIX"
 redis_validate_absolute_path "administrative password file" "$ADMIN_PASSWORD_FILE"
 redis_validate_absolute_path "application password file" "$APPLICATION_PASSWORD_FILE"
+redis_validate_data_profile "$DATA_PROFILE"
 
 case "$PHASE" in
     initialize)
@@ -347,20 +356,26 @@ if [ "$MODE" = plan ]; then
                 "$ADMIN_USER" "$APPLICATION_USER"
             printf '4. Restrict %s to keys %s:* and Pub/Sub channels %s:*; deny administrative and whole-database commands.\n' \
                 "$APPLICATION_USER" "$APPLICATION_KEY_PREFIX" "$APPLICATION_CHANNEL_PREFIX"
-            printf '5. Set maxmemory=%s MiB, noeviction, AOF everysec, RDB snapshots, and hardened systemd controls.\n' \
-                "$MAXMEMORY_MIB"
-            printf '6. Enable, start, and verify authentication, authorization boundaries, persistence, and listener scope.\n'
+            if [ "$DATA_PROFILE" = cache ]; then
+                printf '5. Set maxmemory=%s MiB, allkeys-lru, no AOF or RDB schedule, and hardened systemd controls.\n' \
+                    "$MAXMEMORY_MIB"
+            else
+                printf '5. Set maxmemory=%s MiB, noeviction, AOF everysec, RDB snapshots, and hardened systemd controls.\n' \
+                    "$MAXMEMORY_MIB"
+            fi
+            printf '6. Enable, start, and verify authentication, authorization boundaries, the %s data profile, and listener scope.\n' \
+                "$DATA_PROFILE"
             ;;
         add-application-user)
-            printf '1. Require the secured %s model and authenticate administrative user %s.\n' \
-                "$MODEL" "$ADMIN_USER"
+            printf '1. Require the secured %s/%s configuration and authenticate administrative user %s.\n' \
+                "$MODEL" "$DATA_PROFILE" "$ADMIN_USER"
             printf '2. Add %s only if absent, with keys %s:* and channels %s:*.\n' \
                 "$APPLICATION_USER" "$APPLICATION_KEY_PREFIX" "$APPLICATION_CHANNEL_PREFIX"
             printf '3. Load the ACL atomically and verify allowed operations plus denied cross-prefix and administrative access.\n'
             ;;
         expose-network)
-            printf '1. Verify the secured local model and existing application ACL for %s.\n' \
-                "$APPLICATION_USER"
+            printf '1. Verify the secured local/%s configuration and existing application ACL for %s.\n' \
+                "$DATA_PROFILE" "$APPLICATION_USER"
             printf '2. Validate certificate chain, private key, private DNS identity %s, and bind address %s.\n' \
                 "$SERVER_HOST" "$BIND_ADDRESS"
             printf '3. Replace plaintext TCP with TLS-only port 6379 on 127.0.0.1,%s.\n' \
@@ -449,7 +464,12 @@ case "$PHASE" in
         redis_application_acl_line "$APPLICATION_USER" "$application_hash" \
             "$APPLICATION_KEY_PREFIX" "$APPLICATION_CHANNEL_PREFIX" \
             >> "$TEMPORARY_DIRECTORY/users.acl"
-        redis_render_configuration local "$LOCAL_TEMPLATE" \
+        if [ "$DATA_PROFILE" = cache ]; then
+            configuration_template=$LOCAL_CACHE_TEMPLATE
+        else
+            configuration_template=$LOCAL_DURABLE_TEMPLATE
+        fi
+        redis_render_configuration local "$DATA_PROFILE" "$configuration_template" \
             "$TEMPORARY_DIRECTORY/redis.conf" "$MAXMEMORY_MIB"
         : > "$TEMPORARY_DIRECTORY/allowed-clients"
         redis_render_systemd_policy "$SYSTEMD_TEMPLATE" \
@@ -495,6 +515,14 @@ case "$PHASE" in
             || fail "redis.service must be active before network exposure"
         redis_cli_admin PING 2>/dev/null | grep -Fx PONG >/dev/null \
             || fail "the secured local model and administrative credentials are required"
+        "$VERIFIER" --model local --data-profile "$DATA_PROFILE" \
+            --admin-user "$ADMIN_USER" --admin-password-file "$ADMIN_PASSWORD_FILE" \
+            --application-user "$APPLICATION_USER" \
+            --application-password-file "$APPLICATION_PASSWORD_FILE" \
+            --application-key-prefix "$APPLICATION_KEY_PREFIX" \
+            --application-channel-prefix "$APPLICATION_CHANNEL_PREFIX" \
+            --maxmemory-mib "$MAXMEMORY_MIB" >/dev/null \
+            || fail "the selected local data profile must verify before network exposure"
         for tls_path in "$TLS_CERTIFICATE_FILE" "$TLS_PRIVATE_KEY_FILE" "$TLS_CA_FILE"; do
             [ -f "$tls_path" ] && [ ! -L "$tls_path" ] \
                 || fail "TLS input must be a regular, non-symbolic-link file: $tls_path"
@@ -535,7 +563,12 @@ case "$PHASE" in
         [ "$resolved_server_addresses" = "$BIND_ADDRESS" ] \
             || fail "--server-host must resolve only to --bind-address"
 
-        redis_render_configuration network "$NETWORK_TEMPLATE" \
+        if [ "$DATA_PROFILE" = cache ]; then
+            configuration_template=$NETWORK_CACHE_TEMPLATE
+        else
+            configuration_template=$NETWORK_DURABLE_TEMPLATE
+        fi
+        redis_render_configuration network "$DATA_PROFILE" "$configuration_template" \
             "$TEMPORARY_DIRECTORY/redis.conf" "$MAXMEMORY_MIB" "$BIND_ADDRESS" \
             "$TLS_CERTIFICATE_FILE" "$TLS_PRIVATE_KEY_FILE" "$TLS_CA_FILE"
         sort -u "$ALLOWED_CLIENT_FILE" > "$TEMPORARY_DIRECTORY/allowed-clients"
@@ -569,7 +602,7 @@ verification_model=$MODEL
 if [ "$PHASE" = expose-network ]; then
     verification_model=network
 fi
-set -- "$VERIFIER" --model "$verification_model" \
+set -- "$VERIFIER" --model "$verification_model" --data-profile "$DATA_PROFILE" \
     --admin-user "$ADMIN_USER" --admin-password-file "$ADMIN_PASSWORD_FILE" \
     --application-user "$APPLICATION_USER" \
     --application-password-file "$APPLICATION_PASSWORD_FILE" \

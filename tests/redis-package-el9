@@ -4,7 +4,7 @@
 # Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
 #
 
-# Opt-in package integrity and runtime test for a disposable Rocky Linux 9
+# Opt-in package integrity and runtime test for a disposable EL9
 # environment. It installs the exact reviewed RPM and must not run on a host
 # whose package state must be preserved.
 
@@ -31,7 +31,7 @@ Usage:
   sudo $PROGRAM_NAME
 
 The run mode is destructive to package state and is intended only for a fresh,
-disposable Rocky Linux 9 x86-64 CI container. It verifies the official key,
+disposable Rocky Linux 9 or CentOS Stream 9 x86-64 CI container. It verifies the official key,
 exact RPM digest and signature, current 8.2-series repository release, installed
 NEVRA, and the Redis runtime ACL contract.
 EOF
@@ -76,7 +76,7 @@ fi
 
 if [ "$MODE" = check ]; then
     "$RUNTIME_TEST" --check >/dev/null
-    printf 'Validated opt-in Rocky Linux 9 Redis package-test inputs.\n'
+    printf 'Validated opt-in supported EL9 Redis package-test inputs.\n'
     exit 0
 fi
 
@@ -84,8 +84,10 @@ fi
 [ -f /etc/os-release ] || fail "cannot identify the operating system"
 # shellcheck disable=SC1091
 . /etc/os-release
-[ "$ID" = rocky ] && [ "${VERSION_ID%%.*}" = 9 ] \
-    || fail "run mode requires Rocky Linux 9"
+case "$ID:${VERSION_ID%%.*}" in
+    rocky:9 | centos:9) ;;
+    *) fail "run mode requires Rocky Linux 9 or CentOS Stream 9" ;;
+esac
 [ "$(uname -m)" = x86_64 ] || fail "run mode requires x86_64"
 for required_command in dnf mktemp rm; do
     command -v "$required_command" >/dev/null 2>&1 \
@@ -145,5 +147,9 @@ installed_nevra=$(rpm -q --qf '%{VERSION}-%{RELEASE}.%{ARCH}\n' redis)
     || fail "installed Redis NEVRA differs from the reviewed package"
 redis-server --version 2>/dev/null | grep -Eq 'v=8\.2\.9([[:space:]]|$)' \
     || fail "installed Redis binary is not 8.2.9"
-"$RUNTIME_TEST"
-printf 'Validated the current official Redis 8.2.9 RPM and runtime ACL on Rocky Linux 9.\n'
+for runtime_model in local network; do
+    for runtime_data_profile in cache durable; do
+        "$RUNTIME_TEST" --model "$runtime_model" --data-profile "$runtime_data_profile"
+    done
+done
+printf 'Validated the current official Redis 8.2.9 RPM and all four configurations on supported EL9.\n'

@@ -153,9 +153,17 @@ jobs:
           fi
 
   redis-package:
-    name: Redis 8.2.9 package and ACL on Rocky Linux 9
+    name: Redis 8.2.9 package and profiles on ${{ matrix.platform.name }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - name: Rocky Linux 9
+            image: rockylinux:9
+          - name: CentOS Stream 9
+            image: quay.io/centos/centos:stream9
 
     steps:
       - name: Check out repository
@@ -163,9 +171,11 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Verify exact RPM and exercise the restricted ACL
+      - name: Verify exact RPM and exercise all four configurations
+        env:
+          REDIS_TEST_IMAGE: ${{ matrix.platform.image }}
         run: |
-          redis_image=rockylinux:9
+          redis_image=$REDIS_TEST_IMAGE
           docker pull "$redis_image"
           redis_image_reference=$(
             docker image inspect \

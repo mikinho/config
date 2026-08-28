@@ -46,8 +46,10 @@ redis/install
 redis/lib/common.sh
 redis/packages-8.2.9.manifest
 redis/setup
-redis/templates/redis-local.conf.in
-redis/templates/redis-network.conf.in
+redis/templates/redis-local-cache.conf.in
+redis/templates/redis-local-durable.conf.in
+redis/templates/redis-network-cache.conf.in
+redis/templates/redis-network-durable.conf.in
 redis/templates/redis.service.conf.in
 redis/verify
 EOF

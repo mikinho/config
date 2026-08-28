@@ -1,18 +1,28 @@
-# redis/templates/redis-local.conf.in
+# redis/templates/redis-network-cache.conf.in
 
 #
 # Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
 #
 
-bind 127.0.0.1
+bind 127.0.0.1 @BIND_ADDRESS@
 protected-mode yes
-port 6379
-tls-port 0
+port 0
+tls-port 6379
 tcp-backlog 511
 timeout 0
 tcp-keepalive 300
 unixsocket /run/redis/redis.sock
 unixsocketperm 0770
+
+tls-cert-file @TLS_CERTIFICATE_FILE@
+tls-key-file @TLS_PRIVATE_KEY_FILE@
+tls-ca-cert-file @TLS_CA_FILE@
+tls-auth-clients no
+tls-protocols "TLSv1.2 TLSv1.3"
+tls-prefer-server-ciphers yes
+tls-session-caching yes
+tls-session-cache-size 20480
+tls-session-cache-timeout 300
 
 daemonize no
 supervised systemd
@@ -20,6 +30,7 @@ pidfile /run/redis/redis-server.pid
 loglevel notice
 logfile ""
 always-show-logo no
+disable-thp yes
 
 databases 1
 aclfile /etc/redis/users.acl
@@ -31,28 +42,17 @@ enable-module-command no
 
 maxclients 10000
 maxmemory @MAXMEMORY_MIB@mb
-maxmemory-policy noeviction
+maxmemory-policy allkeys-lru
 maxmemory-samples 5
 
-stop-writes-on-bgsave-error yes
+stop-writes-on-bgsave-error no
 rdbcompression yes
 rdbchecksum yes
 dbfilename dump.rdb
 dir /var/lib/redis
-save 3600 1
-save 300 100
-save 60 10000
+save ""
 
-appendonly yes
-appendfilename "appendonly.aof"
-appenddirname "appendonlydir"
-appendfsync everysec
-no-appendfsync-on-rewrite no
-auto-aof-rewrite-percentage 100
-auto-aof-rewrite-min-size 64mb
-aof-load-truncated yes
-aof-use-rdb-preamble yes
-aof-timestamp-enabled no
+appendonly no
 
 slowlog-log-slower-than -1
 slowlog-max-len 128

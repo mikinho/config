@@ -7,7 +7,7 @@
 # Shared validation and deterministic rendering for the Redis component.
 # Callers define fail() before sourcing this file.
 
-REDIS_APPLICATION_COMMAND_RULES='-@all +@read +@write +@transaction -@admin -@dangerous -keys -scan -randomkey -dbsize -vadd -vcard -vdim -vemb -vgetattr -vinfo -vlinks -vrandmember -vrem -vsetattr -vsim +eval +eval_ro +evalsha +evalsha_ro +publish +subscribe +unsubscribe +psubscribe +punsubscribe +ssubscribe +sunsubscribe +spublish +ping +echo +hello +quit +client|id +client|getname +client|setname +client|setinfo'
+REDIS_APPLICATION_COMMAND_RULES='-@all +@read +@write +@transaction -@admin -@dangerous -keys -scan -randomkey -dbsize -vadd -vcard -vdim -vemb -vgetattr -vinfo -vlinks -vrandmember -vrem -vsetattr -vsim +eval +eval_ro +evalsha +evalsha_ro +publish +subscribe +unsubscribe +psubscribe +punsubscribe +ssubscribe +sunsubscribe +spublish +ping +echo +hello +quit +client|id +client|getname +client|setname +client|setinfo +client|info'
 
 redis_validate_safe_name() {
     redis_name_label=$1
@@ -101,6 +101,13 @@ redis_validate_maxmemory_mib() {
         || fail "--maxmemory-mib must be between 64 and 1048576"
 }
 
+redis_validate_data_profile() {
+    case "$1" in
+        cache | durable) ;;
+        *) fail "--data-profile must be cache or durable" ;;
+    esac
+}
+
 redis_validate_private_ipv4() {
     redis_ipv4_label=$1
     redis_ipv4_value=$2
@@ -167,13 +174,14 @@ redis_application_acl_line() {
 
 redis_render_configuration() {
     redis_render_model=$1
-    redis_render_template=$2
-    redis_render_destination=$3
-    redis_render_maxmemory=$4
-    redis_render_bind=${5:-}
-    redis_render_cert=${6:-}
-    redis_render_key=${7:-}
-    redis_render_ca=${8:-}
+    redis_render_data_profile=$2
+    redis_render_template=$3
+    redis_render_destination=$4
+    redis_render_maxmemory=$5
+    redis_render_bind=${6:-}
+    redis_render_cert=${7:-}
+    redis_render_key=${8:-}
+    redis_render_ca=${9:-}
 
     awk \
         -v maxmemory="$redis_render_maxmemory" \
@@ -205,6 +213,26 @@ redis_render_configuration() {
                 || fail "rendered network Redis configuration did not disable plaintext TCP"
             ;;
         *) fail "internal error: unsupported Redis model: $redis_render_model" ;;
+    esac
+
+    case "$redis_render_data_profile" in
+        cache)
+            grep -Fxc 'maxmemory-policy allkeys-lru' "$redis_render_destination" >/dev/null \
+                || fail "rendered cache configuration must use allkeys-lru"
+            grep -Fxc 'save ""' "$redis_render_destination" >/dev/null \
+                || fail "rendered cache configuration must disable RDB schedules"
+            grep -Fxc 'appendonly no' "$redis_render_destination" >/dev/null \
+                || fail "rendered cache configuration must disable AOF"
+            ;;
+        durable)
+            grep -Fxc 'maxmemory-policy noeviction' "$redis_render_destination" >/dev/null \
+                || fail "rendered durable configuration must use noeviction"
+            grep -Fxc 'appendonly yes' "$redis_render_destination" >/dev/null \
+                || fail "rendered durable configuration must enable AOF"
+            grep -Fxc 'appendfsync everysec' "$redis_render_destination" >/dev/null \
+                || fail "rendered durable configuration must use AOF everysec"
+            ;;
+        *) fail "internal error: unsupported Redis data profile: $redis_render_data_profile" ;;
     esac
 }
 

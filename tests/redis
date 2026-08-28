@@ -87,9 +87,14 @@ assert_contains "$TEST_ROOT/rocky-9.plan" 'redis-8.2.9-1.x86_64'
 assert_contains "$TEST_ROOT/rocky-9.plan" \
     'redis.service would remain stopped and disabled'
 
-expect_failure 'supported here only on Rocky Linux 9' \
-    "$INSTALLER" --plan --os-release "$TEST_ROOT/centos-stream-9" --architecture x86_64
-expect_failure 'supported here only on Rocky Linux 9' \
+"$INSTALLER" --plan --os-release "$TEST_ROOT/centos-stream-9" \
+    --architecture x86_64 > "$TEST_ROOT/centos-stream-9.plan"
+assert_contains "$TEST_ROOT/centos-stream-9.plan" \
+    'reviewed CentOS Stream 9 EL9 compatibility platform'
+assert_contains "$TEST_ROOT/centos-stream-9.plan" \
+    'https://packages.redis.io/rpm/rockylinux9/'
+
+expect_failure 'supported here only on Rocky Linux 9 or CentOS Stream 9' \
     "$INSTALLER" --plan --os-release "$TEST_ROOT/rocky-10" --architecture x86_64
 expect_failure 'supported here only on x86_64' \
     "$INSTALLER" --plan --os-release "$TEST_ROOT/rocky-9" --architecture aarch64
@@ -115,7 +120,7 @@ expect_failure 'refusing to build from a dirty worktree' \
     "$TEST_ROOT/bundle-source/redis/build-bundle" \
     --output "$TEST_ROOT/dirty-bundle"
 
-"$SETUP" --plan --phase initialize --model local \
+"$SETUP" --plan --phase initialize --model local --data-profile durable \
     --admin-user redis_admin \
     --admin-password-file /root/redis-admin.password \
     --application-user example_app \
@@ -130,7 +135,18 @@ assert_contains "$TEST_ROOT/initialize.plan" \
 assert_contains "$TEST_ROOT/initialize.plan" \
     'no password file was read'
 
-"$SETUP" --plan --phase add-application-user --model local \
+"$SETUP" --plan --phase initialize --model local --data-profile cache \
+    --admin-user redis_admin \
+    --admin-password-file /root/redis-admin.password \
+    --application-user example_app \
+    --application-password-file /root/example-app.password \
+    --application-key-prefix example_app \
+    --application-channel-prefix example_app \
+    --maxmemory-mib 1024 > "$TEST_ROOT/initialize-cache.plan"
+assert_contains "$TEST_ROOT/initialize-cache.plan" \
+    'allkeys-lru, no AOF or RDB schedule'
+
+"$SETUP" --plan --phase add-application-user --model local --data-profile durable \
     --admin-user redis_admin \
     --admin-password-file /root/redis-admin.password \
     --application-user second_app \
@@ -140,7 +156,7 @@ assert_contains "$TEST_ROOT/initialize.plan" \
 assert_contains "$TEST_ROOT/add-local.plan" \
     'Add second_app only if absent, with keys second_app:* and channels second_app:*'
 
-"$SETUP" --plan --phase add-application-user --model network \
+"$SETUP" --plan --phase add-application-user --model network --data-profile durable \
     --admin-user redis_admin \
     --admin-password-file /root/redis-admin.password \
     --application-user second_app \
@@ -150,9 +166,10 @@ assert_contains "$TEST_ROOT/add-local.plan" \
     --server-host redis.internal.example \
     --tls-ca-file /etc/pki/redis/ca-chain.crt > "$TEST_ROOT/add-network.plan"
 assert_contains "$TEST_ROOT/add-network.plan" \
-    'Require the secured network model'
+    'Require the secured network/durable configuration'
 
 "$SETUP" --plan --phase expose-network \
+    --data-profile durable \
     --admin-user redis_admin \
     --admin-password-file /root/redis-admin.password \
     --application-user example_app \
@@ -177,6 +194,7 @@ assert_contains "$TEST_ROOT/expose-network.plan" \
 
 expect_failure 'requires --network-controls-confirmed' \
     "$SETUP" --plan --phase expose-network \
+    --data-profile durable \
     --admin-user redis_admin \
     --admin-password-file /root/redis-admin.password \
     --application-user example_app \
@@ -192,6 +210,7 @@ expect_failure 'requires --network-controls-confirmed' \
     --allowed-client-address 10.20.30.21
 expect_failure 'RFC 1918 private address' \
     "$SETUP" --plan --phase expose-network \
+    --data-profile durable \
     --admin-user redis_admin \
     --admin-password-file /root/redis-admin.password \
     --application-user example_app \
@@ -208,6 +227,7 @@ expect_failure 'RFC 1918 private address' \
     --network-controls-confirmed
 expect_failure 'must be unique' \
     "$SETUP" --plan --phase expose-network \
+    --data-profile durable \
     --admin-user redis_admin \
     --admin-password-file /root/redis-admin.password \
     --application-user example_app \
@@ -224,18 +244,34 @@ expect_failure 'must be unique' \
     --allowed-client-address 10.20.30.21 \
     --network-controls-confirmed
 
-assert_contains "$REDIS_DIRECTORY/templates/redis-local.conf.in" 'bind 127.0.0.1'
-assert_contains "$REDIS_DIRECTORY/templates/redis-local.conf.in" 'protected-mode yes'
-assert_contains "$REDIS_DIRECTORY/templates/redis-local.conf.in" 'databases 1'
-assert_contains "$REDIS_DIRECTORY/templates/redis-local.conf.in" 'appendfsync everysec'
-assert_contains "$REDIS_DIRECTORY/templates/redis-local.conf.in" 'maxmemory-policy noeviction'
-assert_contains "$REDIS_DIRECTORY/templates/redis-network.conf.in" 'port 0'
-assert_contains "$REDIS_DIRECTORY/templates/redis-network.conf.in" 'tls-port 6379'
-assert_contains "$REDIS_DIRECTORY/templates/redis-network.conf.in" 'tls-protocols "TLSv1.2 TLSv1.3"'
+for local_template in \
+    "$REDIS_DIRECTORY/templates/redis-local-cache.conf.in" \
+    "$REDIS_DIRECTORY/templates/redis-local-durable.conf.in"
+do
+    assert_contains "$local_template" 'bind 127.0.0.1'
+    assert_contains "$local_template" 'protected-mode yes'
+    assert_contains "$local_template" 'databases 1'
+    assert_contains "$local_template" 'disable-thp yes'
+done
+assert_contains "$REDIS_DIRECTORY/templates/redis-local-cache.conf.in" 'save ""'
+assert_contains "$REDIS_DIRECTORY/templates/redis-local-cache.conf.in" 'appendonly no'
+assert_contains "$REDIS_DIRECTORY/templates/redis-local-cache.conf.in" 'maxmemory-policy allkeys-lru'
+assert_contains "$REDIS_DIRECTORY/templates/redis-local-durable.conf.in" 'appendfsync everysec'
+assert_contains "$REDIS_DIRECTORY/templates/redis-local-durable.conf.in" 'maxmemory-policy noeviction'
+for network_template in \
+    "$REDIS_DIRECTORY/templates/redis-network-cache.conf.in" \
+    "$REDIS_DIRECTORY/templates/redis-network-durable.conf.in"
+do
+    assert_contains "$network_template" 'port 0'
+    assert_contains "$network_template" 'tls-port 6379'
+    assert_contains "$network_template" 'tls-protocols "TLSv1.2 TLSv1.3"'
+    assert_contains "$network_template" 'disable-thp yes'
+done
 assert_contains "$REDIS_DIRECTORY/templates/redis.service.conf.in" 'IPAddressDeny=any'
 assert_contains "$REDIS_DIRECTORY/lib/common.sh" '-keys -scan -randomkey -dbsize'
 assert_contains "$REDIS_DIRECTORY/lib/common.sh" '-vadd -vcard -vdim -vemb'
 assert_contains "$REDIS_DIRECTORY/lib/common.sh" '+eval +eval_ro +evalsha +evalsha_ro'
+assert_contains "$REDIS_DIRECTORY/lib/common.sh" '+client|info'
 
 if grep -Eri 'private_organization|private_application_a|private_application_b|private_redis_host|private_web_host|tailscale' "$REDIS_DIRECTORY"; then
     fail 'public Redis standard contains a client-specific identifier'

@@ -14,8 +14,13 @@ PROGRAM_NAME=${0##*/}
 SCRIPT_DIRECTORY=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 REPOSITORY_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIRECTORY/.." && pwd)
 COMMON_LIBRARY=$REPOSITORY_ROOT/redis/lib/common.sh
-LOCAL_TEMPLATE=$REPOSITORY_ROOT/redis/templates/redis-local.conf.in
+LOCAL_CACHE_TEMPLATE=$REPOSITORY_ROOT/redis/templates/redis-local-cache.conf.in
+LOCAL_DURABLE_TEMPLATE=$REPOSITORY_ROOT/redis/templates/redis-local-durable.conf.in
+NETWORK_CACHE_TEMPLATE=$REPOSITORY_ROOT/redis/templates/redis-network-cache.conf.in
+NETWORK_DURABLE_TEMPLATE=$REPOSITORY_ROOT/redis/templates/redis-network-durable.conf.in
 MODE=run
+MODEL=local
+DATA_PROFILE=durable
 TEST_ROOT=
 REDIS_SOCKET=
 ADMIN_PASSWORD='runtime-admin-0123456789-abcdef-0123456789'
@@ -25,10 +30,12 @@ usage() {
     cat <<EOF
 Usage:
   $PROGRAM_NAME --check
-  $PROGRAM_NAME
+  $PROGRAM_NAME [--model local|network] [--data-profile cache|durable]
 
 Runs one isolated Unix-socket-only Redis process, exercises the managed ACL,
-and removes all transient data. Redis 8.x and redis-cli are required.
+and removes all transient data. The network model parses its TLS configuration
+with a transient certificate but disables the test TCP port. Redis 8.x,
+redis-cli, and OpenSSL are required.
 EOF
 }
 
@@ -54,6 +61,16 @@ cleanup() {
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --check) MODE=check; shift ;;
+        --model)
+            [ "$#" -ge 2 ] || fail "--model requires a value"
+            MODEL=$2
+            shift 2
+            ;;
+        --data-profile)
+            [ "$#" -ge 2 ] || fail "--data-profile requires a value"
+            DATA_PROFILE=$2
+            shift 2
+            ;;
         --help | -h) usage; exit 0 ;;
         *) fail "unknown argument: $1" ;;
     esac
@@ -61,18 +78,28 @@ done
 
 [ -f "$COMMON_LIBRARY" ] && [ ! -L "$COMMON_LIBRARY" ] \
     || fail "Redis common library must be a regular file"
-[ -f "$LOCAL_TEMPLATE" ] && [ ! -L "$LOCAL_TEMPLATE" ] \
-    || fail "Redis local template must be a regular file"
+for configuration_template in \
+    "$LOCAL_CACHE_TEMPLATE" "$LOCAL_DURABLE_TEMPLATE" \
+    "$NETWORK_CACHE_TEMPLATE" "$NETWORK_DURABLE_TEMPLATE"
+do
+    [ -f "$configuration_template" ] && [ ! -L "$configuration_template" ] \
+        || fail "Redis configuration template must be a regular file"
+done
 
 # shellcheck disable=SC1090
 . "$COMMON_LIBRARY"
+case "$MODEL" in
+    local | network) ;;
+    *) fail "--model must be local or network" ;;
+esac
+redis_validate_data_profile "$DATA_PROFILE"
 
 if [ "$MODE" = check ]; then
     printf 'Validated Redis runtime smoke-test sources.\n'
     exit 0
 fi
 
-for required_command in awk grep mktemp redis-cli redis-server rm sed sha256sum sleep sort tail; do
+for required_command in awk grep mktemp openssl redis-cli redis-server rm sed sha256sum sleep sort tail; do
     command -v "$required_command" >/dev/null 2>&1 \
         || fail "required runtime-test command not found: $required_command"
 done
@@ -84,7 +111,27 @@ REDIS_SOCKET=$TEST_ROOT/redis.sock
 trap cleanup EXIT HUP INT TERM
 umask 077
 
-redis_render_configuration local "$LOCAL_TEMPLATE" "$TEST_ROOT/redis.conf" 64
+if [ "$MODEL:$DATA_PROFILE" = local:cache ]; then
+    configuration_template=$LOCAL_CACHE_TEMPLATE
+elif [ "$MODEL:$DATA_PROFILE" = local:durable ]; then
+    configuration_template=$LOCAL_DURABLE_TEMPLATE
+elif [ "$DATA_PROFILE" = cache ]; then
+    configuration_template=$NETWORK_CACHE_TEMPLATE
+else
+    configuration_template=$NETWORK_DURABLE_TEMPLATE
+fi
+if [ "$MODEL" = local ]; then
+    redis_render_configuration local "$DATA_PROFILE" "$configuration_template" \
+        "$TEST_ROOT/redis.conf" 64
+else
+    openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+        -subj /CN=redis-runtime.invalid \
+        -keyout "$TEST_ROOT/server.key" -out "$TEST_ROOT/server.crt" \
+        >/dev/null 2>&1
+    redis_render_configuration network "$DATA_PROFILE" "$configuration_template" \
+        "$TEST_ROOT/redis.conf" 64 127.0.0.2 \
+        "$TEST_ROOT/server.crt" "$TEST_ROOT/server.key" "$TEST_ROOT/server.crt"
+fi
 sed \
     -e "s|dir /var/lib/redis|dir $TEST_ROOT|" \
     -e "s|aclfile /etc/redis/users.acl|aclfile $TEST_ROOT/users.acl|" \
@@ -132,6 +179,8 @@ redis_cli_application SET runtime_app:key verified | grep -Fx OK >/dev/null \
 redis_cli_application PUBLISH runtime_app:channel verified \
     | grep -Eq '^[0-9]+$' \
     || fail "application publish failed"
+redis_cli_application CLIENT INFO | grep -F 'id=' >/dev/null \
+    || fail "application CLIENT INFO failed"
 
 redis-cli -s "$REDIS_SOCKET" PING 2>&1 | grep -F NOAUTH >/dev/null \
     || fail "default user is not disabled"
@@ -163,11 +212,21 @@ case "$module_names" in
 esac
 [ "$(redis_cli_admin CONFIG GET databases | tail -n 1)" = 1 ] \
     || fail "runtime does not expose exactly one logical database"
-[ "$(redis_cli_admin CONFIG GET maxmemory-policy | tail -n 1)" = noeviction ] \
-    || fail "runtime maxmemory policy is not noeviction"
-[ "$(redis_cli_admin CONFIG GET appendonly | tail -n 1)" = yes ] \
-    || fail "runtime AOF is not enabled"
+if [ "$DATA_PROFILE" = cache ]; then
+    [ "$(redis_cli_admin CONFIG GET maxmemory-policy | tail -n 1)" = allkeys-lru ] \
+        || fail "runtime cache policy is not allkeys-lru"
+    [ "$(redis_cli_admin CONFIG GET appendonly | tail -n 1)" = no ] \
+        || fail "runtime cache AOF is not disabled"
+    [ -z "$(redis_cli_admin CONFIG GET save | tail -n 1)" ] \
+        || fail "runtime cache RDB schedule is not disabled"
+else
+    [ "$(redis_cli_admin CONFIG GET maxmemory-policy | tail -n 1)" = noeviction ] \
+        || fail "runtime durable policy is not noeviction"
+    [ "$(redis_cli_admin CONFIG GET appendonly | tail -n 1)" = yes ] \
+        || fail "runtime durable AOF is not enabled"
+fi
 redis_cli_application DEL runtime_app:key >/dev/null \
     || fail "application cleanup failed"
 
-printf 'Validated Redis 8.x template parsing, authentication, ACL boundaries, and persistence policy.\n'
+printf 'Validated Redis 8.x %s/%s template parsing, authentication, ACL boundaries, and data policy.\n' \
+    "$MODEL" "$DATA_PROFILE"

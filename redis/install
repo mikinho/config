@@ -13,8 +13,10 @@ REPOSITORY_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIRECTORY/.." && pwd)
 PLATFORM_LIBRARY=$REPOSITORY_ROOT/deploy/lib/platform.sh
 VERIFIER_SOURCE=$SCRIPT_DIRECTORY/verify
 COMMON_LIBRARY_SOURCE=$SCRIPT_DIRECTORY/lib/common.sh
-LOCAL_TEMPLATE_SOURCE=$SCRIPT_DIRECTORY/templates/redis-local.conf.in
-NETWORK_TEMPLATE_SOURCE=$SCRIPT_DIRECTORY/templates/redis-network.conf.in
+LOCAL_CACHE_TEMPLATE_SOURCE=$SCRIPT_DIRECTORY/templates/redis-local-cache.conf.in
+LOCAL_DURABLE_TEMPLATE_SOURCE=$SCRIPT_DIRECTORY/templates/redis-local-durable.conf.in
+NETWORK_CACHE_TEMPLATE_SOURCE=$SCRIPT_DIRECTORY/templates/redis-network-cache.conf.in
+NETWORK_DURABLE_TEMPLATE_SOURCE=$SCRIPT_DIRECTORY/templates/redis-network-durable.conf.in
 SYSTEMD_TEMPLATE_SOURCE=$SCRIPT_DIRECTORY/templates/redis.service.conf.in
 PACKAGE_MANIFEST_SOURCE=$SCRIPT_DIRECTORY/packages-8.2.9.manifest
 BUNDLE_METADATA=$REPOSITORY_ROOT/BUNDLE-METADATA
@@ -50,9 +52,11 @@ Usage:
 
 Installs the reviewed Redis Open Source $REDIS_SERIES extended release from
 Redis's official Rocky Linux 9 repository after verifying the full signing-key
-fingerprint and exact RPM digest. It installs the verifier and templates but
-does not start or enable redis.service. Run redis/setup after reviewing the
-selected local or restricted-network model.
+fingerprint and exact RPM digest. Rocky Linux 9 is the preferred platform;
+CentOS Stream 9 is an EL9 compatibility platform for existing hosts. It
+installs the verifier and four templates but does not start or enable
+redis.service. Run redis/setup after reviewing the selected listener model and
+data profile.
 EOF
 }
 
@@ -133,8 +137,10 @@ validate_execution_bundle() {
     for bundle_required_path in \
         BUNDLE-METADATA deploy/lib/platform.sh redis/install redis/setup \
         redis/verify redis/lib/common.sh redis/packages-8.2.9.manifest \
-        redis/templates/redis-local.conf.in \
-        redis/templates/redis-network.conf.in \
+        redis/templates/redis-local-cache.conf.in \
+        redis/templates/redis-local-durable.conf.in \
+        redis/templates/redis-network-cache.conf.in \
+        redis/templates/redis-network-durable.conf.in \
         redis/templates/redis.service.conf.in
     do
         awk -v expected="$bundle_required_path" \
@@ -148,7 +154,8 @@ validate_execution_bundle() {
 
 for install_source in \
     "$PLATFORM_LIBRARY" "$VERIFIER_SOURCE" "$COMMON_LIBRARY_SOURCE" \
-    "$LOCAL_TEMPLATE_SOURCE" "$NETWORK_TEMPLATE_SOURCE" \
+    "$LOCAL_CACHE_TEMPLATE_SOURCE" "$LOCAL_DURABLE_TEMPLATE_SOURCE" \
+    "$NETWORK_CACHE_TEMPLATE_SOURCE" "$NETWORK_DURABLE_TEMPLATE_SOURCE" \
     "$SYSTEMD_TEMPLATE_SOURCE" "$PACKAGE_MANIFEST_SOURCE"
 do
     validate_source "$install_source"
@@ -221,13 +228,17 @@ platform_detect_supported_os "$OS_RELEASE_FILE"
 if [ -n "$ARCHITECTURE_OVERRIDE" ]; then
     PLATFORM_OS_ARCHITECTURE=$ARCHITECTURE_OVERRIDE
 fi
-[ "$PLATFORM_OS_ID" = rocky ] && [ "$PLATFORM_OS_VERSION_MAJOR" = 9 ] \
-    || fail "Redis $REDIS_SERIES official package is supported here only on Rocky Linux 9"
+case "$PLATFORM_OS_ID:$PLATFORM_OS_VERSION_MAJOR" in
+    rocky:9) REDIS_PLATFORM_PROFILE='official Rocky Linux 9 platform' ;;
+    centos:9) REDIS_PLATFORM_PROFILE='reviewed CentOS Stream 9 EL9 compatibility platform' ;;
+    *) fail "Redis $REDIS_SERIES is supported here only on Rocky Linux 9 or CentOS Stream 9" ;;
+esac
 [ "$PLATFORM_OS_ARCHITECTURE" = x86_64 ] \
     || fail "Redis $REDIS_SERIES official package is supported here only on x86_64"
 
 printf 'Redis installation target: %s (%s)\n' \
     "$PLATFORM_OS_LABEL" "$PLATFORM_OS_ARCHITECTURE"
+printf 'Redis platform profile: %s\n' "$REDIS_PLATFORM_PROFILE"
 printf 'Redis package series: %s extended release\n' "$REDIS_SERIES"
 printf 'Reviewed Redis package release: %s\n' "$REDIS_VERSION"
 
@@ -349,10 +360,14 @@ install -o root -g root -m 0755 "$VERIFIER_SOURCE" "$VERIFIER_TARGET"
 install -o root -g root -m 0644 "$COMMON_LIBRARY_SOURCE" \
     "$VERIFIER_LIBRARY_DIRECTORY/common.sh"
 install -o root -g root -m 0644 "$PACKAGE_MANIFEST_SOURCE" "$PACKAGE_MANIFEST_TARGET"
-install -o root -g root -m 0644 "$LOCAL_TEMPLATE_SOURCE" \
-    "$VERIFIER_LIBRARY_DIRECTORY/templates/redis-local.conf.in"
-install -o root -g root -m 0644 "$NETWORK_TEMPLATE_SOURCE" \
-    "$VERIFIER_LIBRARY_DIRECTORY/templates/redis-network.conf.in"
+install -o root -g root -m 0644 "$LOCAL_CACHE_TEMPLATE_SOURCE" \
+    "$VERIFIER_LIBRARY_DIRECTORY/templates/redis-local-cache.conf.in"
+install -o root -g root -m 0644 "$LOCAL_DURABLE_TEMPLATE_SOURCE" \
+    "$VERIFIER_LIBRARY_DIRECTORY/templates/redis-local-durable.conf.in"
+install -o root -g root -m 0644 "$NETWORK_CACHE_TEMPLATE_SOURCE" \
+    "$VERIFIER_LIBRARY_DIRECTORY/templates/redis-network-cache.conf.in"
+install -o root -g root -m 0644 "$NETWORK_DURABLE_TEMPLATE_SOURCE" \
+    "$VERIFIER_LIBRARY_DIRECTORY/templates/redis-network-durable.conf.in"
 install -o root -g root -m 0644 "$SYSTEMD_TEMPLATE_SOURCE" \
     "$VERIFIER_LIBRARY_DIRECTORY/templates/redis.service.conf.in"
 
@@ -363,4 +378,4 @@ if [ "$SERVICE_WAS_ENABLED" = yes ]; then
 fi
 printf 'Installed and pinned Redis %s; redis.service remains stopped and disabled.\n' \
     "$REDIS_VERSION"
-printf 'Next: review redis/setup --plan, then initialize one approved security model.\n'
+printf 'Next: review redis/setup --plan, then initialize one approved Redis configuration.\n'

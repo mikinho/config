@@ -18,8 +18,10 @@ COMMON_LIBRARY=$POLICY_DIRECTORY/lib/common.sh
 if [ ! -f "$COMMON_LIBRARY" ]; then
     COMMON_LIBRARY=$POLICY_DIRECTORY/common.sh
 fi
-LOCAL_TEMPLATE=$POLICY_DIRECTORY/templates/redis-local.conf.in
-NETWORK_TEMPLATE=$POLICY_DIRECTORY/templates/redis-network.conf.in
+LOCAL_CACHE_TEMPLATE=$POLICY_DIRECTORY/templates/redis-local-cache.conf.in
+LOCAL_DURABLE_TEMPLATE=$POLICY_DIRECTORY/templates/redis-local-durable.conf.in
+NETWORK_CACHE_TEMPLATE=$POLICY_DIRECTORY/templates/redis-network-cache.conf.in
+NETWORK_DURABLE_TEMPLATE=$POLICY_DIRECTORY/templates/redis-network-durable.conf.in
 SYSTEMD_TEMPLATE=$POLICY_DIRECTORY/templates/redis.service.conf.in
 PACKAGE_MANIFEST=$POLICY_DIRECTORY/packages-8.2.9.manifest
 
@@ -31,6 +33,7 @@ REDIS_SOCKET=/run/redis/redis.sock
 
 MODE=verify
 MODEL=
+DATA_PROFILE=
 ADMIN_USER=
 ADMIN_PASSWORD_FILE=
 APPLICATION_USER=
@@ -50,8 +53,8 @@ usage() {
     cat <<EOF
 Usage:
   $PROGRAM_NAME --check
-  sudo $PROGRAM_NAME --model local OPTIONS
-  sudo $PROGRAM_NAME --model network OPTIONS
+  sudo $PROGRAM_NAME --model local --data-profile cache|durable OPTIONS
+  sudo $PROGRAM_NAME --model network --data-profile cache|durable OPTIONS
 
 Required verification options:
   --admin-user USER --admin-password-file FILE
@@ -83,7 +86,8 @@ validate_source() {
 }
 
 for verify_source in \
-    "$COMMON_LIBRARY" "$LOCAL_TEMPLATE" "$NETWORK_TEMPLATE" \
+    "$COMMON_LIBRARY" "$LOCAL_CACHE_TEMPLATE" "$LOCAL_DURABLE_TEMPLATE" \
+    "$NETWORK_CACHE_TEMPLATE" "$NETWORK_DURABLE_TEMPLATE" \
     "$SYSTEMD_TEMPLATE" "$PACKAGE_MANIFEST"
 do
     validate_source "$verify_source"
@@ -96,6 +100,7 @@ while [ "$#" -gt 0 ]; do
     case "$1" in
         --check) MODE=check; shift ;;
         --model) MODEL=${2:?--model requires a value}; shift 2 ;;
+        --data-profile) DATA_PROFILE=${2:?--data-profile requires a value}; shift 2 ;;
         --admin-user) ADMIN_USER=${2:?--admin-user requires a value}; shift 2 ;;
         --admin-password-file) ADMIN_PASSWORD_FILE=${2:?--admin-password-file requires a value}; shift 2 ;;
         --application-user) APPLICATION_USER=${2:?--application-user requires a value}; shift 2 ;;
@@ -115,12 +120,16 @@ while [ "$#" -gt 0 ]; do
 done
 
 if [ "$MODE" = check ]; then
-    [ -z "$MODEL$ADMIN_USER$ADMIN_PASSWORD_FILE$APPLICATION_USER$APPLICATION_PASSWORD_FILE$APPLICATION_KEY_PREFIX$APPLICATION_CHANNEL_PREFIX$MAXMEMORY_MIB$BIND_ADDRESS$SERVER_HOST$TLS_CERTIFICATE_FILE$TLS_PRIVATE_KEY_FILE$TLS_CA_FILE$ALLOWED_CLIENT_FILE" ] \
+    [ -z "$MODEL$DATA_PROFILE$ADMIN_USER$ADMIN_PASSWORD_FILE$APPLICATION_USER$APPLICATION_PASSWORD_FILE$APPLICATION_KEY_PREFIX$APPLICATION_CHANNEL_PREFIX$MAXMEMORY_MIB$BIND_ADDRESS$SERVER_HOST$TLS_CERTIFICATE_FILE$TLS_PRIVATE_KEY_FILE$TLS_CA_FILE$ALLOWED_CLIENT_FILE" ] \
         || fail "--check does not accept verification options"
-    grep -F '@MAXMEMORY_MIB@' "$LOCAL_TEMPLATE" >/dev/null \
-        || fail "local Redis template is missing maxmemory placeholder"
-    grep -F 'port 0' "$NETWORK_TEMPLATE" >/dev/null \
-        || fail "network Redis template must disable plaintext TCP"
+    for local_template in "$LOCAL_CACHE_TEMPLATE" "$LOCAL_DURABLE_TEMPLATE"; do
+        grep -F '@MAXMEMORY_MIB@' "$local_template" >/dev/null \
+            || fail "local Redis template is missing maxmemory placeholder"
+    done
+    for network_template in "$NETWORK_CACHE_TEMPLATE" "$NETWORK_DURABLE_TEMPLATE"; do
+        grep -F 'port 0' "$network_template" >/dev/null \
+            || fail "network Redis template must disable plaintext TCP"
+    done
     grep -F '@IP_ADDRESS_ALLOW@' "$SYSTEMD_TEMPLATE" >/dev/null \
         || fail "systemd template is missing its address-policy placeholder"
     awk -F'|' 'NF == 4 && $1 == "redis" && $2 == "8.2.9-1.x86_64" \
@@ -141,6 +150,7 @@ case "$MODEL" in
         ;;
     *) fail "--model must be local or network" ;;
 esac
+redis_validate_data_profile "$DATA_PROFILE"
 redis_validate_safe_name "administrative user" "$ADMIN_USER"
 redis_validate_safe_name "application user" "$APPLICATION_USER"
 [ "$ADMIN_USER" != "$APPLICATION_USER" ] \
@@ -233,12 +243,22 @@ trap cleanup EXIT HUP INT TERM
 
 if [ -n "$MAXMEMORY_MIB" ]; then
     if [ "$MODEL" = local ]; then
-        redis_render_configuration local "$LOCAL_TEMPLATE" \
+        if [ "$DATA_PROFILE" = cache ]; then
+            configuration_template=$LOCAL_CACHE_TEMPLATE
+        else
+            configuration_template=$LOCAL_DURABLE_TEMPLATE
+        fi
+        redis_render_configuration local "$DATA_PROFILE" "$configuration_template" \
             "$TEMPORARY_DIRECTORY/redis.conf" "$MAXMEMORY_MIB"
     else
         [ -n "$BIND_ADDRESS$TLS_CERTIFICATE_FILE$TLS_PRIVATE_KEY_FILE" ] \
             || fail "exact network comparison requires bind address and TLS certificate/key paths"
-        redis_render_configuration network "$NETWORK_TEMPLATE" \
+        if [ "$DATA_PROFILE" = cache ]; then
+            configuration_template=$NETWORK_CACHE_TEMPLATE
+        else
+            configuration_template=$NETWORK_DURABLE_TEMPLATE
+        fi
+        redis_render_configuration network "$DATA_PROFILE" "$configuration_template" \
             "$TEMPORARY_DIRECTORY/redis.conf" "$MAXMEMORY_MIB" "$BIND_ADDRESS" \
             "$TLS_CERTIFICATE_FILE" "$TLS_PRIVATE_KEY_FILE" "$TLS_CA_FILE"
     fi
@@ -354,12 +374,22 @@ case "$module_names" in
 esac
 [ "$(redis_cli_admin CONFIG GET databases 2>/dev/null | tail -n 1)" = 1 ] \
     || fail "Redis must expose exactly one logical database"
-[ "$(redis_cli_admin CONFIG GET maxmemory-policy 2>/dev/null | tail -n 1)" = noeviction ] \
-    || fail "Redis maxmemory-policy must be noeviction"
-[ "$(redis_cli_admin CONFIG GET appendonly 2>/dev/null | tail -n 1)" = yes ] \
-    || fail "Redis AOF persistence must be enabled"
-[ "$(redis_cli_admin CONFIG GET appendfsync 2>/dev/null | tail -n 1)" = everysec ] \
-    || fail "Redis AOF fsync policy must be everysec"
+if [ "$DATA_PROFILE" = cache ]; then
+    [ "$(redis_cli_admin CONFIG GET maxmemory-policy 2>/dev/null | tail -n 1)" = allkeys-lru ] \
+        || fail "cache profile must use allkeys-lru"
+    [ "$(redis_cli_admin CONFIG GET appendonly 2>/dev/null | tail -n 1)" = no ] \
+        || fail "cache profile must disable AOF persistence"
+    configured_save=$(redis_cli_admin CONFIG GET save 2>/dev/null | tail -n 1)
+    [ -z "$configured_save" ] \
+        || fail "cache profile must disable scheduled RDB persistence"
+else
+    [ "$(redis_cli_admin CONFIG GET maxmemory-policy 2>/dev/null | tail -n 1)" = noeviction ] \
+        || fail "durable profile must use noeviction"
+    [ "$(redis_cli_admin CONFIG GET appendonly 2>/dev/null | tail -n 1)" = yes ] \
+        || fail "durable profile must enable AOF persistence"
+    [ "$(redis_cli_admin CONFIG GET appendfsync 2>/dev/null | tail -n 1)" = everysec ] \
+        || fail "durable profile must use AOF fsync everysec"
+fi
 if [ -n "$MAXMEMORY_MIB" ]; then
     expected_maxmemory_bytes=$((MAXMEMORY_MIB * 1024 * 1024))
     [ "$(redis_cli_admin CONFIG GET maxmemory 2>/dev/null | tail -n 1)" = "$expected_maxmemory_bytes" ] \
@@ -378,8 +408,13 @@ grep -F 'IPAddressDeny=' "$TEMPORARY_DIRECTORY/systemd.properties" | grep -F 'an
 
 [ "$(sysctl -n vm.overcommit_memory 2>/dev/null)" = 1 ] \
     || fail "vm.overcommit_memory must be 1"
-grep -F '[never]' /sys/kernel/mm/transparent_hugepage/enabled >/dev/null \
-    || fail "Transparent Huge Pages must be disabled"
+redis_main_pid=$(systemctl show redis.service --property=MainPID --value)
+case "$redis_main_pid" in
+    '' | 0 | *[!0-9]*) fail "cannot identify the active Redis process" ;;
+esac
+awk '$1 == "THP_enabled:" && $2 == 0 { disabled = 1 } \
+    END { exit disabled ? 0 : 1 }' "/proc/$redis_main_pid/status" \
+    || fail "Redis process must disable Transparent Huge Pages"
 
 listener_output=$(ss -H -ltn 2>/dev/null)
 redis_tcp_listeners=$(printf '%s\n' "$listener_output" \
@@ -401,8 +436,8 @@ case "$MODEL" in
         ;;
 esac
 
-printf 'Verified Redis %s security model, ACL boundaries, persistence, tuning, and listener scope.\n' \
-    "$MODEL"
+printf 'Verified Redis %s/%s security configuration, ACL boundaries, data policy, tuning, and listener scope.\n' \
+    "$MODEL" "$DATA_PROFILE"
 if [ "$MODEL" = network ]; then
     printf 'External allowed-source and denied-source firewall path evidence must be recorded separately.\n'
 fi

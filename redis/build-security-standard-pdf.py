@@ -25,15 +25,17 @@ from pathlib import Path
 from typing import Final, Sequence
 
 DOCUMENT_DATE: Final[str] = "August 28, 2026"
-DOCUMENT_VERSION: Final[str] = "1.0"
+DOCUMENT_VERSION: Final[str] = "1.1"
 DEFAULT_OUTPUT_RELATIVE: Final[Path] = Path("output/pdf/redis-security-standard.pdf")
 REQUIRED_HEADINGS: Final[tuple[str, ...]] = (
+    "Platform and version policy",
     "Security baseline",
-    "Standard 1: local single-server",
-    "Standard 2: restricted network",
+    "Data profiles",
     "Application ACL contract",
+    "Local configurations",
+    "Restricted-network configurations",
     "Verification and evidence",
-    "Backup, restore, renewal, and change control",
+    "Operations and change control",
 )
 ASCII_REPLACEMENTS: Final[dict[str, str]] = {
     "\u2010": "-",
@@ -254,7 +256,6 @@ def build_pdf(blocks: Sequence[MarkdownBlock], output_path: Path) -> None:
         KeepTogether,
         ListFlowable,
         ListItem,
-        NextPageTemplate,
         PageBreak,
         PageTemplate,
         Paragraph,
@@ -436,17 +437,14 @@ def build_pdf(blocks: Sequence[MarkdownBlock], output_path: Path) -> None:
         canvas_object.drawRightString(page_width - 0.72 * inch, 0.34 * inch, f"Page {document.page}")
         canvas_object.restoreState()
 
-    cover_frame = Frame(
-        0.8 * inch,
-        0.75 * inch,
-        page_width - 1.6 * inch,
-        page_height - 1.5 * inch,
-        leftPadding=0,
-        rightPadding=0,
-        topPadding=0,
-        bottomPadding=0,
-        id="cover",
-    )
+    def draw_page(canvas_object: canvas.Canvas, document: BaseDocTemplate) -> None:
+        """Draw the cover once, then the common body furniture on every page."""
+
+        if document.page == 1:
+            draw_cover(canvas_object, document)
+        else:
+            draw_body(canvas_object, document)
+
     body_frame = Frame(
         0.72 * inch,
         0.66 * inch,
@@ -474,7 +472,7 @@ def build_pdf(blocks: Sequence[MarkdownBlock], output_path: Path) -> None:
             pagesize=LETTER,
             title="Redis Security Standard",
             author="Michael Welter",
-            subject="Client-neutral local and restricted-network Redis security standards",
+            subject="Client-neutral Redis listener and data-profile security standards",
             creator="config redis/build-security-standard-pdf.py",
             leftMargin=0.72 * inch,
             rightMargin=0.72 * inch,
@@ -483,8 +481,11 @@ def build_pdf(blocks: Sequence[MarkdownBlock], output_path: Path) -> None:
         )
         document.addPageTemplates(
             [
-                PageTemplate(id="Cover", frames=[cover_frame], onPage=draw_cover),
-                PageTemplate(id="Body", frames=[body_frame], onPage=draw_body),
+                PageTemplate(
+                    id="Document",
+                    frames=[body_frame],
+                    onPage=draw_page,
+                ),
             ]
         )
 
@@ -494,7 +495,7 @@ def build_pdf(blocks: Sequence[MarkdownBlock], output_path: Path) -> None:
                 Spacer(1, 1.22 * inch),
                 Paragraph("Redis Security Standard", styles["CoverTitle"]),
                 Paragraph(
-                    "Two secure single-server models: local loopback and TLS-only restricted network",
+                    "Four secure single-server configurations across listener and data policy",
                     styles["CoverSubtitle"],
                 ),
                 Spacer(1, 0.46 * inch),
@@ -503,21 +504,34 @@ def build_pdf(blocks: Sequence[MarkdownBlock], output_path: Path) -> None:
         model_table = Table(
             [
                 [
-                    Paragraph("LOCAL SINGLE-SERVER", styles["CoverTableHeader"]),
-                    Paragraph("RESTRICTED NETWORK", styles["CoverTableHeader"]),
+                    Paragraph("LISTENER", styles["CoverTableHeader"]),
+                    Paragraph("CACHE", styles["CoverTableHeader"]),
+                    Paragraph("DURABLE", styles["CoverTableHeader"]),
                 ],
                 [
+                    Paragraph("LOCAL", styles["CoverTableHeader"]),
                     Paragraph(
-                        "Literal loopback profile, ACL identities, no off-host transport.",
+                        "Loopback only. Disposable data, allkeys-lru, persistence off.",
                         styles["ListCustom"],
                     ),
                     Paragraph(
-                        "Private DNS, verified TLS, exact client sources, layered firewall evidence.",
+                        "Loopback only. Noeviction, AOF everysec, RDB and restore proof.",
+                        styles["ListCustom"],
+                    ),
+                ],
+                [
+                    Paragraph("NETWORK", styles["CoverTableHeader"]),
+                    Paragraph(
+                        "Verified TLS and exact sources. Disposable, reproducible data only.",
+                        styles["ListCustom"],
+                    ),
+                    Paragraph(
+                        "Verified TLS and exact sources. Persistence plus restore proof.",
                         styles["ListCustom"],
                     ),
                 ],
             ],
-            colWidths=[3.05 * inch, 3.05 * inch],
+            colWidths=[1.05 * inch, 2.525 * inch, 2.525 * inch],
             hAlign="LEFT",
         )
         model_table.setStyle(
@@ -525,7 +539,9 @@ def build_pdf(blocks: Sequence[MarkdownBlock], output_path: Path) -> None:
                 [
                     ("BACKGROUND", (0, 0), (-1, 0), teal),
                     ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-                    ("BACKGROUND", (0, 1), (-1, 1), colors.HexColor("#F2FAFA")),
+                    ("BACKGROUND", (0, 1), (-1, -1), colors.HexColor("#F2FAFA")),
+                    ("BACKGROUND", (0, 1), (0, -1), navy),
+                    ("TEXTCOLOR", (0, 1), (0, -1), colors.white),
                     ("BOX", (0, 0), (-1, -1), 0.7, colors.HexColor("#78AEBE")),
                     ("INNERGRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#B9D5DD")),
                     ("VALIGN", (0, 0), (-1, -1), "TOP"),
@@ -557,7 +573,7 @@ def build_pdf(blocks: Sequence[MarkdownBlock], output_path: Path) -> None:
                 ),
                 Spacer(1, 0.62 * inch),
                 Paragraph(
-                    f"Version {DOCUMENT_VERSION}<br/>{DOCUMENT_DATE}<br/>Redis Open Source 8.2.9 extended release",
+                    f"Version {DOCUMENT_VERSION}<br/>{DOCUMENT_DATE}<br/>Redis Open Source 8.2.9 extended release<br/>Rocky Linux 9 and CentOS Stream 9 x86-64",
                     ParagraphStyle(
                         "CoverMeta",
                         parent=styles["Normal"],
@@ -567,7 +583,6 @@ def build_pdf(blocks: Sequence[MarkdownBlock], output_path: Path) -> None:
                         textColor=colors.HexColor("#C2DDE3"),
                     ),
                 ),
-                NextPageTemplate("Body"),
                 PageBreak(),
                 Paragraph("Contents", styles["TOCHeading"]),
             ]
