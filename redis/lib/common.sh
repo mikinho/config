@@ -8,6 +8,8 @@
 # Callers define fail() before sourcing this file.
 
 REDIS_APPLICATION_COMMAND_RULES='-@all +@read +@write +@transaction -@admin -@dangerous -keys -scan -randomkey -dbsize -vadd -vcard -vdim -vemb -vgetattr -vinfo -vlinks -vrandmember -vrem -vsetattr -vsim +eval +eval_ro +evalsha +evalsha_ro +publish +subscribe +unsubscribe +psubscribe +punsubscribe +ssubscribe +sunsubscribe +spublish +ping +echo +hello +quit +client|id +client|getname +client|setname +client|setinfo +client|info'
+REDIS_LOCAL_TLS_PROBE_ADDRESS=127.0.0.1
+REDIS_TLS_PORT=6379
 
 redis_validate_safe_name() {
     redis_name_label=$1
@@ -255,4 +257,41 @@ redis_render_systemd_policy() {
     if grep -Eq '@[A-Z0-9_]+@' "$redis_systemd_destination"; then
         fail "rendered Redis systemd policy contains an unresolved placeholder"
     fi
+}
+
+redis_verify_local_tls_service_identity() {
+    redis_served_server_host=$1
+    redis_served_ca_file=$2
+    redis_served_expected_certificate=$3
+    redis_served_transcript=$4
+    redis_served_leaf_certificate=$5
+
+    if ! openssl s_client \
+        -connect "$REDIS_LOCAL_TLS_PROBE_ADDRESS:$REDIS_TLS_PORT" \
+        -servername "$redis_served_server_host" \
+        -CAfile "$redis_served_ca_file" \
+        -verify_hostname "$redis_served_server_host" \
+        -verify_return_error -showcerts \
+        < /dev/null > "$redis_served_transcript" 2>&1
+    then
+        fail "actively served TLS chain and hostname verification failed"
+    fi
+    awk '
+        /-----BEGIN CERTIFICATE-----/ && !capturing { capturing = 1 }
+        capturing { print }
+        capturing && /-----END CERTIFICATE-----/ { exit }
+    ' "$redis_served_transcript" > "$redis_served_leaf_certificate"
+    openssl x509 -in "$redis_served_leaf_certificate" -noout >/dev/null 2>&1 \
+        || fail "actively served TLS endpoint did not present a leaf certificate"
+    openssl x509 -checkhost "$redis_served_server_host" -noout \
+        -in "$redis_served_leaf_certificate" >/dev/null \
+        || fail "actively served TLS certificate does not identify --server-host"
+    redis_expected_certificate_fingerprint=$(openssl x509 \
+        -in "$redis_served_expected_certificate" -noout -fingerprint -sha256 2>/dev/null) \
+        || fail "cannot fingerprint configured TLS certificate"
+    redis_served_certificate_fingerprint=$(openssl x509 \
+        -in "$redis_served_leaf_certificate" -noout -fingerprint -sha256 2>/dev/null) \
+        || fail "cannot fingerprint actively served TLS certificate"
+    [ "$redis_served_certificate_fingerprint" = "$redis_expected_certificate_fingerprint" ] \
+        || fail "actively served TLS certificate differs from configured certificate"
 }

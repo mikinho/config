@@ -32,6 +32,10 @@ fail() {
     exit 1
 }
 
+# shellcheck source=../redis/lib/common.sh
+# shellcheck disable=SC1091
+. "$REDIS_DIRECTORY/lib/common.sh"
+
 assert_contains() {
     checked_file=$1
     expected_text=$2
@@ -192,6 +196,27 @@ assert_contains "$TEST_ROOT/expose-network.plan" \
 assert_contains "$TEST_ROOT/expose-network.plan" \
     'allowed-source and denied-source firewall path evidence'
 
+restricted_bind_address=10.20.30.40
+printf '10.20.30.21\n10.20.30.22\n' > "$TEST_ROOT/allowed-clients"
+if grep -Fx "$restricted_bind_address" "$TEST_ROOT/allowed-clients" >/dev/null; then
+    fail 'restricted-network regression fixture placed the bind address in the client allowlist'
+fi
+redis_render_systemd_policy \
+    "$REDIS_DIRECTORY/templates/redis.service.conf.in" \
+    "$TEST_ROOT/allowed-clients" "$TEST_ROOT/redis.service.conf"
+expected_address_policy='IPAddressDeny=any
+IPAddressAllow=localhost
+IPAddressAllow=10.20.30.21/32
+IPAddressAllow=10.20.30.22/32'
+actual_address_policy=$(grep -E '^IPAddress(Deny|Allow)=' \
+    "$TEST_ROOT/redis.service.conf")
+[ "$actual_address_policy" = "$expected_address_policy" ] \
+    || fail 'restricted-network systemd policy added an address beyond exact clients and loopback'
+if grep -Fx "IPAddressAllow=$restricted_bind_address/32" \
+    "$TEST_ROOT/redis.service.conf" >/dev/null; then
+    fail 'restricted-network systemd policy added the server bind address as a self-probe workaround'
+fi
+
 expect_failure 'requires --network-controls-confirmed' \
     "$SETUP" --plan --phase expose-network \
     --data-profile durable \
@@ -276,6 +301,17 @@ assert_contains "$REDIS_DIRECTORY/lib/common.sh" '+eval +eval_ro +evalsha +evals
 assert_contains "$REDIS_DIRECTORY/lib/common.sh" '+client|info'
 assert_contains "$VERIFIER" 'ps -e -o label= -o comm='
 assert_contains "$VERIFIER" "for required_network in '0.0.0.0/0' '::/0'"
+assert_contains "$SETUP" "--host \"\$REDIS_LOCAL_TLS_PROBE_ADDRESS\""
+assert_contains "$VERIFIER" "--host \"\$REDIS_LOCAL_TLS_PROBE_ADDRESS\""
+assert_contains "$REDIS_DIRECTORY/lib/common.sh" \
+    "-connect \"\$REDIS_LOCAL_TLS_PROBE_ADDRESS:\$REDIS_TLS_PORT\""
+assert_contains "$REDIS_DIRECTORY/lib/common.sh" \
+    "-servername \"\$redis_served_server_host\""
+assert_contains "$REDIS_DIRECTORY/lib/common.sh" \
+    "-verify_hostname \"\$redis_served_server_host\""
+if grep -F -- "--host \"\$SERVER_HOST\"" "$SETUP" "$VERIFIER" >/dev/null; then
+    fail 'target-side Redis verification still connects through the private DNS address'
+fi
 if grep -F 'ps -eZ -o label=,comm=' "$VERIFIER" >/dev/null; then
     fail 'Redis verifier uses a procps-incompatible SELinux process query'
 fi

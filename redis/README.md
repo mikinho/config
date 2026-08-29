@@ -205,10 +205,16 @@ Before the transition, require all of the following:
 - an evidence plan that tests one allowed source and one denied source.
 
 The setup command validates the existing local configuration, chain, key match,
-DNS identity, DNS-to-address resolution, certificate lifetime, Redis account
-readability, and exact private addresses. It sets `port 0`, `tls-port 6379`, TLS
-1.2/1.3, server authentication, and ACL authentication. Client certificates
-are not required by this standard; mutual TLS is a separate reviewed profile.
+DNS identity, unique DNS-to-address resolution, certificate lifetime, Redis
+account readability, and exact private addresses. After the client-only systemd
+allowlist is active, target-side TLS and authenticated probes connect to
+`127.0.0.1` while sending and verifying the production server name. The verifier
+also validates the actively served chain and hostname and requires the served
+leaf identity to match the configured certificate. The server's private bind
+address is never added to `IPAddressAllow` as a self-probe workaround. The
+configuration sets `port 0`, `tls-port 6379`, TLS 1.2/1.3, server authentication,
+and ACL authentication. Client certificates are not required by this standard;
+mutual TLS is a separate reviewed profile.
 
 Review the durable transition below, or select `--data-profile cache` when the
 accepted local source is cache-only:
@@ -236,8 +242,9 @@ accepted local source is cache-only:
 
 Apply with the same options and `sudo`. The confirmation means the operator
 reviewed the external controls; it does not prove the command configured them.
-Acceptance remains pending until allowed-source and denied-source path evidence
-is recorded.
+Target-side loopback verification is not allowed-path evidence. Acceptance
+remains pending until a real listed client records the TLS/authenticated allowed
+path and an independent, non-allowlisted source records the denied path.
 
 The network application connection profile becomes:
 
@@ -300,7 +307,9 @@ The verifier checks:
 - no unapproved loadable modules, one logical database, the exact cache or
   durable memory/persistence policy, host overcommit, effective Redis process
   THP state, and listener scope;
-- TLS identity and rejection of plaintext TCP for the network model.
+- unique private-DNS resolution to the bind address, loopback TLS with the
+  production SNI, the actively served certificate chain, hostname and leaf
+  identity, and rejection of plaintext TCP for the network model.
 
 Capture its output, `systemctl status redis`, certificate metadata without
 private keys, DNS results, firewall rule identifiers, and dated connection

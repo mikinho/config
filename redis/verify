@@ -184,7 +184,7 @@ if [ -n "$ALLOWED_CLIENT_FILE" ]; then
     fi
 fi
 
-for required_command in awk cmp getenforce grep openssl ps redis-cli redis-server rpm sha256sum sort ss stat sysctl systemctl tail tr wc; do
+for required_command in awk cmp getenforce getent grep openssl ps redis-cli redis-server rpm sha256sum sort ss stat sysctl systemctl tail tr wc; do
     command -v "$required_command" >/dev/null 2>&1 \
         || fail "required verification command not found: $required_command"
 done
@@ -235,6 +235,10 @@ if [ "$MODEL" = network ]; then
     fi
     redis_validate_absolute_path "configured TLS certificate file" "$TLS_CERTIFICATE_FILE"
     redis_validate_absolute_path "configured TLS private-key file" "$TLS_PRIVATE_KEY_FILE"
+    resolved_server_addresses=$(getent ahostsv4 "$SERVER_HOST" \
+        | awk '{ print $1 }' | sort -u)
+    [ "$resolved_server_addresses" = "$BIND_ADDRESS" ] \
+        || fail "--server-host must resolve only to --bind-address"
 fi
 
 TEMPORARY_DIRECTORY=$(mktemp -d "${TMPDIR:-/tmp}/config-redis-verify.XXXXXX")
@@ -277,6 +281,13 @@ if [ -n "$ALLOWED_CLIENT_FILE" ]; then
         || fail "Redis systemd network policy differs from the selected standard"
 fi
 
+if [ "$MODEL" = network ]; then
+    redis_verify_local_tls_service_identity \
+        "$SERVER_HOST" "$TLS_CA_FILE" "$TLS_CERTIFICATE_FILE" \
+        "$TEMPORARY_DIRECTORY/served-tls-transcript" \
+        "$TEMPORARY_DIRECTORY/served-leaf.pem"
+fi
+
 admin_password=$(redis_read_password "$ADMIN_PASSWORD_FILE")
 application_password=$(redis_read_password "$APPLICATION_PASSWORD_FILE")
 admin_hash=$(redis_password_hash "$admin_password")
@@ -306,8 +317,9 @@ redis_cli_admin() {
             --user "$ADMIN_USER" -s "$REDIS_SOCKET" "$@"
     else
         REDISCLI_AUTH=$admin_password redis-cli --no-auth-warning --tls \
-            --cacert "$TLS_CA_FILE" --sni "$SERVER_HOST" --host "$SERVER_HOST" \
-            --port 6379 --user "$ADMIN_USER" "$@"
+            --cacert "$TLS_CA_FILE" --sni "$SERVER_HOST" \
+            --host "$REDIS_LOCAL_TLS_PROBE_ADDRESS" --port "$REDIS_TLS_PORT" \
+            --user "$ADMIN_USER" "$@"
     fi
 }
 
@@ -317,8 +329,9 @@ redis_cli_application() {
             --user "$APPLICATION_USER" -s "$REDIS_SOCKET" "$@"
     else
         REDISCLI_AUTH=$application_password redis-cli --no-auth-warning --tls \
-            --cacert "$TLS_CA_FILE" --sni "$SERVER_HOST" --host "$SERVER_HOST" \
-            --port 6379 --user "$APPLICATION_USER" "$@"
+            --cacert "$TLS_CA_FILE" --sni "$SERVER_HOST" \
+            --host "$REDIS_LOCAL_TLS_PROBE_ADDRESS" --port "$REDIS_TLS_PORT" \
+            --user "$APPLICATION_USER" "$@"
     fi
 }
 
@@ -327,7 +340,7 @@ redis_cli_unauthenticated() {
         redis-cli -s "$REDIS_SOCKET" "$@"
     else
         redis-cli --tls --cacert "$TLS_CA_FILE" --sni "$SERVER_HOST" \
-            --host "$SERVER_HOST" --port 6379 "$@"
+            --host "$REDIS_LOCAL_TLS_PROBE_ADDRESS" --port "$REDIS_TLS_PORT" "$@"
     fi
 }
 
@@ -440,11 +453,10 @@ case "$MODEL" in
         expected_listeners=$(printf '127.0.0.1:6379\n%s:6379\n' "$BIND_ADDRESS" | sort -u)
         [ "$redis_tcp_listeners" = "$expected_listeners" ] \
             || fail "network Redis must listen only on loopback and the selected private address"
-        plaintext_result=$(redis-cli --host "$SERVER_HOST" --port 6379 PING 2>&1 || true)
+        plaintext_result=$(redis-cli --host "$REDIS_LOCAL_TLS_PROBE_ADDRESS" \
+            --port "$REDIS_TLS_PORT" PING 2>&1 || true)
         printf '%s\n' "$plaintext_result" | grep -Fx PONG >/dev/null \
             && fail "network Redis unexpectedly accepted plaintext TCP"
-        openssl x509 -checkhost "$SERVER_HOST" -noout -in "$TLS_CERTIFICATE_FILE" >/dev/null \
-            || fail "active TLS certificate does not identify the selected DNS name"
         ;;
 esac
 

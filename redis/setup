@@ -584,8 +584,9 @@ case "$PHASE" in
         wait_attempt=0
         while [ "$wait_attempt" -lt 60 ]; do
             if REDISCLI_AUTH=$admin_password redis-cli --no-auth-warning --tls \
-                --cacert "$TLS_CA_FILE" --sni "$SERVER_HOST" --host "$SERVER_HOST" \
-                --port 6379 --user "$ADMIN_USER" PING 2>/dev/null \
+                --cacert "$TLS_CA_FILE" --sni "$SERVER_HOST" \
+                --host "$REDIS_LOCAL_TLS_PROBE_ADDRESS" --port "$REDIS_TLS_PORT" \
+                --user "$ADMIN_USER" PING 2>/dev/null \
                 | grep -Fx PONG >/dev/null
             then
                 break
@@ -595,6 +596,10 @@ case "$PHASE" in
         done
         [ "$wait_attempt" -lt 60 ] \
             || fail "Redis TLS endpoint did not accept the configured credentials"
+        redis_verify_local_tls_service_identity \
+            "$SERVER_HOST" "$TLS_CA_FILE" "$TLS_CERTIFICATE_FILE" \
+            "$TEMPORARY_DIRECTORY/served-tls-transcript" \
+            "$TEMPORARY_DIRECTORY/served-leaf.pem"
         ;;
 esac
 

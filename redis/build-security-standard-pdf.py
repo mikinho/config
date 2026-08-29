@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Final, Sequence
 
 DOCUMENT_DATE: Final[str] = "August 28, 2026"
-DOCUMENT_VERSION: Final[str] = "1.1"
+DOCUMENT_VERSION: Final[str] = "1.2"
 DEFAULT_OUTPUT_RELATIVE: Final[Path] = Path("output/pdf/redis-security-standard.pdf")
 REQUIRED_HEADINGS: Final[tuple[str, ...]] = (
     "Platform and version policy",
@@ -36,6 +36,16 @@ REQUIRED_HEADINGS: Final[tuple[str, ...]] = (
     "Restricted-network configurations",
     "Verification and evidence",
     "Operations and change control",
+)
+PAGE_BREAK_HEADINGS: Final[frozenset[str]] = frozenset(
+    {
+        "Security baseline",
+        "Local configurations",
+        "Restricted-network configurations",
+        "Verification and evidence",
+        "Operations and change control",
+        "Reproduce the PDF handoff",
+    }
 )
 ASCII_REPLACEMENTS: Final[dict[str, str]] = {
     "\u2010": "-",
@@ -264,7 +274,6 @@ def build_pdf(blocks: Sequence[MarkdownBlock], output_path: Path) -> None:
         TableStyle,
         XPreformatted,
     )
-    from reportlab.platypus.tableofcontents import TableOfContents
 
     navy = colors.HexColor("#102E45")
     teal = colors.HexColor("#176B87")
@@ -386,9 +395,32 @@ def build_pdf(blocks: Sequence[MarkdownBlock], output_path: Path) -> None:
             spaceAfter=18,
         )
     )
+    styles.add(
+        ParagraphStyle(
+            "TOCLevel1",
+            parent=styles["Normal"],
+            fontName="Helvetica-Bold",
+            fontSize=9.5,
+            leading=13,
+            textColor=navy,
+        )
+    )
+    styles.add(
+        ParagraphStyle(
+            "TOCLevel2",
+            parent=styles["Normal"],
+            fontName="Helvetica",
+            fontSize=8.5,
+            leading=12,
+            leftIndent=14,
+            textColor=ink,
+        )
+    )
 
     class SecurityStandardDocument(BaseDocTemplate):
         """Document template that registers headings with the TOC."""
+
+        heading_entries: list[tuple[int, str, int]]
 
         def afterFlowable(self, flowable: object) -> None:  # noqa: N802
             if not isinstance(flowable, Paragraph):
@@ -402,7 +434,7 @@ def build_pdf(blocks: Sequence[MarkdownBlock], output_path: Path) -> None:
             bookmark = f"section-{level}-{self.page}-{bookmark_digest}"
             self.canv.bookmarkPage(bookmark)
             self.canv.addOutlineEntry(plain_text, bookmark, level=level, closed=False)
-            self.notify("TOCEntry", (level, plain_text, self.page, bookmark))
+            self.heading_entries.append((level, plain_text, self.page))
 
     page_width, page_height = LETTER
 
@@ -437,38 +469,23 @@ def build_pdf(blocks: Sequence[MarkdownBlock], output_path: Path) -> None:
         canvas_object.drawRightString(page_width - 0.72 * inch, 0.34 * inch, f"Page {document.page}")
         canvas_object.restoreState()
 
-    def draw_page(canvas_object: canvas.Canvas, document: BaseDocTemplate) -> None:
-        """Draw the cover once, then the common body furniture on every page."""
+    def draw_page_start(canvas_object: canvas.Canvas, document: BaseDocTemplate) -> None:
+        """Draw cover artwork before the first page's content."""
 
         if document.page == 1:
             draw_cover(canvas_object, document)
-        else:
+
+    def draw_page_end(canvas_object: canvas.Canvas, document: BaseDocTemplate) -> None:
+        """Stamp body furniture after content so flowables cannot cover it."""
+
+        if document.page != 1:
             draw_body(canvas_object, document)
 
-    body_frame = Frame(
-        0.72 * inch,
-        0.66 * inch,
-        page_width - 1.44 * inch,
-        page_height - 1.56 * inch,
-        leftPadding=0,
-        rightPadding=0,
-        topPadding=0,
-        bottomPadding=0,
-        id="body",
-    )
+    def make_document(destination: Path) -> SecurityStandardDocument:
+        """Create one fresh document and body frame for a render pass."""
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        prefix=".redis-security-standard-",
-        suffix=".pdf",
-        dir=output_path.parent,
-        delete=False,
-    ) as temporary_file:
-        temporary_path = Path(temporary_file.name)
-
-    try:
         document = SecurityStandardDocument(
-            str(temporary_path),
+            str(destination),
             pagesize=LETTER,
             title="Redis Security Standard",
             author="Michael Welter",
@@ -479,15 +496,68 @@ def build_pdf(blocks: Sequence[MarkdownBlock], output_path: Path) -> None:
             topMargin=0.66 * inch,
             bottomMargin=0.66 * inch,
         )
+        document.heading_entries = []
+        body_frame = Frame(
+            0.72 * inch,
+            0.66 * inch,
+            page_width - 1.44 * inch,
+            page_height - 1.56 * inch,
+            leftPadding=0,
+            rightPadding=0,
+            topPadding=0,
+            bottomPadding=0,
+            id="body",
+        )
         document.addPageTemplates(
             [
                 PageTemplate(
                     id="Document",
                     frames=[body_frame],
-                    onPage=draw_page,
+                    onPage=draw_page_start,
+                    onPageEnd=draw_page_end,
                 ),
             ]
         )
+        return document
+
+    def make_contents_table(
+        heading_entries: Sequence[tuple[int, str, int]],
+    ) -> Table:
+        """Render deterministic contents rows from the preflight page map."""
+
+        rows = [
+            [
+                Paragraph(
+                    inline_markup(heading),
+                    styles["TOCLevel1"] if level == 0 else styles["TOCLevel2"],
+                ),
+                Paragraph(str(page_number), styles["TOCLevel1"]),
+            ]
+            for level, heading, page_number in heading_entries
+        ]
+        contents_table = Table(
+            rows,
+            colWidths=[6.1 * inch, 0.25 * inch],
+            hAlign="LEFT",
+        )
+        contents_table.setStyle(
+            TableStyle(
+                [
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                    ("ALIGN", (1, 0), (1, -1), "RIGHT"),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+                    ("TOPPADDING", (0, 0), (-1, -1), 3),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+                ]
+            )
+        )
+        return contents_table
+
+    def make_story(
+        heading_entries: Sequence[tuple[int, str, int]] | None,
+    ) -> list[object]:
+        """Create a fresh story for preflight or final rendering."""
 
         story: list[object] = []
         story.extend(
@@ -587,31 +657,11 @@ def build_pdf(blocks: Sequence[MarkdownBlock], output_path: Path) -> None:
                 Paragraph("Contents", styles["TOCHeading"]),
             ]
         )
-
-        table_of_contents = TableOfContents()
-        table_of_contents.levelStyles = [
-            ParagraphStyle(
-                "TOCLevel1",
-                fontName="Helvetica-Bold",
-                fontSize=9.5,
-                leading=14,
-                textColor=navy,
-                leftIndent=0,
-                firstLineIndent=0,
-                spaceBefore=4,
-            ),
-            ParagraphStyle(
-                "TOCLevel2",
-                fontName="Helvetica",
-                fontSize=8.5,
-                leading=12,
-                textColor=ink,
-                leftIndent=14,
-                firstLineIndent=0,
-                spaceBefore=2,
-            ),
-        ]
-        story.extend([table_of_contents, PageBreak()])
+        if heading_entries is None:
+            story.append(Spacer(1, 4.5 * inch))
+        else:
+            story.append(make_contents_table(heading_entries))
+        story.append(PageBreak())
 
         index = 0
         while index < len(blocks):
@@ -620,6 +670,8 @@ def build_pdf(blocks: Sequence[MarkdownBlock], output_path: Path) -> None:
                 if block.level == 1:
                     index += 1
                     continue
+                if block.level == 2 and block.text in PAGE_BREAK_HEADINGS:
+                    story.append(PageBreak())
                 style = styles["Heading1Custom"] if block.level == 2 else styles["Heading2Custom"]
                 story.append(Paragraph(inline_markup(block.text), style))
                 index += 1
@@ -686,18 +738,53 @@ def build_pdf(blocks: Sequence[MarkdownBlock], output_path: Path) -> None:
                 ]
             )
         )
+        return story
 
-        document.multiBuild(
-            story,
-            canvasmaker=lambda *args, **kwargs: canvas.Canvas(
-                *args, **(kwargs | {"invariant": 1})
-            ),
+    def invariant_canvas(*args: object, **kwargs: object) -> canvas.Canvas:
+        """Create a reproducible ReportLab canvas."""
+
+        return canvas.Canvas(*args, **(kwargs | {"invariant": 1}))
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        prefix=".redis-security-standard-preflight-",
+        suffix=".pdf",
+        dir=output_path.parent,
+        delete=False,
+    ) as preflight_file:
+        preflight_path = Path(preflight_file.name)
+    with tempfile.NamedTemporaryFile(
+        prefix=".redis-security-standard-",
+        suffix=".pdf",
+        dir=output_path.parent,
+        delete=False,
+    ) as temporary_file:
+        temporary_path = Path(temporary_file.name)
+
+    try:
+        preflight_document = make_document(preflight_path)
+        preflight_document.build(
+            make_story(None),
+            canvasmaker=invariant_canvas,
         )
+        heading_entries = tuple(preflight_document.heading_entries)
+        if not heading_entries:
+            raise RuntimeError("preflight render did not collect heading page numbers")
+
+        document = make_document(temporary_path)
+        document.build(
+            make_story(heading_entries),
+            canvasmaker=invariant_canvas,
+        )
+        if tuple(document.heading_entries) != heading_entries:
+            raise RuntimeError("contents table changed final heading pagination")
         os.replace(temporary_path, output_path)
         output_path.chmod(0o644)
     except Exception:
         temporary_path.unlink(missing_ok=True)
         raise
+    finally:
+        preflight_path.unlink(missing_ok=True)
 
 
 def build_argument_parser(default_source: Path, default_output: Path) -> argparse.ArgumentParser:
