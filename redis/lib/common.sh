@@ -78,6 +78,24 @@ redis_validate_password_file() {
     [ -s "$redis_password_path" ] || fail "$redis_password_label must not be empty"
 }
 
+redis_validate_runtime_password_file() {
+    redis_password_label=$1
+    redis_password_path=$2
+    redis_validate_absolute_path "$redis_password_label" "$redis_password_path"
+    redis_validate_root_owned_parent_chain "$redis_password_path"
+    [ -f "$redis_password_path" ] && [ ! -L "$redis_password_path" ] \
+        || fail "$redis_password_label must be a regular, non-symbolic-link file"
+    redis_password_identity=$(stat -Lc '%U:%G:%a:%h' "$redis_password_path" 2>/dev/null) \
+        || fail "cannot inspect $redis_password_label: $redis_password_path"
+    case "$redis_password_identity" in
+        root:root:400:1 | root:root:600:1) ;;
+        *) fail "$redis_password_label must be a one-link root:root mode 0400 or 0600 file" ;;
+    esac
+    awk 'NR > 1 { exit 1 }' "$redis_password_path" \
+        || fail "$redis_password_label must contain exactly one line"
+    [ -s "$redis_password_path" ] || fail "$redis_password_label must not be empty"
+}
+
 redis_read_password() {
     redis_password_path=$1
     redis_password_value=$(cat -- "$redis_password_path")

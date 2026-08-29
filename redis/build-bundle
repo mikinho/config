@@ -59,6 +59,7 @@ redis/README.md
 redis/install
 redis/lib/common.sh
 redis/packages-8.2.9.manifest
+redis/reload-tls
 redis/setup
 redis/templates/redis-local-cache.conf.in
 redis/templates/redis-local-durable.conf.in
@@ -96,7 +97,7 @@ install_payload() {
     mkdir -p "$target_parent"
     chmod 0755 "$target_parent"
     case "$relative_path" in
-        redis/install | redis/setup | redis/verify) payload_mode=0755 ;;
+        redis/install | redis/reload-tls | redis/setup | redis/verify) payload_mode=0755 ;;
         *) payload_mode=0644 ;;
     esac
     install -m "$payload_mode" "$source_path" "$target_path"

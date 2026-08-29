@@ -32,10 +32,11 @@ Usage:
   $PROGRAM_NAME --check
   $PROGRAM_NAME [--model local|network] [--data-profile cache|durable]
 
-Runs one isolated Unix-socket-only Redis process, exercises the managed ACL,
-and removes all transient data. The network model parses its TLS configuration
-with a transient certificate but disables the test TCP port. Redis 8.x,
-redis-cli, and OpenSSL are required.
+Runs one isolated Redis process, exercises the managed ACL, and removes all
+transient data. The network model additionally enables a transient loopback TLS
+listener, replaces the certificate in place, reloads the TLS context, proves a
+new handshake serves the renewed leaf without a process restart, and exercises
+Redis's atomic failure path. Redis 8.x, redis-cli, and OpenSSL are required.
 EOF
 }
 
@@ -99,7 +100,7 @@ if [ "$MODE" = check ]; then
     exit 0
 fi
 
-for required_command in awk grep mktemp openssl redis-cli redis-server rm sed sha256sum sleep sort tail; do
+for required_command in awk cp grep mktemp mv openssl redis-cli redis-server rm sed sha256sum sleep sort tail; do
     command -v "$required_command" >/dev/null 2>&1 \
         || fail "required runtime-test command not found: $required_command"
 done
@@ -124,19 +125,38 @@ if [ "$MODEL" = local ]; then
     redis_render_configuration local "$DATA_PROFILE" "$configuration_template" \
         "$TEST_ROOT/redis.conf" 64
 else
-    openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
-        -subj /CN=redis-runtime.invalid \
-        -keyout "$TEST_ROOT/server.key" -out "$TEST_ROOT/server.crt" \
+    openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
+        -subj /CN=redis-runtime-ca.invalid \
+        -keyout "$TEST_ROOT/ca.key" -out "$TEST_ROOT/ca.crt" \
         >/dev/null 2>&1
+    openssl req -new -newkey rsa:2048 -nodes \
+        -subj /CN=redis-runtime.invalid \
+        -keyout "$TEST_ROOT/server.key" -out "$TEST_ROOT/server.csr" \
+        >/dev/null 2>&1
+    printf 'subjectAltName=DNS:redis-runtime.invalid\nextendedKeyUsage=serverAuth\n' \
+        > "$TEST_ROOT/server.ext"
+    openssl x509 -req -days 1 -set_serial 1 \
+        -in "$TEST_ROOT/server.csr" \
+        -CA "$TEST_ROOT/ca.crt" -CAkey "$TEST_ROOT/ca.key" \
+        -extfile "$TEST_ROOT/server.ext" \
+        -out "$TEST_ROOT/server-initial.crt" >/dev/null 2>&1
+    openssl x509 -req -days 1 -set_serial 2 \
+        -in "$TEST_ROOT/server.csr" \
+        -CA "$TEST_ROOT/ca.crt" -CAkey "$TEST_ROOT/ca.key" \
+        -extfile "$TEST_ROOT/server.ext" \
+        -out "$TEST_ROOT/server-renewed.crt" >/dev/null 2>&1
+    cp "$TEST_ROOT/server-initial.crt" "$TEST_ROOT/server.crt"
     redis_render_configuration network "$DATA_PROFILE" "$configuration_template" \
         "$TEST_ROOT/redis.conf" 64 127.0.0.2 \
-        "$TEST_ROOT/server.crt" "$TEST_ROOT/server.key" "$TEST_ROOT/server.crt"
+        "$TEST_ROOT/server.crt" "$TEST_ROOT/server.key" "$TEST_ROOT/ca.crt"
 fi
 sed \
     -e "s|dir /var/lib/redis|dir $TEST_ROOT|" \
     -e "s|aclfile /etc/redis/users.acl|aclfile $TEST_ROOT/users.acl|" \
     -e "s|unixsocket /run/redis/redis.sock|unixsocket $REDIS_SOCKET|" \
-    -e 's|port 6379|port 0|' \
+    -e 's|^bind 127\.0\.0\.1 127\.0\.0\.2$|bind 127.0.0.1|' \
+    -e 's|^port 6379$|port 0|' \
+    -e 's|^tls-port 6379$|tls-port 0|' \
     "$TEST_ROOT/redis.conf" > "$TEST_ROOT/redis.runtime.conf"
 
 admin_hash=$(redis_password_hash "$ADMIN_PASSWORD")
@@ -167,6 +187,16 @@ redis_cli_admin() {
 redis_cli_application() {
     REDISCLI_AUTH=$APPLICATION_PASSWORD redis-cli --no-auth-warning \
         -s "$REDIS_SOCKET" --user runtime_app "$@"
+}
+
+served_tls_serial() {
+    served_tls_port=$1
+    openssl s_client \
+        -connect "127.0.0.1:$served_tls_port" \
+        -servername redis-runtime.invalid \
+        -CAfile "$TEST_ROOT/ca.crt" \
+        -verify_return_error < /dev/null 2>/dev/null \
+        | openssl x509 -noout -serial
 }
 
 redis_cli_admin PING | grep -Fx PONG >/dev/null \
@@ -225,8 +255,60 @@ else
     [ "$(redis_cli_admin CONFIG GET appendonly | tail -n 1)" = yes ] \
         || fail "runtime durable AOF is not enabled"
 fi
+
+if [ "$MODEL" = network ]; then
+    runtime_tls_port=$((20000 + ($$ % 20000)))
+    runtime_tls_attempt=0
+    runtime_tls_result=
+    while [ "$runtime_tls_attempt" -lt 50 ]; do
+        runtime_tls_result=$(redis_cli_admin CONFIG SET tls-port \
+            "$runtime_tls_port" 2>&1 || true)
+        [ "$runtime_tls_result" != OK ] || break
+        runtime_tls_port=$((runtime_tls_port + 1))
+        runtime_tls_attempt=$((runtime_tls_attempt + 1))
+    done
+    [ "$runtime_tls_result" = OK ] \
+        || fail "cannot enable a transient TLS listener: $runtime_tls_result"
+
+    initial_file_serial=$(openssl x509 -in "$TEST_ROOT/server-initial.crt" \
+        -noout -serial)
+    renewed_file_serial=$(openssl x509 -in "$TEST_ROOT/server-renewed.crt" \
+        -noout -serial)
+    [ "$initial_file_serial" != "$renewed_file_serial" ] \
+        || fail "runtime TLS certificates must have distinct serials"
+    [ "$(served_tls_serial "$runtime_tls_port")" = "$initial_file_serial" ] \
+        || fail "transient TLS listener did not serve the initial certificate"
+
+    redis_pid_before=$(cat "$TEST_ROOT/redis.pid")
+    cp "$TEST_ROOT/server-renewed.crt" "$TEST_ROOT/server.crt.staged"
+    mv -f "$TEST_ROOT/server.crt.staged" "$TEST_ROOT/server.crt"
+    [ "$(redis_cli_admin CONFIG SET tls-cert-file \
+        "$TEST_ROOT/server.crt" 2>&1)" = OK ] \
+        || fail "Redis rejected the renewed TLS certificate"
+    [ "$(served_tls_serial "$runtime_tls_port")" = "$renewed_file_serial" ] \
+        || fail "new TLS handshakes did not receive the renewed certificate"
+
+    printf 'not a certificate\n' > "$TEST_ROOT/server.crt.staged"
+    mv -f "$TEST_ROOT/server.crt.staged" "$TEST_ROOT/server.crt"
+    failed_reload_result=$(redis_cli_admin CONFIG SET tls-cert-file \
+        "$TEST_ROOT/server.crt" 2>&1 || true)
+    printf '%s\n' "$failed_reload_result" \
+        | grep -F 'Unable to update TLS configuration' >/dev/null \
+        || fail "Redis did not reject malformed runtime TLS material"
+    [ "$(served_tls_serial "$runtime_tls_port")" = "$renewed_file_serial" ] \
+        || fail "failed TLS reload replaced the active TLS context"
+
+    cp "$TEST_ROOT/server-renewed.crt" "$TEST_ROOT/server.crt.staged"
+    mv -f "$TEST_ROOT/server.crt.staged" "$TEST_ROOT/server.crt"
+    [ "$(redis_cli_admin CONFIG SET tls-cert-file \
+        "$TEST_ROOT/server.crt" 2>&1)" = OK ] \
+        || fail "Redis rejected restoration of valid TLS material"
+    [ "$(cat "$TEST_ROOT/redis.pid")" = "$redis_pid_before" ] \
+        || fail "Redis process ID changed during runtime TLS reload"
+fi
+
 redis_cli_application DEL runtime_app:key >/dev/null \
     || fail "application cleanup failed"
 
-printf 'Validated Redis 8.x %s/%s template parsing, authentication, ACL boundaries, and data policy.\n' \
+printf 'Validated Redis 8.x %s/%s template parsing, authentication, ACL boundaries, data policy, and applicable live TLS behavior.\n' \
     "$MODEL" "$DATA_PROFILE"

@@ -1,0 +1,239 @@
+#!/usr/bin/env sh
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
+set -eu
+set -f
+
+PROGRAM_NAME=${0##*/}
+SCRIPT_DIRECTORY=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+case "$SCRIPT_DIRECTORY" in
+    /usr/local/sbin) COMMON_LIBRARY=/usr/local/libexec/config-redis/common.sh ;;
+    *) COMMON_LIBRARY=$SCRIPT_DIRECTORY/lib/common.sh ;;
+esac
+
+CONFIGURATION_PATH=/etc/redis/redis.conf
+REDIS_SOCKET=/run/redis/redis.sock
+MINIMUM_REMAINING_SECONDS=2592000
+
+MODE=apply
+ADMIN_USER=
+ADMIN_PASSWORD_FILE=
+SERVER_HOST=
+TLS_CERTIFICATE_FILE=
+TLS_PRIVATE_KEY_FILE=
+TLS_CA_FILE=
+TEMPORARY_DIRECTORY=
+
+usage() {
+    cat <<EOF
+Usage:
+  sudo $PROGRAM_NAME OPTIONS
+  $PROGRAM_NAME --plan OPTIONS
+  $PROGRAM_NAME --check
+
+Options:
+  --admin-user USER --admin-password-file FILE
+  --server-host DNS_NAME
+  --tls-certificate-file FILE --tls-private-key-file FILE --tls-ca-file FILE
+
+Validates the installed network-model TLS material, authenticates over the
+root-controlled Redis Unix socket, atomically reloads Redis's TLS context, and
+proves that a new loopback TLS handshake serves the installed leaf without
+changing the Redis process ID. The caller remains responsible for preserving
+and restoring the prior certificate if post-install adoption fails.
+EOF
+}
+
+fail() {
+    printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2
+    exit 1
+}
+
+cleanup() {
+    if [ -n "$TEMPORARY_DIRECTORY" ] && [ -d "$TEMPORARY_DIRECTORY" ]; then
+        rm -rf -- "$TEMPORARY_DIRECTORY"
+    fi
+}
+
+[ -f "$COMMON_LIBRARY" ] && [ ! -L "$COMMON_LIBRARY" ] \
+    || fail "Redis common library must be a regular file: $COMMON_LIBRARY"
+
+# shellcheck disable=SC1090
+. "$COMMON_LIBRARY"
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --check)
+            [ "$MODE" = apply ] || fail "select exactly one mode"
+            MODE=check
+            shift
+            ;;
+        --plan)
+            [ "$MODE" = apply ] || fail "select exactly one mode"
+            MODE=plan
+            shift
+            ;;
+        --admin-user)
+            [ "$#" -ge 2 ] || fail "--admin-user requires a value"
+            ADMIN_USER=$2
+            shift 2
+            ;;
+        --admin-password-file)
+            [ "$#" -ge 2 ] || fail "--admin-password-file requires a file"
+            ADMIN_PASSWORD_FILE=$2
+            shift 2
+            ;;
+        --server-host)
+            [ "$#" -ge 2 ] || fail "--server-host requires a value"
+            SERVER_HOST=$2
+            shift 2
+            ;;
+        --tls-certificate-file)
+            [ "$#" -ge 2 ] || fail "--tls-certificate-file requires a file"
+            TLS_CERTIFICATE_FILE=$2
+            shift 2
+            ;;
+        --tls-private-key-file)
+            [ "$#" -ge 2 ] || fail "--tls-private-key-file requires a file"
+            TLS_PRIVATE_KEY_FILE=$2
+            shift 2
+            ;;
+        --tls-ca-file)
+            [ "$#" -ge 2 ] || fail "--tls-ca-file requires a file"
+            TLS_CA_FILE=$2
+            shift 2
+            ;;
+        --help | -h)
+            usage
+            exit 0
+            ;;
+        *) fail "unknown argument: $1" ;;
+    esac
+done
+
+if [ "$MODE" = check ]; then
+    [ -z "$ADMIN_USER$ADMIN_PASSWORD_FILE$SERVER_HOST$TLS_CERTIFICATE_FILE$TLS_PRIVATE_KEY_FILE$TLS_CA_FILE" ] \
+        || fail "--check does not accept reload options"
+    printf 'Validated Redis live TLS-reload sources.\n'
+    exit 0
+fi
+
+redis_validate_safe_name "administrative user" "$ADMIN_USER"
+redis_validate_absolute_path "administrative password file" "$ADMIN_PASSWORD_FILE"
+redis_validate_server_host "$SERVER_HOST"
+redis_validate_absolute_path "TLS certificate file" "$TLS_CERTIFICATE_FILE"
+redis_validate_absolute_path "TLS private-key file" "$TLS_PRIVATE_KEY_FILE"
+redis_validate_absolute_path "TLS CA file" "$TLS_CA_FILE"
+
+if [ "$MODE" = plan ]; then
+    printf '1. Validate the installed certificate chain, hostname, lifetime, key match, and Redis-readable file identities.\n'
+    printf '2. Authenticate administrative user %s over the root-controlled Redis Unix socket.\n' "$ADMIN_USER"
+    printf '3. Reapply volatile tls-cert-file %s so Redis atomically replaces its in-memory TLS context.\n' \
+        "$TLS_CERTIFICATE_FILE"
+    printf '4. Verify a new loopback TLS handshake serves %s and prove the Redis process ID did not change.\n' \
+        "$SERVER_HOST"
+    printf 'Plan complete; no host changes were made and no password file was read.\n'
+    exit 0
+fi
+
+[ "$(id -u)" -eq 0 ] || fail "run as root or use --plan"
+for required_command in \
+    awk cat cmp grep id mktemp openssl redis-cli redis-server rm runuser stat \
+    systemctl tail
+do
+    command -v "$required_command" >/dev/null 2>&1 \
+        || fail "required command not found: $required_command"
+done
+redis-server --version 2>/dev/null | grep -Eq 'v=8\.2\.9([[:space:]]|$)' \
+    || fail "exact Redis 8.2.9 is required"
+systemctl is-active --quiet redis.service \
+    || fail "redis.service must be active before TLS reload"
+[ -f "$CONFIGURATION_PATH" ] && [ ! -L "$CONFIGURATION_PATH" ] \
+    || fail "managed Redis configuration is missing: $CONFIGURATION_PATH"
+[ "$(stat -Lc '%U:%G:%a' "$REDIS_SOCKET" 2>/dev/null)" = redis:redis:700 ] \
+    || fail "Redis administrative socket must be redis:redis mode 0700"
+redis_validate_runtime_password_file "administrative password file" "$ADMIN_PASSWORD_FILE"
+
+for tls_path in "$TLS_CERTIFICATE_FILE" "$TLS_PRIVATE_KEY_FILE" "$TLS_CA_FILE"; do
+    [ -f "$tls_path" ] && [ ! -L "$tls_path" ] \
+        || fail "TLS input must be a regular, non-symbolic-link file: $tls_path"
+    redis_validate_root_owned_parent_chain "$tls_path"
+done
+[ "$(stat -Lc '%U:%G:%a:%h' "$TLS_PRIVATE_KEY_FILE" 2>/dev/null)" = root:redis:640:1 ] \
+    || fail "TLS private key must be a one-link root:redis mode 0640 file"
+certificate_identity=$(stat -Lc '%U:%G:%a:%h' "$TLS_CERTIFICATE_FILE" 2>/dev/null)
+case "$certificate_identity" in
+    root:root:644:1 | root:redis:640:1) ;;
+    *) fail "TLS certificate must be root:root 0644 or root:redis 0640 with one link" ;;
+esac
+ca_identity=$(stat -Lc '%U:%G:%a:%h' "$TLS_CA_FILE" 2>/dev/null)
+case "$ca_identity" in
+    root:root:644:1 | root:redis:640:1) ;;
+    *) fail "TLS CA file must be root:root 0644 or root:redis 0640 with one link" ;;
+esac
+runuser -u redis -- test -r "$TLS_CERTIFICATE_FILE" \
+    || fail "Redis service account cannot read TLS certificate file"
+runuser -u redis -- test -r "$TLS_PRIVATE_KEY_FILE" \
+    || fail "Redis service account cannot read TLS private-key file"
+runuser -u redis -- test -r "$TLS_CA_FILE" \
+    || fail "Redis service account cannot read TLS CA file"
+
+TEMPORARY_DIRECTORY=$(mktemp -d "${TMPDIR:-/tmp}/config-redis-reload-tls.XXXXXX")
+trap cleanup EXIT HUP INT TERM
+umask 077
+
+openssl verify -purpose sslserver -CAfile "$TLS_CA_FILE" \
+    "$TLS_CERTIFICATE_FILE" >/dev/null \
+    || fail "TLS certificate chain verification failed"
+openssl x509 -checkhost "$SERVER_HOST" -noout -in "$TLS_CERTIFICATE_FILE" >/dev/null \
+    || fail "TLS certificate does not identify --server-host"
+openssl x509 -checkend "$MINIMUM_REMAINING_SECONDS" -noout \
+    -in "$TLS_CERTIFICATE_FILE" >/dev/null \
+    || fail "TLS certificate expires within 30 days"
+openssl x509 -in "$TLS_CERTIFICATE_FILE" -pubkey -noout \
+    > "$TEMPORARY_DIRECTORY/certificate-public-key.pem" \
+    || fail "cannot read TLS certificate public key"
+openssl pkey -in "$TLS_PRIVATE_KEY_FILE" -passin pass: -pubout \
+    -out "$TEMPORARY_DIRECTORY/private-public-key.pem" \
+    || fail "cannot read TLS private key"
+cmp -s "$TEMPORARY_DIRECTORY/certificate-public-key.pem" \
+    "$TEMPORARY_DIRECTORY/private-public-key.pem" \
+    || fail "TLS certificate and private key do not match"
+
+admin_password=$(redis_read_password "$ADMIN_PASSWORD_FILE")
+redis_cli_admin() {
+    REDISCLI_AUTH=$admin_password redis-cli --no-auth-warning --raw \
+        --user "$ADMIN_USER" -s "$REDIS_SOCKET" "$@"
+}
+
+redis_cli_admin PING 2>/dev/null | grep -Fx PONG >/dev/null \
+    || fail "administrative Redis authentication failed"
+[ "$(redis_cli_admin CONFIG GET tls-cert-file | tail -n 1)" = "$TLS_CERTIFICATE_FILE" ] \
+    || fail "runtime tls-cert-file differs from --tls-certificate-file"
+[ "$(redis_cli_admin CONFIG GET tls-key-file | tail -n 1)" = "$TLS_PRIVATE_KEY_FILE" ] \
+    || fail "runtime tls-key-file differs from --tls-private-key-file"
+[ "$(redis_cli_admin CONFIG GET tls-ca-cert-file | tail -n 1)" = "$TLS_CA_FILE" ] \
+    || fail "runtime tls-ca-cert-file differs from --tls-ca-file"
+
+redis_main_pid_before=$(systemctl show --property=MainPID --value redis.service)
+case "$redis_main_pid_before" in
+    '' | 0 | *[!0-9]*) fail "redis.service has no valid main process ID" ;;
+esac
+reload_result=$(redis_cli_admin CONFIG SET tls-cert-file "$TLS_CERTIFICATE_FILE" 2>&1) \
+    || fail "Redis rejected the TLS context reload: $reload_result"
+[ "$reload_result" = OK ] \
+    || fail "Redis rejected the TLS context reload: $reload_result"
+
+redis_verify_local_tls_service_identity \
+    "$SERVER_HOST" "$TLS_CA_FILE" "$TLS_CERTIFICATE_FILE" \
+    "$TEMPORARY_DIRECTORY/served-tls-transcript" \
+    "$TEMPORARY_DIRECTORY/served-leaf.pem"
+redis_main_pid_after=$(systemctl show --property=MainPID --value redis.service)
+[ "$redis_main_pid_after" = "$redis_main_pid_before" ] \
+    || fail "Redis process ID changed during TLS reload"
+
+openssl x509 -in "$TLS_CERTIFICATE_FILE" -noout -serial -enddate
+printf 'Reloaded and verified the Redis TLS certificate without restarting Redis.\n'

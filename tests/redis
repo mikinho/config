@@ -17,6 +17,7 @@ INSTALLER=$REDIS_DIRECTORY/install
 BUNDLE_BUILDER=$REDIS_DIRECTORY/build-bundle
 SETUP=$REDIS_DIRECTORY/setup
 VERIFIER=$REDIS_DIRECTORY/verify
+TLS_RELOADER=$REDIS_DIRECTORY/reload-tls
 EL9_TEST=$SCRIPT_DIRECTORY/redis-el9
 RUNTIME_TEST=$SCRIPT_DIRECTORY/redis-runtime
 PACKAGE_TEST=$SCRIPT_DIRECTORY/redis-package-el9
@@ -76,7 +77,7 @@ write_os_release() {
 trap cleanup EXIT HUP INT TERM
 
 for entry_point in \
-    "$BUNDLE_BUILDER" "$INSTALLER" "$SETUP" "$VERIFIER" \
+    "$BUNDLE_BUILDER" "$INSTALLER" "$SETUP" "$VERIFIER" "$TLS_RELOADER" \
     "$EL9_TEST" "$RUNTIME_TEST" "$PACKAGE_TEST"
 do
     [ -x "$entry_point" ] || fail "entry point is not executable: $entry_point"
@@ -208,6 +209,27 @@ assert_contains "$TEST_ROOT/expose-network.plan" \
 assert_contains "$TEST_ROOT/expose-network.plan" \
     'allowed-source and denied-source firewall path evidence'
 
+"$TLS_RELOADER" --plan \
+    --admin-user redis_admin \
+    --admin-password-file /root/redis-admin.password \
+    --server-host redis.internal.example \
+    --tls-certificate-file /etc/pki/redis/server.crt \
+    --tls-private-key-file /etc/pki/redis/server.key \
+    --tls-ca-file /etc/pki/redis/ca-chain.crt \
+    > "$TEST_ROOT/reload-tls.plan"
+assert_contains "$TEST_ROOT/reload-tls.plan" \
+    'atomically replaces its in-memory TLS context'
+assert_contains "$TEST_ROOT/reload-tls.plan" \
+    'prove the Redis process ID did not change'
+assert_contains "$TEST_ROOT/reload-tls.plan" \
+    'no password file was read'
+assert_contains "$REDIS_DIRECTORY/lib/common.sh" \
+    'root:root:400:1 | root:root:600:1'
+assert_contains "$TLS_RELOADER" \
+    'redis_validate_runtime_password_file "administrative password file"'
+assert_contains "$TLS_RELOADER" \
+    '/usr/local/libexec/config-redis/common.sh'
+
 restricted_bind_address=10.20.30.40
 printf '10.20.30.21\n10.20.30.22\n' > "$TEST_ROOT/allowed-clients"
 if grep -Fx "$restricted_bind_address" "$TEST_ROOT/allowed-clients" >/dev/null; then
@@ -311,6 +333,8 @@ assert_contains "$REDIS_DIRECTORY/lib/common.sh" '-keys -scan -randomkey -dbsize
 assert_contains "$REDIS_DIRECTORY/lib/common.sh" '-vadd -vcard -vdim -vemb'
 assert_contains "$REDIS_DIRECTORY/lib/common.sh" '+eval +eval_ro +evalsha +evalsha_ro'
 assert_contains "$REDIS_DIRECTORY/lib/common.sh" '+client|info'
+assert_contains "$TLS_RELOADER" 'CONFIG SET tls-cert-file'
+assert_contains "$TLS_RELOADER" 'Redis process ID changed during TLS reload'
 assert_contains "$VERIFIER" 'ps -e -o label= -o comm='
 assert_contains "$VERIFIER" "for required_network in '0.0.0.0/0' '::/0'"
 assert_contains "$SETUP" "--host \"\$REDIS_LOCAL_TLS_PROBE_ADDRESS\""

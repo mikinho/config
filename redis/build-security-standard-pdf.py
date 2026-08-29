@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Final, Sequence
 
 DOCUMENT_DATE: Final[str] = "August 28, 2026"
-DOCUMENT_VERSION: Final[str] = "1.2"
+DOCUMENT_VERSION: Final[str] = "1.3"
 DEFAULT_OUTPUT_RELATIVE: Final[Path] = Path("output/pdf/redis-security-standard.pdf")
 REQUIRED_HEADINGS: Final[tuple[str, ...]] = (
     "Platform and version policy",
@@ -35,6 +35,7 @@ REQUIRED_HEADINGS: Final[tuple[str, ...]] = (
     "Local configurations",
     "Restricted-network configurations",
     "Verification and evidence",
+    "Zero-downtime TLS certificate adoption",
     "Operations and change control",
 )
 PAGE_BREAK_HEADINGS: Final[frozenset[str]] = frozenset(
@@ -43,6 +44,7 @@ PAGE_BREAK_HEADINGS: Final[frozenset[str]] = frozenset(
         "Local configurations",
         "Restricted-network configurations",
         "Verification and evidence",
+        "Zero-downtime TLS certificate adoption",
         "Operations and change control",
         "Reproduce the PDF handoff",
     }

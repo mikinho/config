@@ -12,6 +12,7 @@ SCRIPT_DIRECTORY=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 REPOSITORY_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIRECTORY/.." && pwd)
 PLATFORM_LIBRARY=$REPOSITORY_ROOT/deploy/lib/platform.sh
 VERIFIER_SOURCE=$SCRIPT_DIRECTORY/verify
+TLS_RELOADER_SOURCE=$SCRIPT_DIRECTORY/reload-tls
 COMMON_LIBRARY_SOURCE=$SCRIPT_DIRECTORY/lib/common.sh
 LOCAL_CACHE_TEMPLATE_SOURCE=$SCRIPT_DIRECTORY/templates/redis-local-cache.conf.in
 LOCAL_DURABLE_TEMPLATE_SOURCE=$SCRIPT_DIRECTORY/templates/redis-local-durable.conf.in
@@ -32,6 +33,7 @@ REPOSITORY_DIRECTORY=/etc/yum.repos.d
 REPOSITORY_TARGET=$REPOSITORY_DIRECTORY/redis-official-8.2.repo
 KEY_TARGET=/etc/pki/rpm-gpg/REDIS-OFFICIAL
 VERIFIER_TARGET=/usr/local/bin/verify-redis
+TLS_RELOADER_TARGET=/usr/local/sbin/reload-redis-tls
 VERIFIER_LIBRARY_DIRECTORY=/usr/local/libexec/config-redis
 PACKAGE_MANIFEST_TARGET=$VERIFIER_LIBRARY_DIRECTORY/packages-8.2.9.manifest
 
@@ -136,7 +138,8 @@ validate_execution_bundle() {
         || fail "deployment bundle metadata has no exact Git source revision"
     for bundle_required_path in \
         BUNDLE-METADATA deploy/lib/platform.sh redis/install redis/setup \
-        redis/verify redis/lib/common.sh redis/packages-8.2.9.manifest \
+        redis/verify redis/reload-tls redis/lib/common.sh \
+        redis/packages-8.2.9.manifest \
         redis/templates/redis-local-cache.conf.in \
         redis/templates/redis-local-durable.conf.in \
         redis/templates/redis-network-cache.conf.in \
@@ -153,7 +156,8 @@ validate_execution_bundle() {
 }
 
 for install_source in \
-    "$PLATFORM_LIBRARY" "$VERIFIER_SOURCE" "$COMMON_LIBRARY_SOURCE" \
+    "$PLATFORM_LIBRARY" "$VERIFIER_SOURCE" "$TLS_RELOADER_SOURCE" \
+    "$COMMON_LIBRARY_SOURCE" \
     "$LOCAL_CACHE_TEMPLATE_SOURCE" "$LOCAL_DURABLE_TEMPLATE_SOURCE" \
     "$NETWORK_CACHE_TEMPLATE_SOURCE" "$NETWORK_DURABLE_TEMPLATE_SOURCE" \
     "$SYSTEMD_TEMPLATE_SOURCE" "$PACKAGE_MANIFEST_SOURCE"
@@ -161,6 +165,8 @@ do
     validate_source "$install_source"
 done
 [ -x "$VERIFIER_SOURCE" ] || fail "verifier must be executable: $VERIFIER_SOURCE"
+[ -x "$TLS_RELOADER_SOURCE" ] \
+    || fail "TLS reloader must be executable: $TLS_RELOADER_SOURCE"
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -218,7 +224,8 @@ fi
 
 if [ "$MODE" = check ]; then
     "$VERIFIER_SOURCE" --check >/dev/null
-    printf 'Validated Redis installer and verifier sources.\n'
+    "$TLS_RELOADER_SOURCE" --check >/dev/null
+    printf 'Validated Redis installer, verifier, and live TLS-reload sources.\n'
     exit 0
 fi
 
@@ -270,6 +277,7 @@ validate_root_directory /etc/pki/rpm-gpg
 validate_root_directory "$REPOSITORY_DIRECTORY"
 validate_root_directory /usr/local
 validate_root_directory /usr/local/bin
+validate_root_directory /usr/local/sbin
 if systemctl is-active --quiet redis.service 2>/dev/null; then
     fail "refusing package changes while redis.service is active"
 fi
@@ -280,7 +288,9 @@ if command -v redis-server >/dev/null 2>&1; then
     redis-server --version 2>/dev/null | grep -Eq 'v=8\.2\.' \
         || fail "an installed Redis server is not from the $REDIS_SERIES extended series"
 fi
-for managed_target in "$REPOSITORY_TARGET" "$KEY_TARGET" "$VERIFIER_TARGET"; do
+for managed_target in \
+    "$REPOSITORY_TARGET" "$KEY_TARGET" "$VERIFIER_TARGET" "$TLS_RELOADER_TARGET"
+do
     if [ -e "$managed_target" ] || [ -L "$managed_target" ]; then
         [ -f "$managed_target" ] && [ ! -L "$managed_target" ] \
             || fail "managed target must be a regular, non-symbolic-link file: $managed_target"
@@ -357,6 +367,7 @@ EOF
 install -d -o root -g root -m 0755 "$VERIFIER_LIBRARY_DIRECTORY"
 install -d -o root -g root -m 0755 "$VERIFIER_LIBRARY_DIRECTORY/templates"
 install -o root -g root -m 0755 "$VERIFIER_SOURCE" "$VERIFIER_TARGET"
+install -o root -g root -m 0755 "$TLS_RELOADER_SOURCE" "$TLS_RELOADER_TARGET"
 install -o root -g root -m 0644 "$COMMON_LIBRARY_SOURCE" \
     "$VERIFIER_LIBRARY_DIRECTORY/common.sh"
 install -o root -g root -m 0644 "$PACKAGE_MANIFEST_SOURCE" "$PACKAGE_MANIFEST_TARGET"

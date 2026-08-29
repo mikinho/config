@@ -203,7 +203,8 @@ validate_execution_bundle() {
     grep -Eq '^sourceRevision=[0-9a-f]{40}$' "$BUNDLE_METADATA" \
         || fail "deployment bundle metadata has no exact Git source revision"
     for bundle_required_path in \
-        BUNDLE-METADATA redis/setup redis/verify redis/lib/common.sh \
+        BUNDLE-METADATA redis/setup redis/verify redis/reload-tls \
+        redis/lib/common.sh \
         redis/templates/redis-local-cache.conf.in \
         redis/templates/redis-local-durable.conf.in \
         redis/templates/redis-network-cache.conf.in \

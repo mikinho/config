@@ -52,6 +52,7 @@ if command -v shellcheck >/dev/null 2>&1; then
         "$REPOSITORY_ROOT/mongodb/verify" \
         "$REPOSITORY_ROOT/redis/install" \
         "$REPOSITORY_ROOT/redis/build-bundle" \
+        "$REPOSITORY_ROOT/redis/reload-tls" \
         "$REPOSITORY_ROOT/redis/setup" \
         "$REPOSITORY_ROOT/redis/verify" \
         "$REPOSITORY_ROOT/redis/lib/common.sh" \

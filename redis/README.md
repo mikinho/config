@@ -198,7 +198,7 @@ Before the transition, require all of the following:
 - a server certificate whose SAN contains that DNS name, issued by the
   deployment's approved private or public CA;
 - a readable certificate, private key, and complete CA chain at stable absolute
-  paths, with renewal automation and an audited service reload/restart hook;
+  paths, with renewal automation and an audited in-process TLS reload hook;
 - the CA trust artifact installed explicitly on every application host;
 - exact application source addresses in host and cloud/network firewalls;
 - no public Redis rule and no broad private CIDR when exact sources are known;
@@ -315,6 +315,40 @@ Capture its output, `systemctl status redis`, certificate metadata without
 private keys, DNS results, firewall rule identifiers, and dated connection
 tests in the private deployment evidence set.
 
+## Zero-downtime TLS certificate adoption
+
+Redis 8.2 can replace its in-memory OpenSSL context through the runtime
+`tls-cert-file` configuration without stopping its listeners or disconnecting
+existing clients. The installed `reload-redis-tls` helper uses the protected
+Unix socket and administrative ACL rather than the certificate-dependent TCP
+path. It re-applies the stable certificate path, verifies a new loopback TLS
+handshake with the production server name, and requires the Redis process ID to
+remain unchanged.
+
+Review a deployment-specific invocation without reading the administrative
+secret:
+
+```sh
+/usr/local/sbin/reload-redis-tls --plan \
+  --admin-user redis_admin \
+  --admin-password-file /root/redis-admin.password \
+  --server-host redis.internal.example \
+  --tls-certificate-file /etc/pki/redis/server.crt \
+  --tls-private-key-file /etc/pki/redis/server.key \
+  --tls-ca-file /etc/pki/redis/ca-chain.crt
+```
+
+The renewal owner must validate and preserve the prior certificate before
+atomically replacing the stable file. After replacement, run the same command
+with `sudo`. The reload helper accepts either the standard root-owned mode
+`0600` password file or a root-owned mode `0400` systemd credential, allowing a
+renewal service to use `LoadCredential=` without copying the secret or exposing
+it in process arguments. If adoption or served-identity verification fails,
+restore the prior certificate atomically and invoke the helper again. Redis
+constructs the replacement TLS context before swapping it, so a rejected
+runtime update leaves the existing context active. A process restart is a
+documented recovery fallback, not the routine certificate-renewal mechanism.
+
 ## Operations and change control
 
 - For durable profiles, back up Redis persistence files from a consistent
@@ -330,7 +364,9 @@ tests in the private deployment evidence set.
 - Rotate application passwords one identity at a time using a reviewed overlap
   procedure rather than hand-editing the managed ACL.
 - CA renewal automation must preserve paths, ownership, modes, SELinux access,
-  and the DNS SAN, then restart Redis and rerun TLS verification.
+  and the DNS SAN; preserve the prior leaf; atomically install the renewed
+  chain; invoke `reload-redis-tls`; verify the served leaf and unchanged process
+  ID; and restore plus reapply the prior leaf on failure.
 - Upgrades require a new reviewed package manifest, full key and digest
   validation, release-note/security review, durable backup and restore proof
   where applicable, application staging, and a rollback window. Never convert
@@ -356,6 +392,8 @@ wrapping, headers, footers, page references, and placeholder absence.
 - [Redis RPM installation](https://redis.io/docs/latest/operate/oss_and_stack/install/install-stack/rpm/)
 - [Redis security](https://redis.io/docs/latest/operate/oss_and_stack/management/security/)
 - [Redis TLS](https://redis.io/docs/latest/operate/oss_and_stack/management/security/encryption/)
+- [Redis 8.2 runtime TLS configuration](https://github.com/redis/redis/blob/8.2/src/config.c#L3024-L3043)
+- [Redis atomic TLS context replacement](https://github.com/redis/redis/blob/8.2/src/tls.c#L234-L354)
 - [Redis ACLs](https://redis.io/docs/latest/operate/oss_and_stack/management/security/acl/)
 - [Redis persistence](https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/)
 - [Redis eviction](https://redis.io/docs/latest/develop/reference/eviction/)
