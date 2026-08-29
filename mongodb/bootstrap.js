@@ -5,6 +5,7 @@
 // argument. This file intentionally contains no deployment-specific values.
 
 (() => {
+    const authenticationSucceeded = (result) => result === 1 || result?.ok === 1;
     const requiredEnvironment = [
         "MONGODB_ADMIN_USER",
         "MONGODB_ADMIN_PASSWORD",
@@ -55,7 +56,15 @@
             { role: "userAdminAnyDatabase", db: "admin" },
         ],
     });
-    if (adminDatabase.auth({ user: adminUser, pwd: adminPassword, mechanism: "SCRAM-SHA-256" }) !== 1) {
+    if (
+        !authenticationSucceeded(
+            adminDatabase.auth({
+                user: adminUser,
+                pwd: adminPassword,
+                mechanism: "SCRAM-SHA-256",
+            }),
+        )
+    ) {
         throw new Error("The new administrative user could not authenticate.");
     }
 

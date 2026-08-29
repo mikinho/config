@@ -5,6 +5,7 @@
 // unexpected configurations.
 
 (() => {
+    const authenticationSucceeded = (result) => result === 1 || result?.ok === 1;
     const adminUser = process.env.MONGODB_ADMIN_USER;
     const adminPassword = process.env.MONGODB_ADMIN_PASSWORD;
     const memberHost = process.env.MONGODB_MEMBER_HOST;
@@ -13,7 +14,15 @@
     }
 
     const adminDatabase = db.getSiblingDB("admin");
-    if (adminDatabase.auth({ user: adminUser, pwd: adminPassword, mechanism: "SCRAM-SHA-256" }) !== 1) {
+    if (
+        !authenticationSucceeded(
+            adminDatabase.auth({
+                user: adminUser,
+                pwd: adminPassword,
+                mechanism: "SCRAM-SHA-256",
+            }),
+        )
+    ) {
         throw new Error("Administrative authentication failed.");
     }
 

@@ -5,6 +5,7 @@
 // process environment and are never printed.
 
 (() => {
+    const authenticationSucceeded = (result) => result === 1 || result?.ok === 1;
     const requiredEnvironment = [
         "MONGODB_ADMIN_USER",
         "MONGODB_ADMIN_PASSWORD",
@@ -21,11 +22,13 @@
 
     const adminDatabase = db.getSiblingDB("admin");
     if (
-        adminDatabase.auth({
-            user: process.env.MONGODB_ADMIN_USER,
-            pwd: process.env.MONGODB_ADMIN_PASSWORD,
-            mechanism: "SCRAM-SHA-256",
-        }) !== 1
+        !authenticationSucceeded(
+            adminDatabase.auth({
+                user: process.env.MONGODB_ADMIN_USER,
+                pwd: process.env.MONGODB_ADMIN_PASSWORD,
+                mechanism: "SCRAM-SHA-256",
+            }),
+        )
     ) {
         throw new Error("Administrative authentication failed.");
     }

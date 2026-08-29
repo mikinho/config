@@ -417,9 +417,34 @@ verify_tls_files() {
 }
 
 report_host_advisories() {
-    if [ -r /sys/kernel/mm/transparent_hugepage/enabled ] \
-        && grep -F '[never]' /sys/kernel/mm/transparent_hugepage/enabled >/dev/null 2>&1; then
-        fail "transparent huge pages are disabled; MongoDB 8.0 requires the reviewed THP policy"
+    thp_directory=
+    for candidate_thp_directory in \
+        /sys/kernel/mm/transparent_hugepage \
+        /sys/kernel/mm/redhat_transparent_hugepage
+    do
+        if [ -d "$candidate_thp_directory" ]; then
+            thp_directory=$candidate_thp_directory
+            break
+        fi
+    done
+    if [ -z "$thp_directory" ] || [ ! -r "$thp_directory/enabled" ]; then
+        printf 'Warning: could not inspect transparent huge page settings.\n' >&2
+    elif ! grep -F '[always]' "$thp_directory/enabled" >/dev/null 2>&1; then
+        fail "transparent huge pages must be set to always for MongoDB 8.0"
+    fi
+    if [ -n "$thp_directory" ] \
+        && [ -r "$thp_directory/defrag" ] \
+        && ! grep -F '[defer+madvise]' "$thp_directory/defrag" >/dev/null 2>&1; then
+        printf 'Warning: MongoDB 8.0 guidance prefers THP defrag=defer+madvise.\n' >&2
+    fi
+    if [ -n "$thp_directory" ] \
+        && [ -r "$thp_directory/khugepaged/max_ptes_none" ] \
+        && [ "$(cat "$thp_directory/khugepaged/max_ptes_none")" != 0 ]; then
+        printf 'Warning: MongoDB 8.0 guidance prefers THP max_ptes_none=0.\n' >&2
+    fi
+    if [ -r /proc/sys/vm/overcommit_memory ] \
+        && [ "$(cat /proc/sys/vm/overcommit_memory)" != 1 ]; then
+        printf 'Warning: MongoDB 8.0 guidance prefers vm.overcommit_memory=1.\n' >&2
     fi
     if [ -r /proc/sys/vm/zone_reclaim_mode ] \
         && [ "$(cat /proc/sys/vm/zone_reclaim_mode)" != 0 ]; then
@@ -500,7 +525,7 @@ case "$open_file_limit" in
     *) [ "$open_file_limit" -ge 64000 ] || fail "mongod.service LimitNOFILE must be at least 64000" ;;
 esac
 [ "$(getenforce)" = Enforcing ] || fail "SELinux must be Enforcing"
-ps -eZ -o label=,comm= | awk '$2 == "mongod" && $1 ~ /:mongod_t:/ { found = 1 } END { exit found ? 0 : 1 }' \
+ps -e -o label= -o comm= | awk '$2 == "mongod" && $1 ~ /:mongod_t:/ { found = 1 } END { exit found ? 0 : 1 }' \
     || fail "running mongod process is not confined by mongod_t"
 
 require_regular_file_identity "$KEY_FILE_PATH" mongod:mongod:400:1

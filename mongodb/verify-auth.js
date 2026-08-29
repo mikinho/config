@@ -1,9 +1,10 @@
-/* global db, rs */
+/* global db, rs, EJSON, print */
 
 // Authenticated functional checks used by mongodb/verify. This script emits no
 // credentials or database contents.
 
 (() => {
+    const authenticationSucceeded = (result) => result === 1 || result?.ok === 1;
     const requiredEnvironment = [
         "MONGODB_ADMIN_USER",
         "MONGODB_ADMIN_PASSWORD",
@@ -20,11 +21,13 @@
 
     const adminDatabase = db.getSiblingDB("admin");
     if (
-        adminDatabase.auth({
-            user: process.env.MONGODB_ADMIN_USER,
-            pwd: process.env.MONGODB_ADMIN_PASSWORD,
-            mechanism: "SCRAM-SHA-256",
-        }) !== 1
+        !authenticationSucceeded(
+            adminDatabase.auth({
+                user: process.env.MONGODB_ADMIN_USER,
+                pwd: process.env.MONGODB_ADMIN_PASSWORD,
+                mechanism: "SCRAM-SHA-256",
+            }),
+        )
     ) {
         throw new Error("Administrative authentication failed.");
     }
@@ -50,6 +53,30 @@
     const hello = adminDatabase.runCommand({ hello: 1 });
     if (hello.ok !== 1 || hello.setName !== process.env.MONGODB_REPLICA_SET || hello.isWritablePrimary !== true) {
         throw new Error("The expected replica set is not a writable primary.");
+    }
+
+    const buildInfo = adminDatabase.runCommand({ buildInfo: 1 });
+    const featureCompatibility = adminDatabase.runCommand({
+        getParameter: 1,
+        featureCompatibilityVersion: 1,
+    });
+    if (
+        buildInfo.ok !== 1 ||
+        buildInfo.version !== "8.0.29" ||
+        featureCompatibility.ok !== 1 ||
+        featureCompatibility.featureCompatibilityVersion?.version !== "8.0"
+    ) {
+        throw new Error("The running MongoDB version or feature compatibility is not the reviewed 8.0 baseline.");
+    }
+
+    const serverStatus = adminDatabase.runCommand({ serverStatus: 1 });
+    const tcmallocCpuFree = Number(serverStatus.tcmalloc?.tcmalloc?.cpu_free ?? 0);
+    if (
+        serverStatus.ok !== 1 ||
+        serverStatus.tcmalloc?.usingPerCPUCaches !== true ||
+        !(tcmallocCpuFree > 0)
+    ) {
+        throw new Error("MongoDB 8.0 TCMalloc per-CPU caches are not active.");
     }
 
     const expectedMemberHost =
@@ -126,4 +153,13 @@
     if (JSON.stringify(users.users[0].mechanisms) !== JSON.stringify(["SCRAM-SHA-256"])) {
         throw new Error("The application user must use only SCRAM-SHA-256.");
     }
+
+    print(
+        EJSON.stringify({
+            featureCompatibilityVersion:
+                featureCompatibility.featureCompatibilityVersion.version,
+            serverVersion: buildInfo.version,
+            tcmallocPerCpuCaches: true,
+        }),
+    );
 })();

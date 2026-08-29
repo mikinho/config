@@ -16,7 +16,9 @@ LOCAL_TEMPLATE=$TEMPLATE_DIRECTORY/mongod-local.conf.in
 NETWORK_TEMPLATE=$TEMPLATE_DIRECTORY/mongod-network.conf.in
 BOOTSTRAP_SCRIPT=$SCRIPT_DIRECTORY/bootstrap.js
 ADD_USER_SCRIPT=$SCRIPT_DIRECTORY/add-application-user.js
+ADD_BACKUP_USER_SCRIPT=$SCRIPT_DIRECTORY/create-backup-user.js
 RECONFIGURE_SCRIPT=$SCRIPT_DIRECTORY/reconfigure-member.js
+VERIFY_BACKUP_SCRIPT=$SCRIPT_DIRECTORY/verify-backup.js
 VERIFIER=$SCRIPT_DIRECTORY/verify
 BUNDLE_METADATA=$REPOSITORY_ROOT/BUNDLE-METADATA
 BUNDLE_CHECKSUMS=$REPOSITORY_ROOT/SHA256SUMS
@@ -37,6 +39,8 @@ ADMIN_PASSWORD_FILE=
 APPLICATION_USER=
 APPLICATION_DATABASE=
 APPLICATION_PASSWORD_FILE=
+BACKUP_USER=
+BACKUP_PASSWORD_FILE=
 BIND_ADDRESS=
 MEMBER_HOST=
 TLS_CERTIFICATE_KEY_FILE=
@@ -55,6 +59,8 @@ Usage:
   sudo $PROGRAM_NAME --phase initialize OPTIONS
   $PROGRAM_NAME --plan --phase add-application-user --model local|network OPTIONS
   sudo $PROGRAM_NAME --phase add-application-user --model local|network OPTIONS
+  $PROGRAM_NAME --plan --phase add-backup-user --model local|network OPTIONS
+  sudo $PROGRAM_NAME --phase add-backup-user --model local|network OPTIONS
   $PROGRAM_NAME --plan --phase expose-network OPTIONS
   sudo $PROGRAM_NAME --phase expose-network OPTIONS
 
@@ -69,6 +75,13 @@ Add-application-user options:
   --admin-user USER --admin-password-file FILE
   --application-user USER --application-database DATABASE
   --application-password-file FILE
+  Network model also requires --member-host HOST --bind-address PRIVATE_IPV4,
+  --tls-ca-file FILE, and --tls-certificate-key-file FILE.
+
+Add-backup-user options:
+  --model local|network --replica-set NAME
+  --admin-user USER --admin-password-file FILE
+  --backup-user USER --backup-password-file FILE
   Network model also requires --member-host HOST --bind-address PRIVATE_IPV4,
   --tls-ca-file FILE, and --tls-certificate-key-file FILE.
 
@@ -140,7 +153,8 @@ validate_execution_bundle() {
     for bundle_required_path in \
         BUNDLE-METADATA mongodb/setup mongodb/verify \
         mongodb/bootstrap.js mongodb/add-application-user.js \
-        mongodb/reconfigure-member.js mongodb/verify-auth.js \
+        mongodb/create-backup-user.js mongodb/reconfigure-member.js \
+        mongodb/verify-auth.js mongodb/verify-backup.js \
         mongodb/verify-application.js mongodb/verify-unauthenticated.js \
         mongodb/packages-8.0.29.manifest \
         mongodb/templates/mongod-bootstrap.conf.in \
@@ -288,9 +302,21 @@ validate_common_identity_selection() {
     validate_absolute_path "administrative password file" "$ADMIN_PASSWORD_FILE"
 }
 
+validate_backup_identity_selection() {
+    validate_replica_set
+    validate_safe_name "administrative user" "$ADMIN_USER"
+    validate_safe_name "backup user" "$BACKUP_USER"
+    [ "$ADMIN_USER" != "$BACKUP_USER" ] \
+        || fail "administrative and backup users must be different"
+    validate_absolute_path "administrative password file" "$ADMIN_PASSWORD_FILE"
+    validate_absolute_path "backup password file" "$BACKUP_PASSWORD_FILE"
+    [ -z "$APPLICATION_USER$APPLICATION_DATABASE$APPLICATION_PASSWORD_FILE" ] \
+        || fail "application identity options do not apply to --phase add-backup-user"
+}
+
 reject_initialize_only_options() {
-    [ -z "$MODEL$BIND_ADDRESS$MEMBER_HOST$TLS_CERTIFICATE_KEY_FILE$TLS_CA_FILE" ] \
-        || fail "network and model options do not apply to --phase initialize"
+    [ -z "$MODEL$BACKUP_USER$BACKUP_PASSWORD_FILE$BIND_ADDRESS$MEMBER_HOST$TLS_CERTIFICATE_KEY_FILE$TLS_CA_FILE" ] \
+        || fail "network, model, and backup options do not apply to --phase initialize"
     [ "$NETWORK_CONTROLS_CONFIRMED" = no ] \
         || fail "--network-controls-confirmed applies only to --phase expose-network"
 }
@@ -305,6 +331,8 @@ validate_selection() {
         add-application-user)
             validate_common_identity_selection
             validate_absolute_path "application password file" "$APPLICATION_PASSWORD_FILE"
+            [ -z "$BACKUP_USER$BACKUP_PASSWORD_FILE" ] \
+                || fail "backup identity options do not apply to --phase add-application-user"
             case "$MODEL" in
                 local)
                     [ -z "$MEMBER_HOST$TLS_CA_FILE" ] \
@@ -321,9 +349,29 @@ validate_selection() {
             [ "$NETWORK_CONTROLS_CONFIRMED" = no ] \
                 || fail "--network-controls-confirmed applies only to --phase expose-network"
             ;;
+        add-backup-user)
+            validate_backup_identity_selection
+            case "$MODEL" in
+                local)
+                    [ -z "$MEMBER_HOST$BIND_ADDRESS$TLS_CA_FILE$TLS_CERTIFICATE_KEY_FILE" ] \
+                        || fail "network connection options do not apply to the local model"
+                    ;;
+                network)
+                    validate_member_host
+                    validate_ipv4_address
+                    validate_absolute_path "TLS CA file" "$TLS_CA_FILE"
+                    validate_absolute_path "TLS certificate/key file" "$TLS_CERTIFICATE_KEY_FILE"
+                    ;;
+                *) fail "--phase add-backup-user requires --model local or --model network" ;;
+            esac
+            [ "$NETWORK_CONTROLS_CONFIRMED" = no ] \
+                || fail "--network-controls-confirmed applies only to --phase expose-network"
+            ;;
         expose-network)
             validate_common_identity_selection
             validate_absolute_path "application password file" "$APPLICATION_PASSWORD_FILE"
+            [ -z "$BACKUP_USER$BACKUP_PASSWORD_FILE" ] \
+                || fail "backup identity options do not apply to --phase expose-network"
             [ -z "$MODEL" ] \
                 || fail "model options do not apply to --phase expose-network"
             validate_ipv4_address
@@ -333,7 +381,7 @@ validate_selection() {
             [ "$NETWORK_CONTROLS_CONFIRMED" = yes ] \
                 || fail "--phase expose-network requires --network-controls-confirmed"
             ;;
-        *) fail "select --phase initialize, add-application-user, or expose-network" ;;
+        *) fail "select --phase initialize, add-application-user, add-backup-user, or expose-network" ;;
     esac
 }
 
@@ -352,6 +400,13 @@ print_plan() {
             printf '2. Refuse an existing user, then create %s with only readWrite on %s.\n' \
                 "$APPLICATION_USER" "$APPLICATION_DATABASE"
             printf '3. Verify the exact application role and initialized replica set %s.\n' "$REPLICA_SET"
+            ;;
+        add-backup-user)
+            printf '1. Authenticate to the %s model with administrative user %s.\n' "$MODEL" "$ADMIN_USER"
+            printf '2. Refuse an existing user, then create %s with only backup@admin.\n' \
+                "$BACKUP_USER"
+            printf '3. Authenticate as %s and verify its exact role plus writable replica set %s.\n' \
+                "$BACKUP_USER" "$REPLICA_SET"
             ;;
         expose-network)
             printf '1. Verify the secured local replica set %s and application user %s.\n' \
@@ -440,6 +495,7 @@ restore_original_configuration() {
 cleanup() {
     admin_password=
     application_password=
+    backup_password=
     if [ "$ROLLBACK_REQUIRED" = yes ]; then
         systemctl stop mongod.service >/dev/null 2>&1 || true
         if [ "$PHASE" = expose-network ]; then
@@ -594,6 +650,38 @@ add_application_user() {
         "$APPLICATION_USER" "$APPLICATION_DATABASE"
 }
 
+add_backup_user() {
+    validate_mongodb_runtime
+    validate_password_file "administrative password file" "$ADMIN_PASSWORD_FILE"
+    validate_password_file "backup password file" "$BACKUP_PASSWORD_FILE"
+    if [ "$MODEL" = network ]; then
+        validate_tls_server_identity
+    fi
+    admin_password=$(read_password "$ADMIN_PASSWORD_FILE")
+    backup_password=$(read_password "$BACKUP_PASSWORD_FILE")
+    if [ "$MODEL" = local ]; then
+        set -- --host 127.0.0.1 --port "$MONGODB_PORT"
+    else
+        set -- --host "$MEMBER_HOST" --port "$MONGODB_PORT" \
+            --tls --tlsCAFile "$TLS_CA_FILE"
+    fi
+    env \
+        MONGODB_ADMIN_USER="$ADMIN_USER" \
+        MONGODB_ADMIN_PASSWORD="$admin_password" \
+        MONGODB_BACKUP_USER="$BACKUP_USER" \
+        MONGODB_BACKUP_PASSWORD="$backup_password" \
+        mongosh --quiet --norc "$@" --file "$ADD_BACKUP_USER_SCRIPT"
+    env \
+        MONGODB_ADMIN_USER="$ADMIN_USER" \
+        MONGODB_ADMIN_PASSWORD="$admin_password" \
+        MONGODB_BACKUP_USER="$BACKUP_USER" \
+        MONGODB_BACKUP_PASSWORD="$backup_password" \
+        MONGODB_REPLICA_SET="$REPLICA_SET" \
+        mongosh --quiet --norc "$@" --file "$VERIFY_BACKUP_SCRIPT"
+    printf 'Created and verified backup user %s with exactly backup@admin.\n' \
+        "$BACKUP_USER"
+}
+
 validate_tls_server_identity() {
     [ -f "$TLS_CERTIFICATE_KEY_FILE" ] && [ ! -L "$TLS_CERTIFICATE_KEY_FILE" ] \
         || fail "TLS certificate/key file must be a regular, non-symbolic-link file"
@@ -666,7 +754,8 @@ expose_network_model() {
 
 for setup_dependency in \
     "$BOOTSTRAP_TEMPLATE" "$LOCAL_TEMPLATE" "$NETWORK_TEMPLATE" \
-    "$BOOTSTRAP_SCRIPT" "$ADD_USER_SCRIPT" "$RECONFIGURE_SCRIPT" "$VERIFIER"
+    "$BOOTSTRAP_SCRIPT" "$ADD_USER_SCRIPT" "$ADD_BACKUP_USER_SCRIPT" \
+    "$RECONFIGURE_SCRIPT" "$VERIFY_BACKUP_SCRIPT" "$VERIFIER"
 do
     validate_source "$setup_dependency"
 done
@@ -692,6 +781,8 @@ while [ "$#" -gt 0 ]; do
         --application-user) [ "$#" -ge 2 ] || fail "--application-user requires a value"; APPLICATION_USER=$2; shift 2 ;;
         --application-database) [ "$#" -ge 2 ] || fail "--application-database requires a value"; APPLICATION_DATABASE=$2; shift 2 ;;
         --application-password-file) [ "$#" -ge 2 ] || fail "--application-password-file requires a value"; APPLICATION_PASSWORD_FILE=$2; shift 2 ;;
+        --backup-user) [ "$#" -ge 2 ] || fail "--backup-user requires a value"; BACKUP_USER=$2; shift 2 ;;
+        --backup-password-file) [ "$#" -ge 2 ] || fail "--backup-password-file requires a value"; BACKUP_PASSWORD_FILE=$2; shift 2 ;;
         --bind-address) [ "$#" -ge 2 ] || fail "--bind-address requires a value"; BIND_ADDRESS=$2; shift 2 ;;
         --member-host) [ "$#" -ge 2 ] || fail "--member-host requires a value"; MEMBER_HOST=$2; shift 2 ;;
         --tls-certificate-key-file) [ "$#" -ge 2 ] || fail "--tls-certificate-key-file requires a value"; TLS_CERTIFICATE_KEY_FILE=$2; shift 2 ;;
@@ -703,7 +794,7 @@ while [ "$#" -gt 0 ]; do
 done
 
 if [ "$MODE" = check ]; then
-    [ -z "$PHASE$MODEL$REPLICA_SET$ADMIN_USER$ADMIN_PASSWORD_FILE$APPLICATION_USER$APPLICATION_DATABASE$APPLICATION_PASSWORD_FILE$BIND_ADDRESS$MEMBER_HOST$TLS_CERTIFICATE_KEY_FILE$TLS_CA_FILE" ] \
+    [ -z "$PHASE$MODEL$REPLICA_SET$ADMIN_USER$ADMIN_PASSWORD_FILE$APPLICATION_USER$APPLICATION_DATABASE$APPLICATION_PASSWORD_FILE$BACKUP_USER$BACKUP_PASSWORD_FILE$BIND_ADDRESS$MEMBER_HOST$TLS_CERTIFICATE_KEY_FILE$TLS_CA_FILE" ] \
         && [ "$NETWORK_CONTROLS_CONFIRMED" = no ] \
         || fail "--check does not accept deployment selections"
     for template_path in "$BOOTSTRAP_TEMPLATE" "$LOCAL_TEMPLATE" "$NETWORK_TEMPLATE"; do
@@ -734,5 +825,6 @@ TEMPORARY_DIRECTORY=$(mktemp -d "${TMPDIR:-/tmp}/config-mongodb-setup.XXXXXX") \
 case "$PHASE" in
     initialize) initialize_new_replica_set ;;
     add-application-user) add_application_user ;;
+    add-backup-user) add_backup_user ;;
     expose-network) expose_network_model ;;
 esac

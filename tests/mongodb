@@ -96,7 +96,9 @@ done
 for javascript_source in \
     "$MONGODB_DIRECTORY/bootstrap.js" \
     "$MONGODB_DIRECTORY/add-application-user.js" \
+    "$MONGODB_DIRECTORY/create-backup-user.js" \
     "$MONGODB_DIRECTORY/reconfigure-member.js" \
+    "$MONGODB_DIRECTORY/verify-backup.js" \
     "$MONGODB_DIRECTORY/verify-application.js" \
     "$MONGODB_DIRECTORY/verify-auth.js" \
     "$MONGODB_DIRECTORY/verify-unauthenticated.js"
@@ -107,6 +109,9 @@ do
         node --check "$javascript_source"
     fi
 done
+if command -v node >/dev/null 2>&1; then
+    node "$SCRIPT_DIRECTORY/mongodb-mongosh-compatibility.mjs"
+fi
 
 write_os_release "$TEST_ROOT/rocky-9" rocky 'Rocky Linux 9.6' 9.6
 write_os_release "$TEST_ROOT/centos-stream-9" centos 'CentOS Stream 9' 9
@@ -216,6 +221,40 @@ assert_contains "$TEST_ROOT/expose-network.plan" \
 assert_contains "$TEST_ROOT/add-network-user.plan" \
     'Authenticate to the network model'
 
+"$SETUP" --plan --phase add-backup-user --model network \
+    --replica-set example_rs \
+    --admin-user database_admin \
+    --admin-password-file /root/database-admin.password \
+    --backup-user example_backup \
+    --backup-password-file /root/example-backup.password \
+    --bind-address 10.20.30.40 \
+    --member-host mongodb.internal.example \
+    --tls-certificate-key-file /etc/pki/mongodb/server.pem \
+    --tls-ca-file /etc/pki/mongodb/ca.pem \
+    > "$TEST_ROOT/add-backup-user.plan"
+assert_contains "$TEST_ROOT/add-backup-user.plan" \
+    'create example_backup with only backup@admin'
+assert_contains "$TEST_ROOT/add-backup-user.plan" \
+    'Authenticate to the network model'
+expect_failure 'backup identity options do not apply to --phase add-application-user' \
+    "$SETUP" --plan --phase add-application-user --model local \
+    --replica-set example_rs \
+    --admin-user database_admin \
+    --admin-password-file /root/database-admin.password \
+    --application-user example_app \
+    --application-database example_database \
+    --application-password-file /root/example-app.password \
+    --backup-user example_backup \
+    --backup-password-file /root/example-backup.password
+expect_failure 'application identity options do not apply to --phase add-backup-user' \
+    "$SETUP" --plan --phase add-backup-user --model local \
+    --replica-set example_rs \
+    --admin-user database_admin \
+    --admin-password-file /root/database-admin.password \
+    --backup-user example_backup \
+    --backup-password-file /root/example-backup.password \
+    --application-user example_app
+
 expect_failure 'requires --network-controls-confirmed' \
     "$SETUP" --plan --phase expose-network \
     --replica-set example_rs \
@@ -295,6 +334,13 @@ assert_contains "$VERIFIER" 'TLS server certificate expires within 48 hours'
 assert_contains "$VERIFIER" "-untrusted \"\$TLS_CERTIFICATE_KEY_FILE\""
 # shellcheck disable=SC2016
 assert_contains "$VERIFIER" 'require_directory_identity "$DATA_DIRECTORY" mongod:mongod:750'
+assert_contains "$VERIFIER" 'ps -e -o label= -o comm='
+assert_contains "$VERIFIER" 'THP defrag=defer+madvise'
+assert_contains "$VERIFIER" 'THP max_ptes_none=0'
+assert_contains "$VERIFIER" 'vm.overcommit_memory=1'
+if grep -F 'ps -eZ -o label=,comm=' "$VERIFIER" >/dev/null; then
+    fail 'MongoDB verifier still uses the non-portable ps option combination'
+fi
 if grep -F 'checkend 2592000' "$SETUP" "$VERIFIER" >/dev/null 2>&1; then
     fail 'MongoDB TLS validation still requires an impossible 30-day margin'
 fi

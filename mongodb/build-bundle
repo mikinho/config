@@ -58,6 +58,7 @@ deploy/lib/platform.sh
 mongodb/README.md
 mongodb/add-application-user.js
 mongodb/bootstrap.js
+mongodb/create-backup-user.js
 mongodb/install
 mongodb/logrotate/mongodb
 mongodb/packages-8.0.29.manifest
@@ -69,6 +70,7 @@ mongodb/templates/mongod-network.conf.in
 mongodb/verify
 mongodb/verify-application.js
 mongodb/verify-auth.js
+mongodb/verify-backup.js
 mongodb/verify-unauthenticated.js
 EOF
 }

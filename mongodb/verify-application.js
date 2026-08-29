@@ -5,6 +5,8 @@
 // It does not write data or emit credentials or database contents.
 
 (() => {
+    const authenticationSucceeded = (result) => result === 1 || result?.ok === 1;
+    const isUnauthorized = (result) => result?.code === 13 || result?.codeName === "Unauthorized";
     const requiredEnvironment = [
         "MONGODB_APPLICATION_USER",
         "MONGODB_APPLICATION_PASSWORD",
@@ -19,11 +21,13 @@
     const applicationDatabaseName = process.env.MONGODB_APPLICATION_DATABASE;
     const applicationDatabase = db.getSiblingDB(applicationDatabaseName);
     if (
-        applicationDatabase.auth({
-            user: process.env.MONGODB_APPLICATION_USER,
-            pwd: process.env.MONGODB_APPLICATION_PASSWORD,
-            mechanism: "SCRAM-SHA-256",
-        }) !== 1
+        !authenticationSucceeded(
+            applicationDatabase.auth({
+                user: process.env.MONGODB_APPLICATION_USER,
+                pwd: process.env.MONGODB_APPLICATION_PASSWORD,
+                mechanism: "SCRAM-SHA-256",
+            }),
+        )
     ) {
         throw new Error("Application authentication failed.");
     }
@@ -45,12 +49,18 @@
         throw new Error("The application identity cannot read its own database.");
     }
 
-    const administrativeRead = applicationDatabase.getSiblingDB("admin").runCommand({
-        find: "system.users",
-        filter: {},
-        limit: 1,
-    });
-    if (administrativeRead.ok !== 0 || administrativeRead.code !== 13) {
+    let administrativeReadDenied = false;
+    try {
+        const administrativeRead = applicationDatabase.getSiblingDB("admin").runCommand({
+            find: "system.users",
+            filter: {},
+            limit: 1,
+        });
+        administrativeReadDenied = administrativeRead.ok === 0 && isUnauthorized(administrativeRead);
+    } catch (error) {
+        administrativeReadDenied = isUnauthorized(error);
+    }
+    if (!administrativeReadDenied) {
         throw new Error("The application identity was not denied access to the administrative database.");
     }
 })();

@@ -122,6 +122,32 @@ The administrative identity receives exactly `clusterAdmin` and
 `readWrite` on their own database. Create separate, narrowly scoped identities
 for backup, monitoring, or restore jobs when those workflows are implemented.
 
+Create a backup identity only when an encrypted backup workflow is ready. The
+guarded phase refuses an existing name, creates exactly `backup@admin`, then
+authenticates as that identity and proves the non-mutating database inventory
+prerequisite. It does not grant restore, user administration, or application
+write roles:
+
+```sh
+sudo mongodb/setup \
+    --phase add-backup-user \
+    --model network \
+    --replica-set REPLICA_SET \
+    --admin-user ADMIN_USER \
+    --admin-password-file /root/mongodb-admin.password \
+    --backup-user BACKUP_USER \
+    --backup-password-file /root/mongodb-backup.password \
+    --bind-address PRIVATE_IPV4 \
+    --member-host mongodb.internal.example \
+    --tls-certificate-key-file /etc/pki/mongodb/server.pem \
+    --tls-ca-file /etc/pki/mongodb/ca.pem
+```
+
+Keep the backup credential independent from administrative and application
+credentials. A successful identity check does not prove encryption, remote
+retention, notification, or restore readiness; those remain separate workflow
+evidence.
+
 Store each application's percent-encoded MongoDB URI in its protected runtime
 secret file. Do not embed administrative credentials. Typical shapes are:
 
@@ -276,9 +302,35 @@ identities, service state, the exact reviewed MongoDB package set, and the
 `mongod_t` SELinux domain.
 
 The verifier reports but does not automatically change host-wide tuning. XFS
-is preferred for WiredTiger; ext4 is supported. MongoDB 8.0 expects transparent
-huge pages enabled, `vm.zone_reclaim_mode=0`, and a low swappiness value. Apply
-host tuning only after capacity and co-located workload review.
+is strongly preferred for new WiredTiger data volumes; ext4 remains supported,
+so an existing ext4 volume is a performance/remediation decision rather than a
+security incident. Do not attempt an in-place filesystem conversion.
+
+For MongoDB 8.0 on supported x86_64 and ARM64 Linux hosts, verify the complete
+TCMalloc/THP posture rather than checking only that THP is not disabled:
+
+- THP `enabled` selects `always`;
+- THP `defrag` selects `defer+madvise`;
+- `khugepaged/max_ptes_none` is `0`;
+- `vm.overcommit_memory` is `1`;
+- `serverStatus` reports `tcmalloc.usingPerCPUCaches: true` and positive
+  `tcmalloc.tcmalloc.cpu_free`; and
+- `vm.zone_reclaim_mode` is `0`.
+
+Use `vm.swappiness=1` on a dedicated database host, or on a host that also runs
+other software where emergency swap remains preferable to an out-of-memory
+failure. MongoDB also permits `0` after workload and recovery review. On RHEL
+derivatives, account for the active `tuned` profile and cgroup-v2 swappiness
+behavior so a persistent setting is not silently overridden. Apply all
+host-wide tuning only after capacity and co-located workload review, persist it
+through the platform's reviewed systemd, sysctl, and `tuned` mechanisms, and
+reverify it after reboot.
+
+Historical startup warnings are not current-state evidence. In particular,
+the access-control warning is resolved only when the effective authenticated
+verifier proves authorization, disabled localhost bypass, and unauthenticated
+denial after the final restart. Retain the dated final-start warning set rather
+than relying on warnings from an earlier insecure boot.
 
 Operational acceptance also requires controls the Community server cannot
 prove by configuration alone:
