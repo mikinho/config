@@ -1,0 +1,214 @@
+#!/usr/bin/env sh
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
+set -eu
+set -f
+
+PROGRAM_NAME=${0##*/}
+SCRIPT_DIRECTORY=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+REPOSITORY_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIRECTORY/.." && pwd)
+PLATFORM_LIBRARY=$REPOSITORY_ROOT/deploy/lib/platform.sh
+PACKAGE_MANIFEST=$SCRIPT_DIRECTORY/packages.manifest
+VERIFIER_SOURCE=$SCRIPT_DIRECTORY/verify
+CA_TEMPLATE_SOURCE=$SCRIPT_DIRECTORY/templates/ca.json.in
+SYSTEMD_TEMPLATE_SOURCE=$SCRIPT_DIRECTORY/templates/step-ca.service.in
+POLICY_DIRECTORY=/usr/local/libexec/config-step-ca
+VERIFIER_TARGET=/usr/local/bin/verify-step-ca
+
+MODE=install
+OS_RELEASE_FILE=/etc/os-release
+OS_RELEASE_OVERRIDDEN=no
+ARCHITECTURE_OVERRIDE=
+TEMPORARY_DIRECTORY=
+
+usage() {
+    cat <<EOF
+Usage:
+  $PROGRAM_NAME
+  $PROGRAM_NAME --plan [--os-release FILE] [--architecture x86_64]
+  $PROGRAM_NAME --check
+
+Installs the exact reviewed Smallstep CLI and step-ca release RPMs on Rocky
+Linux 9 or 10 x86_64. Each official release asset is pinned by SHA-256.
+Installation does not initialize a PKI, create a root key, or enable the
+service. Run smallstep-ca/setup with externally prepared CA material.
+EOF
+}
+
+fail() {
+    printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2
+    exit 1
+}
+
+cleanup() {
+    if [ -n "$TEMPORARY_DIRECTORY" ] && [ -d "$TEMPORARY_DIRECTORY" ]; then
+        rm -rf -- "$TEMPORARY_DIRECTORY"
+    fi
+}
+
+validate_source() {
+    source_path=$1
+    [ -f "$source_path" ] && [ ! -L "$source_path" ] \
+        || fail "repository dependency must be a regular file: $source_path"
+}
+
+validate_manifest() {
+    manifest_rows=$(awk -F'|' '
+        /^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
+        NF != 5 { exit 2 }
+        $1 !~ /^[a-z0-9-]+$/ { exit 2 }
+        $2 !~ /^[0-9][0-9A-Za-z.-]+$/ { exit 2 }
+        $3 !~ /^[A-Za-z0-9._-]+\.rpm$/ { exit 2 }
+        $4 !~ /^[0-9a-f]{64}$/ { exit 2 }
+        $5 !~ /^https:\/\/github\.com\/smallstep\/[a-z-]+\/releases\/download\/v[0-9]/ { exit 2 }
+        { count += 1 }
+        END { if (count != 2) exit 2; print count }
+    ' "$PACKAGE_MANIFEST") || fail "invalid Smallstep package manifest"
+    [ "$manifest_rows" -eq 2 ] || fail "manifest must contain two package rows"
+}
+
+for source_path in \
+    "$PLATFORM_LIBRARY" "$PACKAGE_MANIFEST" "$VERIFIER_SOURCE" \
+    "$CA_TEMPLATE_SOURCE" "$SYSTEMD_TEMPLATE_SOURCE"
+do
+    validate_source "$source_path"
+done
+validate_manifest
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --check)
+            [ "$MODE" = install ] || fail "select exactly one mode"
+            MODE=check
+            shift
+            ;;
+        --plan)
+            [ "$MODE" = install ] || fail "select exactly one mode"
+            MODE=plan
+            shift
+            ;;
+        --os-release)
+            [ "$#" -ge 2 ] || fail "--os-release requires a file"
+            OS_RELEASE_FILE=$2
+            OS_RELEASE_OVERRIDDEN=yes
+            shift 2
+            ;;
+        --architecture)
+            [ "$#" -ge 2 ] || fail "--architecture requires a value"
+            ARCHITECTURE_OVERRIDE=$2
+            shift 2
+            ;;
+        --help | -h)
+            usage
+            exit 0
+            ;;
+        *) fail "unknown argument: $1" ;;
+    esac
+done
+
+if [ "$MODE" != plan ] && [ "$OS_RELEASE_OVERRIDDEN" = yes ]; then
+    fail "--os-release is accepted only with --plan"
+fi
+if [ "$MODE" != plan ] && [ -n "$ARCHITECTURE_OVERRIDE" ]; then
+    fail "--architecture is accepted only with --plan"
+fi
+if [ "$MODE" = check ]; then
+    "$VERIFIER_SOURCE" --check >/dev/null
+    printf 'Validated Smallstep installer, package manifest, templates, and verifier.\n'
+    exit 0
+fi
+
+# shellcheck disable=SC1090,SC1091
+. "$PLATFORM_LIBRARY"
+
+# shellcheck disable=SC2034
+PLATFORM_MODE=$MODE
+platform_detect_supported_os "$OS_RELEASE_FILE"
+if [ -n "$ARCHITECTURE_OVERRIDE" ]; then
+    PLATFORM_OS_ARCHITECTURE=$ARCHITECTURE_OVERRIDE
+fi
+case "$PLATFORM_OS_ID:$PLATFORM_OS_VERSION_MAJOR" in
+    rocky:9 | rocky:10) ;;
+    *) fail "Smallstep CA is supported here only on Rocky Linux 9 or 10" ;;
+esac
+[ "$PLATFORM_OS_ARCHITECTURE" = x86_64 ] \
+    || fail "Smallstep CA is supported here only on x86_64"
+
+printf 'Smallstep CA installation target: %s (%s)\n' \
+    "$PLATFORM_OS_LABEL" "$PLATFORM_OS_ARCHITECTURE"
+awk -F'|' '
+    /^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
+    { printf "Reviewed package: %s %s (%s)\n", $1, $2, $4 }
+' "$PACKAGE_MANIFEST"
+
+if [ "$MODE" = plan ]; then
+    platform_print_command dnf install --assumeyes \
+        ca-certificates curl jq openssl policycoreutils
+    awk -F'|' '
+        /^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
+        { printf "+ download %s/%s\n+ verify SHA-256 %s\n", $5, $3, $4 }
+    ' "$PACKAGE_MANIFEST"
+    printf '+ install both verified local RPMs as one dnf transaction\n'
+    printf '+ install verifier and reviewed templates under /usr/local\n'
+    printf 'Plan complete; the installer would not start, stop, enable, or disable step-ca.service.\n'
+    exit 0
+fi
+
+[ "$(id -u)" -eq 0 ] || fail "run as root or use --plan"
+for required_command in awk curl dnf install mktemp rpm sha256sum systemctl; do
+    command -v "$required_command" >/dev/null 2>&1 \
+        || fail "required command not found: $required_command"
+done
+
+packages_exact=yes
+while IFS='|' read -r package_name package_version package_asset package_sha package_url; do
+    case "$package_name" in '' | \#*) continue ;; esac
+    installed_version=$(rpm -q --qf '%{VERSION}-%{RELEASE}' "$package_name" 2>/dev/null || true)
+    if [ "$installed_version" != "$package_version" ]; then
+        packages_exact=no
+    fi
+done < "$PACKAGE_MANIFEST"
+
+if [ "$packages_exact" = no ] && systemctl is-active --quiet step-ca.service 2>/dev/null; then
+    fail "refusing package changes while step-ca.service is active"
+fi
+
+dnf install --assumeyes ca-certificates curl jq openssl policycoreutils
+TEMPORARY_DIRECTORY=$(mktemp -d "${TMPDIR:-/tmp}/config-step-ca-install.XXXXXX")
+trap cleanup EXIT HUP INT TERM
+
+set --
+while IFS='|' read -r package_name package_version package_asset package_sha package_url; do
+    case "$package_name" in '' | \#*) continue ;; esac
+    asset_path=$TEMPORARY_DIRECTORY/$package_asset
+    curl --fail --location --silent --show-error \
+        --output "$asset_path" "$package_url/$package_asset"
+    printf '%s  %s\n' "$package_sha" "$asset_path" | sha256sum --check --strict >/dev/null \
+        || fail "SHA-256 verification failed for $package_asset"
+    set -- "$@" "$asset_path"
+done < "$PACKAGE_MANIFEST"
+
+dnf install --assumeyes "$@"
+
+while IFS='|' read -r package_name package_version package_asset package_sha package_url; do
+    case "$package_name" in '' | \#*) continue ;; esac
+    installed_version=$(rpm -q --qf '%{VERSION}-%{RELEASE}' "$package_name" 2>/dev/null) \
+        || fail "package was not installed: $package_name"
+    [ "$installed_version" = "$package_version" ] \
+        || fail "installed $package_name version differs from reviewed $package_version"
+done < "$PACKAGE_MANIFEST"
+
+install -d -o root -g root -m 0755 /usr/local/bin "$POLICY_DIRECTORY" \
+    "$POLICY_DIRECTORY/templates"
+install -o root -g root -m 0755 "$VERIFIER_SOURCE" "$VERIFIER_TARGET"
+install -o root -g root -m 0644 "$PACKAGE_MANIFEST" \
+    "$POLICY_DIRECTORY/packages.manifest"
+install -o root -g root -m 0644 "$CA_TEMPLATE_SOURCE" \
+    "$POLICY_DIRECTORY/templates/ca.json.in"
+install -o root -g root -m 0644 "$SYSTEMD_TEMPLATE_SOURCE" \
+    "$POLICY_DIRECTORY/templates/step-ca.service.in"
+
+printf 'Installed reviewed Smallstep packages and policy files without changing service state.\n'

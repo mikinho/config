@@ -56,6 +56,9 @@ if command -v shellcheck >/dev/null 2>&1; then
         "$REPOSITORY_ROOT/redis/setup" \
         "$REPOSITORY_ROOT/redis/verify" \
         "$REPOSITORY_ROOT/redis/lib/common.sh" \
+        "$REPOSITORY_ROOT/smallstep-ca/install" \
+        "$REPOSITORY_ROOT/smallstep-ca/setup" \
+        "$REPOSITORY_ROOT/smallstep-ca/verify" \
         "$REPOSITORY_ROOT/packages/rsync/build-el9" \
         "$REPOSITORY_ROOT/selinux/apply-nginx-policy" \
         "$REPOSITORY_ROOT/selinux/install" \
@@ -86,6 +89,7 @@ if command -v shellcheck >/dev/null 2>&1; then
         "$REPOSITORY_ROOT/tests/redis-el9" \
         "$REPOSITORY_ROOT/tests/redis-runtime" \
         "$REPOSITORY_ROOT/tests/redis-package-el9" \
+        "$REPOSITORY_ROOT/tests/smallstep-ca" \
         "$REPOSITORY_ROOT/tests/rsync-packaging" \
         "$REPOSITORY_ROOT/tests/run-all-local" \
         "$REPOSITORY_ROOT/tests/script-conventions" \
@@ -154,6 +158,10 @@ step "Running MongoDB installer and initialized replica-set model tests..."
 
 step "Running Redis installer and single-server security model tests..."
 "$REPOSITORY_ROOT/tests/redis"
+
+step "Running Smallstep CA package and security-model tests..."
+"$REPOSITORY_ROOT/tests/smallstep-ca"
+PYTHONDONTWRITEBYTECODE=1 python3 "$REPOSITORY_ROOT/tests/smallstep-ca-pdf.py"
 
 step "Running strict host and certificate healthcheck tests..."
 "$REPOSITORY_ROOT/tests/health-verifiers"

@@ -1,0 +1,3 @@
+# package|version-release|asset|sha256|release-url
+step-cli|0.30.6-1|step-cli-0.30.6-1.x86_64.rpm|10b2e467fa6ab3a1f2cf6f11e0407e50f16e5efca9c161b13fe88669d333c27f|https://github.com/smallstep/cli/releases/download/v0.30.6
+step-ca|0.30.2-1|step-ca-0.30.2-1.x86_64.rpm|58fc771efc6c0c2e9ffc48f031a2ff41c1f2c8dd6faba44ceaa453df27183f4f|https://github.com/smallstep/certificates/releases/download/v0.30.2

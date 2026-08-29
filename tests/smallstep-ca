@@ -1,0 +1,195 @@
+#!/usr/bin/env sh
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
+set -eu
+set -f
+
+PROGRAM_NAME=${0##*/}
+SCRIPT_DIRECTORY=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+REPOSITORY_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIRECTORY/.." && pwd)
+COMPONENT_DIRECTORY=$REPOSITORY_ROOT/smallstep-ca
+INSTALLER=$COMPONENT_DIRECTORY/install
+SETUP=$COMPONENT_DIRECTORY/setup
+VERIFIER=$COMPONENT_DIRECTORY/verify
+CA_TEMPLATE=$COMPONENT_DIRECTORY/templates/ca.json.in
+SYSTEMD_TEMPLATE=$COMPONENT_DIRECTORY/templates/step-ca.service.in
+MANIFEST=$COMPONENT_DIRECTORY/packages.manifest
+PDF_BUILDER=$COMPONENT_DIRECTORY/build-security-standard-pdf.py
+TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/config-step-ca-tests.XXXXXX")
+
+cleanup() {
+    if [ -d "$TEST_ROOT" ]; then
+        rm -rf -- "$TEST_ROOT"
+    fi
+}
+
+fail() {
+    printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2
+    exit 1
+}
+
+assert_contains() {
+    checked_file=$1
+    expected_text=$2
+    grep -F -- "$expected_text" "$checked_file" >/dev/null \
+        || fail "$checked_file is missing: $expected_text"
+}
+
+expect_failure() {
+    expected_message=$1
+    shift
+    if "$@" > "$TEST_ROOT/command.stdout" 2> "$TEST_ROOT/command.stderr"; then
+        fail "command unexpectedly succeeded: $*"
+    fi
+    assert_contains "$TEST_ROOT/command.stderr" "$expected_message"
+}
+
+write_os_release() {
+    release_path=$1
+    release_id=$2
+    release_name=$3
+    release_version=$4
+    printf 'ID=%s\nPRETTY_NAME="%s"\nVERSION_ID="%s"\n' \
+        "$release_id" "$release_name" "$release_version" > "$release_path"
+}
+
+setup_plan() {
+    "$SETUP" --plan \
+        --server-name ca.internal.example.invalid \
+        --bind-address 10.20.30.40 \
+        --port 8443 \
+        --root-certificate-file /root/ca-import/root_ca.crt \
+        --intermediate-certificate-file /root/ca-import/intermediate_ca.crt \
+        --intermediate-private-key-file /root/ca-import/intermediate_ca_key \
+        --intermediate-password-file /root/ca-import/intermediate.password \
+        --provisioners-file /root/ca-import/provisioners.json \
+        --x509-policy-file /root/ca-import/x509-policy.json \
+        --allowed-client-network 10.20.0.0/16 \
+        --network-controls-confirmed "$@"
+}
+
+trap cleanup EXIT HUP INT TERM
+
+for entry_point in "$INSTALLER" "$SETUP" "$VERIFIER"; do
+    [ -x "$entry_point" ] || fail "entry point is not executable: $entry_point"
+    "$entry_point" --help >/dev/null
+    "$entry_point" --check >/dev/null
+done
+[ -x "$PDF_BUILDER" ] || fail "PDF builder is not executable: $PDF_BUILDER"
+PYTHONPYCACHEPREFIX=$TEST_ROOT/pycache python3 -m py_compile "$PDF_BUILDER"
+"$PDF_BUILDER" --check >/dev/null
+
+jq -e '
+    .root == "/etc/step-ca/certs/root_ca.crt" and
+    .crt == "/etc/step-ca/certs/intermediate_ca.crt" and
+    .key == "/etc/step-ca/secrets/intermediate_ca_key" and
+    .db.type == "badgerv2" and
+    .tls.minVersion == 1.2 and .tls.maxVersion == 1.3 and
+    .tls.renegotiation == false and (has("password") | not)
+' "$CA_TEMPLATE" >/dev/null || fail 'CA template baseline is invalid'
+
+assert_contains "$SYSTEMD_TEMPLATE" 'LoadCredential=intermediate.password:'
+assert_contains "$SYSTEMD_TEMPLATE" 'ProtectSystem=strict'
+assert_contains "$SYSTEMD_TEMPLATE" 'IPAddressDeny=any'
+assert_contains "$SYSTEMD_TEMPLATE" 'SocketBindDeny=any'
+assert_contains "$SYSTEMD_TEMPLATE" 'MemoryDenyWriteExecute=yes'
+assert_contains "$SYSTEMD_TEMPLATE" 'ProtectProc=invisible'
+assert_contains "$SYSTEMD_TEMPLATE" 'CapabilityBoundingSet='
+assert_contains "$SYSTEMD_TEMPLATE" 'SystemCallFilter=@system-service'
+assert_contains "$SYSTEMD_TEMPLATE" 'SystemCallErrorNumber=EPERM'
+
+assert_contains "$MANIFEST" \
+    'step-cli|0.30.6-1|step-cli-0.30.6-1.x86_64.rpm|10b2e467fa6ab3a1f2cf6f11e0407e50f16e5efca9c161b13fe88669d333c27f'
+assert_contains "$MANIFEST" \
+    'step-ca|0.30.2-1|step-ca-0.30.2-1.x86_64.rpm|58fc771efc6c0c2e9ffc48f031a2ff41c1f2c8dd6faba44ceaa453df27183f4f'
+
+write_os_release "$TEST_ROOT/rocky-9" rocky 'Rocky Linux 9.6' 9.6
+write_os_release "$TEST_ROOT/rocky-10" rocky 'Rocky Linux 10.2' 10.2
+write_os_release "$TEST_ROOT/centos-10" centos 'CentOS Stream 10' 10
+
+for release_file in "$TEST_ROOT/rocky-9" "$TEST_ROOT/rocky-10"; do
+    "$INSTALLER" --plan --os-release "$release_file" --architecture x86_64 \
+        > "$TEST_ROOT/install.plan"
+    assert_contains "$TEST_ROOT/install.plan" 'Reviewed package: step-cli 0.30.6-1'
+    assert_contains "$TEST_ROOT/install.plan" 'Reviewed package: step-ca 0.30.2-1'
+    assert_contains "$TEST_ROOT/install.plan" \
+        'would not start, stop, enable, or disable step-ca.service'
+done
+expect_failure 'supported here only on Rocky Linux 9 or 10' \
+    "$INSTALLER" --plan --os-release "$TEST_ROOT/centos-10" --architecture x86_64
+expect_failure 'supported here only on x86_64' \
+    "$INSTALLER" --plan --os-release "$TEST_ROOT/rocky-10" --architecture aarch64
+expect_failure '--architecture is accepted only with --plan' \
+    "$INSTALLER" --architecture x86_64
+
+setup_plan > "$TEST_ROOT/setup.plan"
+assert_contains "$TEST_ROOT/setup.plan" \
+    'install root-owned CA material; no root private key is accepted or generated'
+assert_contains "$TEST_ROOT/setup.plan" \
+    'hardened systemd service with exact source-network controls'
+assert_contains "$TEST_ROOT/setup.plan" 'no input file or secret was read'
+assert_contains "$TEST_ROOT/setup.plan" \
+    'TLS certificate lifetime: default 24h, maximum 720h'
+
+setup_plan --max-tls-hours 840 > "$TEST_ROOT/setup-exception.plan"
+assert_contains "$TEST_ROOT/setup-exception.plan" \
+    'Exception notice: maximum exceeds the preferred 720-hour'
+
+expect_failure 'maximum TLS duration must not exceed the 840-hour absolute ceiling' \
+    setup_plan --max-tls-hours 8760
+expect_failure 'default TLS duration must not exceed the maximum' \
+    setup_plan --default-tls-hours 800 --max-tls-hours 720
+expect_failure 'default TLS duration must not exceed 168 hours' \
+    setup_plan --default-tls-hours 169 --max-tls-hours 720
+expect_failure 'RFC 1918 private address' \
+    "$SETUP" --plan \
+        --server-name ca.internal.example.invalid \
+        --bind-address 203.0.113.40 \
+        --root-certificate-file /root/ca-import/root_ca.crt \
+        --intermediate-certificate-file /root/ca-import/intermediate_ca.crt \
+        --intermediate-private-key-file /root/ca-import/intermediate_ca_key \
+        --intermediate-password-file /root/ca-import/intermediate.password \
+        --provisioners-file /root/ca-import/provisioners.json \
+        --x509-policy-file /root/ca-import/x509-policy.json \
+        --allowed-client-network 10.20.0.0/16 \
+        --network-controls-confirmed
+expect_failure 'requires --network-controls-confirmed' \
+    "$SETUP" --plan \
+        --server-name ca.internal.example.invalid \
+        --bind-address 10.20.30.40 \
+        --root-certificate-file /root/ca-import/root_ca.crt \
+        --intermediate-certificate-file /root/ca-import/intermediate_ca.crt \
+        --intermediate-private-key-file /root/ca-import/intermediate_ca_key \
+        --intermediate-password-file /root/ca-import/intermediate.password \
+        --provisioners-file /root/ca-import/provisioners.json \
+        --x509-policy-file /root/ca-import/x509-policy.json \
+        --allowed-client-network 10.20.0.0/16
+expect_failure 'values must be unique' \
+    setup_plan --allowed-client-network 10.20.0.0/16
+expect_failure 'must use its canonical network address' \
+    setup_plan --allowed-client-network 10.20.1.0/16
+expect_failure 'unknown argument: --root-private-key-file' \
+    "$SETUP" --root-private-key-file /root/root_ca_key
+
+assert_contains "$SETUP" 'root private key must not exist on the online CA host'
+assert_contains "$SETUP" 'has("password") | not'
+assert_contains "$SETUP" '.type == "JWK"'
+assert_contains "$SETUP" 'BEGIN ENCRYPTED PRIVATE KEY'
+assert_contains "$SETUP" 'CA:TRUE, pathlen:0'
+assert_contains "$SETUP" 'step must be a system account with the reviewed home and shell'
+assert_contains "$SETUP" "installed \$policy_label differs; rerun the reviewed installer"
+assert_contains "$VERIFIER" "find /etc/step-ca -xdev -type f"
+assert_contains "$VERIFIER" 'expected exactly one CA listener'
+assert_contains "$VERIFIER" 'installed root certificate must remain valid for at least one year'
+assert_contains "$VERIFIER" 'installed intermediate must remain valid for at least 31 days'
+assert_contains "$VERIFIER" 'installed intermediate password must contain one value of at least 16 characters'
+assert_contains "$VERIFIER" '/health'
+
+if grep -Eri 'omicelo|havenside|vulcan|omredis|omweb' "$COMPONENT_DIRECTORY"; then
+    fail 'public Smallstep CA standard contains a private deployment identifier'
+fi
+
+printf 'Validated Smallstep CA package, offline-root, policy, lifetime, and listener contracts.\n'

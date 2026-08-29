@@ -37,6 +37,7 @@ but only for explicitly trusted immediate peers.
 | Tailscale | Current stable RPM from Tailscale's official repository | Required only for tagged-server enrollment and Tailscale SSH under the explicit two-plane policy in `tailscale/`. |
 | MongoDB | **8.0 LTS** Community on EL9 x86_64 | Required only on database hosts. Both local and networked models are initialized single-node replica sets so transactions are available; one member does not provide high availability. |
 | Redis | **8.2.9 extended release** Open Source on Rocky Linux 9 x86_64 | Required only on Redis hosts. The local model is loopback-only; the restricted-network model is TLS-only on one private address and exact application sources. Both are single-server availability models. |
+| Smallstep CA | **Step CLI 0.30.6** and **step-ca 0.30.2** on Rocky Linux 9 or 10 x86_64 | Required only on an internal online-intermediate CA host. The root private key remains offline; the initial standard is a private-listener, JWK-only, single-server model. |
 | rsync | **3.5.0 or newer** for restricted `rrsync` deployment identities | 3.5.0 adds the confinement contract needed to close CVE-2026-53783. `packages/rsync/` supplies an audited temporary EL9 rebuild while the vendor package lags. |
 | firewalld | A currently supported RHEL-family release | Required only for the `firewalld/` service definitions and reference zone. |
 | SELinux | Enforcing mode with the RHEL `httpd` policy | Expected on the supported platforms; do not disable it to deploy this baseline. |
@@ -211,6 +212,11 @@ TCP 443 so clients always have an HTTP/2 or HTTP/1.1 fallback.
   local model, a TLS-only exact-source restricted-network model, immutable
   deployment bundles, strict runtime verification, and a reproducible PDF
   security handoff. It is never included automatically on an edge host.
+- `smallstep-ca/` installs pinned Smallstep releases and provides guarded
+  first-install import of an offline-root/online-intermediate hierarchy,
+  scoped JWK issuance, a hardened private listener, strict verification, and a
+  reproducible PDF security handoff. It is never included automatically on an
+  edge or database host.
 - `tailscale/` contains the official-repository installer and three-phase tagged
   server setup that keeps native deployment SSH on TCP 2356 while enabling
   Tailscale SSH on tailnet TCP 22 for explicitly named human accounts.

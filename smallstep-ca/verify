@@ -1,0 +1,360 @@
+#!/usr/bin/env sh
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
+set -eu
+set -f
+
+PROGRAM_NAME=${0##*/}
+SCRIPT_DIRECTORY=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+if [ -f "$SCRIPT_DIRECTORY/templates/step-ca.service.in" ]; then
+    SYSTEMD_TEMPLATE=$SCRIPT_DIRECTORY/templates/step-ca.service.in
+    PACKAGE_MANIFEST=$SCRIPT_DIRECTORY/packages.manifest
+else
+    SYSTEMD_TEMPLATE=/usr/local/libexec/config-step-ca/templates/step-ca.service.in
+    PACKAGE_MANIFEST=/usr/local/libexec/config-step-ca/packages.manifest
+fi
+
+CONFIGURATION_PATH=/etc/step-ca/config/ca.json
+ROOT_CERTIFICATE_PATH=/etc/step-ca/certs/root_ca.crt
+INTERMEDIATE_CERTIFICATE_PATH=/etc/step-ca/certs/intermediate_ca.crt
+INTERMEDIATE_KEY_PATH=/etc/step-ca/secrets/intermediate_ca_key
+INTERMEDIATE_PASSWORD_PATH=/etc/step-ca/secrets/intermediate-password
+SERVICE_PATH=/etc/systemd/system/step-ca.service
+
+MODE=verify
+SERVER_NAME=
+BIND_ADDRESS=
+PORT=8443
+DEFAULT_TLS_HOURS=24
+MAX_TLS_HOURS=720
+ALLOWED_NETWORK_FILE=
+ALLOWED_NETWORK_COUNT=0
+TEMPORARY_DIRECTORY=
+
+usage() {
+    cat <<EOF
+Usage:
+  $PROGRAM_NAME --check
+  sudo $PROGRAM_NAME --server-name DNS_NAME --bind-address RFC1918_IPV4 \\
+      [--port PORT] [--default-tls-hours HOURS] [--max-tls-hours HOURS] \\
+      --allowed-client-network CIDR [--allowed-client-network CIDR ...]
+
+Verifies exact package versions, CA material and permissions, offline-root
+separation, rendered configuration, service hardening, listener confinement,
+DNS, certificate chain, and the authenticated HTTPS health endpoint.
+EOF
+}
+
+fail() {
+    printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2
+    exit 1
+}
+
+cleanup() {
+    if [ -n "$TEMPORARY_DIRECTORY" ] && [ -d "$TEMPORARY_DIRECTORY" ]; then
+        rm -rf -- "$TEMPORARY_DIRECTORY"
+    fi
+    if [ -n "$ALLOWED_NETWORK_FILE" ] && [ -f "$ALLOWED_NETWORK_FILE" ]; then
+        rm -f -- "$ALLOWED_NETWORK_FILE"
+    fi
+}
+
+validate_source() {
+    source_path=$1
+    [ -f "$source_path" ] && [ ! -L "$source_path" ] \
+        || fail "verification dependency must be a regular file: $source_path"
+}
+
+validate_dns_name() {
+    dns_name=$1
+    case "$dns_name" in
+        *[!a-z0-9.-]* | .* | *..* | *.) fail "--server-name must be a lowercase DNS name" ;;
+    esac
+    printf '%s\n' "$dns_name" | grep -Eq '^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$' \
+        || fail "--server-name must be a lowercase DNS name"
+    case "$dns_name" in
+        *.*) ;;
+        *) fail "--server-name must contain a DNS suffix" ;;
+    esac
+}
+
+validate_ipv4() {
+    address_label=$1
+    address_value=$2
+    printf '%s\n' "$address_value" | awk -F. '
+        NF != 4 { exit 1 }
+        { for (field_index = 1; field_index <= 4; field_index += 1) {
+              if ($field_index !~ /^[0-9]+$/ || $field_index < 0 || $field_index > 255) exit 1
+          }
+        }
+    ' || fail "$address_label must be an IPv4 address"
+}
+
+validate_private_ipv4() {
+    address_label=$1
+    address_value=$2
+    validate_ipv4 "$address_label" "$address_value"
+    first_octet=${address_value%%.*}
+    remaining_octets=${address_value#*.}
+    second_octet=${remaining_octets%%.*}
+    case "$first_octet:$second_octet" in
+        10:* | 172:1[6-9] | 172:2[0-9] | 172:3[01] | 192:168) ;;
+        *) fail "$address_label must be an RFC 1918 private address" ;;
+    esac
+}
+
+validate_private_cidr() {
+    cidr_value=$1
+    case "$cidr_value" in */*) ;; *) fail "client network must use CIDR notation" ;; esac
+    cidr_address=${cidr_value%/*}
+    cidr_prefix=${cidr_value##*/}
+    validate_private_ipv4 "client-network address" "$cidr_address"
+    case "$cidr_prefix" in '' | *[!0-9]*) fail "invalid client-network prefix" ;; esac
+    first_octet=${cidr_address%%.*}
+    remaining_octets=${cidr_address#*.}
+    second_octet=${remaining_octets%%.*}
+    case "$first_octet:$second_octet" in
+        10:*) minimum_prefix=8 ;;
+        172:*) minimum_prefix=12 ;;
+        192:168) minimum_prefix=16 ;;
+        *) fail "client network must be RFC 1918" ;;
+    esac
+    [ "$cidr_prefix" -ge "$minimum_prefix" ] && [ "$cidr_prefix" -le 32 ] \
+        || fail "client-network prefix must stay within its RFC 1918 block"
+    printf '%s\n' "$cidr_address" | awk -F. -v prefix="$cidr_prefix" '
+        {
+            remaining = prefix
+            for (field_number = 1; field_number <= 4; field_number += 1) {
+                if (remaining >= 8) {
+                    network_octet = $field_number
+                } else if (remaining <= 0) {
+                    network_octet = 0
+                } else {
+                    block_size = 2 ^ (8 - remaining)
+                    network_octet = int($field_number / block_size) * block_size
+                }
+                if ($field_number != network_octet) exit 1
+                remaining -= 8
+            }
+        }
+    ' || fail "client network must use its canonical network address"
+}
+
+validate_positive_integer() {
+    value_label=$1
+    value=$2
+    case "$value" in '' | *[!0-9]*) fail "$value_label must be a positive integer" ;; esac
+    [ "$value" -gt 0 ] || fail "$value_label must be a positive integer"
+}
+
+validate_service_identity() {
+    getent passwd step | awk -F: '
+        $1 == "step" && $3 > 0 && $3 < 1000 &&
+        $6 == "/etc/step-ca" && $7 == "/usr/sbin/nologin" { valid = 1 }
+        END { exit valid ? 0 : 1 }
+    ' || fail "step must be a system account with the reviewed home and shell"
+    [ "$(id -gn step)" = step ] && [ "$(id -Gn step)" = step ] \
+        || fail "step must have only its matching primary group"
+}
+
+append_allowed_network() {
+    network_value=$1
+    validate_private_cidr "$network_value"
+    if grep -Fx "$network_value" "$ALLOWED_NETWORK_FILE" >/dev/null 2>&1; then
+        fail "--allowed-client-network values must be unique"
+    fi
+    printf '%s\n' "$network_value" >> "$ALLOWED_NETWORK_FILE"
+    ALLOWED_NETWORK_COUNT=$((ALLOWED_NETWORK_COUNT + 1))
+}
+
+render_service() {
+    output_path=$1
+    awk -v port="$PORT" -v networks="$ALLOWED_NETWORK_FILE" '
+        $0 == "@ALLOWED_CLIENT_NETWORKS@" {
+            while ((getline network < networks) > 0) {
+                print "IPAddressAllow=" network
+            }
+            close(networks)
+            next
+        }
+        { gsub(/@PORT@/, port); print }
+    ' "$SYSTEMD_TEMPLATE" > "$output_path"
+}
+
+validate_source "$SYSTEMD_TEMPLATE"
+validate_source "$PACKAGE_MANIFEST"
+ALLOWED_NETWORK_FILE=$(mktemp "${TMPDIR:-/tmp}/config-step-ca-verify-networks.XXXXXX")
+: > "$ALLOWED_NETWORK_FILE"
+trap cleanup EXIT HUP INT TERM
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --check) [ "$MODE" = verify ] || fail "select exactly one mode"; MODE=check; shift ;;
+        --server-name) [ "$#" -ge 2 ] || fail "--server-name requires a value"; SERVER_NAME=$2; shift 2 ;;
+        --bind-address) [ "$#" -ge 2 ] || fail "--bind-address requires a value"; BIND_ADDRESS=$2; shift 2 ;;
+        --port) [ "$#" -ge 2 ] || fail "--port requires a value"; PORT=$2; shift 2 ;;
+        --default-tls-hours) [ "$#" -ge 2 ] || fail "--default-tls-hours requires a value"; DEFAULT_TLS_HOURS=$2; shift 2 ;;
+        --max-tls-hours) [ "$#" -ge 2 ] || fail "--max-tls-hours requires a value"; MAX_TLS_HOURS=$2; shift 2 ;;
+        --allowed-client-network) [ "$#" -ge 2 ] || fail "--allowed-client-network requires a CIDR"; append_allowed_network "$2"; shift 2 ;;
+        --help | -h) usage; exit 0 ;;
+        *) fail "unknown argument: $1" ;;
+    esac
+done
+
+if [ "$MODE" = check ]; then
+    [ -z "$SERVER_NAME$BIND_ADDRESS" ] && [ "$ALLOWED_NETWORK_COUNT" -eq 0 ] \
+        || fail "--check does not accept verification options"
+    printf 'Validated Smallstep CA verifier source and policy dependencies.\n'
+    exit 0
+fi
+
+[ "$(id -u)" -eq 0 ] || fail "verification must run as root"
+[ -n "$SERVER_NAME" ] || fail "--server-name is required"
+[ -n "$BIND_ADDRESS" ] || fail "--bind-address is required"
+[ "$ALLOWED_NETWORK_COUNT" -gt 0 ] || fail "at least one --allowed-client-network is required"
+validate_dns_name "$SERVER_NAME"
+validate_private_ipv4 "--bind-address" "$BIND_ADDRESS"
+validate_positive_integer "--port" "$PORT"
+[ "$PORT" -ge 1024 ] && [ "$PORT" -le 65535 ] || fail "invalid listener port"
+validate_positive_integer "--default-tls-hours" "$DEFAULT_TLS_HOURS"
+validate_positive_integer "--max-tls-hours" "$MAX_TLS_HOURS"
+[ "$DEFAULT_TLS_HOURS" -le "$MAX_TLS_HOURS" ] || fail "default duration exceeds maximum"
+[ "$DEFAULT_TLS_HOURS" -le 168 ] || fail "default duration exceeds 168-hour ceiling"
+[ "$MAX_TLS_HOURS" -le 840 ] || fail "maximum duration exceeds 840-hour ceiling"
+
+for required_command in awk cmp curl find getent grep id jq openssl rpm sort ss stat systemctl; do
+    command -v "$required_command" >/dev/null 2>&1 \
+        || fail "required command not found: $required_command"
+done
+id step >/dev/null 2>&1 || fail "step service account is missing"
+validate_service_identity
+
+while IFS='|' read -r package_name package_version _; do
+    case "$package_name" in '' | \#*) continue ;; esac
+    installed_version=$(rpm -q --qf '%{VERSION}-%{RELEASE}' "$package_name" 2>/dev/null) \
+        || fail "required package is missing: $package_name"
+    [ "$installed_version" = "$package_version" ] \
+        || fail "$package_name version differs from reviewed $package_version"
+done < "$PACKAGE_MANIFEST"
+
+[ "$(stat -Lc '%U:%G:%a:%h' "$CONFIGURATION_PATH" 2>/dev/null)" = root:step:440:1 ] \
+    || fail "CA configuration must be a one-link root:step mode 0440 file"
+[ "$(stat -Lc '%U:%G:%a:%h' "$ROOT_CERTIFICATE_PATH" 2>/dev/null)" = root:step:440:1 ] \
+    || fail "root certificate must be a one-link root:step mode 0440 file"
+[ "$(stat -Lc '%U:%G:%a:%h' "$INTERMEDIATE_CERTIFICATE_PATH" 2>/dev/null)" = root:step:440:1 ] \
+    || fail "intermediate certificate must be a one-link root:step mode 0440 file"
+[ "$(stat -Lc '%U:%G:%a:%h' "$INTERMEDIATE_KEY_PATH" 2>/dev/null)" = root:step:440:1 ] \
+    || fail "intermediate key must be a one-link root:step mode 0440 file"
+[ "$(stat -Lc '%U:%G:%a:%h' "$INTERMEDIATE_PASSWORD_PATH" 2>/dev/null)" = root:root:600:1 ] \
+    || fail "intermediate password must be a one-link root:root mode 0600 file"
+[ "$(stat -Lc '%U:%G:%a:%h' "$SERVICE_PATH" 2>/dev/null)" = root:root:644:1 ] \
+    || fail "service unit must be a one-link root:root mode 0644 file"
+[ "$(stat -Lc '%U:%G:%a' /var/lib/step-ca 2>/dev/null)" = step:step:700 ] \
+    || fail "CA state directory must be step:step mode 0700"
+
+root_key_path=$(find /etc/step-ca -xdev -type f \
+    \( -iname '*root*key*' -o -iname '*root*.key' \) -print -quit)
+[ -z "$root_key_path" ] || fail "root private key is present on the online host: $root_key_path"
+
+jq -e --arg address "$BIND_ADDRESS:$PORT" \
+    --arg server_name "$SERVER_NAME" \
+    --arg default_duration "${DEFAULT_TLS_HOURS}h" \
+    --arg max_duration "${MAX_TLS_HOURS}h" '
+        .root == "/etc/step-ca/certs/root_ca.crt" and
+        .crt == "/etc/step-ca/certs/intermediate_ca.crt" and
+        .key == "/etc/step-ca/secrets/intermediate_ca_key" and
+        .address == $address and .insecureAddress == "" and
+        .dnsNames == [$server_name] and
+        .db.type == "badgerv2" and .db.dataSource == "/var/lib/step-ca/db" and
+        .authority.claims.minTLSCertDuration == "5m" and
+        .authority.claims.defaultTLSCertDuration == $default_duration and
+        .authority.claims.maxTLSCertDuration == $max_duration and
+        .authority.claims.disableRenewal == false and
+        .authority.claims.allowRenewalAfterExpiry == false and
+        (.authority.policy | type == "object" and keys == ["x509"]) and
+        (.authority.policy.x509 | type == "object" and
+            (keys - ["allow", "allowWildcardNames", "deny"] | length == 0)) and
+        (.authority.policy.x509.allow | type == "object" and length > 0 and
+            all(to_entries[];
+                ((.key == "cn" or .key == "dns" or .key == "email" or
+                    .key == "ip" or .key == "uri") and
+                (.value | type == "array" and length > 0 and
+                    all(.[]; type == "string" and length > 0)))) and
+        ((.authority.policy.x509 | has("deny") | not) or
+            (.authority.policy.x509.deny | type == "object" and length > 0 and
+                all(to_entries[];
+                    ((.key == "cn" or .key == "dns" or .key == "email" or
+                        .key == "ip" or .key == "uri") and
+                    (.value | type == "array" and length > 0 and
+                        all(.[]; type == "string" and length > 0))))) and
+        .authority.policy.x509.allowWildcardNames == false and
+        (.authority.provisioners | type == "array" and length > 0) and
+        all(.authority.provisioners[];
+            .type == "JWK" and .key.use == "sig" and .key.kty == "EC" and
+            .key.crv == "P-256" and .key.alg == "ES256" and
+            (.key.kid | type == "string" and length > 0) and
+            (.key.x | type == "string" and length > 0) and
+            (.key.y | type == "string" and length > 0) and
+            (.encryptedKey | type == "string" and
+                test("^[A-Za-z0-9_-]+(\\.[A-Za-z0-9_-]+){4}$"))) and
+        .tls.minVersion == 1.2 and .tls.maxVersion == 1.3 and
+        .tls.renegotiation == false and (has("password") | not)
+    ' "$CONFIGURATION_PATH" >/dev/null \
+    || fail "CA configuration differs from the selected security standard"
+
+TEMPORARY_DIRECTORY=$(mktemp -d "${TMPDIR:-/tmp}/config-step-ca-verify.XXXXXX")
+umask 077
+render_service "$TEMPORARY_DIRECTORY/step-ca.service"
+cmp -s "$TEMPORARY_DIRECTORY/step-ca.service" "$SERVICE_PATH" \
+    || fail "step-ca systemd policy differs from the selected standard"
+
+openssl verify -check_ss_sig -CAfile "$ROOT_CERTIFICATE_PATH" \
+    "$ROOT_CERTIFICATE_PATH" >/dev/null \
+    || fail "installed root certificate self-signature is invalid"
+openssl x509 -checkend 31536000 -noout -in "$ROOT_CERTIFICATE_PATH" \
+    || fail "installed root certificate must remain valid for at least one year"
+openssl x509 -in "$INTERMEDIATE_CERTIFICATE_PATH" -noout -text \
+    | grep -F 'CA:TRUE, pathlen:0' >/dev/null \
+    || fail "installed intermediate must assert CA:TRUE with pathlen:0"
+openssl x509 -checkend 2678400 -noout -in "$INTERMEDIATE_CERTIFICATE_PATH" \
+    || fail "installed intermediate must remain valid for at least 31 days"
+grep -Fx -- '-----BEGIN ENCRYPTED PRIVATE KEY-----' \
+    "$INTERMEDIATE_KEY_PATH" >/dev/null \
+    || fail "installed intermediate key is not encrypted PKCS #8 PEM"
+awk 'NR == 1 && length($0) >= 16 { valid = 1; next } { exit 1 } \
+    END { exit valid ? 0 : 1 }' "$INTERMEDIATE_PASSWORD_PATH" \
+    || fail "installed intermediate password must contain one value of at least 16 characters"
+openssl verify -CAfile "$ROOT_CERTIFICATE_PATH" "$INTERMEDIATE_CERTIFICATE_PATH" >/dev/null \
+    || fail "intermediate certificate does not verify under the installed root"
+openssl pkey -in "$INTERMEDIATE_KEY_PATH" -passin "file:$INTERMEDIATE_PASSWORD_PATH" \
+    -pubout -out "$TEMPORARY_DIRECTORY/key.pub"
+openssl x509 -in "$INTERMEDIATE_CERTIFICATE_PATH" -pubkey -noout \
+    -out "$TEMPORARY_DIRECTORY/certificate.pub"
+cmp -s "$TEMPORARY_DIRECTORY/key.pub" "$TEMPORARY_DIRECTORY/certificate.pub" \
+    || fail "installed intermediate key does not match its certificate"
+
+systemctl is-enabled --quiet step-ca.service || fail "step-ca.service is not enabled"
+systemctl is-active --quiet step-ca.service || fail "step-ca.service is not active"
+main_pid=$(systemctl show --property MainPID --value step-ca.service)
+case "$main_pid" in '' | 0 | *[!0-9]*) fail "step-ca.service has no live main process" ;; esac
+
+resolved_addresses=$(getent ahostsv4 "$SERVER_NAME" | awk '{ print $1 }' | sort -u)
+[ "$resolved_addresses" = "$BIND_ADDRESS" ] \
+    || fail "server DNS name must resolve only to the configured bind address"
+listener_count=$(ss -H -ltn | awk -v endpoint="$BIND_ADDRESS:$PORT" '$4 == endpoint { count += 1 } END { print count + 0 }')
+[ "$listener_count" -eq 1 ] || fail "expected exactly one CA listener on $BIND_ADDRESS:$PORT"
+unexpected_listener=$(ss -H -ltn | awk -v suffix=":$PORT" -v endpoint="$BIND_ADDRESS:$PORT" \
+    'substr($4, length($4) - length(suffix) + 1) == suffix && $4 != endpoint { print $4; exit }')
+[ -z "$unexpected_listener" ] || fail "unexpected CA-port listener: $unexpected_listener"
+
+curl --fail --silent --show-error \
+    --cacert "$ROOT_CERTIFICATE_PATH" \
+    --resolve "$SERVER_NAME:$PORT:$BIND_ADDRESS" \
+    "https://$SERVER_NAME:$PORT/health" \
+    | jq -e '.status == "ok"' >/dev/null \
+    || fail "authenticated step-ca health endpoint failed"
+
+printf 'Validated Smallstep CA packages, offline-root boundary, policy, service, DNS, and TLS health.\n'
