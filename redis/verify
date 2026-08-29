@@ -223,8 +223,13 @@ ps -e -o label= -o comm= 2>/dev/null \
 
 if [ "$MODEL" = network ]; then
     if [ -z "$BIND_ADDRESS" ]; then
-        BIND_ADDRESS=$(awk '$1 == "bind" { for (index = 2; index <= NF; index += 1) \
-            if ($index != "127.0.0.1") { print $index; exit } }' "$CONFIGURATION_PATH")
+        BIND_ADDRESS=$(awk '$1 == "bind" { \
+            for (field_number = 2; field_number <= NF; field_number += 1) \
+                if ($field_number != "127.0.0.1") { \
+                    print $field_number
+                    exit
+                } \
+        }' "$CONFIGURATION_PATH")
         redis_validate_private_ipv4 "configured bind address" "$BIND_ADDRESS"
     fi
     if [ -z "$TLS_CERTIFICATE_FILE" ]; then
@@ -318,7 +323,7 @@ redis_cli_admin() {
     else
         REDISCLI_AUTH=$admin_password redis-cli --no-auth-warning --tls \
             --cacert "$TLS_CA_FILE" --sni "$SERVER_HOST" \
-            --host "$REDIS_LOCAL_TLS_PROBE_ADDRESS" --port "$REDIS_TLS_PORT" \
+            -h "$REDIS_LOCAL_TLS_PROBE_ADDRESS" -p "$REDIS_TLS_PORT" \
             --user "$ADMIN_USER" "$@"
     fi
 }
@@ -330,7 +335,7 @@ redis_cli_application() {
     else
         REDISCLI_AUTH=$application_password redis-cli --no-auth-warning --tls \
             --cacert "$TLS_CA_FILE" --sni "$SERVER_HOST" \
-            --host "$REDIS_LOCAL_TLS_PROBE_ADDRESS" --port "$REDIS_TLS_PORT" \
+            -h "$REDIS_LOCAL_TLS_PROBE_ADDRESS" -p "$REDIS_TLS_PORT" \
             --user "$APPLICATION_USER" "$@"
     fi
 }
@@ -340,7 +345,7 @@ redis_cli_unauthenticated() {
         redis-cli -s "$REDIS_SOCKET" "$@"
     else
         redis-cli --tls --cacert "$TLS_CA_FILE" --sni "$SERVER_HOST" \
-            --host "$REDIS_LOCAL_TLS_PROBE_ADDRESS" --port "$REDIS_TLS_PORT" "$@"
+            -h "$REDIS_LOCAL_TLS_PROBE_ADDRESS" -p "$REDIS_TLS_PORT" "$@"
     fi
 }
 
@@ -453,8 +458,8 @@ case "$MODEL" in
         expected_listeners=$(printf '127.0.0.1:6379\n%s:6379\n' "$BIND_ADDRESS" | sort -u)
         [ "$redis_tcp_listeners" = "$expected_listeners" ] \
             || fail "network Redis must listen only on loopback and the selected private address"
-        plaintext_result=$(redis-cli --host "$REDIS_LOCAL_TLS_PROBE_ADDRESS" \
-            --port "$REDIS_TLS_PORT" PING 2>&1 || true)
+        plaintext_result=$(redis-cli -h "$REDIS_LOCAL_TLS_PROBE_ADDRESS" \
+            -p "$REDIS_TLS_PORT" PING 2>&1 || true)
         printf '%s\n' "$plaintext_result" | grep -Fx PONG >/dev/null \
             && fail "network Redis unexpectedly accepted plaintext TCP"
         ;;

@@ -586,7 +586,7 @@ case "$PHASE" in
         while [ "$wait_attempt" -lt 60 ]; do
             if REDISCLI_AUTH=$admin_password redis-cli --no-auth-warning --tls \
                 --cacert "$TLS_CA_FILE" --sni "$SERVER_HOST" \
-                --host "$REDIS_LOCAL_TLS_PROBE_ADDRESS" --port "$REDIS_TLS_PORT" \
+                -h "$REDIS_LOCAL_TLS_PROBE_ADDRESS" -p "$REDIS_TLS_PORT" \
                 --user "$ADMIN_USER" PING 2>/dev/null \
                 | grep -Fx PONG >/dev/null
             then

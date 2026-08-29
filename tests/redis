@@ -337,19 +337,29 @@ assert_contains "$TLS_RELOADER" 'CONFIG SET tls-cert-file'
 assert_contains "$TLS_RELOADER" 'Redis process ID changed during TLS reload'
 assert_contains "$VERIFIER" 'ps -e -o label= -o comm='
 assert_contains "$VERIFIER" "for required_network in '0.0.0.0/0' '::/0'"
-assert_contains "$SETUP" "--host \"\$REDIS_LOCAL_TLS_PROBE_ADDRESS\""
-assert_contains "$VERIFIER" "--host \"\$REDIS_LOCAL_TLS_PROBE_ADDRESS\""
+assert_contains "$VERIFIER" 'for (field_number = 2; field_number <= NF; field_number += 1)'
+assert_contains "$SETUP" "-h \"\$REDIS_LOCAL_TLS_PROBE_ADDRESS\" -p \"\$REDIS_TLS_PORT\""
+assert_contains "$VERIFIER" "-h \"\$REDIS_LOCAL_TLS_PROBE_ADDRESS\" -p \"\$REDIS_TLS_PORT\""
 assert_contains "$REDIS_DIRECTORY/lib/common.sh" \
     "-connect \"\$REDIS_LOCAL_TLS_PROBE_ADDRESS:\$REDIS_TLS_PORT\""
 assert_contains "$REDIS_DIRECTORY/lib/common.sh" \
     "-servername \"\$redis_served_server_host\""
 assert_contains "$REDIS_DIRECTORY/lib/common.sh" \
     "-verify_hostname \"\$redis_served_server_host\""
-if grep -F -- "--host \"\$SERVER_HOST\"" "$SETUP" "$VERIFIER" >/dev/null; then
+if grep -F -- "--host" "$SETUP" "$VERIFIER" >/dev/null; then
+    fail 'Redis commands use the non-portable long hostname option'
+fi
+if grep -F -- "--port" "$SETUP" "$VERIFIER" >/dev/null; then
+    fail 'Redis commands use the non-portable long port option'
+fi
+if grep -F -- "-h \"\$SERVER_HOST\"" "$SETUP" "$VERIFIER" >/dev/null; then
     fail 'target-side Redis verification still connects through the private DNS address'
 fi
 if grep -F 'ps -eZ -o label=,comm=' "$VERIFIER" >/dev/null; then
     fail 'Redis verifier uses a procps-incompatible SELinux process query'
+fi
+if grep -F 'for (index = 2;' "$VERIFIER" >/dev/null; then
+    fail 'Redis verifier uses awk built-in name index as an iteration variable'
 fi
 
 if grep -Eri 'tailscale' "$REDIS_DIRECTORY"; then
