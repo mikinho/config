@@ -70,6 +70,7 @@ if command -v shellcheck >/dev/null 2>&1; then
         "$REPOSITORY_ROOT/tailscale/setup" \
         "$REPOSITORY_ROOT/terminal/install" \
         "$REPOSITORY_ROOT/terminal/verify" \
+        "$REPOSITORY_ROOT/tests/bundle-builder-stat" \
         "$REPOSITORY_ROOT/tests/certbot-installer" \
         "$REPOSITORY_ROOT/tests/certbot-issue" \
         "$REPOSITORY_ROOT/tests/config-conventions" \
@@ -143,6 +144,9 @@ step "Running generic terminal readiness tests..."
 
 step "Running Tailscale installer and setup tests..."
 "$REPOSITORY_ROOT/tests/tailscale"
+
+step "Validating portable bundle hard-link inspection..."
+"$REPOSITORY_ROOT/tests/bundle-builder-stat"
 
 step "Running MongoDB installer and initialized replica-set model tests..."
 "$REPOSITORY_ROOT/tests/mongodb"
