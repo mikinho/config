@@ -10,6 +10,8 @@ set -f
 PROGRAM_NAME=${0##*/}
 SCRIPT_DIRECTORY=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 REPOSITORY_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIRECTORY/.." && pwd)
+LOCAL_ENVIRONMENT_FILE=$REPOSITORY_ROOT/.env
+CONFIG_PRIVATE_IDENTIFIER_PATTERN=
 REDIS_DIRECTORY=$REPOSITORY_ROOT/redis
 INSTALLER=$REDIS_DIRECTORY/install
 BUNDLE_BUILDER=$REDIS_DIRECTORY/build-bundle
@@ -31,6 +33,16 @@ fail() {
     printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2
     exit 1
 }
+
+load_local_environment() {
+    [ -e "$LOCAL_ENVIRONMENT_FILE" ] || return 0
+    [ -f "$LOCAL_ENVIRONMENT_FILE" ] && [ ! -L "$LOCAL_ENVIRONMENT_FILE" ] \
+        || fail "local environment must be a regular, non-symbolic-link file: $LOCAL_ENVIRONMENT_FILE"
+    # shellcheck source=/dev/null
+    . "$LOCAL_ENVIRONMENT_FILE"
+}
+
+load_local_environment
 
 # shellcheck source=../redis/lib/common.sh
 # shellcheck disable=SC1091
@@ -316,7 +328,12 @@ if grep -F 'ps -eZ -o label=,comm=' "$VERIFIER" >/dev/null; then
     fail 'Redis verifier uses a procps-incompatible SELinux process query'
 fi
 
-if grep -Eri 'private_organization|private_application_a|private_application_b|private_redis_host|private_web_host|tailscale' "$REDIS_DIRECTORY"; then
+if grep -Eri 'tailscale' "$REDIS_DIRECTORY"; then
+    fail 'public Redis standard contains an unapproved network-specific identifier'
+fi
+if [ -n "$CONFIG_PRIVATE_IDENTIFIER_PATTERN" ] \
+    && grep -Eri -- "$CONFIG_PRIVATE_IDENTIFIER_PATTERN" "$REDIS_DIRECTORY"
+then
     fail 'public Redis standard contains a client-specific identifier'
 fi
 
