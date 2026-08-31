@@ -184,7 +184,9 @@ copy_requested_fragments() {
 validate_candidate() {
     candidate_main=$1
     candidate_logrotate=$2
-    [ "$(stat -f '%Lp' "$candidate_main" 2>/dev/null || stat -c '%a' "$candidate_main")" = 600 ] \
+    candidate_main_mode=$(stat -c '%a' "$candidate_main" 2>/dev/null \
+        || stat -f '%Lp' "$candidate_main")
+    [ "$candidate_main_mode" = 600 ] \
         || fail "candidate main control file must be mode 0600"
     if command -v monit >/dev/null 2>&1; then
         monit -t -c "$candidate_main" >/dev/null \

@@ -38,8 +38,8 @@ assert_contains() {
 assert_mode() {
     checked_file=$1
     expected_mode=$2
-    actual_mode=$(stat -f '%Lp' "$checked_file" 2>/dev/null \
-        || stat -c '%a' "$checked_file")
+    actual_mode=$(stat -c '%a' "$checked_file" 2>/dev/null \
+        || stat -f '%Lp' "$checked_file")
     [ "$actual_mode" = "$expected_mode" ] \
         || fail "$checked_file mode is $actual_mode, expected $expected_mode"
 }
@@ -121,6 +121,36 @@ printf '%s\n' "$rendered_password" | grep -Eq '^[0-9a-f]{64}$' \
 if grep -F '@@' "$TEST_ROOT/rendered/etc/monitrc" >/dev/null 2>&1; then
     fail 'rendered main control file retained a template token'
 fi
+
+install -d "$TEST_ROOT/gnu-stat-bin" "$TEST_ROOT/bsd-stat-bin"
+cat > "$TEST_ROOT/gnu-stat-bin/stat" <<'EOF'
+#!/usr/bin/env sh
+if [ "$1" = -c ] && [ "$2" = %a ]; then
+    printf '600\n'
+    exit 0
+fi
+if [ "$1" = -f ]; then
+    printf 'GNU stat -f emitted filesystem metadata before failing\n'
+    exit 1
+fi
+exit 1
+EOF
+cat > "$TEST_ROOT/bsd-stat-bin/stat" <<'EOF'
+#!/usr/bin/env sh
+if [ "$1" = -c ]; then
+    exit 1
+fi
+if [ "$1" = -f ] && [ "$2" = %Lp ]; then
+    printf '600\n'
+    exit 0
+fi
+exit 1
+EOF
+chmod 0755 "$TEST_ROOT/gnu-stat-bin/stat" "$TEST_ROOT/bsd-stat-bin/stat"
+PATH="$TEST_ROOT/gnu-stat-bin:$PATH" \
+    "$SETUP" --output "$TEST_ROOT/gnu-stat-rendered"
+PATH="$TEST_ROOT/bsd-stat-bin:$PATH" \
+    "$SETUP" --output "$TEST_ROOT/bsd-stat-rendered"
 
 install -d "$TEST_ROOT/fragments-a" "$TEST_ROOT/fragments-b"
 printf '%s\n' 'check process example with pidfile /run/example.pid' \
