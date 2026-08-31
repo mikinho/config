@@ -44,6 +44,10 @@ assert_mode() {
         || fail "$checked_file mode is $actual_mode, expected $expected_mode"
 }
 
+file_mtime() {
+    stat -c '%Y' "$1" 2>/dev/null || stat -f '%m' "$1"
+}
+
 expect_failure() {
     expected_error=$1
     shift
@@ -214,6 +218,29 @@ then
 fi
 [ "$(cat "$TEST_ROOT/control-attempts")" = 75 ] \
     || fail 'control-plane readiness wait used the wrong timeout bound'
+
+rollback_target=$TEST_ROOT/rollback-target
+rollback_relative_path=${rollback_target#/}
+rollback_root=$TEST_ROOT/rollback
+rollback_file=$rollback_root/files/$rollback_relative_path
+rollback_present=$rollback_root/present/$rollback_relative_path
+install -d "${rollback_file%/*}" "${rollback_present%/*}"
+printf '%s\n' 'package original' > "$rollback_file"
+chmod 0600 "$rollback_file"
+touch -t 202001020304 "$rollback_file"
+: > "$rollback_present"
+printf '%s\n' 'managed replacement' > "$rollback_target"
+chmod 0644 "$rollback_target"
+restore_target_function=$(extract_function restore_target "$SETUP")
+[ -n "$restore_target_function" ] \
+    || fail 'cannot extract Monit rollback restore function'
+BACKUP_DIRECTORY=$rollback_root sh -c "$restore_target_function
+    restore_target '$rollback_target'"
+cmp -s "$rollback_file" "$rollback_target" \
+    || fail 'Monit rollback did not restore exact file content'
+assert_mode "$rollback_target" 600
+[ "$(file_mtime "$rollback_target")" = "$(file_mtime "$rollback_file")" ] \
+    || fail 'Monit rollback did not preserve the original modification time'
 
 install -d "$TEST_ROOT/fragments-a" "$TEST_ROOT/fragments-b"
 printf '%s\n' 'check process example with pidfile /run/example.pid' \

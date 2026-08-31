@@ -366,8 +366,7 @@ restore_target() {
     restore_present=$BACKUP_DIRECTORY/present/$restore_relative_path
     restore_absent=$BACKUP_DIRECTORY/absent/$restore_relative_path
     if [ -f "$restore_present" ]; then
-        install -o root -g root -m "$(stat -Lc '%a' "$restore_file")" \
-            "$restore_file" "$restore_target_path"
+        cp -p -- "$restore_file" "$restore_target_path"
     elif [ -f "$restore_absent" ]; then
         rm -f -- "$restore_target_path"
     fi
