@@ -211,6 +211,19 @@ render_validation_main() {
     chmod 0600 "$validation_target"
 }
 
+wait_for_control_plane() {
+    control_attempt=1
+    while [ "$control_attempt" -le 75 ]; do
+        if monit -c "$MONIT_MAIN" summary >/dev/null 2>&1; then
+            return 0
+        fi
+        [ "$control_attempt" -lt 75 ] || break
+        sleep 1
+        control_attempt=$((control_attempt + 1))
+    done
+    return 1
+}
+
 validate_candidate() {
     candidate_main=$1
     candidate_logrotate=$2
@@ -469,7 +482,7 @@ if [ "$MODE" = plan ]; then
     exit 0
 fi
 
-for required_command in awk chmod cp find grep install mkdir mv openssl stat wc; do
+for required_command in awk chmod cp find grep install mkdir mv openssl sleep stat wc; do
     command -v "$required_command" >/dev/null 2>&1 \
         || fail "required command not found: $required_command"
 done
@@ -561,7 +574,7 @@ systemctl is-enabled --quiet monit.service \
     || fail "monit.service is not enabled after setup"
 systemctl is-active --quiet monit.service \
     || fail "monit.service is not active after setup"
-monit -c "$MONIT_MAIN" summary >/dev/null \
+wait_for_control_plane \
     || fail "Monit local control-plane health check failed"
 "$VERIFIER_SOURCE" >/dev/null
 

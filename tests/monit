@@ -53,6 +53,12 @@ expect_failure() {
     assert_contains "$TEST_ROOT/expected.stderr" "$expected_error"
 }
 
+extract_function() {
+    function_name=$1
+    source_file=$2
+    sed -n "/^$function_name() {/,/^}/p" "$source_file"
+}
+
 make_os_release() {
     output_path=$1
     os_id=$2
@@ -174,6 +180,40 @@ EOF
 chmod 0755 "$TEST_ROOT/monit-bin/monit"
 PATH="$TEST_ROOT/monit-bin:$PATH" \
     "$SETUP" --output "$TEST_ROOT/runtime-safe-rendered"
+
+install -d "$TEST_ROOT/control-bin"
+cat > "$TEST_ROOT/control-bin/monit" <<'EOF'
+#!/usr/bin/env sh
+attempts=$(cat "$CONTROL_ATTEMPTS" 2>/dev/null || printf '0')
+attempts=$((attempts + 1))
+printf '%s\n' "$attempts" > "$CONTROL_ATTEMPTS"
+[ "$attempts" -ge "${CONTROL_SUCCEEDS_ON:-999}" ]
+EOF
+cat > "$TEST_ROOT/control-bin/sleep" <<'EOF'
+#!/usr/bin/env sh
+exit 0
+EOF
+chmod 0755 "$TEST_ROOT/control-bin/monit" "$TEST_ROOT/control-bin/sleep"
+wait_for_control_plane_function=$(extract_function wait_for_control_plane "$SETUP")
+[ -n "$wait_for_control_plane_function" ] \
+    || fail 'cannot extract Monit control-plane readiness function'
+CONTROL_ATTEMPTS="$TEST_ROOT/control-attempts" CONTROL_SUCCEEDS_ON=3 \
+    MONIT_MAIN=/test/monitrc PATH="$TEST_ROOT/control-bin:$PATH" \
+    sh -c "$wait_for_control_plane_function
+        wait_for_control_plane" \
+    || fail 'control-plane readiness wait rejected eventual success'
+[ "$(cat "$TEST_ROOT/control-attempts")" = 3 ] \
+    || fail 'control-plane readiness wait did not retry to success'
+rm -f "$TEST_ROOT/control-attempts"
+if CONTROL_ATTEMPTS="$TEST_ROOT/control-attempts" CONTROL_SUCCEEDS_ON=999 \
+    MONIT_MAIN=/test/monitrc PATH="$TEST_ROOT/control-bin:$PATH" \
+    sh -c "$wait_for_control_plane_function
+        wait_for_control_plane"
+then
+    fail 'control-plane readiness wait did not time out'
+fi
+[ "$(cat "$TEST_ROOT/control-attempts")" = 75 ] \
+    || fail 'control-plane readiness wait used the wrong timeout bound'
 
 install -d "$TEST_ROOT/fragments-a" "$TEST_ROOT/fragments-b"
 printf '%s\n' 'check process example with pidfile /run/example.pid' \
