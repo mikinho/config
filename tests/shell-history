@@ -51,6 +51,13 @@ trap cleanup EXIT HUP INT TERM
 
 "$SHELL_SETUP" --help >/dev/null
 "$SHELL_SETUP" --check >/dev/null
+if grep -F -- 'case "$PS1" in *'"'"'[PROD ROOT]'"'"'*)' \
+    "$SHELL_SETUP" >/dev/null; then
+    fail "shell setup embeds a single-quoted PROD root prompt inside bash -lic"
+fi
+grep -F -- 'case "$PS1" in *"[PROD ROOT]"*)' \
+    "$SHELL_SETUP" >/dev/null \
+    || fail "shell setup omits the quote-safe PROD root prompt validation"
 "$SHELL_SETUP" --plan --environment TEST > "$TEST_ROOT/setup.plan"
 grep -F -- '/etc/profile.d/90-no-persistent-history.sh' \
     "$TEST_ROOT/setup.plan" >/dev/null \

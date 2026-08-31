@@ -226,7 +226,7 @@ validate_login_behavior() {
             *) exit 1 ;;
         esac
         if [ "$EXPECTED_MANAGED_ENVIRONMENT" = PROD ] && [ "$EUID" -eq 0 ]; then
-            case "$PS1" in *'[PROD ROOT]'*) ;; *) exit 1 ;; esac
+            case "$PS1" in *"[PROD ROOT]"*) ;; *) exit 1 ;; esac
         fi
         bash -ic "
             [ \"\${HISTFILE:-}\" = /dev/null ] || exit 1
