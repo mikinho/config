@@ -181,6 +181,36 @@ copy_requested_fragments() {
     done
 }
 
+render_validation_main() {
+    validation_source=$1
+    validation_target=$2
+    validation_runtime_root=$3
+    awk -v runtime_root="$validation_runtime_root" '
+        $0 == "set log /var/log/monit/monit.log" {
+            print "set log " runtime_root "/log/monit.log"
+            next
+        }
+        $0 == "set pidfile /run/monit/monit.pid" {
+            print "set pidfile " runtime_root "/run/monit.pid"
+            next
+        }
+        $0 == "set idfile /var/lib/monit/id" {
+            print "set idfile " runtime_root "/state/id"
+            next
+        }
+        $0 == "set statefile /var/lib/monit/state" {
+            print "set statefile " runtime_root "/state/state"
+            next
+        }
+        $0 == "    basedir /var/lib/monit/events" {
+            print "    basedir " runtime_root "/state/events"
+            next
+        }
+        { print }
+    ' "$validation_source" > "$validation_target"
+    chmod 0600 "$validation_target"
+}
+
 validate_candidate() {
     candidate_main=$1
     candidate_logrotate=$2
@@ -189,7 +219,13 @@ validate_candidate() {
     [ "$candidate_main_mode" = 600 ] \
         || fail "candidate main control file must be mode 0600"
     if command -v monit >/dev/null 2>&1; then
-        monit -t -c "$candidate_main" >/dev/null \
+        candidate_runtime_root=$TEMPORARY_DIRECTORY/validation-runtime
+        install -d -m 0700 "$candidate_runtime_root/log" \
+            "$candidate_runtime_root/run" "$candidate_runtime_root/state/events"
+        candidate_validation_main=$TEMPORARY_DIRECTORY/validation-monitrc
+        render_validation_main "$candidate_main" "$candidate_validation_main" \
+            "$candidate_runtime_root"
+        monit -t -c "$candidate_validation_main" >/dev/null \
             || fail "Monit rejected the assembled candidate control tree"
     elif [ "$MODE" = apply ]; then
         fail "required command not found: monit"
