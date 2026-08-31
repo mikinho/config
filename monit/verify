@@ -1,0 +1,304 @@
+#!/usr/bin/env sh
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
+set -eu
+set -f
+
+PROGRAM_NAME=${0##*/}
+SCRIPT_DIRECTORY=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+SOURCE_ROOT=$SCRIPT_DIRECTORY
+if [ ! -f "$SOURCE_ROOT/templates/monitrc.in" ] \
+    && [ -d /usr/local/libexec/config-monit ]; then
+    SOURCE_ROOT=/usr/local/libexec/config-monit
+fi
+if [ "$SOURCE_ROOT" = "$SCRIPT_DIRECTORY" ]; then
+    MAIN_TEMPLATE=$SOURCE_ROOT/templates/monitrc.in
+    SYSTEM_SOURCE=$SOURCE_ROOT/conf.d/10-system.conf
+    LOGROTATE_SOURCE=$SOURCE_ROOT/logrotate/monit
+    SYSTEMD_SOURCE=$SOURCE_ROOT/systemd/monit.service.conf
+else
+    MAIN_TEMPLATE=$SOURCE_ROOT/monitrc.in
+    SYSTEM_SOURCE=$SOURCE_ROOT/10-system.conf
+    LOGROTATE_SOURCE=$SOURCE_ROOT/logrotate-monit
+    SYSTEMD_SOURCE=$SOURCE_ROOT/monit.service.conf
+fi
+
+MONIT_MAIN=/etc/monitrc
+MONIT_FRAGMENT_DIRECTORY=/etc/monit.d
+SYSTEM_TARGET=$MONIT_FRAGMENT_DIRECTORY/10-system.conf
+LOGROTATE_TARGET=/etc/logrotate.d/monit
+SYSTEMD_TARGET=/etc/systemd/system/monit.service.d/10-baseline.conf
+MONIT_LOG_DIRECTORY=/var/log/monit
+MONIT_LOG=$MONIT_LOG_DIRECTORY/monit.log
+MONIT_STATE_DIRECTORY=/var/lib/monit
+MONIT_RUNTIME_DIRECTORY=/run/monit
+PACKAGE_UNIT=/usr/lib/systemd/system/monit.service
+PACKAGE_BINARY=/usr/bin/monit
+MANAGED_MARKER='Managed by mikinho/config monit/setup.'
+
+MODE=verify
+
+usage() {
+    cat <<EOF
+Usage:
+  sudo $PROGRAM_NAME
+  $PROGRAM_NAME --check
+
+Performs a read-only acceptance audit of the installed Monit baseline,
+including package integrity, enforcing SELinux, control-plane exposure,
+configuration syntax, systemd state, file identities, logrotate policy,
+runtime health, and Monit AVC denials recorded since boot.
+EOF
+}
+
+fail() {
+    printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2
+    exit 1
+}
+
+validate_source() {
+    verifier_source=$1
+    [ -f "$verifier_source" ] && [ ! -L "$verifier_source" ] \
+        || fail "repository dependency must be a regular file: $verifier_source"
+}
+
+require_command() {
+    command -v "$1" >/dev/null 2>&1 \
+        || fail "required verification command not found: $1"
+}
+
+require_regular_file_identity() {
+    checked_file=$1
+    expected_identity=$2
+    actual_identity=$(stat -Lc '%U:%G:%a:%h' "$checked_file" 2>/dev/null) \
+        || fail "cannot inspect required file: $checked_file"
+    [ "$actual_identity" = "$expected_identity" ] \
+        || fail "$checked_file must be $expected_identity (found $actual_identity)"
+}
+
+require_directory_identity() {
+    checked_directory=$1
+    expected_identity=$2
+    actual_identity=$(stat -Lc '%U:%G:%a' "$checked_directory" 2>/dev/null) \
+        || fail "cannot inspect required directory: $checked_directory"
+    [ "$actual_identity" = "$expected_identity" ] \
+        || fail "$checked_directory must be $expected_identity (found $actual_identity)"
+}
+
+require_exact_line() {
+    expected_line=$1
+    checked_file=$2
+    line_count=$(grep -Fxc -- "$expected_line" "$checked_file" || true)
+    [ "$line_count" -eq 1 ] \
+        || fail "$checked_file must contain exactly once: $expected_line"
+}
+
+verify_version_floor() {
+    monit_version=$(monit -V 2>&1 | awk '
+        $1 == "This" && $2 == "is" && $3 == "Monit" && $4 == "version" {
+            print $5
+            exit
+        }
+    ')
+    [ -n "$monit_version" ] || fail "cannot determine the installed Monit version"
+    printf '%s\n' "$monit_version" | awk -F. '
+        NF >= 2 && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ {
+            exit ($1 > 5 || ($1 == 5 && $2 >= 33)) ? 0 : 1
+        }
+        { exit 1 }
+    ' || fail "Monit 5.33 or newer is required (found $monit_version)"
+}
+
+verify_package_integrity() {
+    rpm -q monit >/dev/null 2>&1 || fail "Monit package is not installed"
+    package_signature=$(rpm -q --qf '%{RSAHEADER:pgpsig}\n' monit 2>/dev/null || true)
+    printf '%s\n' "$package_signature" | grep -Eqi 'Key ID|RSA/SHA' \
+        || fail "installed Monit package has no verifiable RPM signature metadata"
+    if verification_output=$(rpm -V monit 2>/dev/null); then
+        verification_status=0
+    else
+        verification_status=$?
+    fi
+    [ "$verification_status" -le 1 ] \
+        || fail "cannot verify the installed Monit package"
+    for package_path in "$PACKAGE_BINARY" "$PACKAGE_UNIT"; do
+        if printf '%s\n' "$verification_output" \
+            | awk -v expected="$package_path" '$NF == expected { found = 1 } END { exit found ? 0 : 1 }'
+        then
+            fail "package-owned Monit file failed RPM verification: $package_path"
+        fi
+    done
+}
+
+verify_control_file() {
+    require_regular_file_identity "$MONIT_MAIN" root:root:600:1
+    grep -F "$MANAGED_MARKER" "$MONIT_MAIN" >/dev/null 2>&1 \
+        || fail "$MONIT_MAIN is not the managed baseline"
+    require_exact_line 'set daemon 30' "$MONIT_MAIN"
+    require_exact_line 'set log /var/log/monit/monit.log' "$MONIT_MAIN"
+    require_exact_line 'set httpd port 2812 and' "$MONIT_MAIN"
+    require_exact_line '    use address 127.0.0.1' "$MONIT_MAIN"
+    require_exact_line 'include /etc/monit.d/*.conf' "$MONIT_MAIN"
+    if grep -F 'admin:monit' "$MONIT_MAIN" >/dev/null 2>&1; then
+        fail "$MONIT_MAIN retains the package default credential"
+    fi
+    control_passwords=$(awk '
+        $1 == "allow" && $2 ~ /^admin:/ {
+            sub(/^admin:/, "", $2)
+            print $2
+        }
+    ' "$MONIT_MAIN")
+    printf '%s\n' "$control_passwords" | grep -Eq '^[0-9a-f]{64}$' \
+        || fail "$MONIT_MAIN has an invalid local control credential"
+    [ "$(printf '%s\n' "$control_passwords" | wc -l | tr -d ' ')" -eq 1 ] \
+        || fail "$MONIT_MAIN must contain exactly one local control credential"
+    monit -t -c "$MONIT_MAIN" >/dev/null \
+        || fail "Monit rejected the installed control tree"
+}
+
+verify_managed_files() {
+    require_directory_identity "$MONIT_FRAGMENT_DIRECTORY" root:root:750
+    require_directory_identity "$MONIT_LOG_DIRECTORY" root:root:700
+    require_directory_identity "$MONIT_STATE_DIRECTORY" root:root:700
+    require_directory_identity "$MONIT_RUNTIME_DIRECTORY" root:root:750
+    require_regular_file_identity "$SYSTEM_TARGET" root:root:600:1
+    require_regular_file_identity "$LOGROTATE_TARGET" root:root:644:1
+    require_regular_file_identity "$SYSTEMD_TARGET" root:root:644:1
+    require_regular_file_identity "$MONIT_LOG" root:root:600:1
+    cmp -s "$SYSTEM_SOURCE" "$SYSTEM_TARGET" \
+        || fail "installed system checks differ from repository policy"
+    cmp -s "$LOGROTATE_SOURCE" "$LOGROTATE_TARGET" \
+        || fail "installed logrotate policy differs from repository policy"
+    cmp -s "$SYSTEMD_SOURCE" "$SYSTEMD_TARGET" \
+        || fail "installed systemd policy differs from repository policy"
+}
+
+verify_log_rotation() {
+    for logrotate_line in \
+        '/var/log/monit/monit.log {' \
+        '    maxsize 25M' \
+        '    rotate 14' \
+        '    create 0600 root root' \
+        '            /usr/bin/systemctl kill --kill-who=main --signal=SIGHUP monit.service'
+    do
+        require_exact_line "$logrotate_line" "$LOGROTATE_TARGET"
+    done
+    matching_policies=$(grep -RlF '/var/log/monit/monit.log' \
+        /etc/logrotate.d 2>/dev/null || true)
+    [ "$matching_policies" = "$LOGROTATE_TARGET" ] \
+        || fail "Monit log path is managed by an unexpected or duplicate logrotate policy"
+    logrotate --debug "$LOGROTATE_TARGET" >/dev/null 2>&1 \
+        || fail "Monit logrotate policy failed syntax validation"
+}
+
+verify_systemd_policy() {
+    systemctl is-enabled --quiet monit.service \
+        || fail "monit.service is not enabled"
+    systemctl is-active --quiet monit.service \
+        || fail "monit.service is not active"
+    [ "$(systemctl show monit.service --property=RuntimeDirectory --value)" = monit ] \
+        || fail "monit.service RuntimeDirectory is not monit"
+    [ "$(systemctl show monit.service --property=StateDirectory --value)" = monit ] \
+        || fail "monit.service StateDirectory is not monit"
+    [ "$(systemctl show monit.service --property=LogsDirectory --value)" = monit ] \
+        || fail "monit.service LogsDirectory is not monit"
+    case "$(systemctl show monit.service --property=UMask --value)" in
+        0077 | 077) ;;
+        *) fail "monit.service UMask is not 0077" ;;
+    esac
+    [ "$(systemctl show monit.service --property=Restart --value)" = on-failure ] \
+        || fail "monit.service restart policy is not on-failure"
+}
+
+verify_listener() {
+    listener_output=$(ss -H -lnt 'sport = :2812') \
+        || fail "cannot inspect the Monit control listener"
+    [ -n "$listener_output" ] || fail "Monit control listener is not active"
+    printf '%s\n' "$listener_output" | awk '
+        NF {
+            count += 1
+            if ($4 == "127.0.0.1:2812") local = 1
+        }
+        END { exit count == 1 && local ? 0 : 1 }
+    ' || fail "Monit control listener must bind only to 127.0.0.1:2812"
+}
+
+verify_selinux() {
+    [ "$(getenforce)" = Enforcing ] || fail "SELinux must be Enforcing"
+    for labeled_path in "$MONIT_MAIN" "$MONIT_FRAGMENT_DIRECTORY" \
+        "$LOGROTATE_TARGET" "$SYSTEMD_TARGET" "$MONIT_LOG_DIRECTORY" \
+        "$MONIT_STATE_DIRECTORY" "$MONIT_RUNTIME_DIRECTORY"
+    do
+        matchpathcon -V "$labeled_path" >/dev/null 2>&1 \
+            || fail "SELinux label differs from policy default: $labeled_path"
+    done
+    main_pid=$(systemctl show monit.service --property=MainPID --value)
+    case "$main_pid" in
+        '' | *[!0-9]* | 0 | 1) fail "monit.service has no valid main PID" ;;
+    esac
+    process_label=$(ps -e -o label= -o pid= -o comm= \
+        | awk -v expected_pid="$main_pid" \
+            '$2 == expected_pid && $3 == "monit" { print $1; exit }')
+    [ -n "$process_label" ] \
+        || fail "cannot find the Monit process with an SELinux label"
+    case "$process_label" in
+        *:unconfined_t:*) fail "Monit is running in the user unconfined_t domain" ;;
+    esac
+    if avc_output=$(ausearch -m AVC,USER_AVC -ts boot -c monit --raw 2>/dev/null); then
+        [ -z "$avc_output" ] \
+            || fail "SELinux recorded a Monit AVC denial since boot"
+    else
+        ausearch_status=$?
+        [ "$ausearch_status" -eq 1 ] \
+            || fail "cannot query the audit log for Monit AVC denials"
+    fi
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --check)
+            [ "$MODE" = verify ] || fail "select exactly one mode"
+            MODE=check
+            shift
+            ;;
+        --help | -h)
+            usage
+            exit 0
+            ;;
+        *) fail "unknown argument: $1" ;;
+    esac
+done
+
+for verifier_source in \
+    "$MAIN_TEMPLATE" "$SYSTEM_SOURCE" "$LOGROTATE_SOURCE" "$SYSTEMD_SOURCE"
+do
+    validate_source "$verifier_source"
+done
+
+if [ "$MODE" = check ]; then
+    printf 'Validated Monit verification sources.\n'
+    exit 0
+fi
+
+[ "$(id -u)" -eq 0 ] || fail "run as root"
+for verify_command in ausearch awk cmp getenforce grep logrotate matchpathcon \
+    monit ps rpm ss stat systemctl wc
+do
+    require_command "$verify_command"
+done
+
+verify_package_integrity
+verify_version_floor
+verify_control_file
+verify_managed_files
+verify_log_rotation
+verify_systemd_policy
+verify_listener
+verify_selinux
+monit -c "$MONIT_MAIN" summary >/dev/null \
+    || fail "Monit local control-plane health check failed"
+
+printf 'Verified Monit package, configuration, SELinux, log rotation, and runtime health.\n'

@@ -50,6 +50,9 @@ if command -v shellcheck >/dev/null 2>&1; then
         "$REPOSITORY_ROOT/mongodb/build-bundle" \
         "$REPOSITORY_ROOT/mongodb/setup" \
         "$REPOSITORY_ROOT/mongodb/verify" \
+        "$REPOSITORY_ROOT/monit/install" \
+        "$REPOSITORY_ROOT/monit/setup" \
+        "$REPOSITORY_ROOT/monit/verify" \
         "$REPOSITORY_ROOT/redis/install" \
         "$REPOSITORY_ROOT/redis/build-bundle" \
         "$REPOSITORY_ROOT/redis/reload-tls" \
@@ -85,6 +88,7 @@ if command -v shellcheck >/dev/null 2>&1; then
         "$REPOSITORY_ROOT/tests/nginx-runtime" \
         "$REPOSITORY_ROOT/tests/mongodb" \
         "$REPOSITORY_ROOT/tests/mongodb-el9" \
+        "$REPOSITORY_ROOT/tests/monit" \
         "$REPOSITORY_ROOT/tests/redis" \
         "$REPOSITORY_ROOT/tests/redis-el9" \
         "$REPOSITORY_ROOT/tests/redis-runtime" \
@@ -155,6 +159,10 @@ step "Validating portable bundle hard-link inspection..."
 
 step "Running MongoDB installer and initialized replica-set model tests..."
 "$REPOSITORY_ROOT/tests/mongodb"
+
+step "Running Monit installer, setup, and operations-standard tests..."
+"$REPOSITORY_ROOT/tests/monit"
+PYTHONDONTWRITEBYTECODE=1 python3 "$REPOSITORY_ROOT/tests/monit-pdf.py"
 
 step "Running Redis installer and single-server security model tests..."
 "$REPOSITORY_ROOT/tests/redis"

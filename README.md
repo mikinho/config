@@ -30,7 +30,8 @@ but only for explicitly trusted immediate peers.
 | systemd | **249** syntax floor; validated on Rocky Linux 9 and CentOS Stream 10 | Required for the service sandbox, including `ProtectProc` and `SocketBindDeny`. |
 | PHP-FPM | **PHP 8.3 or newer** with systemd and POSIX ACL support; OPcache for production | Required only for the optional per-site PHP-FPM service and configuration under `php-fpm/`. |
 | Certbot | A currently supported native package or the official Snap, selected per host | Required only for the included ACME renewal timer and its selected native or Snap payload. |
-| logrotate | A currently supported release | Required when installing the included nginx or MongoDB file-log rotation policy. |
+| logrotate | A currently supported release | Required when installing the included nginx, MongoDB, or Monit file-log rotation policy. |
+| Monit | **5.33 or newer** from EPEL; last reviewed with **6.0.0** | Required only for the optional client-neutral virtual-machine monitoring baseline under `monit/`. |
 | fail2ban | A currently supported EPEL release | Required only for the optional intrusion-ban policy in `fail2ban/`. |
 | OpenSSH | A supported RHEL-family sshd with the stock `sshd_config.d` include | Required only for the `ssh/` drop-ins; RHEL 8-era sshd lacks the include and silently ignores them. |
 | ncurses terminfo | Vendor `ncurses` and `ncurses-base` packages with working `tic`, `infocmp`, and `xterm-256color` | Provides a terminal-generic compatibility floor and the tooling for reviewed user-local terminfo entries. |
@@ -217,6 +218,13 @@ TCP 443 so clients always have an HTTP/2 or HTTP/1.1 fallback.
   scoped JWK issuance, a hardened private listener, strict verification, and a
   reproducible PDF security handoff. It is never included automatically on an
   edge or database host.
+- `monit/` installs the current signed EPEL package and provides a transactional
+  client-neutral monitoring baseline with alert-only VM checks, enforcing
+  SELinux validation, local-only authenticated control, safe file-log rotation,
+  deployment-fragment preservation, strict runtime verification, and a
+  reproducible PDF operations handoff. It is never included automatically in a
+  host profile because notification transport and service checks are private
+  deployment policy.
 - `tailscale/` contains the official-repository installer and three-phase tagged
   server setup that keeps native deployment SSH on TCP 2356 while enabling
   Tailscale SSH on tailnet TCP 22 for explicitly named human accounts.

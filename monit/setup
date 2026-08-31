@@ -1,0 +1,531 @@
+#!/usr/bin/env sh
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
+set -eu
+set -f
+
+PROGRAM_NAME=${0##*/}
+SCRIPT_DIRECTORY=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+MAIN_TEMPLATE=$SCRIPT_DIRECTORY/templates/monitrc.in
+SYSTEM_SOURCE=$SCRIPT_DIRECTORY/conf.d/10-system.conf
+LOGROTATE_SOURCE=$SCRIPT_DIRECTORY/logrotate/monit
+SYSTEMD_SOURCE=$SCRIPT_DIRECTORY/systemd/monit.service.conf
+VERIFIER_SOURCE=$SCRIPT_DIRECTORY/verify
+
+MONIT_MAIN=/etc/monitrc
+MONIT_FRAGMENT_DIRECTORY=/etc/monit.d
+SYSTEM_TARGET=$MONIT_FRAGMENT_DIRECTORY/10-system.conf
+LOGROTATE_TARGET=/etc/logrotate.d/monit
+SYSTEMD_DIRECTORY=/etc/systemd/system/monit.service.d
+SYSTEMD_TARGET=$SYSTEMD_DIRECTORY/10-baseline.conf
+MONIT_LOG_DIRECTORY=/var/log/monit
+MONIT_STATE_DIRECTORY=/var/lib/monit
+MONIT_RUNTIME_DIRECTORY=/run/monit
+LIVE_INCLUDE_GLOB='/etc/monit.d/*.conf'
+MANAGED_MARKER='Managed by mikinho/config monit/setup.'
+
+MODE=apply
+OUTPUT_DIRECTORY=
+FRAGMENT_SOURCES=
+FRAGMENT_NAMES=
+REPLACE_MAIN=no
+TEMPORARY_DIRECTORY=
+BACKUP_DIRECTORY=
+BACKED_UP_TARGETS=
+CHANGES_STARTED=no
+TRANSACTION_COMMITTED=no
+SERVICE_WAS_ACTIVE=no
+SERVICE_WAS_ENABLED=no
+
+usage() {
+    cat <<EOF
+Usage:
+  $PROGRAM_NAME --check
+  $PROGRAM_NAME --output DIRECTORY [--fragment FILE ...]
+  $PROGRAM_NAME --plan [--fragment FILE ...] [--replace-main]
+  sudo $PROGRAM_NAME [--fragment FILE ...] [--replace-main]
+
+Renders or applies the client-neutral Monit baseline. --fragment installs a
+deployment-specific root-only *.conf file by basename. Existing *.conf files
+not named by this command are preserved. A modified unmanaged /etc/monitrc is
+never replaced unless --replace-main explicitly records an adoption decision.
+Setup validates an assembled candidate before activation and reloads an active
+Monit daemon without restarting monitored services.
+EOF
+}
+
+fail() {
+    printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2
+    exit 1
+}
+
+append_line() {
+    existing_lines=$1
+    appended_line=$2
+    printf '%s' "$existing_lines${existing_lines:+
+}$appended_line"
+}
+
+validate_source() {
+    setup_source=$1
+    [ -f "$setup_source" ] && [ ! -L "$setup_source" ] \
+        || fail "repository dependency must be a regular file: $setup_source"
+}
+
+validate_fragment_source() {
+    fragment_source=$1
+    validate_source "$fragment_source"
+    if printf '%s' "$fragment_source" | grep '[[:space:]]' >/dev/null 2>&1; then
+        fail "fragment paths must not contain whitespace: $fragment_source"
+    fi
+    fragment_name=${fragment_source##*/}
+    case "$fragment_name" in
+        10-system.conf)
+            fail "fragment name is reserved by the baseline: $fragment_name"
+            ;;
+        '' | .* | *[!A-Za-z0-9_.-]* | *.conf.conf)
+            fail "invalid fragment basename: $fragment_name"
+            ;;
+        *.conf) ;;
+        *) fail "fragment basename must end in .conf: $fragment_name" ;;
+    esac
+    if printf '%s\n' "$FRAGMENT_NAMES" | grep -Fx "$fragment_name" >/dev/null 2>&1; then
+        fail "duplicate fragment basename: $fragment_name"
+    fi
+    FRAGMENT_SOURCES=$(append_line "$FRAGMENT_SOURCES" "$fragment_source")
+    FRAGMENT_NAMES=$(append_line "$FRAGMENT_NAMES" "$fragment_name")
+}
+
+validate_template_contract() {
+    [ "$(grep -Fxc '    allow admin:@@CONTROL_PASSWORD@@' "$MAIN_TEMPLATE" || true)" -eq 1 ] \
+        || fail "main template must contain exactly one control-password token"
+    [ "$(grep -Fxc 'include @@INCLUDE_GLOB@@' "$MAIN_TEMPLATE" || true)" -eq 1 ] \
+        || fail "main template must contain exactly one include-glob token"
+    if grep -F 'admin:monit' "$MAIN_TEMPLATE" >/dev/null 2>&1; then
+        fail "main template contains the package default credential"
+    fi
+}
+
+generate_control_password() {
+    generated_password=$(openssl rand -hex 32) \
+        || fail "cannot generate the local control password"
+    printf '%s\n' "$generated_password" | grep -Eq '^[0-9a-f]{64}$' \
+        || fail "OpenSSL returned an invalid control password"
+    printf '%s\n' "$generated_password"
+}
+
+existing_control_password() {
+    [ -f "$MONIT_MAIN" ] && [ ! -L "$MONIT_MAIN" ] || return 1
+    grep -F "$MANAGED_MARKER" "$MONIT_MAIN" >/dev/null 2>&1 || return 1
+    preserved_password=$(awk '
+        $1 == "allow" && $2 ~ /^admin:[0-9a-f]+$/ {
+            sub(/^admin:/, "", $2)
+            print $2
+        }
+    ' "$MONIT_MAIN")
+    printf '%s\n' "$preserved_password" | grep -Eq '^[0-9a-f]{64}$' \
+        || return 1
+    [ "$(printf '%s\n' "$preserved_password" | wc -l | tr -d ' ')" -eq 1 ] \
+        || return 1
+    printf '%s\n' "$preserved_password"
+}
+
+render_main() {
+    rendered_target=$1
+    rendered_include_glob=$2
+    rendered_password=$3
+    awk -v include_glob="$rendered_include_glob" \
+        -v control_password="$rendered_password" '
+        $0 == "    allow admin:@@CONTROL_PASSWORD@@" {
+            print "    allow admin:" control_password
+            next
+        }
+        $0 == "include @@INCLUDE_GLOB@@" {
+            print "include " include_glob
+            next
+        }
+        { print }
+    ' "$MAIN_TEMPLATE" > "$rendered_target"
+    if grep -F '@@' "$rendered_target" >/dev/null 2>&1; then
+        fail "main render retained an unresolved template token"
+    fi
+    chmod 0600 "$rendered_target"
+}
+
+copy_existing_fragments() {
+    staged_fragment_directory=$1
+    [ -e "$MONIT_FRAGMENT_DIRECTORY" ] || return 0
+    [ -d "$MONIT_FRAGMENT_DIRECTORY" ] && [ ! -L "$MONIT_FRAGMENT_DIRECTORY" ] \
+        || fail "live fragment path must be a real directory"
+    unsafe_fragment=$(find "$MONIT_FRAGMENT_DIRECTORY" \
+        -mindepth 1 -maxdepth 1 -name '*.conf' ! -type f -print -quit)
+    [ -z "$unsafe_fragment" ] \
+        || fail "live Monit fragment must be a regular file: $unsafe_fragment"
+    find "$MONIT_FRAGMENT_DIRECTORY" \
+        -mindepth 1 -maxdepth 1 -type f -name '*.conf' -print \
+        | while IFS= read -r live_fragment; do
+            install -m 0600 "$live_fragment" \
+                "$staged_fragment_directory/${live_fragment##*/}"
+        done
+}
+
+copy_requested_fragments() {
+    staged_fragment_directory=$1
+    for fragment_source in $FRAGMENT_SOURCES; do
+        fragment_name=${fragment_source##*/}
+        install -m 0600 "$fragment_source" \
+            "$staged_fragment_directory/$fragment_name"
+    done
+}
+
+validate_candidate() {
+    candidate_main=$1
+    candidate_logrotate=$2
+    [ "$(stat -f '%Lp' "$candidate_main" 2>/dev/null || stat -c '%a' "$candidate_main")" = 600 ] \
+        || fail "candidate main control file must be mode 0600"
+    if command -v monit >/dev/null 2>&1; then
+        monit -t -c "$candidate_main" >/dev/null \
+            || fail "Monit rejected the assembled candidate control tree"
+    elif [ "$MODE" = apply ]; then
+        fail "required command not found: monit"
+    fi
+    if command -v logrotate >/dev/null 2>&1; then
+        logrotate --debug "$candidate_logrotate" >/dev/null 2>&1 \
+            || fail "logrotate rejected the candidate policy"
+    elif [ "$MODE" = apply ]; then
+        fail "required command not found: logrotate"
+    fi
+}
+
+prepare_candidate() {
+    candidate_root=$1
+    candidate_password=$2
+    candidate_include_glob=$candidate_root/etc/monit.d/'*.conf'
+    install -d -m 0700 "$candidate_root/etc/monit.d"
+    install -d -m 0700 "$candidate_root/etc/logrotate.d"
+    install -d -m 0700 "$candidate_root/etc/systemd/system/monit.service.d"
+    if [ "$MODE" = apply ]; then
+        copy_existing_fragments "$candidate_root/etc/monit.d"
+    fi
+    install -m 0600 "$SYSTEM_SOURCE" "$candidate_root/etc/monit.d/10-system.conf"
+    copy_requested_fragments "$candidate_root/etc/monit.d"
+    install -m 0644 "$LOGROTATE_SOURCE" "$candidate_root/etc/logrotate.d/monit"
+    install -m 0644 "$SYSTEMD_SOURCE" \
+        "$candidate_root/etc/systemd/system/monit.service.d/10-baseline.conf"
+    render_main "$candidate_root/etc/monitrc" \
+        "$candidate_include_glob" "$candidate_password"
+    validate_candidate "$candidate_root/etc/monitrc" \
+        "$candidate_root/etc/logrotate.d/monit"
+}
+
+validate_output_target() {
+    [ -n "$OUTPUT_DIRECTORY" ] || fail "--output requires a directory"
+    case "${OUTPUT_DIRECTORY##*/}" in
+        '' | . | ..) fail "invalid output directory: $OUTPUT_DIRECTORY" ;;
+    esac
+    [ ! -e "$OUTPUT_DIRECTORY" ] && [ ! -L "$OUTPUT_DIRECTORY" ] \
+        || fail "output path already exists: $OUTPUT_DIRECTORY"
+    output_parent=${OUTPUT_DIRECTORY%/*}
+    [ "$output_parent" != "$OUTPUT_DIRECTORY" ] || output_parent=.
+    [ -d "$output_parent" ] && [ ! -L "$output_parent" ] \
+        || fail "output parent must be a real directory: $output_parent"
+}
+
+validate_root_directory() {
+    checked_directory=$1
+    [ -d "$checked_directory" ] && [ ! -L "$checked_directory" ] \
+        || fail "target must be a real directory: $checked_directory"
+    checked_identity=$(stat -Lc '%U:%G:%a' "$checked_directory" 2>/dev/null) \
+        || fail "cannot inspect directory: $checked_directory"
+    checked_owner_group=${checked_identity%:*}
+    checked_mode=${checked_identity##*:}
+    [ "$checked_owner_group" = root:root ] \
+        || fail "target directory must be root:root: $checked_directory"
+    if [ "$((0$checked_mode & 0022))" -ne 0 ]; then
+        fail "target directory must not be writable by group or other: $checked_directory"
+    fi
+}
+
+ensure_directory() {
+    managed_directory=$1
+    managed_mode=$2
+    if [ -e "$managed_directory" ] || [ -L "$managed_directory" ]; then
+        validate_root_directory "$managed_directory"
+    fi
+    install -d -o root -g root -m "$managed_mode" "$managed_directory"
+}
+
+validate_managed_target() {
+    managed_target=$1
+    if [ -e "$managed_target" ] || [ -L "$managed_target" ]; then
+        [ -f "$managed_target" ] && [ ! -L "$managed_target" ] \
+            || fail "managed target must be a regular file: $managed_target"
+    fi
+}
+
+main_replacement_is_safe() {
+    [ -e "$MONIT_MAIN" ] || return 0
+    validate_managed_target "$MONIT_MAIN"
+    if grep -F "$MANAGED_MARKER" "$MONIT_MAIN" >/dev/null 2>&1; then
+        return 0
+    fi
+    if [ "$REPLACE_MAIN" = yes ]; then
+        return 0
+    fi
+    package_owner=$(rpm -qf --qf '%{NAME}\n' "$MONIT_MAIN" 2>/dev/null || true)
+    [ "$package_owner" = monit ] || fail \
+        "refusing unmanaged $MONIT_MAIN not owned by the Monit package; migrate private policy to *.conf fragments, then rerun with --replace-main"
+    if rpm -V monit > "$TEMPORARY_DIRECTORY/rpm-verification" 2>/dev/null; then
+        verification_status=0
+    else
+        verification_status=$?
+    fi
+    [ "$verification_status" -le 1 ] \
+        || fail "cannot verify the installed Monit package"
+    verification_output=$(awk -v expected="$MONIT_MAIN" \
+        '$NF == expected { print }' "$TEMPORARY_DIRECTORY/rpm-verification")
+    [ -z "$verification_output" ] || fail \
+        "refusing modified unmanaged $MONIT_MAIN; migrate private policy to *.conf fragments, then rerun with --replace-main"
+}
+
+backup_target() {
+    backup_target_path=$1
+    backup_relative_path=${backup_target_path#/}
+    backup_file=$BACKUP_DIRECTORY/files/$backup_relative_path
+    backup_present=$BACKUP_DIRECTORY/present/$backup_relative_path
+    backup_absent=$BACKUP_DIRECTORY/absent/$backup_relative_path
+    mkdir -p "${backup_file%/*}" "${backup_present%/*}" "${backup_absent%/*}"
+    if [ -e "$backup_target_path" ] || [ -L "$backup_target_path" ]; then
+        validate_managed_target "$backup_target_path"
+        cp -p "$backup_target_path" "$backup_file"
+        : > "$backup_present"
+    else
+        : > "$backup_absent"
+    fi
+    BACKED_UP_TARGETS=$(append_line "$BACKED_UP_TARGETS" "$backup_target_path")
+}
+
+restore_target() {
+    restore_target_path=$1
+    restore_relative_path=${restore_target_path#/}
+    restore_file=$BACKUP_DIRECTORY/files/$restore_relative_path
+    restore_present=$BACKUP_DIRECTORY/present/$restore_relative_path
+    restore_absent=$BACKUP_DIRECTORY/absent/$restore_relative_path
+    if [ -f "$restore_present" ]; then
+        install -o root -g root -m "$(stat -Lc '%a' "$restore_file")" \
+            "$restore_file" "$restore_target_path"
+    elif [ -f "$restore_absent" ]; then
+        rm -f -- "$restore_target_path"
+    fi
+}
+
+rollback_transaction() {
+    set +e
+    printf '%s: setup failed; restoring managed files and prior service state\n' \
+        "$PROGRAM_NAME" >&2
+    for rollback_target in $BACKED_UP_TARGETS; do
+        restore_target "$rollback_target"
+    done
+    systemctl daemon-reload >/dev/null 2>&1
+    if [ "$SERVICE_WAS_ACTIVE" = yes ]; then
+        monit -t -c "$MONIT_MAIN" >/dev/null 2>&1 \
+            && systemctl reload monit.service >/dev/null 2>&1
+    else
+        systemctl stop monit.service >/dev/null 2>&1
+    fi
+    if [ "$SERVICE_WAS_ENABLED" = yes ]; then
+        systemctl enable monit.service >/dev/null 2>&1
+    else
+        systemctl disable monit.service >/dev/null 2>&1
+    fi
+    set -e
+}
+
+cleanup() {
+    if [ "$CHANGES_STARTED" = yes ] && [ "$TRANSACTION_COMMITTED" = no ]; then
+        rollback_transaction
+    fi
+    if [ -n "$TEMPORARY_DIRECTORY" ] && [ -d "$TEMPORARY_DIRECTORY" ]; then
+        rm -rf -- "$TEMPORARY_DIRECTORY"
+    fi
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --check)
+            [ "$MODE" = apply ] || fail "select exactly one mode"
+            MODE=check
+            shift
+            ;;
+        --fragment)
+            [ "$#" -ge 2 ] || fail "--fragment requires a file"
+            validate_fragment_source "$2"
+            shift 2
+            ;;
+        --output)
+            [ "$MODE" = apply ] || fail "select exactly one mode"
+            [ "$#" -ge 2 ] || fail "--output requires a directory"
+            MODE=output
+            OUTPUT_DIRECTORY=$2
+            shift 2
+            ;;
+        --plan)
+            [ "$MODE" = apply ] || fail "select exactly one mode"
+            MODE=plan
+            shift
+            ;;
+        --replace-main)
+            REPLACE_MAIN=yes
+            shift
+            ;;
+        --help | -h)
+            usage
+            exit 0
+            ;;
+        *) fail "unknown argument: $1" ;;
+    esac
+done
+
+for setup_source in \
+    "$MAIN_TEMPLATE" "$SYSTEM_SOURCE" "$LOGROTATE_SOURCE" \
+    "$SYSTEMD_SOURCE" "$VERIFIER_SOURCE"
+do
+    validate_source "$setup_source"
+done
+[ -x "$VERIFIER_SOURCE" ] || fail "verifier source must be executable"
+validate_template_contract
+
+if [ "$MODE" = check ]; then
+    [ -z "$FRAGMENT_SOURCES$OUTPUT_DIRECTORY" ] && [ "$REPLACE_MAIN" = no ] \
+        || fail "--check does not accept deployment options"
+    "$VERIFIER_SOURCE" --check >/dev/null
+    printf 'Validated Monit setup templates, policies, and verifier source.\n'
+    exit 0
+fi
+if [ "$MODE" = output ] && [ "$REPLACE_MAIN" = yes ]; then
+    fail "--replace-main is not valid with --output"
+fi
+
+if [ "$MODE" = plan ]; then
+    printf 'Monit setup plan:\n'
+    printf '+ install root-only baseline /etc/monitrc with a generated local control credential\n'
+    printf '+ preserve existing /etc/monit.d/*.conf fragments\n'
+    for fragment_source in $FRAGMENT_SOURCES; do
+        printf '+ install root-only fragment %s as /etc/monit.d/%s\n' \
+            "$fragment_source" "${fragment_source##*/}"
+    done
+    printf '+ install alert-only system resource checks\n'
+    printf '+ install logrotate policy with SIGHUP log reopen\n'
+    printf '+ install systemd runtime, state, log, umask, and reload policy\n'
+    printf '+ restore default SELinux labels and reject any Monit AVC denial\n'
+    printf '+ validate the assembled tree, then reload or start monit.service\n'
+    if [ "$REPLACE_MAIN" = yes ]; then
+        printf '+ explicitly replace a modified unmanaged /etc/monitrc\n'
+    else
+        printf '+ refuse a modified unmanaged /etc/monitrc\n'
+    fi
+    printf 'Plan complete; no host changes were made.\n'
+    exit 0
+fi
+
+for required_command in awk chmod cp find grep install mkdir mv openssl stat wc; do
+    command -v "$required_command" >/dev/null 2>&1 \
+        || fail "required command not found: $required_command"
+done
+
+TEMPORARY_DIRECTORY=$(mktemp -d "${TMPDIR:-/tmp}/config-monit-setup.XXXXXX")
+umask 077
+trap cleanup EXIT HUP INT TERM
+
+if [ "$MODE" = output ]; then
+    validate_output_target
+    control_password=$(generate_control_password)
+    prepare_candidate "$TEMPORARY_DIRECTORY/publication" "$control_password"
+    render_main "$TEMPORARY_DIRECTORY/publication/etc/monitrc" \
+        "$LIVE_INCLUDE_GLOB" "$control_password"
+    mv "$TEMPORARY_DIRECTORY/publication" "$OUTPUT_DIRECTORY"
+    printf 'Rendered Monit baseline: %s\n' "$OUTPUT_DIRECTORY"
+    exit 0
+fi
+
+[ "$(id -u)" -eq 0 ] || fail "run as root, use --plan, or use --output"
+for required_command in getenforce logrotate matchpathcon monit restorecon rpm \
+    systemctl
+do
+    command -v "$required_command" >/dev/null 2>&1 \
+        || fail "required command not found: $required_command"
+done
+[ "$(getenforce)" = Enforcing ] || fail "SELinux must be Enforcing"
+rpm -q monit >/dev/null 2>&1 || fail "Monit package is not installed"
+main_replacement_is_safe
+
+if systemctl is-active --quiet monit.service 2>/dev/null; then
+    SERVICE_WAS_ACTIVE=yes
+fi
+if systemctl is-enabled --quiet monit.service 2>/dev/null; then
+    SERVICE_WAS_ENABLED=yes
+fi
+
+control_password=$(existing_control_password || generate_control_password)
+prepare_candidate "$TEMPORARY_DIRECTORY/candidate" "$control_password"
+render_main "$TEMPORARY_DIRECTORY/final-monitrc" \
+    "$LIVE_INCLUDE_GLOB" "$control_password"
+
+for fixed_target in "$MONIT_MAIN" "$SYSTEM_TARGET" "$LOGROTATE_TARGET" "$SYSTEMD_TARGET"; do
+    validate_managed_target "$fixed_target"
+done
+for fragment_source in $FRAGMENT_SOURCES; do
+    validate_managed_target "$MONIT_FRAGMENT_DIRECTORY/${fragment_source##*/}"
+done
+
+BACKUP_DIRECTORY=$TEMPORARY_DIRECTORY/backup
+for fixed_target in "$MONIT_MAIN" "$SYSTEM_TARGET" "$LOGROTATE_TARGET" "$SYSTEMD_TARGET"; do
+    backup_target "$fixed_target"
+done
+for fragment_source in $FRAGMENT_SOURCES; do
+    backup_target "$MONIT_FRAGMENT_DIRECTORY/${fragment_source##*/}"
+done
+CHANGES_STARTED=yes
+
+ensure_directory "$MONIT_FRAGMENT_DIRECTORY" 0750
+ensure_directory /etc/logrotate.d 0755
+ensure_directory /etc/systemd/system 0755
+ensure_directory "$SYSTEMD_DIRECTORY" 0755
+ensure_directory "$MONIT_LOG_DIRECTORY" 0700
+ensure_directory "$MONIT_STATE_DIRECTORY" 0700
+ensure_directory "$MONIT_RUNTIME_DIRECTORY" 0750
+
+install -o root -g root -m 0600 "$TEMPORARY_DIRECTORY/final-monitrc" "$MONIT_MAIN"
+install -o root -g root -m 0600 "$SYSTEM_SOURCE" "$SYSTEM_TARGET"
+for fragment_source in $FRAGMENT_SOURCES; do
+    install -o root -g root -m 0600 "$fragment_source" \
+        "$MONIT_FRAGMENT_DIRECTORY/${fragment_source##*/}"
+done
+install -o root -g root -m 0644 "$LOGROTATE_SOURCE" "$LOGROTATE_TARGET"
+install -o root -g root -m 0644 "$SYSTEMD_SOURCE" "$SYSTEMD_TARGET"
+
+restorecon -RF "$MONIT_MAIN" "$MONIT_FRAGMENT_DIRECTORY" \
+    "$LOGROTATE_TARGET" "$SYSTEMD_DIRECTORY" "$MONIT_LOG_DIRECTORY" \
+    "$MONIT_STATE_DIRECTORY" "$MONIT_RUNTIME_DIRECTORY" >/dev/null
+systemctl daemon-reload
+monit -t -c "$MONIT_MAIN" >/dev/null
+logrotate --debug "$LOGROTATE_TARGET" >/dev/null 2>&1
+
+if [ "$SERVICE_WAS_ACTIVE" = yes ]; then
+    systemctl reload monit.service
+else
+    systemctl enable --now monit.service
+fi
+systemctl is-enabled --quiet monit.service \
+    || fail "monit.service is not enabled after setup"
+systemctl is-active --quiet monit.service \
+    || fail "monit.service is not active after setup"
+monit -c "$MONIT_MAIN" summary >/dev/null \
+    || fail "Monit local control-plane health check failed"
+"$VERIFIER_SOURCE" >/dev/null
+
+TRANSACTION_COMMITTED=yes
+printf 'Applied and verified Monit baseline; monit.service is active and enabled.\n'

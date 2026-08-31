@@ -1,0 +1,29 @@
+# monit/templates/monitrc.in
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
+# Managed by mikinho/config monit/setup. Deployment-specific notification
+# transport, recipients, and service checks belong in root-only *.conf
+# fragments under /etc/monit.d.
+
+set daemon 30
+    with start delay 60
+
+set log /var/log/monit/monit.log
+set pidfile /run/monit/monit.pid
+set idfile /var/lib/monit/id
+set statefile /var/lib/monit/state
+
+set eventqueue
+    basedir /var/lib/monit/events
+    slots 100
+
+# The control plane is loopback-only. A random per-host password is rendered
+# into this root-only file so unprivileged local users cannot issue actions.
+set httpd port 2812 and
+    use address 127.0.0.1
+    allow admin:@@CONTROL_PASSWORD@@
+
+include @@INCLUDE_GLOB@@

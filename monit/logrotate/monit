@@ -1,0 +1,23 @@
+# monit/logrotate/monit
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
+/var/log/monit/monit.log {
+    daily
+    maxsize 25M
+    rotate 14
+    dateext
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0600 root root
+    sharedscripts
+    postrotate
+        if /usr/bin/systemctl is-active --quiet monit.service; then
+            /usr/bin/systemctl kill --kill-who=main --signal=SIGHUP monit.service
+        fi
+    endscript
+}

@@ -1,0 +1,157 @@
+#!/usr/bin/env python3
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
+"""Focused parser and safety tests for the Monit operations PDF renderer."""
+
+from __future__ import annotations
+
+import contextlib
+import importlib.util
+import io
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from types import ModuleType
+from typing import Final
+
+
+sys.dont_write_bytecode = True
+
+
+REPOSITORY_ROOT: Final = Path(__file__).resolve().parents[1]
+RENDERER_PATH: Final = REPOSITORY_ROOT / "monit" / "build-operations-standard-pdf.py"
+
+
+def load_renderer() -> ModuleType:
+    """Load the renderer without modifying the repository import path."""
+
+    spec = importlib.util.spec_from_file_location("monit_operations_pdf", RENDERER_PATH)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load renderer: {RENDERER_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+RENDERER: Final = load_renderer()
+
+
+def minimal_standard(extra_text: str = "") -> str:
+    """Return the smallest canonical source accepted by the renderer."""
+
+    sections = ["# Minimal Monit standard"]
+    sections.extend(f"## {heading}\n\nValidated content." for heading in RENDERER.REQUIRED_HEADINGS)
+    if extra_text:
+        sections.append(extra_text)
+    return "\n\n".join(sections) + "\n"
+
+
+class MarkdownParserTests(unittest.TestCase):
+    """Exercise the constrained Markdown parser's stable behavior."""
+
+    def test_parser_handles_lists_tables_code_and_markup(self) -> None:
+        """Supported block types remain distinct and retain their content."""
+
+        source = """# Title
+
+Paragraph with `code` and **emphasis**.
+
+- one
+- two
+
+1. first
+2. second
+
+| Name | Value |
+| --- | --- |
+| alpha | beta |
+
+```sh
+command --flag
+```
+"""
+        blocks = RENDERER.parse_markdown(source)
+        self.assertEqual(
+            [block.kind for block in blocks],
+            ["heading", "paragraph", "bullet", "bullet", "numbered", "numbered", "table", "code"],
+        )
+        self.assertEqual(blocks[-2].rows, (("Name", "Value"), ("alpha", "beta")))
+        self.assertEqual(blocks[-1].text, "command --flag")
+
+    def test_unterminated_code_fence_is_rejected(self) -> None:
+        """A malformed fenced block cannot silently consume later content."""
+
+        with self.assertRaisesRegex(ValueError, "unterminated fenced code block"):
+            RENDERER.parse_markdown("# Title\n\n```sh\ncommand\n")
+
+    def test_inconsistent_table_shape_is_rejected(self) -> None:
+        """Rows cannot drift from the declared table width."""
+
+        with self.assertRaisesRegex(ValueError, "inconsistent columns"):
+            RENDERER.parse_markdown(
+                "| Name | Value |\n| --- | --- |\n| only-one |\n"
+            )
+
+    def test_code_wrapping_bounds_long_lines(self) -> None:
+        """Long command lines are wrapped to a predictable printable width."""
+
+        wrapped = RENDERER.wrap_code("command " + "x" * 120, width=32)
+        self.assertGreater(len(wrapped.splitlines()), 1)
+        self.assertTrue(all(len(line) <= 32 for line in wrapped.splitlines()))
+
+
+class CanonicalBoundaryTests(unittest.TestCase):
+    """Verify canonical-source and output-path safety gates."""
+
+    def test_required_heading_is_enforced(self) -> None:
+        """Removing a critical section makes the source invalid."""
+
+        blocks = RENDERER.parse_markdown("# Minimal\n\n## Install\n\nContent.\n")
+        with self.assertRaisesRegex(ValueError, "missing headings"):
+            RENDERER.validate_blocks(blocks)
+
+    def test_private_identifier_is_rejected(self) -> None:
+        """The reusable public standard fails closed on deployment identifiers."""
+
+        blocks = RENDERER.parse_markdown(minimal_standard("A havenside deployment."))
+        with self.assertRaisesRegex(ValueError, "client identifiers"):
+            RENDERER.validate_blocks(blocks)
+
+    def test_check_mode_requires_distinct_output(self) -> None:
+        """The renderer cannot replace its own canonical Markdown source."""
+
+        with tempfile.TemporaryDirectory(prefix="monit-pdf-tests.") as temporary:
+            source_path = Path(temporary) / "standard.md"
+            source_path.write_text(minimal_standard(), encoding="utf-8")
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit) as raised:
+                RENDERER.main(
+                    ["--check", "--source", str(source_path), "--output", str(source_path)]
+                )
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("output must differ", stderr.getvalue())
+
+    def test_check_mode_validates_without_pdf_dependency(self) -> None:
+        """Canonical validation stays usable where ReportLab is not installed."""
+
+        with tempfile.TemporaryDirectory(prefix="monit-pdf-tests.") as temporary:
+            source_path = Path(temporary) / "standard.md"
+            output_path = Path(temporary) / "standard.pdf"
+            source_path.write_text(minimal_standard(), encoding="utf-8")
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                status = RENDERER.main(
+                    ["--check", "--source", str(source_path), "--output", str(output_path)]
+                )
+        self.assertEqual(status, 0)
+        self.assertIn("Validated canonical Monit operations standard", stdout.getvalue())
+        self.assertFalse(output_path.exists())
+
+
+if __name__ == "__main__":
+    unittest.main()

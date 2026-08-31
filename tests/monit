@@ -1,0 +1,204 @@
+#!/usr/bin/env sh
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
+set -eu
+set -f
+
+PROGRAM_NAME=${0##*/}
+SCRIPT_DIRECTORY=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+REPOSITORY_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIRECTORY/.." && pwd)
+MONIT_DIRECTORY=$REPOSITORY_ROOT/monit
+INSTALLER=$MONIT_DIRECTORY/install
+SETUP=$MONIT_DIRECTORY/setup
+VERIFIER=$MONIT_DIRECTORY/verify
+TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/config-monit-tests.XXXXXX")
+CONFIG_PRIVATE_IDENTIFIER_PATTERN=${CONFIG_PRIVATE_IDENTIFIER_PATTERN:-}
+
+cleanup() {
+    if [ -d "$TEST_ROOT" ]; then
+        rm -rf -- "$TEST_ROOT"
+    fi
+}
+
+fail() {
+    printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2
+    exit 1
+}
+
+assert_contains() {
+    checked_file=$1
+    expected_text=$2
+    grep -F -- "$expected_text" "$checked_file" >/dev/null 2>&1 \
+        || fail "expected text not found in $checked_file: $expected_text"
+}
+
+assert_mode() {
+    checked_file=$1
+    expected_mode=$2
+    actual_mode=$(stat -f '%Lp' "$checked_file" 2>/dev/null \
+        || stat -c '%a' "$checked_file")
+    [ "$actual_mode" = "$expected_mode" ] \
+        || fail "$checked_file mode is $actual_mode, expected $expected_mode"
+}
+
+expect_failure() {
+    expected_error=$1
+    shift
+    if "$@" > "$TEST_ROOT/unexpected.stdout" 2> "$TEST_ROOT/expected.stderr"; then
+        fail "command unexpectedly succeeded: $*"
+    fi
+    assert_contains "$TEST_ROOT/expected.stderr" "$expected_error"
+}
+
+make_os_release() {
+    output_path=$1
+    os_id=$2
+    pretty_name=$3
+    version_id=$4
+    {
+        printf 'ID=%s\n' "$os_id"
+        printf 'PRETTY_NAME="%s"\n' "$pretty_name"
+        printf 'VERSION_ID="%s"\n' "$version_id"
+    } > "$output_path"
+}
+
+trap cleanup EXIT HUP INT TERM
+
+make_os_release "$TEST_ROOT/rocky9" rocky 'Rocky Linux 9.6' 9.6
+make_os_release "$TEST_ROOT/centos10" centos 'CentOS Stream 10' 10
+
+"$INSTALLER" --check >/dev/null
+"$SETUP" --check >/dev/null
+"$VERIFIER" --check >/dev/null
+
+"$INSTALLER" --plan --os-release "$TEST_ROOT/rocky9" \
+    > "$TEST_ROOT/install-rocky.plan"
+assert_contains "$TEST_ROOT/install-rocky.plan" 'Monit installation target: Rocky Linux 9'
+for package_name in audit iproute libselinux-utils logrotate monit openssl \
+    policycoreutils procps-ng
+do
+    assert_contains "$TEST_ROOT/install-rocky.plan" "$package_name"
+done
+assert_contains "$TEST_ROOT/install-rocky.plan" \
+    '/usr/local/libexec/config-monit'
+assert_contains "$TEST_ROOT/install-rocky.plan" \
+    'Plan complete; Monit policy would remain inactive.'
+
+"$INSTALLER" --plan --os-release "$TEST_ROOT/centos10" \
+    > "$TEST_ROOT/install-centos.plan"
+assert_contains "$TEST_ROOT/install-centos.plan" 'Monit installation target: CentOS Stream 10'
+
+"$SETUP" --output "$TEST_ROOT/rendered"
+for rendered_path in \
+    etc/monitrc \
+    etc/monit.d/10-system.conf \
+    etc/logrotate.d/monit \
+    etc/systemd/system/monit.service.d/10-baseline.conf
+do
+    [ -f "$TEST_ROOT/rendered/$rendered_path" ] \
+        || fail "rendered Monit path is missing: $rendered_path"
+done
+assert_mode "$TEST_ROOT/rendered/etc/monitrc" 600
+assert_mode "$TEST_ROOT/rendered/etc/monit.d/10-system.conf" 600
+assert_mode "$TEST_ROOT/rendered/etc/logrotate.d/monit" 644
+assert_mode "$TEST_ROOT/rendered/etc/systemd/system/monit.service.d/10-baseline.conf" 644
+assert_contains "$TEST_ROOT/rendered/etc/monitrc" 'include /etc/monit.d/*.conf'
+assert_contains "$TEST_ROOT/rendered/etc/monitrc" '    use address 127.0.0.1'
+if grep -F 'admin:monit' "$TEST_ROOT/rendered/etc/monitrc" >/dev/null 2>&1; then
+    fail 'render retained the package default Monit credential'
+fi
+rendered_password=$(awk '
+    $1 == "allow" && $2 ~ /^admin:/ {
+        sub(/^admin:/, "", $2)
+        print $2
+    }
+' "$TEST_ROOT/rendered/etc/monitrc")
+printf '%s\n' "$rendered_password" | grep -Eq '^[0-9a-f]{64}$' \
+    || fail 'rendered local control password is not 256-bit hexadecimal'
+if grep -F '@@' "$TEST_ROOT/rendered/etc/monitrc" >/dev/null 2>&1; then
+    fail 'rendered main control file retained a template token'
+fi
+
+install -d "$TEST_ROOT/fragments-a" "$TEST_ROOT/fragments-b"
+printf '%s\n' 'check process example with pidfile /run/example.pid' \
+    > "$TEST_ROOT/fragments-a/70-example.conf"
+printf '%s\n' 'check host example with address 127.0.0.1' \
+    > "$TEST_ROOT/fragments-b/70-example.conf"
+"$SETUP" --output "$TEST_ROOT/fragment-render" \
+    --fragment "$TEST_ROOT/fragments-a/70-example.conf"
+cmp -s "$TEST_ROOT/fragments-a/70-example.conf" \
+    "$TEST_ROOT/fragment-render/etc/monit.d/70-example.conf" \
+    || fail 'requested deployment fragment was not copied exactly'
+assert_mode "$TEST_ROOT/fragment-render/etc/monit.d/70-example.conf" 600
+
+expect_failure 'duplicate fragment basename' \
+    "$SETUP" --plan \
+    --fragment "$TEST_ROOT/fragments-a/70-example.conf" \
+    --fragment "$TEST_ROOT/fragments-b/70-example.conf"
+expect_failure 'fragment name is reserved' \
+    "$SETUP" --plan --fragment "$MONIT_DIRECTORY/conf.d/10-system.conf"
+expect_failure 'output path already exists' \
+    "$SETUP" --output "$TEST_ROOT/rendered"
+expect_failure '--replace-main is not valid with --output' \
+    "$SETUP" --output "$TEST_ROOT/replace-render" --replace-main
+
+"$SETUP" --plan --replace-main \
+    --fragment "$TEST_ROOT/fragments-a/70-example.conf" \
+    > "$TEST_ROOT/setup.plan"
+assert_contains "$TEST_ROOT/setup.plan" \
+    'explicitly replace a modified unmanaged /etc/monitrc'
+assert_contains "$TEST_ROOT/setup.plan" \
+    'preserve existing /etc/monit.d/*.conf fragments'
+assert_contains "$TEST_ROOT/setup.plan" \
+    'restore default SELinux labels and reject any Monit AVC denial'
+
+assert_contains "$MONIT_DIRECTORY/conf.d/10-system.conf" \
+    'if memory usage > 90% for 5 cycles then alert'
+assert_contains "$MONIT_DIRECTORY/conf.d/10-system.conf" \
+    'if space usage > 85% for 3 cycles then alert'
+if grep -E 'then (start|stop|restart|exec)' \
+    "$MONIT_DIRECTORY/conf.d/10-system.conf" >/dev/null 2>&1
+then
+    fail 'generic Monit checks contain a mutating action'
+fi
+
+assert_contains "$MONIT_DIRECTORY/logrotate/monit" 'create 0600 root root'
+assert_contains "$MONIT_DIRECTORY/logrotate/monit" \
+    'systemctl kill --kill-who=main --signal=SIGHUP monit.service'
+if grep -F 'copytruncate' "$MONIT_DIRECTORY/logrotate/monit" >/dev/null 2>&1; then
+    fail 'Monit logrotate policy uses copytruncate instead of signal reopen'
+fi
+
+# shellcheck disable=SC2016
+for systemd_line in \
+    'UMask=0077' \
+    'RuntimeDirectory=monit' \
+    'StateDirectory=monit' \
+    'LogsDirectory=monit' \
+    'Restart=on-failure' \
+    'ExecReload=/bin/kill -HUP $MAINPID'
+do
+    assert_contains "$MONIT_DIRECTORY/systemd/monit.service.conf" "$systemd_line"
+done
+
+# shellcheck disable=SC2016
+assert_contains "$SETUP" 'refusing modified unmanaged $MONIT_MAIN'
+# shellcheck disable=SC2016
+assert_contains "$SETUP" 'monit -t -c "$MONIT_MAIN"'
+assert_contains "$SETUP" 'systemctl reload monit.service'
+assert_contains "$VERIFIER" 'ausearch -m AVC,USER_AVC -ts boot -c monit --raw'
+assert_contains "$VERIFIER" 'must bind only to 127.0.0.1:2812'
+assert_contains "$VERIFIER" 'Monit 5.33 or newer is required'
+
+python3 "$MONIT_DIRECTORY/build-operations-standard-pdf.py" --check >/dev/null
+
+if [ -n "$CONFIG_PRIVATE_IDENTIFIER_PATTERN" ] \
+    && grep -Eri -- "$CONFIG_PRIVATE_IDENTIFIER_PATTERN" "$MONIT_DIRECTORY"
+then
+    fail 'public Monit standard contains a client-specific identifier'
+fi
+
+printf 'Validated Monit installer, render, policies, verifier, and client-neutral boundaries.\n'
