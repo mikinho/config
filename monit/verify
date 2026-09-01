@@ -15,11 +15,13 @@ if [ ! -f "$SOURCE_ROOT/templates/monitrc.in" ] \
     SOURCE_ROOT=/usr/local/libexec/config-monit
 fi
 if [ "$SOURCE_ROOT" = "$SCRIPT_DIRECTORY" ]; then
+    VERSION_LIBRARY=$SOURCE_ROOT/lib/version.sh
     MAIN_TEMPLATE=$SOURCE_ROOT/templates/monitrc.in
     SYSTEM_SOURCE=$SOURCE_ROOT/conf.d/10-system.conf
     LOGROTATE_SOURCE=$SOURCE_ROOT/logrotate/monit
     SYSTEMD_SOURCE=$SOURCE_ROOT/systemd/monit.service.conf
 else
+    VERSION_LIBRARY=$SOURCE_ROOT/version.sh
     MAIN_TEMPLATE=$SOURCE_ROOT/monitrc.in
     SYSTEM_SOURCE=$SOURCE_ROOT/10-system.conf
     LOGROTATE_SOURCE=$SOURCE_ROOT/logrotate-monit
@@ -97,19 +99,17 @@ require_exact_line() {
 }
 
 verify_version_floor() {
-    monit_version=$(monit -V 2>&1 | awk '
-        $1 == "This" && $2 == "is" && $3 == "Monit" && $4 == "version" {
-            print $5
-            exit
-        }
-    ')
+    monit_version=$(monit_read_binary_version "$PACKAGE_BINARY")
     [ -n "$monit_version" ] || fail "cannot determine the installed Monit version"
-    printf '%s\n' "$monit_version" | awk -F. '
-        NF >= 2 && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ {
-            exit ($1 > 5 || ($1 == 5 && $2 >= 33)) ? 0 : 1
-        }
-        { exit 1 }
-    ' || fail "Monit 5.33 or newer is required (found $monit_version)"
+    monit_version_is_at_least "$monit_version" "$MONIT_SUPPORTED_VERSION" \
+        || fail "Monit $MONIT_SUPPORTED_VERSION or newer is required (found $monit_version)"
+    if monit_version_is_at_least "$monit_version" "$MONIT_PREFERRED_VERSION"; then
+        printf 'Monit version %s satisfies the preferred release policy.\n' \
+            "$monit_version"
+    else
+        printf 'Monit version %s is the supported compatibility release; prefer %s when the enabled EPEL stream supplies it.\n' \
+            "$monit_version" "$MONIT_PREFERRED_VERSION"
+    fi
 }
 
 verify_package_integrity() {
@@ -155,7 +155,7 @@ verify_control_file() {
         || fail "$MONIT_MAIN has an invalid local control credential"
     [ "$(printf '%s\n' "$control_passwords" | wc -l | tr -d ' ')" -eq 1 ] \
         || fail "$MONIT_MAIN must contain exactly one local control credential"
-    monit -t -c "$MONIT_MAIN" >/dev/null \
+    "$PACKAGE_BINARY" -t -c "$MONIT_MAIN" >/dev/null \
         || fail "Monit rejected the installed control tree"
 }
 
@@ -273,10 +273,17 @@ while [ "$#" -gt 0 ]; do
 done
 
 for verifier_source in \
-    "$MAIN_TEMPLATE" "$SYSTEM_SOURCE" "$LOGROTATE_SOURCE" "$SYSTEMD_SOURCE"
+    "$VERSION_LIBRARY" "$MAIN_TEMPLATE" "$SYSTEM_SOURCE" \
+    "$LOGROTATE_SOURCE" "$SYSTEMD_SOURCE"
 do
     validate_source "$verifier_source"
 done
+command -v awk >/dev/null 2>&1 || fail "required verification command not found: awk"
+
+# shellcheck disable=SC1090
+. "$VERSION_LIBRARY"
+monit_validate_version_policy \
+    || fail "invalid Monit version policy in $VERSION_LIBRARY"
 
 if [ "$MODE" = check ]; then
     printf 'Validated Monit verification sources.\n'
@@ -285,7 +292,7 @@ fi
 
 [ "$(id -u)" -eq 0 ] || fail "run as root"
 for verify_command in ausearch awk cmp getenforce grep logrotate matchpathcon \
-    monit ps rpm ss stat systemctl wc
+    ps rpm ss stat systemctl wc
 do
     require_command "$verify_command"
 done
@@ -298,7 +305,7 @@ verify_log_rotation
 verify_systemd_policy
 verify_listener
 verify_selinux
-monit -c "$MONIT_MAIN" summary >/dev/null \
+"$PACKAGE_BINARY" -c "$MONIT_MAIN" summary >/dev/null \
     || fail "Monit local control-plane health check failed"
 
 printf 'Verified Monit package, configuration, SELinux, log rotation, and runtime health.\n'

@@ -18,11 +18,27 @@ Linux, and CentOS Stream major versions 9 and 10 on x86-64 or ARM64. It enables
 the appropriate EPEL repository through the shared platform helper and
 installs the repository's current signed `monit` package.
 
-The control syntax has a Monit 5.33 floor. The baseline was last reviewed with
-Monit 6.0.0 from EPEL on August 31, 2026. The installer deliberately follows
-the supported EPEL package rather than pinning an old build; the verifier
-rejects a downgrade below the syntax floor and checks the installed binary and
-vendor systemd unit with RPM verification.
+The supported compatibility floor is Monit 5.35.2 and the preferred release is
+6.0.0. EPEL 9 supplies 6.0.0, while EPEL 10.2 supplies 5.35.2 as of August 31,
+2026. The installer deliberately follows the enabled, signed EPEL stream and
+reports which policy tier was installed. It does not add a subscription
+repository, copy a licensed package from another host, use a package built for
+a different Enterprise Linux minor stream, or compile a replacement locally.
+
+Monit 6.0.0 fixes event-state handling when multiple resource tests share an
+event type, which is relevant to the generic resource policy in this baseline.
+Use 6.0.0 wherever the supported distribution stream provides it. The 5.35.2
+compatibility tier keeps EL10.2 on its supported package; deployments using
+that tier should retain independent host telemetry to cover the resource-alert
+limitation. Advance an EL10.2 host only after its own EPEL stream publishes a
+signed 6.0.0-or-newer package or after a separately reviewed package-promotion
+path is available.
+
+The verifier rejects a downgrade below 5.35.2, identifies compatibility-tier
+installs in its output, and checks the installed binary and vendor systemd unit
+with RPM verification. Running `monit/install` again follows the enabled EPEL
+stream, so the normal package transaction adopts 6.0.0 when it becomes
+available without a repository-policy change.
 
 ## Security and ownership model
 
@@ -66,6 +82,7 @@ generated allow rules without review.
 | `/var/lib/monit` | Persistent ID, state, and queued events; `root:root` mode `0700` |
 | `/run/monit` | Runtime PID directory; `root:root` mode `0750` |
 | `/usr/local/bin/verify-monit` | Installed read-only acceptance verifier |
+| `/usr/local/libexec/config-monit/version.sh` | Installed compatibility and preferred-version policy used by the verifier |
 
 The main control file includes only `/etc/monit.d/*.conf`. Staging files must
 therefore use a different suffix or a directory outside `/etc/monit.d`; a

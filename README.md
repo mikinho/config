@@ -31,7 +31,7 @@ but only for explicitly trusted immediate peers.
 | PHP-FPM | **PHP 8.3 or newer** with systemd and POSIX ACL support; OPcache for production | Required only for the optional per-site PHP-FPM service and configuration under `php-fpm/`. |
 | Certbot | A currently supported native package or the official Snap, selected per host | Required only for the included ACME renewal timer and its selected native or Snap payload. |
 | logrotate | A currently supported release | Required when installing the included nginx, MongoDB, or Monit file-log rotation policy. |
-| Monit | **5.33 or newer** from EPEL; last reviewed with **6.0.0** | Required only for the optional client-neutral virtual-machine monitoring baseline under `monit/`. |
+| Monit | **5.35.2 compatibility floor**, **6.0.0 preferred**, from the enabled signed EPEL stream | Required only for the optional client-neutral virtual-machine monitoring baseline under `monit/`; EPEL 10.2 remains on the compatibility tier. |
 | fail2ban | A currently supported EPEL release | Required only for the optional intrusion-ban policy in `fail2ban/`. |
 | OpenSSH | A supported RHEL-family sshd with the stock `sshd_config.d` include | Required only for the `ssh/` drop-ins; RHEL 8-era sshd lacks the include and silently ignores them. |
 | ncurses terminfo | Vendor `ncurses` and `ncurses-base` packages with working `tic`, `infocmp`, and `xterm-256color` | Provides a terminal-generic compatibility floor and the tooling for reviewed user-local terminfo entries. |

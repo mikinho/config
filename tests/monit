@@ -14,6 +14,7 @@ MONIT_DIRECTORY=$REPOSITORY_ROOT/monit
 INSTALLER=$MONIT_DIRECTORY/install
 SETUP=$MONIT_DIRECTORY/setup
 VERIFIER=$MONIT_DIRECTORY/verify
+VERSION_LIBRARY=$MONIT_DIRECTORY/lib/version.sh
 TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/config-monit-tests.XXXXXX")
 CONFIG_PRIVATE_IDENTIFIER_PATTERN=${CONFIG_PRIVATE_IDENTIFIER_PATTERN:-}
 
@@ -84,9 +85,27 @@ make_os_release "$TEST_ROOT/centos10" centos 'CentOS Stream 10' 10
 "$SETUP" --check >/dev/null
 "$VERIFIER" --check >/dev/null
 
+# shellcheck disable=SC1090
+. "$VERSION_LIBRARY"
+monit_validate_version_policy \
+    || fail 'Monit version policy is internally inconsistent'
+for supported_version in 5.35.2 5.35.2.0 6.0.0 10.0; do
+    monit_version_is_at_least "$supported_version" "$MONIT_SUPPORTED_VERSION" \
+        || fail "supported Monit version was rejected: $supported_version"
+done
+for unsupported_version in 5.35.1 5.34.4 4.99.0 malformed; do
+    if monit_version_is_at_least \
+        "$unsupported_version" "$MONIT_SUPPORTED_VERSION"
+    then
+        fail "unsupported Monit version was accepted: $unsupported_version"
+    fi
+done
+
 "$INSTALLER" --plan --os-release "$TEST_ROOT/rocky9" \
     > "$TEST_ROOT/install-rocky.plan"
 assert_contains "$TEST_ROOT/install-rocky.plan" 'Monit installation target: Rocky Linux 9'
+assert_contains "$TEST_ROOT/install-rocky.plan" \
+    'Monit version policy: require 5.35.2 or newer; prefer 6.0.0 when EPEL supplies it.'
 for package_name in audit iproute libselinux-utils logrotate monit openssl \
     policycoreutils procps-ng
 do
@@ -311,7 +330,10 @@ assert_contains "$SETUP" 'monit -t -c "$MONIT_MAIN"'
 assert_contains "$SETUP" 'systemctl reload monit.service'
 assert_contains "$VERIFIER" 'ausearch -m AVC,USER_AVC -ts boot -c monit --raw'
 assert_contains "$VERIFIER" 'must bind only to 127.0.0.1:2812'
-assert_contains "$VERIFIER" 'Monit 5.33 or newer is required'
+assert_contains "$VERSION_LIBRARY" 'MONIT_SUPPORTED_VERSION=5.35.2'
+assert_contains "$VERSION_LIBRARY" 'MONIT_PREFERRED_VERSION=6.0.0'
+assert_contains "$VERIFIER" \
+    'is the supported compatibility release; prefer'
 
 python3 "$MONIT_DIRECTORY/build-operations-standard-pdf.py" --check >/dev/null
 

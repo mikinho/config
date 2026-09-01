@@ -15,6 +15,8 @@ SETUP_SOURCE=$SCRIPT_DIRECTORY/setup
 VERIFIER_SOURCE=$SCRIPT_DIRECTORY/verify
 VERIFIER_TARGET=/usr/local/bin/verify-monit
 VERIFIER_LIBRARY_DIRECTORY=/usr/local/libexec/config-monit
+VERSION_LIBRARY_SOURCE=$SCRIPT_DIRECTORY/lib/version.sh
+VERSION_LIBRARY_TARGET=$VERIFIER_LIBRARY_DIRECTORY/version.sh
 MAIN_TEMPLATE=$SCRIPT_DIRECTORY/templates/monitrc.in
 SYSTEM_SOURCE=$SCRIPT_DIRECTORY/conf.d/10-system.conf
 LOGROTATE_SOURCE=$SCRIPT_DIRECTORY/logrotate/monit
@@ -73,12 +75,19 @@ validate_install_target() {
 
 for install_source in \
     "$PLATFORM_LIBRARY" "$SETUP_SOURCE" "$VERIFIER_SOURCE" \
+    "$VERSION_LIBRARY_SOURCE" \
     "$MAIN_TEMPLATE" "$SYSTEM_SOURCE" "$LOGROTATE_SOURCE" "$SYSTEMD_SOURCE"
 do
     validate_source "$install_source"
 done
 [ -x "$SETUP_SOURCE" ] || fail "setup source must be executable: $SETUP_SOURCE"
 [ -x "$VERIFIER_SOURCE" ] || fail "verifier source must be executable: $VERIFIER_SOURCE"
+command -v awk >/dev/null 2>&1 || fail "required command not found: awk"
+
+# shellcheck disable=SC1090
+. "$VERSION_LIBRARY_SOURCE"
+monit_validate_version_policy \
+    || fail "invalid Monit version policy in $VERSION_LIBRARY_SOURCE"
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -123,6 +132,8 @@ fi
 platform_detect_supported_os "$OS_RELEASE_FILE"
 printf 'Monit installation target: %s (%s)\n' \
     "$PLATFORM_OS_LABEL" "$PLATFORM_OS_ARCHITECTURE"
+printf 'Monit version policy: require %s or newer; prefer %s when EPEL supplies it.\n' \
+    "$MONIT_SUPPORTED_VERSION" "$MONIT_PREFERRED_VERSION"
 
 if [ "$MODE" = install ]; then
     [ "$(id -u)" -eq 0 ] || fail "run as root or use --plan"
@@ -168,6 +179,20 @@ do
         || fail "package installation did not provide required command: $installed_command"
 done
 rpm -q monit >/dev/null 2>&1 || fail "Monit package was not installed"
+installed_monit_version=$(monit_read_binary_version /usr/bin/monit)
+[ -n "$installed_monit_version" ] \
+    || fail "cannot determine the installed Monit version"
+monit_version_is_at_least \
+    "$installed_monit_version" "$MONIT_SUPPORTED_VERSION" \
+    || fail "Monit $MONIT_SUPPORTED_VERSION or newer is required (found $installed_monit_version)"
+if monit_version_is_at_least \
+    "$installed_monit_version" "$MONIT_PREFERRED_VERSION"
+then
+    printf 'Installed preferred Monit release: %s.\n' "$installed_monit_version"
+else
+    printf 'Notice: installed Monit %s is the supported compatibility release; EPEL does not yet supply preferred %s for every supported stream.\n' \
+        "$installed_monit_version" "$MONIT_PREFERRED_VERSION"
+fi
 
 if [ ! -e /usr/local/bin ]; then
     install -d -o root -g root -m 0755 /usr/local/bin
@@ -192,6 +217,7 @@ fi
     || fail "verifier library target must be a real directory"
 validate_root_directory "$VERIFIER_LIBRARY_DIRECTORY"
 for verifier_library_target in \
+    "$VERSION_LIBRARY_TARGET" \
     "$VERIFIER_LIBRARY_DIRECTORY/monitrc.in" \
     "$VERIFIER_LIBRARY_DIRECTORY/10-system.conf" \
     "$VERIFIER_LIBRARY_DIRECTORY/logrotate-monit" \
@@ -199,6 +225,8 @@ for verifier_library_target in \
 do
     validate_install_target "$verifier_library_target"
 done
+install -o root -g root -m 0644 "$VERSION_LIBRARY_SOURCE" \
+    "$VERSION_LIBRARY_TARGET"
 install -o root -g root -m 0644 "$MAIN_TEMPLATE" \
     "$VERIFIER_LIBRARY_DIRECTORY/monitrc.in"
 install -o root -g root -m 0644 "$SYSTEM_SOURCE" \
@@ -207,6 +235,8 @@ install -o root -g root -m 0644 "$LOGROTATE_SOURCE" \
     "$VERIFIER_LIBRARY_DIRECTORY/logrotate-monit"
 install -o root -g root -m 0644 "$SYSTEMD_SOURCE" \
     "$VERIFIER_LIBRARY_DIRECTORY/monit.service.conf"
+cmp -s "$VERSION_LIBRARY_SOURCE" "$VERSION_LIBRARY_TARGET" \
+    || fail "installed version policy differs from repository source"
 cmp -s "$MAIN_TEMPLATE" "$VERIFIER_LIBRARY_DIRECTORY/monitrc.in" \
     || fail "installed main template differs from repository source"
 cmp -s "$SYSTEM_SOURCE" "$VERIFIER_LIBRARY_DIRECTORY/10-system.conf" \
