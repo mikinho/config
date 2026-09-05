@@ -8,6 +8,36 @@ design rationale and cross-component contracts are documented in the
 Installable units live under `systemd/system/` to mirror their destination
 under `/etc/systemd/system/`; repository-only documentation remains here.
 
+## Runtime directory modes
+
+Choose `RuntimeDirectoryMode=` from the operations each identity needs; do not
+copy a mode without its ownership and access model. A service that creates a
+PID file, socket, or temporary file in its runtime directory needs owner write
+and search permission, so a read-only owner mode such as `0550` is invalid.
+
+| Mode | Use |
+| --- | --- |
+| `0700` | Only the service accesses the runtime directory. |
+| `0710` | A group peer reaches a known pathname, such as a Unix socket, but must not enumerate the directory. |
+| `0750` | Group members intentionally inspect or enumerate the runtime directory. |
+| `0755` | Other users intentionally need discovery or traversal; require an explicit rationale. |
+
+For a service-owned Unix socket shared with one peer group, prefer `0710` for
+the directory and grant the required access on the socket itself, commonly
+`0660`. The service owner retains `rwx`; the peer group receives search-only
+access to the known pathname; all other users are denied. Group membership or
+a directory ACL, the socket mode or ACL, and any SELinux/AppArmor policy must
+all authorize the same peer. Directory mode alone is not an access contract.
+
+Validate the composed behavior on the target service after every change:
+
+1. Restart the service so systemd recreates the runtime directory.
+2. Confirm the directory owner, group, and exact mode with `stat`.
+3. Confirm the peer can connect to the known socket.
+4. Confirm the peer cannot list the directory when using `0710`.
+5. Exercise restart and reload paths plus the public or local health check.
+6. Confirm the mandatory-access-control domain and labels remain correct.
+
 ## Installation
 
 Install the common nginx and optional PHP-FPM units first:
