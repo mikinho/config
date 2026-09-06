@@ -254,7 +254,7 @@ validate_target_file() {
 validate_live_host() {
     check_live_capacity
     [ "$(id -u)" -eq 0 ] || fail "run as root or use --plan"
-    for nginx_command in chgrp cmp install logrotate mktemp sed setpriv stat sysctl systemctl systemd-analyze; do
+    for nginx_command in chgrp cmp install logrotate mktemp sed setpriv stat sysctl systemctl systemd-analyze timeout; do
         command -v "$nginx_command" >/dev/null 2>&1 \
             || fail "required command not found: $nginx_command"
     done
@@ -306,6 +306,7 @@ print_plan() {
     printf '+ %s -t -q -c %s -g "daemon off;"\n' "$NGINX_BINARY" "$NGINX_CONFIG"
     printf 'A planned nginx restart is required to activate the installed systemd sandbox; allow a service interruption.\n'
     printf '+ recheck effective task budget after daemon-reload\n'
+    printf '+ verify composed mount-syscall denial before stopping the running master\n'
     printf '+ systemctl restart nginx.service\n'
     printf '+ verify active fresh master, reviewed workers, Umask, capabilities, seccomp, and log-directory access\n'
     printf '+ systemctl enable nginx.service\n'
@@ -345,6 +346,7 @@ apply_runtime() {
     systemd-analyze --man=no verify nginx.service
     "$NGINX_BINARY" -t -q -c "$NGINX_CONFIG" -g 'daemon off;'
     check_live_capacity
+    NGINX_QUIC_BPF=no "$RUNTIME_VERIFIER_SOURCE" --policy-only
     printf 'Restarting nginx to activate the installed systemd runtime settings.\n'
     systemctl restart nginx.service
     verify_restarted_master

@@ -142,6 +142,13 @@ cat > "$FIXTURE_ROOT/nginx/verify-runtime" <<'MOCK'
 #!/usr/bin/env sh
 printf 'runtime-verify %s\n' "$*" >> "$COMMAND_LOG"
 [ "${NGINX_QUIC_BPF:-}" = no ] || exit 1
+if [ "$*" = --policy-only ]; then
+    [ "${NGINX_TEST_MOUNT_POLICY_FAIL:-no}" = no ] || {
+        printf 'nginx.service SystemCallFilter does not deny required mount syscalls: mount\n' >&2
+        exit 1
+    }
+    exit 0
+fi
 [ "${NGINX_TEST_RUNTIME_FAIL:-no}" = no ] || {
     printf 'nginx worker does not retain Umask 0027\n' >&2
     exit 1
@@ -149,7 +156,7 @@ printf 'runtime-verify %s\n' "$*" >> "$COMMAND_LOG"
 MOCK
 chmod 0755 "$FIXTURE_ROOT/nginx/verify-runtime"
 chmod 0755 "$TEST_ROOT/bin/"*
-for mock_command in install logrotate setpriv sysctl systemd-analyze restorecon; do
+for mock_command in install logrotate setpriv sysctl systemd-analyze restorecon timeout; do
     cp "$TEST_ROOT/bin/noop" "$TEST_ROOT/bin/$mock_command"
 done
 for fixture_helper in \
@@ -247,6 +254,15 @@ if grep -F 'systemctl enable nginx.service' "$COMMAND_LOG" >/dev/null \
 fi
 
 # The actual apply branch restarts existing and stopped/first-install services.
+reset_fixture
+expect_failure 'does not deny required mount syscalls' env NGINX_TEST_MOUNT_POLICY_FAIL=yes "$SETUP" \
+    --workers 4 --threads-per-worker 32 --tasks-budget 512 --quic-bpf
+assert_contains "$COMMAND_LOG" 'systemctl daemon-reload'
+assert_contains "$COMMAND_LOG" 'runtime-verify --policy-only'
+if grep -E '^systemctl (restart|enable) nginx.service$' "$COMMAND_LOG" >/dev/null; then
+    fail 'a weakened composed mount policy stopped or enabled nginx'
+fi
+
 for previous_pid in 101 0; do
     reset_fixture
     env NGINX_TEST_OLD_PID="$previous_pid" "$SETUP" \
@@ -255,6 +271,9 @@ for previous_pid in 101 0; do
     assert_contains "$COMMAND_LOG" 'systemctl enable nginx.service'
     assert_contains "$TEST_ROOT/stdout" 'Verified restarted nginx master PID 201'
     assert_contains "$COMMAND_LOG" "runtime-verify --master-pid 201 --previous-master-pid $previous_pid --workers 4"
+    awk '/^runtime-verify --policy-only$/ { verified = 1 }
+        /^systemctl restart nginx.service$/ { if (!verified) exit 1 }' "$COMMAND_LOG" \
+        || fail 'nginx restarted before composed mount-policy verification'
     if grep -E 'reload-or-restart|systemctl reload nginx' "$COMMAND_LOG" >/dev/null; then
         fail 'host setup used a config reload instead of restart'
     fi

@@ -15,6 +15,8 @@ export TEST_ROOT
 VERIFY=$TEST_ROOT/verify
 BASE_CAPABILITIES=00000000010004eb
 QUIC_CAPABILITIES=000000c0012014eb
+MOUNT_SYSCALLS='chroot fsconfig fsmount fsopen fspick mount mount_setattr move_mount open_tree pivot_root umount umount2'
+export MOUNT_SYSCALLS
 
 cleanup() { rm -rf -- "$TEST_ROOT"; }
 trap cleanup EXIT HUP INT TERM
@@ -111,6 +113,31 @@ if [ "${TEST_DELAYED_WORKERS:-no}" = yes ]; then
     printf '201 202\n' > "$TEST_ROOT/proc/101/task/101/children"
 fi
 MOCK
+cat > "$TEST_ROOT/bin/timeout" <<'MOCK'
+#!/usr/bin/env sh
+[ "$1 $2" = '--kill-after=1 5' ] || exit 1
+shift 2
+exec "$@"
+MOCK
+cat > "$TEST_ROOT/bin/systemctl" <<'MOCK'
+#!/usr/bin/env sh
+[ "$*" = '--no-pager show --property=LoadState,NeedDaemonReload,SystemCallFilter,SystemCallErrorNumber,MainPID nginx.service' ] || exit 1
+[ "${TEST_MANAGER_UNAVAILABLE:-no}" = no ] || exit 1
+printf 'LoadState=%s\nNeedDaemonReload=%s\nSystemCallErrorNumber=%s\nMainPID=%s\nSystemCallFilter=%s\n' \
+    "${TEST_UNIT_LOAD:-loaded}" "${TEST_UNIT_STALE:-no}" "${TEST_SYSCALL_ERRNO:-1}" \
+    "${TEST_UNIT_PID:-101}" "${TEST_SYSCALL_FILTER-~$MOUNT_SYSCALLS}"
+MOCK
+cat > "$TEST_ROOT/bin/systemd-analyze" <<'MOCK'
+#!/usr/bin/env sh
+[ "$*" = 'syscall-filter @mount' ] || exit 1
+[ "${TEST_ANALYZE_UNAVAILABLE:-no}" = no ] || exit 1
+if [ "${TEST_ANALYZE_MALFORMED:-no}" = yes ]; then
+    printf 'unexpected analyzer output\n'
+    exit 0
+fi
+printf '@mount\n    # Mounting and unmounting of file systems\n'
+for syscall in $MOUNT_SYSCALLS; do printf '    %s\n' "$syscall"; done
+MOCK
 chmod 0755 "$TEST_ROOT/bin/"*
 PATH=$TEST_ROOT/bin:$PATH
 export PATH
@@ -124,12 +151,26 @@ expect_failure 'expected exactly 1' "$VERIFY" --workers 1 --timeout-seconds 0
 "$VERIFY" --timeout-seconds 0 > "$TEST_ROOT/stdout"
 assert_contains "$TEST_ROOT/stdout" 'master PID 101 and 2 active worker(s)'
 expect_failure 'master did not change' "$VERIFY" --previous-master-pid 101 --timeout-seconds 0
-expect_failure 'PID file does not match' "$VERIFY" --master-pid 202 --timeout-seconds 0
+expect_failure 'PID file does not match' env TEST_UNIT_PID=202 "$VERIFY" --master-pid 202 --timeout-seconds 0
+expect_failure 'unit whose mount policy was inspected' env TEST_UNIT_PID=202 "$VERIFY" --timeout-seconds 0
 expect_failure 'run as root' env TEST_CALLER_UID=501 "$VERIFY" --timeout-seconds 0
 expect_failure 'root:nginx with mode 0750' env TEST_LOG_METADATA=0:0:750 "$VERIFY" --timeout-seconds 0
 expect_failure 'root:nginx with mode 0750' env TEST_LOG_METADATA=991:990:750 "$VERIFY" --timeout-seconds 0
 expect_failure 'root:nginx with mode 0750' env TEST_LOG_METADATA=0:990:755 "$VERIFY" --timeout-seconds 0
 expect_failure 'cannot traverse' env TEST_TRAVERSAL_DENIED=yes "$VERIFY" --timeout-seconds 0
+"$VERIFY" --policy-only > "$TEST_ROOT/stdout"
+assert_contains "$TEST_ROOT/stdout" 'composed mount-syscall denial'
+expect_failure 'does not accept process assertions' "$VERIFY" --policy-only --workers 1
+expect_failure 'cannot inspect the composed' env TEST_MANAGER_UNAVAILABLE=yes "$VERIFY" --policy-only
+expect_failure 'must be loaded' env TEST_UNIT_LOAD=not-found "$VERIFY" --policy-only
+expect_failure 'metadata is stale or unknown' env TEST_UNIT_STALE=yes "$VERIFY" --policy-only
+expect_failure 'cannot expand the local' env TEST_ANALYZE_UNAVAILABLE=yes "$VERIFY" --policy-only
+expect_failure 'cannot interpret the local' env TEST_ANALYZE_MALFORMED=yes "$VERIFY" --policy-only
+expect_failure 'must retain SystemCallErrorNumber=EPERM' env TEST_SYSCALL_ERRNO=0 "$VERIFY" --policy-only
+# Ordering, redundant entries, additional restrictions, and denying errno
+# suffixes do not weaken the mandatory set.
+env TEST_SYSCALL_FILTER="~umount2 mount:EPERM $MOUNT_SYSCALLS reboot:kill" \
+    "$VERIFY" --policy-only > "$TEST_ROOT/stdout"
 
 for process_pid in 101 201; do
     for bad_field in Umask NoNewPrivs Seccomp CapBnd CapEff CapPrm CapAmb Uid Gid; do
@@ -171,6 +212,23 @@ replace_status 101 CapPrm "$QUIC_CAPABILITIES"
 expect_failure 'unexpected capability bounding set' "$VERIFY" --timeout-seconds 0
 "$VERIFY" --quic-bpf --timeout-seconds 0 > "$TEST_ROOT/stdout"
 env NGINX_QUIC_BPF=yes "$VERIFY" --timeout-seconds 0 > "$TEST_ROOT/stdout"
+# Keep valid QUIC capabilities and Seccomp=2 in every process. These cases must
+# fail because the composed mount barrier is missing, not because filtering or
+# CAP_SYS_ADMIN disappeared. Exercise every member, including newer mount APIs.
+for missing_syscall in $MOUNT_SYSCALLS; do
+    remaining_syscalls=
+    for syscall in $MOUNT_SYSCALLS; do
+        [ "$syscall" = "$missing_syscall" ] || remaining_syscalls="$remaining_syscalls $syscall"
+    done
+    expect_failure "does not deny required mount syscalls: $missing_syscall" \
+        env TEST_SYSCALL_FILTER="~$remaining_syscalls" "$VERIFY" --quic-bpf --timeout-seconds 0
+done
+expect_failure 'does not deny required mount syscalls' env TEST_SYSCALL_FILTER='~' "$VERIFY" --quic-bpf --timeout-seconds 0
+expect_failure 'must use a SystemCallFilter deny-list' env TEST_SYSCALL_FILTER= "$VERIFY" --quic-bpf --timeout-seconds 0
+expect_failure 'must use a SystemCallFilter deny-list' env TEST_SYSCALL_FILTER='@system-service mount' "$VERIFY" --quic-bpf --timeout-seconds 0
+expect_failure 'unsupported SystemCallFilter entry' env TEST_SYSCALL_FILTER="~$MOUNT_SYSCALLS mount:0" "$VERIFY" --quic-bpf --timeout-seconds 0
+assert_contains "$TEST_ROOT/proc/101/status" "Seccomp:$(printf '\t')2"
+assert_contains "$TEST_ROOT/proc/101/status" "CapEff:$(printf '\t')$QUIC_CAPABILITIES"
 expect_failure 'must be yes or no' env NGINX_QUIC_BPF=maybe "$VERIFY"
 for invalid_value in 00 08 -1 1.5 '1+1'; do
     expect_failure 'canonical decimal integer' "$VERIFY" --timeout-seconds "$invalid_value"

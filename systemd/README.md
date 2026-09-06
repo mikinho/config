@@ -165,26 +165,39 @@ ten seconds for the managed PID file and at least one active worker, checking
 master/worker identity, effective mask, capability sets, `NoNewPrivs`, seccomp
 activation, and nginx's ability to traverse the root-owned log directory.
 Failure fails service startup, so ordered dependents do not mistake successful
-`execve` for readiness. The helper needs `setpriv` from `util-linux` and ordinary
-Linux `/proc` access. Setup additionally checks a fresh master and exactly the
+`execve` for readiness. The helper needs `setpriv` from `util-linux`, coreutils
+`timeout`, systemd's inspection tools, and ordinary Linux `/proc` access.
+Setup additionally checks a fresh master and exactly the
 reviewed worker count: an explicit `--workers N` rejects both missing and extra
 workers, while the default startup check requires at least one. Setup also
 migrates existing root-owned directory groups without
 recursing into their contents. Unexpected ownership, writable parents or
 symbolic links fail setup before host mutation.
 
+The helper separately reads PID 1's composed `SystemCallFilter` and requires
+its deny-list to contain every member of the local `@mount` syscall group,
+expanded using `systemd-analyze syscall-filter @mount`. Empty filters, partial
+groups, allow-list replacements, changed `SystemCallErrorNumber=EPERM`, and
+stale manager metadata fail verification even if `/proc` reports `Seccomp: 2`.
+`nginx/setup` invokes `--policy-only` after daemon-reload and before stopping
+the existing master; startup and the installed host verifier repeat this check.
+Policy commands have five-second deadlines and a one-second forced-kill grace.
+
 These are targeted observations, not proof of every sandbox or SELinux rule.
-In particular, `Seccomp: 2` confirms a filter exists, not which syscalls it
-denies. On the target Linux host, inspect the composed unit, effective mount
-filter and capabilities, test intended reads/writes and upstream connections,
-and exercise graceful reload and log rotation under representative traffic.
+The checker reads the composed policy rather than dumping a running process's
+seccomp bytecode. Restart after changing execution policy; daemon-reload alone
+does not replace an existing process's filters. Test intended reads/writes and
+upstream connections, plus graceful reload and rotation under real traffic.
 
 The `nginx-systemd-runtime` CI job runs the real unit and verifier on a
 disposable Linux host using fixture-only paths and a Unix HTTP socket. It
 checks successful startup and exact worker-count assertions, then removes only
 the checker's `!` prefix and requires the cross-UID `/proc` failure. This
 negative case prevents a host that ignores `ProtectProc` from producing a
-false pass. `tests/nginx-systemd-runtime --check` is read-only source validation;
+false pass. A second negative fixture retains QUIC capabilities and active
+seccomp filtering while a later assignment clears the mount denial; both
+runtime verification and startup must reject it. It attempts no mounts.
+`tests/nginx-systemd-runtime --check` is read-only source validation;
 it is not the Linux runtime test. The hosted Ubuntu kernel gate does not prove
 the target EL9 build, optional QUIC BPF profile, or enforcing SELinux policy.
 

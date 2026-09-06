@@ -225,7 +225,11 @@ cat > "$TEST_ROOT/nginx-runtime-verify" <<'EOF'
 #!/bin/sh
 [ "${NGINX_QUIC_BPF:-}" = no ] || exit 1
 printf '%s\n' "$*" > "$RUNTIME_ARGUMENTS"
-[ "$RUNTIME_RESULT" = pass ] || { printf 'running mask drift\n'; exit 1; }
+case "$RUNTIME_RESULT" in
+    pass) ;;
+    mount-fail) printf 'nginx.service SystemCallFilter does not deny required mount syscalls: mount\n'; exit 1 ;;
+    *) printf 'running mask drift\n'; exit 1 ;;
+esac
 printf 'runtime accepted\n'
 EOF
 chmod 0755 "$TEST_ROOT/nginx-runtime-verify"
@@ -251,7 +255,7 @@ EOF
 printf '%s\n' "$nginx_runtime_function" >> "$TEST_ROOT/nginx-runtime-harness"
 printf '%s\n' 'check_nginx_runtime' 'printf "%s\n" "$FAILED_CHECKS"' \
     >> "$TEST_ROOT/nginx-runtime-harness"
-for runtime_case in baseline bpf loaded-drift running-drift; do
+for runtime_case in baseline bpf loaded-drift running-drift missing-mount-filter; do
     runtime_mask=0027
     runtime_result=pass
     runtime_bpf=no
@@ -260,6 +264,7 @@ for runtime_case in baseline bpf loaded-drift running-drift; do
         bpf) runtime_bpf=yes ;;
         loaded-drift) runtime_mask=0000; runtime_expected_failures=1 ;;
         running-drift) runtime_result=fail; runtime_expected_failures=1 ;;
+        missing-mount-filter) runtime_result=mount-fail; runtime_bpf=yes; runtime_expected_failures=1 ;;
     esac
     runtime_failures=$(NGINX_RUNTIME_VERIFIER="$TEST_ROOT/nginx-runtime-verify" \
         LOADED_MASK="$runtime_mask" RUNTIME_RESULT="$runtime_result" \

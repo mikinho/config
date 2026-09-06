@@ -152,7 +152,8 @@ headroom or operational serialization; this check is not a runtime guarantee.
 Applying host setup performs a planned restart to activate the installed
 systemd execution restrictions and can interrupt service. `ExecStartPost`
 performs bounded readiness/security checks on every start; setup additionally
-checks a fresh master and the reviewed worker count. Schedule the operation and retain a recovery
+checks the composed mount filter before restarting, then a fresh master and the
+reviewed worker count. Schedule the operation and retain a recovery
 plan. Configuration-only updates still use nginx's validated reload path.
 
 `sites/sample_wp.conf.example` matches the `sample_wp` PHP-FPM pool and systemd
@@ -181,7 +182,9 @@ it deliberately.
 
 `tests/nginx-runtime-verifier` covers the actual read-only checker with isolated
 process-status fixtures, including startup delay, timeout, unexpected masks or
-capabilities, missing workers, and log-directory traversal denial.
+capabilities, missing workers, and log-directory traversal denial. It also
+rejects cleared, partial, or allow-list replacements of the composed mount
+filter while the fixture retains QUIC capabilities and `Seccomp: 2`.
 `tests/nginx-setup` covers the setup flow with privileged commands mocked,
 including preservation of existing cache descendants during parent-group
 migration. Neither substitutes for a booted Linux unit test. On a target host,
@@ -189,3 +192,16 @@ run `/usr/local/libexec/nginx-runtime-verify --workers REVIEWED_COUNT` (add
 `--quic-bpf` only for that profile), inspect `systemctl show`'s capability and
 syscall policies, and verify application traffic, actual log rotation, reload,
 and graceful shutdown. Review `systemd-analyze security` as an advisory report.
+After changing execution policy, restart nginx before accepting runtime
+verification. A standalone check reads the current composed policy; it cannot
+prove that an unchanged master adopted filters from a later daemon-reload.
+
+The runtime checker compares PID 1's expanded `SystemCallFilter` against the
+target's own `systemd-analyze syscall-filter @mount` group. Every member must
+remain denied, and `SystemCallErrorNumber=EPERM` must remain set. This gate
+applies to ordinary and QUIC BPF profiles; other seccomp restrictions do not
+substitute for mount denial. `--policy-only` checks the composed policy without
+requiring a running master. Stale manager metadata and unavailable policy
+inspection fail closed. The installed host verifier invokes the same check.
+The helper uses `systemctl`, `systemd-analyze`, and coreutils `timeout`, with
+five-second command deadlines and one additional second before forced cleanup.

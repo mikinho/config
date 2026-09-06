@@ -12,7 +12,10 @@ PROGRAM_NAME=${0##*/}
 PROC_ROOT=/proc
 NGINX_PID_FILE=/run/nginx/nginx.pid
 NGINX_LOG_DIRECTORY=/var/log/nginx
+NGINX_SYSTEMD_UNIT=nginx.service
 TEST_BINARY=/usr/bin/test
+MODE=runtime
+POLICY_COMMAND_TIMEOUT=5
 MASTER_PID=
 PREVIOUS_MASTER_PID=
 EXPECTED_WORKERS=1
@@ -28,6 +31,7 @@ usage() {
     cat <<EOF
 Usage: $PROGRAM_NAME [--master-pid PID] [--previous-master-pid PID]
        [--workers N] [--timeout-seconds N] [--quic-bpf]
+       $PROGRAM_NAME --policy-only
 
 Checks the live Linux nginx master, active workers, effective process security,
 and root-owned log-directory traversal without changing service or file state.
@@ -35,6 +39,8 @@ Run as root. Defaults to the managed PID file, at least one active worker, and
 ten seconds of startup polling. --workers requires exactly the reviewed count,
 not merely a minimum, so extra workers cannot bypass the reviewed task budget.
 The QUIC BPF expectation can also come from the managed service environment.
+Every invocation requires the loaded unit to deny the complete local @mount
+syscall group. --policy-only checks that composed policy before service start.
 EOF
 }
 
@@ -52,6 +58,79 @@ status_field() {
     # /proc fields are kernel-owned single lines. A process exiting during
     # inspection is a retryable startup condition, never successful evidence.
     awk -v key="$2:" '$1 == key { $1 = ""; sub(/^[ \t]+/, ""); print; exit }' "$1" 2>/dev/null
+}
+
+unit_property() {
+    printf '%s\n' "$unit_policy" | awk -v prefix="$1=" '
+        index($0, prefix) == 1 { count++; value = substr($0, length(prefix) + 1) }
+        END { if (count != 1) exit 1; print value }
+    '
+}
+
+check_systemd_policy() {
+    # Inspect PID 1's composed policy, including later site drop-ins. Seccomp=2
+    # alone also occurs when unrelated settings install filters but @mount was
+    # cleared. Bound manager access; this check must not hang host verification.
+    unit_policy=$(LC_ALL=C SYSTEMD_COLORS=0 timeout --kill-after=1 "$POLICY_COMMAND_TIMEOUT" \
+        systemctl --no-pager show \
+        --property=LoadState,NeedDaemonReload,SystemCallFilter,SystemCallErrorNumber,MainPID \
+        "$NGINX_SYSTEMD_UNIT" 2>/dev/null) \
+        || fail "cannot inspect the composed $NGINX_SYSTEMD_UNIT mount policy within $POLICY_COMMAND_TIMEOUT seconds"
+    [ "$(unit_property LoadState)" = loaded ] \
+        || fail "$NGINX_SYSTEMD_UNIT must be loaded for mount-policy verification"
+    [ "$(unit_property NeedDaemonReload)" = no ] \
+        || fail "$NGINX_SYSTEMD_UNIT manager metadata is stale or unknown; review and reload systemd before verification"
+    composed_filter=$(unit_property SystemCallFilter) \
+        || fail "$NGINX_SYSTEMD_UNIT has no readable SystemCallFilter property"
+    case "$composed_filter" in
+        '~'*) denied_syscalls=${composed_filter#\~} ;;
+        *) fail "$NGINX_SYSTEMD_UNIT must use a SystemCallFilter deny-list containing the complete @mount group; allow-list replacements require separate review" ;;
+    esac
+    [ "$(unit_property SystemCallErrorNumber)" = 1 ] \
+        || fail "$NGINX_SYSTEMD_UNIT must retain SystemCallErrorNumber=EPERM"
+    SYSTEMD_MASTER_PID=$(unit_property MainPID) \
+        || fail "$NGINX_SYSTEMD_UNIT has no readable MainPID property"
+
+    # systemctl resolves groups to syscall names. Expand the local systemd
+    # group's definition too, rather than pinning a list that can miss new
+    # mount APIs after an operating-system update. Unknown output fails closed.
+    mount_group=$(LC_ALL=C SYSTEMD_COLORS=0 timeout --kill-after=1 "$POLICY_COMMAND_TIMEOUT" \
+        systemd-analyze syscall-filter @mount 2>/dev/null) \
+        || fail "cannot expand the local @mount syscall group within $POLICY_COMMAND_TIMEOUT seconds"
+    required_syscalls=$(printf '%s\n' "$mount_group" | awk '
+        $0 == "@mount" { header++; next }
+        /^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
+        NF == 1 && $1 ~ /^[a-z_][a-z0-9_]*$/ {
+            names[$1] = 1
+            printf "%s%s", separator, $1
+            separator = " "
+            next
+        }
+        { invalid = 1 }
+        END { if (invalid || header != 1 || !names["mount"] || !names["umount2"] || !names["pivot_root"]) exit 1 }
+    ') || fail 'cannot interpret the local @mount syscall group'
+    missing_syscalls=$(printf '%s\n' "$denied_syscalls" | awk -v required="$required_syscalls" '
+        {
+            for (i = 1; i <= NF; i++) {
+                entry = $i
+                # A nonzero errno or kill also blocks the syscall. Reject
+                # zero/success actions and malformed names instead of assuming
+                # that an arbitrary suffix provides the required containment.
+                if (entry !~ /^[a-z_][a-z0-9_]*(:([A-Z][A-Z0-9_]*|[1-9][0-9]*|kill))?$/) exit 2
+                sub(/:.*/, "", entry)
+                denied[entry] = 1
+            }
+        }
+        END {
+            count = split(required, names, " ")
+            for (i = 1; i <= count; i++) if (!denied[names[i]]) {
+                printf "%s%s", separator, names[i]
+                separator = " "
+            }
+        }
+    ') || fail "$NGINX_SYSTEMD_UNIT has an unsupported SystemCallFilter entry"
+    [ -z "$missing_syscalls" ] \
+        || fail "$NGINX_SYSTEMD_UNIT SystemCallFilter does not deny required mount syscalls: $missing_syscalls"
 }
 
 check_process_security() {
@@ -104,6 +183,8 @@ inspect_runtime() {
     case "$observed_pid" in
         '' | 0 | *[!0-9]*) pending 'nginx has no valid master PID'; return 1 ;;
     esac
+    [ "$observed_pid" = "$SYSTEMD_MASTER_PID" ] \
+        || { pending 'nginx master does not match the unit whose mount policy was inspected'; return 1; }
     [ "$observed_pid" != "$PREVIOUS_MASTER_PID" ] \
         || { pending 'nginx master did not change after restart'; return 1; }
     [ -f "$NGINX_PID_FILE" ] && [ ! -L "$NGINX_PID_FILE" ] \
@@ -166,6 +247,7 @@ while [ "$#" -gt 0 ]; do
             shift 2
             ;;
         --quic-bpf) QUIC_BPF=yes; shift ;;
+        --policy-only) MODE=policy; shift ;;
         --help | -h) usage; exit 0 ;;
         *) fail "unknown argument: $1" ;;
     esac
@@ -175,10 +257,19 @@ case "$QUIC_BPF" in
     yes) EXPECTED_CAPABILITIES=$QUIC_CAPABILITIES ;;
     *) fail 'NGINX_QUIC_BPF must be yes or no' ;;
 esac
-for required_command in awk cat id setpriv stat tr sed sleep; do
+for required_command in awk cat id setpriv stat tr sed sleep systemctl systemd-analyze timeout; do
     command -v "$required_command" >/dev/null 2>&1 || fail "required command not found: $required_command"
 done
 [ "$(id -u)" -eq 0 ] || fail 'run as root to inspect nginx process security'
+if [ "$MODE" = policy ]; then
+    [ -z "$MASTER_PID$PREVIOUS_MASTER_PID" ] && [ "$EXACT_WORKERS" = no ] \
+        || fail '--policy-only does not accept process assertions'
+fi
+check_systemd_policy
+if [ "$MODE" = policy ]; then
+    printf 'Verified %s composed mount-syscall denial.\n' "$NGINX_SYSTEMD_UNIT"
+    exit 0
+fi
 NGINX_UID=$(id -u nginx) || fail 'nginx user is unavailable'
 NGINX_GID=$(id -g nginx) || fail 'nginx group is unavailable'
 
@@ -188,5 +279,5 @@ while ! inspect_runtime; do
     remaining_attempts=$((remaining_attempts - 1))
     sleep 1
 done
-printf 'Verified nginx master PID %s and %s active worker(s): Umask 0027, identities, process restrictions, and log-directory traversal.\n' \
+printf 'Verified nginx master PID %s and %s active worker(s): Umask 0027, identities, process restrictions, composed mount-syscall denial, and log-directory traversal.\n' \
     "$observed_pid" "$active_workers"

@@ -13,6 +13,7 @@ SCRIPT_DIRECTORY=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 REPOSITORY_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIRECTORY/.." && pwd)
 UNIT_SOURCE=$REPOSITORY_ROOT/systemd/system/nginx.service
 VERIFIER_SOURCE=$REPOSITORY_ROOT/nginx/verify-runtime
+QUIC_DROPIN_SOURCE=$REPOSITORY_ROOT/nginx/templates/quic-bpf.service.conf
 TEST_DIRECTORY=
 UNIT_NAME=
 UNIT_PATH=
@@ -68,7 +69,7 @@ case "$1" in
     --check | --disposable-ci-host) mode=$1 ;;
     *) fail "unknown argument: $1" ;;
 esac
-for source_file in "$UNIT_SOURCE" "$VERIFIER_SOURCE"; do
+for source_file in "$UNIT_SOURCE" "$VERIFIER_SOURCE" "$QUIC_DROPIN_SOURCE"; do
     [ -f "$source_file" ] && [ ! -L "$source_file" ] || fail "source must be a real file: $source_file"
 done
 [ -x "$VERIFIER_SOURCE" ] || fail 'runtime verifier source must be executable'
@@ -90,7 +91,7 @@ fi
 [ "$(id -u)" -eq 0 ] || fail 'execution requires root on a disposable CI host'
 [ "$(cat /proc/1/comm)" = systemd ] || fail 'execution requires systemd as PID 1'
 [ -x /usr/sbin/nginx ] || fail '/usr/sbin/nginx is required'
-for required_command in curl getent install journalctl mktemp sed setpriv systemctl; do
+for required_command in awk curl getent install journalctl mktemp sed setpriv systemctl systemd-analyze timeout; do
     command -v "$required_command" >/dev/null 2>&1 || fail "required command not found: $required_command"
 done
 id nginx >/dev/null 2>&1 || fail 'nginx user is required'
@@ -109,6 +110,7 @@ UNIT_PATH=/run/systemd/system/$UNIT_NAME
 sed \
     -e "s|^NGINX_PID_FILE=.*|NGINX_PID_FILE=/run/$fixture_name/nginx.pid|" \
     -e "s|^NGINX_LOG_DIRECTORY=.*|NGINX_LOG_DIRECTORY=/var/log/$fixture_name|" \
+    -e "s|^NGINX_SYSTEMD_UNIT=.*|NGINX_SYSTEMD_UNIT=$UNIT_NAME|" \
     "$VERIFIER_SOURCE" > "$TEST_DIRECTORY/verify"
 chmod 0755 "$TEST_DIRECTORY/verify"
 sed \
@@ -163,4 +165,48 @@ fi
 journalctl --no-pager -u "$UNIT_NAME" -o cat > "$TEST_DIRECTORY/journal"
 assert_contains "$TEST_DIRECTORY/journal" 'nginx has 0 active workers; expected at least 1'
 
-printf 'Validated real nginx startup, exact worker counts, and the ProtectProc checker credential boundary under systemd.\n'
+# Simulate a later site drop-in clearing @mount, while retaining the optional
+# QUIC capabilities and unrelated seccomp restrictions. Disable only this
+# fixture's startup checker first so the read-only checker can inspect the
+# deliberately incorrect running service. No mount operation is attempted.
+sed '/^ExecStartPost=/d' "$TEST_DIRECTORY/positive.service" \
+    > "$TEST_DIRECTORY/mount-negative.service"
+cat "$QUIC_DROPIN_SOURCE" >> "$TEST_DIRECTORY/mount-negative.service"
+printf '\nSystemCallFilter=\nSystemCallFilter=~@clock\n' \
+    >> "$TEST_DIRECTORY/mount-negative.service"
+install -m 0644 "$TEST_DIRECTORY/mount-negative.service" "$UNIT_PATH"
+systemctl daemon-reload
+systemctl reset-failed "$UNIT_NAME"
+if ! systemctl start "$UNIT_NAME"; then
+    diagnostics
+    fail 'the weakened-filter fixture could not start'
+fi
+mount_fixture_pid=$(systemctl show "$UNIT_NAME" --property=MainPID --value)
+quic_capabilities=$(sed -n 's/^QUIC_CAPABILITIES=//p' "$VERIFIER_SOURCE")
+[ "$(awk '$1 == "Seccomp:" { print $2 }' "/proc/$mount_fixture_pid/status")" = 2 ] \
+    || fail 'the weakened-filter fixture did not retain seccomp filtering'
+for capability_field in CapBnd CapEff CapPrm; do
+    [ "$(awk -v field="$capability_field:" '$1 == field { print $2 }' "/proc/$mount_fixture_pid/status")" = "$quic_capabilities" ] \
+        || fail "the weakened-filter fixture did not retain its QUIC $capability_field set"
+done
+if "$TEST_DIRECTORY/verify" --quic-bpf --workers 2 --timeout-seconds 0 \
+    > "$TEST_DIRECTORY/mount.stdout" 2> "$TEST_DIRECTORY/mount.stderr"; then
+    fail 'Seccomp=2 hid the missing mount barrier from the runtime checker'
+fi
+assert_contains "$TEST_DIRECTORY/mount.stderr" 'SystemCallFilter does not deny required mount syscalls:'
+
+# Restore the actual startup checker and require the same composed weakening
+# to fail activation too, before any caller could report a verified startup.
+systemctl stop "$UNIT_NAME"
+grep '^ExecStartPost=' "$TEST_DIRECTORY/positive.service" \
+    >> "$TEST_DIRECTORY/mount-negative.service"
+install -m 0644 "$TEST_DIRECTORY/mount-negative.service" "$UNIT_PATH"
+systemctl daemon-reload
+if systemctl start "$UNIT_NAME"; then
+    diagnostics
+    fail 'startup accepted a QUIC-capable master without the mount barrier'
+fi
+journalctl --no-pager -u "$UNIT_NAME" -o cat > "$TEST_DIRECTORY/mount-journal"
+assert_contains "$TEST_DIRECTORY/mount-journal" 'SystemCallFilter does not deny required mount syscalls:'
+
+printf 'Validated nginx startup, worker counts, checker credentials, and mandatory mount denial despite retained QUIC capabilities and Seccomp=2.\n'
