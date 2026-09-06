@@ -17,6 +17,7 @@ VERIFIER_TARGET=/usr/local/bin/verify-monit
 VERIFIER_LIBRARY_DIRECTORY=/usr/local/libexec/config-monit
 VERSION_LIBRARY_SOURCE=$SCRIPT_DIRECTORY/lib/version.sh
 VERSION_LIBRARY_TARGET=$VERIFIER_LIBRARY_DIRECTORY/version.sh
+SECURITY_LIBRARY_SOURCE=$SCRIPT_DIRECTORY/lib/security.sh
 MAIN_TEMPLATE=$SCRIPT_DIRECTORY/templates/monitrc.in
 SYSTEM_SOURCE=$SCRIPT_DIRECTORY/conf.d/10-system.conf
 LOGROTATE_SOURCE=$SCRIPT_DIRECTORY/logrotate/monit
@@ -75,7 +76,7 @@ validate_install_target() {
 
 for install_source in \
     "$PLATFORM_LIBRARY" "$SETUP_SOURCE" "$VERIFIER_SOURCE" \
-    "$VERSION_LIBRARY_SOURCE" \
+    "$VERSION_LIBRARY_SOURCE" "$SECURITY_LIBRARY_SOURCE" \
     "$MAIN_TEMPLATE" "$SYSTEM_SOURCE" "$LOGROTATE_SOURCE" "$SYSTEMD_SOURCE"
 do
     validate_source "$install_source"
@@ -154,6 +155,7 @@ fi
 PLATFORM_MODE=$MODE
 platform_install_epel_repository
 platform_run dnf install --assumeyes \
+    acl \
     audit \
     iproute \
     libselinux-utils \
@@ -172,7 +174,7 @@ if [ "$MODE" = plan ]; then
     exit 0
 fi
 
-for installed_command in ausearch getenforce logrotate matchpathcon monit \
+for installed_command in ausearch getenforce getfacl logrotate matchpathcon monit \
     openssl ps restorecon ss
 do
     command -v "$installed_command" >/dev/null 2>&1 \
@@ -218,6 +220,7 @@ fi
 validate_root_directory "$VERIFIER_LIBRARY_DIRECTORY"
 for verifier_library_target in \
     "$VERSION_LIBRARY_TARGET" \
+    "$VERIFIER_LIBRARY_DIRECTORY/security.sh" \
     "$VERIFIER_LIBRARY_DIRECTORY/monitrc.in" \
     "$VERIFIER_LIBRARY_DIRECTORY/10-system.conf" \
     "$VERIFIER_LIBRARY_DIRECTORY/logrotate-monit" \
@@ -227,6 +230,8 @@ do
 done
 install -o root -g root -m 0644 "$VERSION_LIBRARY_SOURCE" \
     "$VERSION_LIBRARY_TARGET"
+install -o root -g root -m 0644 "$SECURITY_LIBRARY_SOURCE" \
+    "$VERIFIER_LIBRARY_DIRECTORY/security.sh"
 install -o root -g root -m 0644 "$MAIN_TEMPLATE" \
     "$VERIFIER_LIBRARY_DIRECTORY/monitrc.in"
 install -o root -g root -m 0644 "$SYSTEM_SOURCE" \
@@ -237,6 +242,8 @@ install -o root -g root -m 0644 "$SYSTEMD_SOURCE" \
     "$VERIFIER_LIBRARY_DIRECTORY/monit.service.conf"
 cmp -s "$VERSION_LIBRARY_SOURCE" "$VERSION_LIBRARY_TARGET" \
     || fail "installed version policy differs from repository source"
+cmp -s "$SECURITY_LIBRARY_SOURCE" "$VERIFIER_LIBRARY_DIRECTORY/security.sh" \
+    || fail "installed security policy differs from repository source"
 cmp -s "$MAIN_TEMPLATE" "$VERIFIER_LIBRARY_DIRECTORY/monitrc.in" \
     || fail "installed main template differs from repository source"
 cmp -s "$SYSTEM_SOURCE" "$VERIFIER_LIBRARY_DIRECTORY/10-system.conf" \

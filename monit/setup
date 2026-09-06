@@ -14,6 +14,7 @@ SYSTEM_SOURCE=$SCRIPT_DIRECTORY/conf.d/10-system.conf
 LOGROTATE_SOURCE=$SCRIPT_DIRECTORY/logrotate/monit
 SYSTEMD_SOURCE=$SCRIPT_DIRECTORY/systemd/monit.service.conf
 VERIFIER_SOURCE=$SCRIPT_DIRECTORY/verify
+SECURITY_LIBRARY=$SCRIPT_DIRECTORY/lib/security.sh
 
 MONIT_MAIN=/etc/monitrc
 MONIT_FRAGMENT_DIRECTORY=/etc/monit.d
@@ -26,6 +27,7 @@ MONIT_STATE_DIRECTORY=/var/lib/monit
 MONIT_RUNTIME_DIRECTORY=/run/monit
 LIVE_INCLUDE_GLOB='/etc/monit.d/*.conf'
 MANAGED_MARKER='Managed by mikinho/config monit/setup.'
+BACKUP_ROOT=/var/lib/config-monit/backups
 
 MODE=apply
 OUTPUT_DIRECTORY=
@@ -39,6 +41,8 @@ CHANGES_STARTED=no
 TRANSACTION_COMMITTED=no
 SERVICE_WAS_ACTIVE=no
 SERVICE_WAS_ENABLED=no
+SERVICE_RESTART_REQUIRED=no
+PENDING_STAGE=
 
 usage() {
     cat <<EOF
@@ -52,8 +56,9 @@ Renders or applies the client-neutral Monit baseline. --fragment installs a
 deployment-specific root-only *.conf file by basename. Existing *.conf files
 not named by this command are preserved. A modified unmanaged /etc/monitrc is
 never replaced unless --replace-main explicitly records an adoption decision.
-Setup validates an assembled candidate before activation and reloads an active
-Monit daemon without restarting monitored services.
+Setup validates an assembled candidate before activation. Configuration-only
+updates reload Monit; changed systemd execution policy or a stale process umask
+requires a controlled Monit restart. Root-only transaction backups are retained.
 EOF
 }
 
@@ -78,6 +83,7 @@ validate_source() {
 validate_fragment_source() {
     fragment_source=$1
     validate_source "$fragment_source"
+    monit_require_flat_fragment "$fragment_source"
     if printf '%s' "$fragment_source" | grep '[[:space:]]' >/dev/null 2>&1; then
         fail "fragment paths must not contain whitespace: $fragment_source"
     fi
@@ -164,9 +170,20 @@ copy_existing_fragments() {
         -mindepth 1 -maxdepth 1 -name '*.conf' ! -type f -print -quit)
     [ -z "$unsafe_fragment" ] \
         || fail "live Monit fragment must be a regular file: $unsafe_fragment"
-    find "$MONIT_FRAGMENT_DIRECTORY" \
-        -mindepth 1 -maxdepth 1 -type f -name '*.conf' -print \
-        | while IFS= read -r live_fragment; do
+    live_fragment_paths=$(find "$MONIT_FRAGMENT_DIRECTORY" \
+        -mindepth 1 -maxdepth 1 -type f -name '*.conf' -print) \
+        || fail "cannot enumerate the live Monit fragments"
+    printf '%s\n' "$live_fragment_paths" | while IFS= read -r live_fragment; do
+            [ -n "$live_fragment" ] || continue
+            # An explicit --fragment replaces/adopts this basename from the
+            # validated staged source; never load its untrusted live original.
+            if [ "${live_fragment##*/}" = 10-system.conf ] \
+                || printf '%s\n' "$FRAGMENT_NAMES" \
+                    | grep -Fx "${live_fragment##*/}" >/dev/null 2>&1
+            then
+                continue
+            fi
+            monit_require_private_fragment "$live_fragment"
             install -m 0600 "$live_fragment" \
                 "$staged_fragment_directory/${live_fragment##*/}"
         done
@@ -298,6 +315,7 @@ validate_root_directory() {
     if [ "$((0$checked_mode & 0022))" -ne 0 ]; then
         fail "target directory must not be writable by group or other: $checked_directory"
     fi
+    monit_require_no_acl "$checked_directory"
 }
 
 ensure_directory() {
@@ -351,7 +369,7 @@ backup_target() {
     mkdir -p "${backup_file%/*}" "${backup_present%/*}" "${backup_absent%/*}"
     if [ -e "$backup_target_path" ] || [ -L "$backup_target_path" ]; then
         validate_managed_target "$backup_target_path"
-        cp -p "$backup_target_path" "$backup_file"
+        cp --preserve=mode,ownership,timestamps,xattr,context -- "$backup_target_path" "$backup_file"
         : > "$backup_present"
     else
         : > "$backup_absent"
@@ -366,42 +384,121 @@ restore_target() {
     restore_present=$BACKUP_DIRECTORY/present/$restore_relative_path
     restore_absent=$BACKUP_DIRECTORY/absent/$restore_relative_path
     if [ -f "$restore_present" ]; then
-        cp -p -- "$restore_file" "$restore_target_path"
+        restore_stage=$(mktemp "$restore_target_path.rollback.XXXXXX") || return 1
+        if ! cp --preserve=mode,ownership,timestamps,xattr,context -- "$restore_file" "$restore_stage" \
+            || ! mv -f -- "$restore_stage" "$restore_target_path"
+        then
+            rm -f -- "$restore_stage"
+            return 1
+        fi
     elif [ -f "$restore_absent" ]; then
         rm -f -- "$restore_target_path"
+    else
+        printf '%s: rollback manifest is incomplete for %s\n' \
+            "$PROGRAM_NAME" "$restore_target_path" >&2
+        return 1
     fi
 }
 
 rollback_transaction() {
-    set +e
+    rollback_failed=no
     printf '%s: setup failed; restoring managed files and prior service state\n' \
         "$PROGRAM_NAME" >&2
     for rollback_target in $BACKED_UP_TARGETS; do
-        restore_target "$rollback_target"
+        if ! restore_target "$rollback_target"; then
+            printf '%s: could not restore %s\n' "$PROGRAM_NAME" "$rollback_target" >&2
+            rollback_failed=yes
+        fi
     done
-    systemctl daemon-reload >/dev/null 2>&1
-    if [ "$SERVICE_WAS_ACTIVE" = yes ]; then
-        monit -t -c "$MONIT_MAIN" >/dev/null 2>&1 \
-            && systemctl reload monit.service >/dev/null 2>&1
+    if ! systemctl daemon-reload; then
+        rollback_failed=yes
+    fi
+    if [ "$rollback_failed" = no ] && [ "$SERVICE_WAS_ACTIVE" = yes ]; then
+        if ! monit -t -c "$MONIT_MAIN" >/dev/null; then
+            rollback_failed=yes
+        elif [ "$SERVICE_RESTART_REQUIRED" = yes ]; then
+            systemctl restart monit.service || rollback_failed=yes
+        elif systemctl is-active --quiet monit.service; then
+            systemctl reload monit.service || rollback_failed=yes
+        else
+            systemctl start monit.service || rollback_failed=yes
+        fi
     else
-        systemctl stop monit.service >/dev/null 2>&1
+        systemctl stop monit.service || rollback_failed=yes
     fi
     if [ "$SERVICE_WAS_ENABLED" = yes ]; then
-        systemctl enable monit.service >/dev/null 2>&1
+        systemctl enable monit.service || rollback_failed=yes
     else
-        systemctl disable monit.service >/dev/null 2>&1
+        systemctl disable monit.service || rollback_failed=yes
     fi
-    set -e
+    if [ "$rollback_failed" = yes ]; then
+        printf '%s\n' rollback-incomplete > "$BACKUP_DIRECTORY/status"
+        printf '%s: rollback incomplete; retained originals require operator recovery: %s\n' \
+            "$PROGRAM_NAME" "$BACKUP_DIRECTORY" >&2
+        return 1
+    fi
+    printf '%s\n' rolled-back > "$BACKUP_DIRECTORY/status"
 }
 
 cleanup() {
+    cleanup_status=$1
+    trap - EXIT HUP INT TERM
     if [ "$CHANGES_STARTED" = yes ] && [ "$TRANSACTION_COMMITTED" = no ]; then
-        rollback_transaction
+        rollback_transaction || cleanup_status=1
+    fi
+    if [ -n "$PENDING_STAGE" ]; then
+        rm -f -- "$PENDING_STAGE" || cleanup_status=1
     fi
     if [ -n "$TEMPORARY_DIRECTORY" ] && [ -d "$TEMPORARY_DIRECTORY" ]; then
-        rm -rf -- "$TEMPORARY_DIRECTORY"
+        rm -rf -- "$TEMPORARY_DIRECTORY" || cleanup_status=1
+    fi
+    if [ -n "$BACKUP_DIRECTORY" ]; then
+        printf 'Retained root-only Monit transaction: %s\n' "$BACKUP_DIRECTORY" >&2
+    fi
+    exit "$cleanup_status"
+}
+
+install_managed_file() {
+    staged_source=$1
+    live_target=$2
+    live_mode=$3
+    PENDING_STAGE=$(mktemp "$live_target.tmp.XXXXXX")
+    install -o root -g root -m "$live_mode" "$staged_source" "$PENDING_STAGE"
+    mv -f -- "$PENDING_STAGE" "$live_target"
+    PENDING_STAGE=
+}
+
+select_activation_policy() {
+    [ "$SERVICE_WAS_ACTIVE" = yes ] || return 0
+    if ! cmp -s "$SYSTEMD_SOURCE" "$SYSTEMD_TARGET"; then
+        SERVICE_RESTART_REQUIRED=yes
+    fi
+    current_main_pid=$(systemctl show monit.service --property=MainPID --value)
+    current_process_umask=$(monit_read_process_umask "$current_main_pid") \
+        || fail "cannot inspect the running Monit process umask"
+    case "$current_process_umask" in
+        0077 | 077) ;;
+        *) SERVICE_RESTART_REQUIRED=yes ;;
+    esac
+}
+
+activate_service() {
+    if [ "$SERVICE_WAS_ACTIVE" = yes ]; then
+        systemctl enable monit.service
+        if [ "$SERVICE_RESTART_REQUIRED" = yes ]; then
+            printf 'Restarting Monit to apply changed execution policy or process umask.\n'
+            systemctl restart monit.service
+        else
+            systemctl reload monit.service
+        fi
+    else
+        systemctl enable --now monit.service
     fi
 }
+
+validate_source "$SECURITY_LIBRARY"
+# shellcheck disable=SC1090
+. "$SECURITY_LIBRARY"
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -463,6 +560,7 @@ if [ "$MODE" = plan ]; then
     printf 'Monit setup plan:\n'
     printf '+ install root-only baseline /etc/monitrc with a generated local control credential\n'
     printf '+ preserve existing /etc/monit.d/*.conf fragments\n'
+    printf '+ require trusted root-owned fragments, one link, no extended ACLs, and no nested includes\n'
     for fragment_source in $FRAGMENT_SOURCES; do
         printf '+ install root-only fragment %s as /etc/monit.d/%s\n' \
             "$fragment_source" "${fragment_source##*/}"
@@ -471,7 +569,9 @@ if [ "$MODE" = plan ]; then
     printf '+ install logrotate policy with SIGHUP log reopen\n'
     printf '+ install systemd runtime, state, log, umask, and reload policy\n'
     printf '+ restore default SELinux labels and reject any Monit AVC denial\n'
-    printf '+ validate the assembled tree, then reload or start monit.service\n'
+    printf '+ retain root-only transaction originals under /var/lib/config-monit/backups\n'
+    printf '+ validate the assembled tree; reload configuration-only changes or restart Monit for changed execution policy/process umask\n'
+    printf '+ start fresh Monit deployments and verify the running process Umask is 0077\n'
     if [ "$REPLACE_MAIN" = yes ]; then
         printf '+ explicitly replace a modified unmanaged /etc/monitrc\n'
     else
@@ -481,14 +581,17 @@ if [ "$MODE" = plan ]; then
     exit 0
 fi
 
-for required_command in awk chmod cp find grep install mkdir mv openssl sleep stat wc; do
+for required_command in awk chmod cmp cp find grep install mkdir mktemp mv openssl sleep stat wc; do
     command -v "$required_command" >/dev/null 2>&1 \
         || fail "required command not found: $required_command"
 done
 
 TEMPORARY_DIRECTORY=$(mktemp -d "${TMPDIR:-/tmp}/config-monit-setup.XXXXXX")
 umask 077
-trap cleanup EXIT HUP INT TERM
+trap 'cleanup "$?"' EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 if [ "$MODE" = output ]; then
     validate_output_target
@@ -502,7 +605,7 @@ if [ "$MODE" = output ]; then
 fi
 
 [ "$(id -u)" -eq 0 ] || fail "run as root, use --plan, or use --output"
-for required_command in getenforce logrotate matchpathcon monit restorecon rpm \
+for required_command in getenforce getfacl logrotate matchpathcon monit readlink restorecon rpm \
     systemctl
 do
     command -v "$required_command" >/dev/null 2>&1 \
@@ -510,7 +613,41 @@ do
 done
 [ "$(getenforce)" = Enforcing ] || fail "SELinux must be Enforcing"
 rpm -q monit >/dev/null 2>&1 || fail "Monit package is not installed"
+canonical_fragment_sources=
+for fragment_source in $FRAGMENT_SOURCES; do
+    validate_source "$fragment_source"
+    case "$fragment_source" in
+        /*) source_absolute=$fragment_source ;;
+        *) source_absolute=$(pwd -P)/$fragment_source ;;
+    esac
+    source_parent=${source_absolute%/*}
+    while [ -n "$source_parent" ]; do
+        validate_root_directory "$source_parent"
+        source_parent=${source_parent%/*}
+    done
+    # Copy from the validated canonical path, never from a replaceable ancestor
+    # symlink. All source ancestors must be trusted too.
+    canonical_fragment=$(readlink -f -- "$fragment_source") \
+        || fail "cannot resolve adoption source: $fragment_source"
+    if printf '%s' "$canonical_fragment" | grep '[[:space:]]' >/dev/null 2>&1; then
+        fail "canonical fragment paths must not contain whitespace: $fragment_source"
+    fi
+    monit_require_adoption_source "$canonical_fragment"
+    source_parent=${canonical_fragment%/*}
+    while [ -n "$source_parent" ]; do
+        validate_root_directory "$source_parent"
+        source_parent=${source_parent%/*}
+    done
+    canonical_fragment_sources=$(append_line "$canonical_fragment_sources" "$canonical_fragment")
+done
+FRAGMENT_SOURCES=$canonical_fragment_sources
 main_replacement_is_safe
+for trusted_parent in /etc /var/lib /var/log /run; do
+    validate_root_directory "$trusted_parent"
+done
+if [ -e "$MONIT_FRAGMENT_DIRECTORY" ] || [ -L "$MONIT_FRAGMENT_DIRECTORY" ]; then
+    validate_root_directory "$MONIT_FRAGMENT_DIRECTORY"
+fi
 
 if systemctl is-active --quiet monit.service 2>/dev/null; then
     SERVICE_WAS_ACTIVE=yes
@@ -518,6 +655,7 @@ fi
 if systemctl is-enabled --quiet monit.service 2>/dev/null; then
     SERVICE_WAS_ENABLED=yes
 fi
+select_activation_policy
 
 control_password=$(existing_control_password || generate_control_password)
 prepare_candidate "$TEMPORARY_DIRECTORY/candidate" "$control_password"
@@ -531,14 +669,22 @@ for fragment_source in $FRAGMENT_SOURCES; do
     validate_managed_target "$MONIT_FRAGMENT_DIRECTORY/${fragment_source##*/}"
 done
 
-BACKUP_DIRECTORY=$TEMPORARY_DIRECTORY/backup
+ensure_directory /var/lib/config-monit 0700
+ensure_directory "$BACKUP_ROOT" 0700
+BACKUP_DIRECTORY=$(mktemp -d "$BACKUP_ROOT/transaction.XXXXXXXX")
+printf 'active=%s\nenabled=%s\nrestart_required=%s\n' \
+    "$SERVICE_WAS_ACTIVE" "$SERVICE_WAS_ENABLED" "$SERVICE_RESTART_REQUIRED" \
+    > "$BACKUP_DIRECTORY/service-state"
+printf '%s\n' preparing > "$BACKUP_DIRECTORY/status"
 for fixed_target in "$MONIT_MAIN" "$SYSTEM_TARGET" "$LOGROTATE_TARGET" "$SYSTEMD_TARGET"; do
     backup_target "$fixed_target"
 done
 for fragment_source in $FRAGMENT_SOURCES; do
     backup_target "$MONIT_FRAGMENT_DIRECTORY/${fragment_source##*/}"
 done
+printf '%s\n' "$BACKED_UP_TARGETS" > "$BACKUP_DIRECTORY/targets"
 CHANGES_STARTED=yes
+printf '%s\n' applying > "$BACKUP_DIRECTORY/status"
 
 ensure_directory "$MONIT_FRAGMENT_DIRECTORY" 0750
 ensure_directory /etc/logrotate.d 0755
@@ -548,14 +694,14 @@ ensure_directory "$MONIT_LOG_DIRECTORY" 0700
 ensure_directory "$MONIT_STATE_DIRECTORY" 0700
 ensure_directory "$MONIT_RUNTIME_DIRECTORY" 0750
 
-install -o root -g root -m 0600 "$TEMPORARY_DIRECTORY/final-monitrc" "$MONIT_MAIN"
-install -o root -g root -m 0600 "$SYSTEM_SOURCE" "$SYSTEM_TARGET"
+install_managed_file "$TEMPORARY_DIRECTORY/final-monitrc" "$MONIT_MAIN" 0600
+install_managed_file "$TEMPORARY_DIRECTORY/candidate/etc/monit.d/10-system.conf" "$SYSTEM_TARGET" 0600
 for fragment_source in $FRAGMENT_SOURCES; do
-    install -o root -g root -m 0600 "$fragment_source" \
-        "$MONIT_FRAGMENT_DIRECTORY/${fragment_source##*/}"
+    install_managed_file "$TEMPORARY_DIRECTORY/candidate/etc/monit.d/${fragment_source##*/}" \
+        "$MONIT_FRAGMENT_DIRECTORY/${fragment_source##*/}" 0600
 done
-install -o root -g root -m 0644 "$LOGROTATE_SOURCE" "$LOGROTATE_TARGET"
-install -o root -g root -m 0644 "$SYSTEMD_SOURCE" "$SYSTEMD_TARGET"
+install_managed_file "$TEMPORARY_DIRECTORY/candidate/etc/logrotate.d/monit" "$LOGROTATE_TARGET" 0644
+install_managed_file "$TEMPORARY_DIRECTORY/candidate/etc/systemd/system/monit.service.d/10-baseline.conf" "$SYSTEMD_TARGET" 0644
 
 restorecon -RF "$MONIT_MAIN" "$MONIT_FRAGMENT_DIRECTORY" \
     "$LOGROTATE_TARGET" "$SYSTEMD_DIRECTORY" "$MONIT_LOG_DIRECTORY" \
@@ -564,11 +710,7 @@ systemctl daemon-reload
 monit -t -c "$MONIT_MAIN" >/dev/null
 logrotate --debug "$LOGROTATE_TARGET" >/dev/null 2>&1
 
-if [ "$SERVICE_WAS_ACTIVE" = yes ]; then
-    systemctl reload monit.service
-else
-    systemctl enable --now monit.service
-fi
+activate_service
 systemctl is-enabled --quiet monit.service \
     || fail "monit.service is not enabled after setup"
 systemctl is-active --quiet monit.service \
@@ -577,5 +719,6 @@ wait_for_control_plane \
     || fail "Monit local control-plane health check failed"
 "$VERIFIER_SOURCE" >/dev/null
 
+printf '%s\n' committed > "$BACKUP_DIRECTORY/status"
 TRANSACTION_COMMITTED=yes
 printf 'Applied and verified Monit baseline; monit.service is active and enabled.\n'

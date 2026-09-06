@@ -15,6 +15,7 @@ INSTALLER=$MONIT_DIRECTORY/install
 SETUP=$MONIT_DIRECTORY/setup
 VERIFIER=$MONIT_DIRECTORY/verify
 VERSION_LIBRARY=$MONIT_DIRECTORY/lib/version.sh
+SECURITY_LIBRARY=$MONIT_DIRECTORY/lib/security.sh
 TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/config-monit-tests.XXXXXX")
 CONFIG_PRIVATE_IDENTIFIER_PATTERN=${CONFIG_PRIVATE_IDENTIFIER_PATTERN:-}
 
@@ -106,7 +107,7 @@ done
 assert_contains "$TEST_ROOT/install-rocky.plan" 'Monit installation target: Rocky Linux 9'
 assert_contains "$TEST_ROOT/install-rocky.plan" \
     'Monit version policy: require 5.35.2 or newer; prefer 6.0.0 when EPEL supplies it.'
-for package_name in audit iproute libselinux-utils logrotate monit openssl \
+for package_name in acl audit iproute libselinux-utils logrotate monit openssl \
     policycoreutils procps-ng
 do
     assert_contains "$TEST_ROOT/install-rocky.plan" "$package_name"
@@ -253,13 +254,33 @@ chmod 0644 "$rollback_target"
 restore_target_function=$(extract_function restore_target "$SETUP")
 [ -n "$restore_target_function" ] \
     || fail 'cannot extract Monit rollback restore function'
-BACKUP_DIRECTORY=$rollback_root sh -c "$restore_target_function
+# Production rollback uses GNU cp to preserve SELinux contexts and ACLs too.
+# Translate its SELinux-specific options for this portable metadata fixture;
+# full context/xattr acceptance still requires an enforcing target host.
+install -d "$TEST_ROOT/metadata-bin"
+cat > "$TEST_ROOT/metadata-bin/cp" <<'EOF'
+#!/usr/bin/env sh
+if [ "$1" = --preserve=mode,ownership,timestamps,xattr,context ]; then
+    shift
+    exec /bin/cp -p "$@"
+fi
+exec /bin/cp "$@"
+EOF
+chmod 0755 "$TEST_ROOT/metadata-bin/cp"
+BACKUP_DIRECTORY=$rollback_root PATH="$TEST_ROOT/metadata-bin:$PATH" sh -c "$restore_target_function
     restore_target '$rollback_target'"
 cmp -s "$rollback_file" "$rollback_target" \
     || fail 'Monit rollback did not restore exact file content'
 assert_mode "$rollback_target" 600
 [ "$(file_mtime "$rollback_target")" = "$(file_mtime "$rollback_file")" ] \
     || fail 'Monit rollback did not preserve the original modification time'
+# Atomic restore must sever a live hardlink rather than overwriting its alias.
+ln "$rollback_target" "$TEST_ROOT/rollback-alias"
+printf '%s\n' 'later mutation' > "$rollback_target"
+BACKUP_DIRECTORY=$rollback_root PATH="$TEST_ROOT/metadata-bin:$PATH" sh -c "$restore_target_function
+    restore_target '$rollback_target'"
+assert_contains "$TEST_ROOT/rollback-alias" 'later mutation'
+assert_contains "$rollback_target" 'package original'
 
 install -d "$TEST_ROOT/fragments-a" "$TEST_ROOT/fragments-b"
 printf '%s\n' 'check process example with pidfile /run/example.pid' \
@@ -334,6 +355,248 @@ assert_contains "$VERSION_LIBRARY" 'MONIT_SUPPORTED_VERSION=5.35.2'
 assert_contains "$VERSION_LIBRARY" 'MONIT_PREFERRED_VERSION=6.0.0'
 assert_contains "$VERIFIER" \
     'is the supported compatibility release; prefer'
+
+install -d "$TEST_ROOT/security-bin"
+cat > "$TEST_ROOT/security-bin/stat" <<'EOF'
+#!/usr/bin/env sh
+if [ "$1" = -c ] && [ "$2" = '%u:%g:%a:%h' ]; then
+    if [ "$(uname -s)" = Darwin ]; then
+        file_modes=$(/usr/bin/stat -f '%Lp:%l' "$3") || exit 1
+    else
+        file_modes=$(/usr/bin/stat -c '%a:%h' "$3") || exit 1
+    fi
+    printf '%s:%s\n' "${MONIT_TEST_OWNER:-0:0}" "$file_modes"
+    exit 0
+fi
+if [ "$1" = -c ] && [ "$2" = '%u:%g:%h' ]; then
+    if [ "$(uname -s)" = Darwin ]; then
+        file_links=$(/usr/bin/stat -f '%l' "$3") || exit 1
+    else
+        file_links=$(/usr/bin/stat -c '%h' "$3") || exit 1
+    fi
+    printf '%s:%s\n' "${MONIT_TEST_OWNER:-0:0}" "$file_links"
+    exit 0
+fi
+if [ "$1" = -c ] && [ "$2" = '%a' ] && [ "$(uname -s)" = Darwin ]; then
+    exec /usr/bin/stat -f '%Lp' "$3"
+fi
+exec /usr/bin/stat "$@"
+EOF
+cat > "$TEST_ROOT/security-bin/getfacl" <<'EOF'
+#!/usr/bin/env sh
+printf 'user::rw-\ngroup::---\nother::---\n'
+case "${MONIT_TEST_ACL:-basic}" in
+    basic) ;;
+    named) printf 'user:1000:rw-\nmask::rw-\n' ;;
+    default) printf 'default:user::rwx\n' ;;
+    unavailable) exit 1 ;;
+esac
+EOF
+chmod 0755 "$TEST_ROOT/security-bin/stat" "$TEST_ROOT/security-bin/getfacl"
+security_fixture=$TEST_ROOT/private-fragment.conf
+printf 'check file sample with path /var/lib/include/data\n' > "$security_fixture"
+chmod 0600 "$security_fixture"
+security_check=". '$SECURITY_LIBRARY'
+    fail() { printf '%s\\n' \"\$*\" >&2; exit 1; }
+    monit_require_private_fragment '$security_fixture'"
+PATH="$TEST_ROOT/security-bin:$PATH" sh -c "$security_check"
+chmod 0660 "$security_fixture"
+expect_failure 'root:root mode 0600 with one link' \
+    env PATH="$TEST_ROOT/security-bin:$PATH" sh -c "$security_check"
+chmod 0600 "$security_fixture"
+expect_failure 'root:root mode 0600 with one link' \
+    env MONIT_TEST_OWNER=1000:0 PATH="$TEST_ROOT/security-bin:$PATH" sh -c "$security_check"
+ln "$security_fixture" "$TEST_ROOT/private-fragment-alias"
+expect_failure 'root:root mode 0600 with one link' \
+    env PATH="$TEST_ROOT/security-bin:$PATH" sh -c "$security_check"
+rm -f "$TEST_ROOT/private-fragment-alias"
+for rejected_acl in named default; do
+    expect_failure 'extended or default ACL requires explicit remediation' \
+        env MONIT_TEST_ACL="$rejected_acl" PATH="$TEST_ROOT/security-bin:$PATH" \
+        sh -c "$security_check"
+done
+expect_failure 'cannot inspect ACL' \
+    env MONIT_TEST_ACL=unavailable PATH="$TEST_ROOT/security-bin:$PATH" sh -c "$security_check"
+mv "$security_fixture" "$security_fixture.real"
+ln -s "$security_fixture.real" "$security_fixture"
+expect_failure 'non-symbolic regular file' \
+    env PATH="$TEST_ROOT/security-bin:$PATH" sh -c "$security_check"
+rm -f "$security_fixture"
+mv "$security_fixture.real" "$security_fixture"
+
+adoption_check=". '$SECURITY_LIBRARY'
+    fail() { printf '%s\\n' \"\$*\" >&2; exit 1; }
+    monit_require_adoption_source '$security_fixture'"
+for adoptable_mode in 0644 0640 0600; do
+    chmod "$adoptable_mode" "$security_fixture"
+    PATH="$TEST_ROOT/security-bin:$PATH" sh -c "$adoption_check"
+done
+chmod 0664 "$security_fixture"
+expect_failure 'must not be writable by group or other' \
+    env PATH="$TEST_ROOT/security-bin:$PATH" sh -c "$adoption_check"
+chmod 0644 "$security_fixture"
+expect_failure 'root:root with one link' \
+    env MONIT_TEST_OWNER=1000:0 PATH="$TEST_ROOT/security-bin:$PATH" sh -c "$adoption_check"
+ln "$security_fixture" "$TEST_ROOT/adoption-alias"
+expect_failure 'root:root with one link' \
+    env PATH="$TEST_ROOT/security-bin:$PATH" sh -c "$adoption_check"
+rm -f "$TEST_ROOT/adoption-alias"
+
+# A trusted 0644 live fragment is rejected when merely preserved, but can be
+# explicitly adopted by its own path without first altering the live tree.
+install -d "$TEST_ROOT/adoption-live" "$TEST_ROOT/adoption-stage"
+cp "$security_fixture" "$TEST_ROOT/adoption-live/50-private.conf"
+chmod 0644 "$TEST_ROOT/adoption-live/50-private.conf"
+existing_copy_function=$(extract_function copy_existing_fragments "$SETUP")
+requested_copy_function=$(extract_function copy_requested_fragments "$SETUP")
+copy_check="set -eu
+    . '$SECURITY_LIBRARY'
+    fail() { printf '%s\\n' \"\$*\" >&2; exit 1; }
+    $existing_copy_function
+    $requested_copy_function
+    copy_existing_fragments '$TEST_ROOT/adoption-stage'
+    copy_requested_fragments '$TEST_ROOT/adoption-stage'"
+expect_failure 'root:root mode 0600 with one link' \
+    env MONIT_FRAGMENT_DIRECTORY="$TEST_ROOT/adoption-live" FRAGMENT_NAMES='' \
+    FRAGMENT_SOURCES='' PATH="$TEST_ROOT/security-bin:$PATH" sh -c "$copy_check"
+MONIT_FRAGMENT_DIRECTORY="$TEST_ROOT/adoption-live" FRAGMENT_NAMES=50-private.conf \
+    FRAGMENT_SOURCES="$TEST_ROOT/adoption-live/50-private.conf" \
+    PATH="$TEST_ROOT/security-bin:$PATH" sh -c "$copy_check"
+cmp -s "$TEST_ROOT/adoption-live/50-private.conf" "$TEST_ROOT/adoption-stage/50-private.conf" \
+    || fail 'explicit fragment adoption changed its reviewed contents'
+assert_mode "$TEST_ROOT/adoption-live/50-private.conf" 644
+assert_mode "$TEST_ROOT/adoption-stage/50-private.conf" 600
+chmod 0600 "$security_fixture"
+
+cat > "$security_fixture" <<'EOF'
+# include /not/an/include.conf
+check file "include" with path "/var/lib/include/data"
+    if content = "include /also/not/a/directive" then alert
+EOF
+PATH="$TEST_ROOT/security-bin:$PATH" sh -c "$security_check"
+for nested_directive in \
+    'include /private/external.conf' \
+    'check filesystem root with path / InClUdE "/private/external.conf"' \
+    'include"/private/external.conf"'
+do
+    printf '%s\n' "$nested_directive" > "$security_fixture"
+    expect_failure 'nested include directives are unsupported' \
+        "$SETUP" --plan --fragment "$security_fixture"
+done
+
+# Global policy comparison rejects extra includes before trusting Monit syntax.
+control_validation=$(extract_function verify_control_file "$VERIFIER")
+line_validation=$(extract_function require_exact_line "$VERIFIER")
+control_check="fail() { printf '%s\\n' \"\$*\" >&2; exit 1; }
+    require_regular_file_identity() { :; }
+    $line_validation
+    $control_validation
+    verify_control_file"
+MONIT_MAIN="$TEST_ROOT/rendered/etc/monitrc" \
+    MAIN_TEMPLATE="$MONIT_DIRECTORY/templates/monitrc.in" \
+    MANAGED_MARKER='Managed by mikinho/config monit/setup.' \
+    PACKAGE_BINARY=/usr/bin/true sh -c "$control_check"
+cp "$TEST_ROOT/rendered/etc/monitrc" "$TEST_ROOT/canonical-monitrc"
+printf '\ninclude /unreviewed/external.conf\n' >> "$TEST_ROOT/rendered/etc/monitrc"
+expect_failure 'differs from the managed global policy' \
+    env MONIT_MAIN="$TEST_ROOT/rendered/etc/monitrc" \
+    MAIN_TEMPLATE="$MONIT_DIRECTORY/templates/monitrc.in" \
+    MANAGED_MARKER='Managed by mikinho/config monit/setup.' \
+    PACKAGE_BINARY=/usr/bin/true sh -c "$control_check"
+awk '/^    allow admin:/ { $0 = $0 " include /unreviewed/external.conf" }
+    { print }' "$TEST_ROOT/canonical-monitrc" > "$TEST_ROOT/rendered/etc/monitrc"
+expect_failure 'differs from the managed global policy' \
+    env MONIT_MAIN="$TEST_ROOT/rendered/etc/monitrc" \
+    MAIN_TEMPLATE="$MONIT_DIRECTORY/templates/monitrc.in" \
+    MANAGED_MARKER='Managed by mikinho/config monit/setup.' \
+    PACKAGE_BINARY=/usr/bin/true sh -c "$control_check"
+
+# Retained backup storage is deliberately separate from disposable candidates.
+cleanup_function=$(extract_function cleanup "$SETUP")
+install -d "$TEST_ROOT/cleanup-temporary" "$TEST_ROOT/retained-transaction"
+printf '%s\n' 'recovery original' > "$TEST_ROOT/retained-transaction/original"
+TEMPORARY_DIRECTORY="$TEST_ROOT/cleanup-temporary" \
+    BACKUP_DIRECTORY="$TEST_ROOT/retained-transaction" \
+    CHANGES_STARTED=yes TRANSACTION_COMMITTED=yes PENDING_STAGE='' \
+    sh -c "$cleanup_function
+        cleanup 0" > "$TEST_ROOT/cleanup.stdout" 2> "$TEST_ROOT/cleanup.stderr"
+[ ! -e "$TEST_ROOT/cleanup-temporary" ] || fail 'cleanup retained disposable candidates'
+assert_contains "$TEST_ROOT/retained-transaction/original" 'recovery original'
+assert_contains "$TEST_ROOT/cleanup.stderr" 'Retained root-only Monit transaction:'
+
+# A failed restoration is reported and retains the original for operator repair.
+rollback_function=$(extract_function rollback_transaction "$SETUP")
+rollback_check="PROGRAM_NAME=monit-test
+    restore_target() { return 1; }
+    systemctl() { return 0; }
+    $rollback_function
+    rollback_transaction"
+expect_failure 'rollback incomplete' \
+    env BACKUP_DIRECTORY="$TEST_ROOT/retained-transaction" BACKED_UP_TARGETS=/test/target \
+    SERVICE_WAS_ACTIVE=yes SERVICE_WAS_ENABLED=yes SERVICE_RESTART_REQUIRED=no \
+    sh -c "$rollback_check"
+assert_contains "$TEST_ROOT/retained-transaction/status" rollback-incomplete
+assert_contains "$TEST_ROOT/retained-transaction/original" 'recovery original'
+
+# Activate an existing daemon only as required by execution-policy changes.
+selection_function=$(extract_function select_activation_policy "$SETUP")
+activation_function=$(extract_function activate_service "$SETUP")
+activation_check="fail() { printf '%s\\n' \"\$*\" >&2; exit 1; }
+    systemctl() {
+        if [ \"\$1\" = show ]; then printf '123\\n';
+        else printf '%s\\n' \"\$*\"; fi
+    }
+    monit_read_process_umask() { printf '%s\\n' \"\$MONIT_TEST_UMASK\"; }
+    $selection_function
+    $activation_function
+    select_activation_policy
+    activate_service"
+cp "$MONIT_DIRECTORY/systemd/monit.service.conf" "$TEST_ROOT/current-systemd.conf"
+SERVICE_WAS_ACTIVE=yes SERVICE_RESTART_REQUIRED=no MONIT_TEST_UMASK=0077 \
+    SYSTEMD_SOURCE="$MONIT_DIRECTORY/systemd/monit.service.conf" \
+    SYSTEMD_TARGET="$TEST_ROOT/current-systemd.conf" sh -c "$activation_check" \
+    > "$TEST_ROOT/reload-activation"
+assert_contains "$TEST_ROOT/reload-activation" 'reload monit.service'
+if grep -F 'restart monit.service' "$TEST_ROOT/reload-activation" >/dev/null; then
+    fail 'configuration-only adoption restarted Monit'
+fi
+SERVICE_WAS_ACTIVE=yes SERVICE_RESTART_REQUIRED=no MONIT_TEST_UMASK=0022 \
+    SYSTEMD_SOURCE="$MONIT_DIRECTORY/systemd/monit.service.conf" \
+    SYSTEMD_TARGET="$TEST_ROOT/current-systemd.conf" sh -c "$activation_check" \
+    > "$TEST_ROOT/umask-activation"
+assert_contains "$TEST_ROOT/umask-activation" 'restart monit.service'
+printf '\nRestartSec=10s\n' >> "$TEST_ROOT/current-systemd.conf"
+SERVICE_WAS_ACTIVE=yes SERVICE_RESTART_REQUIRED=no MONIT_TEST_UMASK=0077 \
+    SYSTEMD_SOURCE="$MONIT_DIRECTORY/systemd/monit.service.conf" \
+    SYSTEMD_TARGET="$TEST_ROOT/current-systemd.conf" sh -c "$activation_check" \
+    > "$TEST_ROOT/policy-activation"
+assert_contains "$TEST_ROOT/policy-activation" 'restart monit.service'
+SERVICE_WAS_ACTIVE=no SERVICE_RESTART_REQUIRED=no sh -c "$activation_check" \
+    > "$TEST_ROOT/fresh-activation"
+assert_contains "$TEST_ROOT/fresh-activation" 'enable --now monit.service'
+
+# Configured systemd UMask alone must not conceal a stale running process mask.
+systemd_verification=$(extract_function verify_systemd_policy "$VERIFIER")
+systemd_check="fail() { printf '%s\\n' \"\$*\" >&2; exit 1; }
+    systemctl() {
+        [ \"\$1\" = show ] || return 0
+        case \"\$3\" in
+            --property=RuntimeDirectory|--property=StateDirectory|--property=LogsDirectory)
+                printf 'monit\\n' ;;
+            --property=StateDirectoryMode|--property=LogsDirectoryMode) printf '0700\\n' ;;
+            --property=RuntimeDirectoryMode) printf '0750\\n' ;;
+            --property=UMask) printf '0077\\n' ;;
+            --property=MainPID) printf '123\\n' ;;
+            --property=Restart) printf 'on-failure\\n' ;;
+            *) return 1 ;;
+        esac
+    }
+    monit_read_process_umask() { printf '%s\\n' \"\$MONIT_TEST_UMASK\"; }
+    $systemd_verification
+    verify_systemd_policy"
+MONIT_TEST_UMASK=0077 sh -c "$systemd_check"
+expect_failure 'running Monit process UMask is not 0077' \
+    env MONIT_TEST_UMASK=0022 sh -c "$systemd_check"
 
 python3 "$MONIT_DIRECTORY/build-operations-standard-pdf.py" --check >/dev/null
 

@@ -16,12 +16,14 @@ if [ ! -f "$SOURCE_ROOT/templates/monitrc.in" ] \
 fi
 if [ "$SOURCE_ROOT" = "$SCRIPT_DIRECTORY" ]; then
     VERSION_LIBRARY=$SOURCE_ROOT/lib/version.sh
+    SECURITY_LIBRARY=$SOURCE_ROOT/lib/security.sh
     MAIN_TEMPLATE=$SOURCE_ROOT/templates/monitrc.in
     SYSTEM_SOURCE=$SOURCE_ROOT/conf.d/10-system.conf
     LOGROTATE_SOURCE=$SOURCE_ROOT/logrotate/monit
     SYSTEMD_SOURCE=$SOURCE_ROOT/systemd/monit.service.conf
 else
     VERSION_LIBRARY=$SOURCE_ROOT/version.sh
+    SECURITY_LIBRARY=$SOURCE_ROOT/security.sh
     MAIN_TEMPLATE=$SOURCE_ROOT/monitrc.in
     SYSTEM_SOURCE=$SOURCE_ROOT/10-system.conf
     LOGROTATE_SOURCE=$SOURCE_ROOT/logrotate-monit
@@ -75,19 +77,25 @@ require_command() {
 require_regular_file_identity() {
     checked_file=$1
     expected_identity=$2
+    [ -f "$checked_file" ] && [ ! -L "$checked_file" ] \
+        || fail "required file must be a non-symbolic regular file: $checked_file"
     actual_identity=$(stat -Lc '%U:%G:%a:%h' "$checked_file" 2>/dev/null) \
         || fail "cannot inspect required file: $checked_file"
     [ "$actual_identity" = "$expected_identity" ] \
         || fail "$checked_file must be $expected_identity (found $actual_identity)"
+    monit_require_no_acl "$checked_file"
 }
 
 require_directory_identity() {
     checked_directory=$1
     expected_identity=$2
+    [ -d "$checked_directory" ] && [ ! -L "$checked_directory" ] \
+        || fail "required directory must be non-symbolic: $checked_directory"
     actual_identity=$(stat -Lc '%U:%G:%a' "$checked_directory" 2>/dev/null) \
         || fail "cannot inspect required directory: $checked_directory"
     [ "$actual_identity" = "$expected_identity" ] \
         || fail "$checked_directory must be $expected_identity (found $actual_identity)"
+    monit_require_no_acl "$checked_directory"
 }
 
 require_exact_line() {
@@ -155,6 +163,19 @@ verify_control_file() {
         || fail "$MONIT_MAIN has an invalid local control credential"
     [ "$(printf '%s\n' "$control_passwords" | wc -l | tr -d ' ')" -eq 1 ] \
         || fail "$MONIT_MAIN must contain exactly one local control credential"
+    # Exact comparison with only the generated fields normalized prevents an
+    # extra include/global directive from escaping the fragment audit.
+    normalized_control=$(awk '
+        /^    allow admin:[0-9a-f]+$/ {
+            $0 = "    allow admin:@@CONTROL_PASSWORD@@"
+        }
+        $0 == "include /etc/monit.d/*.conf" {
+            $0 = "include @@INCLUDE_GLOB@@"
+        }
+        { print }
+    ' "$MONIT_MAIN")
+    [ "$normalized_control" = "$(cat "$MAIN_TEMPLATE")" ] \
+        || fail "$MONIT_MAIN differs from the managed global policy; use flat deployment fragments"
     "$PACKAGE_BINARY" -t -c "$MONIT_MAIN" >/dev/null \
         || fail "Monit rejected the installed control tree"
 }
@@ -168,6 +189,16 @@ verify_managed_files() {
     require_regular_file_identity "$LOGROTATE_TARGET" root:root:644:1
     require_regular_file_identity "$SYSTEMD_TARGET" root:root:644:1
     require_regular_file_identity "$MONIT_LOG" root:root:600:1
+    unsafe_fragment=$(find "$MONIT_FRAGMENT_DIRECTORY" \
+        -mindepth 1 -maxdepth 1 -name '*.conf' ! -type f -print -quit)
+    [ -z "$unsafe_fragment" ] \
+        || fail "Monit fragment must be a non-symbolic regular file: $unsafe_fragment"
+    verified_fragment_paths=$(find "$MONIT_FRAGMENT_DIRECTORY" -mindepth 1 -maxdepth 1 \
+        -type f -name '*.conf' -print) || fail "cannot enumerate installed Monit fragments"
+    printf '%s\n' "$verified_fragment_paths" | while IFS= read -r verified_fragment; do
+            [ -n "$verified_fragment" ] || continue
+            monit_require_private_fragment "$verified_fragment"
+        done
     cmp -s "$SYSTEM_SOURCE" "$SYSTEM_TARGET" \
         || fail "installed system checks differ from repository policy"
     cmp -s "$LOGROTATE_SOURCE" "$LOGROTATE_TARGET" \
@@ -205,9 +236,22 @@ verify_systemd_policy() {
         || fail "monit.service StateDirectory is not monit"
     [ "$(systemctl show monit.service --property=LogsDirectory --value)" = monit ] \
         || fail "monit.service LogsDirectory is not monit"
+    for private_directory_property in StateDirectoryMode LogsDirectoryMode; do
+        [ "$(systemctl show monit.service --property="$private_directory_property" --value)" = 0700 ] \
+            || fail "monit.service $private_directory_property is not 0700"
+    done
+    [ "$(systemctl show monit.service --property=RuntimeDirectoryMode --value)" = 0750 ] \
+        || fail "monit.service RuntimeDirectoryMode is not 0750"
     case "$(systemctl show monit.service --property=UMask --value)" in
         0077 | 077) ;;
         *) fail "monit.service UMask is not 0077" ;;
+    esac
+    running_pid=$(systemctl show monit.service --property=MainPID --value)
+    running_umask=$(monit_read_process_umask "$running_pid") \
+        || fail "cannot inspect the running Monit process umask"
+    case "$running_umask" in
+        0077 | 077) ;;
+        *) fail "running Monit process UMask is not 0077; restart Monit to apply execution policy" ;;
     esac
     [ "$(systemctl show monit.service --property=Restart --value)" = on-failure ] \
         || fail "monit.service restart policy is not on-failure"
@@ -273,7 +317,7 @@ while [ "$#" -gt 0 ]; do
 done
 
 for verifier_source in \
-    "$VERSION_LIBRARY" "$MAIN_TEMPLATE" "$SYSTEM_SOURCE" \
+    "$VERSION_LIBRARY" "$SECURITY_LIBRARY" "$MAIN_TEMPLATE" "$SYSTEM_SOURCE" \
     "$LOGROTATE_SOURCE" "$SYSTEMD_SOURCE"
 do
     validate_source "$verifier_source"
@@ -282,6 +326,8 @@ command -v awk >/dev/null 2>&1 || fail "required verification command not found:
 
 # shellcheck disable=SC1090
 . "$VERSION_LIBRARY"
+# shellcheck disable=SC1090
+. "$SECURITY_LIBRARY"
 monit_validate_version_policy \
     || fail "invalid Monit version policy in $VERSION_LIBRARY"
 
@@ -291,7 +337,7 @@ if [ "$MODE" = check ]; then
 fi
 
 [ "$(id -u)" -eq 0 ] || fail "run as root"
-for verify_command in ausearch awk cmp getenforce grep logrotate matchpathcon \
+for verify_command in ausearch awk cat cmp find getenforce getfacl grep logrotate matchpathcon \
     ps rpm ss stat systemctl wc
 do
     require_command "$verify_command"

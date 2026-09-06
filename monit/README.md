@@ -49,16 +49,29 @@ available without a repository-policy change.
   management port. Root uses the protected control file for `monit summary`,
   `monit status`, and other client commands.
 - `/etc/monit.d/*.conf` fragments are `root:root` mode `0600`. Existing matching
-  fragments are preserved. A requested fragment is installed by its basename,
-  and duplicate or unsafe names fail before host changes.
+  fragments are preserved only after checking ownership, permissions, a single
+  hardlink, and the absence of extended ACLs. Fragment directories must have no
+  extended or default ACL. A requested fragment explicitly adopts its basename
+  from a validated staged copy, replacing the old inode and severing aliases.
+  Symbolic links and nested include directives are rejected before activation.
 - The public resource fragment alerts on sustained load, CPU, memory, swap,
   root-filesystem space, and inode pressure. It contains no start, stop, or
   restart action.
 - systemd owns Monit's own recovery through `Restart=on-failure`. The drop-in
   creates private runtime, state, and log directories and applies `UMask=0077`.
+  Acceptance checks both the configured mask and the running daemon's
+  `/proc/MAINPID/status` `Umask` field. A changed drop-in or stale process mask
+  requires a controlled Monit restart; configuration-only updates use reload.
 - Notification transport and recipients are deployment secrets. Place them in
   a separate protected fragment; never add them to the public template, a
   command line, a rendered plan, or an evidence record.
+
+The service mask protects files created by the Monit daemon. Monit 6.0.0's
+command runner explicitly sets `0022` for spawned check/action programs, so
+those programs do not inherit the daemon's `0077` policy. Any reviewed helper
+that creates private files must set its own `umask 077` before writing and use
+explicit modes where needed. Keep service management behind systemd and review
+the effective execution policy before adding an action.
 
 Monit is intentionally a privileged observer. A general monitor may need to
 read process state, sockets, files, filesystems, and service-specific paths,
@@ -83,6 +96,8 @@ generated allow rules without review.
 | `/run/monit` | Runtime PID directory; `root:root` mode `0750` |
 | `/usr/local/bin/verify-monit` | Installed read-only acceptance verifier |
 | `/usr/local/libexec/config-monit/version.sh` | Installed compatibility and preferred-version policy used by the verifier |
+| `/usr/local/libexec/config-monit/security.sh` | Shared fragment, ACL, and process-umask validation |
+| `/var/lib/config-monit/backups/transaction.*` | Retained root-only transaction originals, target manifest, status, and previous service state |
 
 The main control file includes only `/etc/monit.d/*.conf`. Staging files must
 therefore use a different suffix or a directory outside `/etc/monit.d`; a
@@ -103,7 +118,8 @@ inspection dependencies:
 sudo monit/install
 ```
 
-The installer preserves an existing service's active/enabled state. A fresh
+The installer includes `getfacl` from the `acl` package. It preserves an existing
+service's active/enabled state. A fresh
 installation remains stopped and disabled until setup validates a complete
 candidate. It also installs `verify-monit` and the exact public policy sources
 the installed verifier compares against.
@@ -149,9 +165,13 @@ sudo monit/setup \
 Setup assembles the candidate with every existing live `*.conf` fragment,
 parses the full tree, validates logrotate, takes recoverable copies of every
 managed target, installs atomically by file, restores SELinux labels, reloads
-systemd, and then either reloads an active Monit daemon or enables and starts a
-fresh one. It runs the complete verifier before committing the transaction.
-Failure restores the managed files and prior service enablement/activity state.
+systemd, and then activates Monit. Existing daemons reload for configuration-only
+changes. A changed systemd drop-in or a running mask other than `0077` requires
+a controlled restart of Monit so execution settings take effect. Fresh daemons
+are enabled and started. The complete verifier checks the running process mask
+before committing the transaction. Failure attempts to restore the managed
+files and prior service enablement/activity state; incomplete recovery is an
+explicit error with retained originals for operator repair.
 
 The EPEL package's unmodified example `/etc/monitrc` may be replaced safely.
 Any other unmanaged modification is a migration boundary because it may hold
@@ -168,15 +188,32 @@ sudo monit/setup --replace-main \
 delete unrelated fragments. Keep the setup backup until notification delivery
 and all service checks have passed acceptance.
 
+To adopt a trusted root-owned fragment currently at `0644` or `0640`, run
+`monit/install` first if `getfacl` is missing, then explicitly supply that same
+live path with `monit/setup --fragment /etc/monit.d/50-notifications.conf`.
+The source and its canonical parent directories must be `root:root`, have no
+group/other write bits or extended ACLs, and the file must have one hardlink.
+Use a protected root directory for off-tree adoption sources. Setup validates
+a staged copy and promotes it as `0600`.
+An original with an untrusted owner, writable access, aliases, or ACLs requires
+a separately reviewed independent root-owned source before adoption; passing
+the unsafe original directly is rejected. Directory ACLs require separate
+explicit remediation before setup. Setup never
+silently follows a symbolic link or an external include tree. The main file
+must match the managed template apart from its generated credential and include
+path; deployment policy belongs in the directly included fragments.
+
 ## Deployment fragment contract
 
 A deployment fragment must be non-symbolic, end in `.conf`, and use a basename
 containing only letters, numbers, dots, underscores, and hyphens. The reserved
-name `10-system.conf` cannot be supplied. Keep global notification policy in an
-earlier fragment and service checks in later clearly named fragments, but do
-not rely on wildcard include order for cross-file definitions: Monit documents
-glob inclusion as unsorted. A fragment must be independently meaningful or use
-an explicit full-path include when order is required.
+name `10-system.conf` cannot be supplied. Each fragment must be independently
+meaningful and contain no nested `include` directive. Keep global notification
+policy in an earlier fragment and service checks in later clearly named
+fragments, but do not rely on wildcard include order for cross-file definitions:
+Monit documents glob inclusion as unsorted. Flatten an existing nested tree into
+reviewed, directly supplied fragments before adoption. Reserve the unquoted
+`include` token for the managed main file; quote literal uses in fragment values.
 
 Prefer alert-only checks. A service already managed by systemd should not also
 be restarted by Monit without an explicit failure-amplification analysis. In
@@ -220,8 +257,9 @@ Acceptance additionally requires deployment-specific checks:
    meaning and does not expose credentials in output.
 3. A controlled failure alert and its recovery notification are received
    through the protected transport.
-4. Monit's main PID and every monitored application's main PID are unchanged by
-   configuration promotion and log rotation.
+4. Monit's main PID is unchanged by configuration-only promotion and log
+   rotation. Execution-policy promotion changes Monit's PID and the new daemon
+   reports `Umask: 0077`; monitored application PIDs remain unchanged.
 5. `ausearch -m AVC,USER_AVC -ts boot -c monit` returns no denial.
 6. The only TCP 2812 listener is `127.0.0.1:2812`; no host or cloud firewall
    rule exposes it.
@@ -230,16 +268,38 @@ Acceptance additionally requires deployment-specific checks:
 
 ## Rollback
 
-The setup transaction restores managed files automatically when validation or
-activation fails. For a later operator rollback, restore the retained copies
-of `/etc/monitrc`, the changed `.conf` fragments, the logrotate policy, and the
-systemd drop-in; then run:
+Setup prints its retained transaction path under
+`/var/lib/config-monit/backups/transaction.*`. The directory is `root:root` mode
+`0700`; it contains protected originals under `files`, existence records under
+`present` and `absent`, a `targets` manifest, `service-state`, and a `status`
+record. GNU metadata-preserving copies retain modes, ownership, timestamps,
+ACLs, and SELinux contexts. Restoration replaces files atomically and does not
+reconnect old hardlink aliases.
+
+Automatic rollback attempts every target and reports `rollback-incomplete` if
+any file or service restoration fails. The originals remain available after
+success, failure, or incomplete recovery; ordinary candidate cleanup does not
+remove them. An incomplete file restoration leaves Monit stopped when possible
+so it cannot consume a partially restored tree. Inspect the error and transaction
+records, repair the cause, and restore the recorded originals before activation.
+
+For a later operator rollback, use `targets` and the `present`/`absent` records
+to restore the previous files and remove targets that did not previously exist.
+Preserve their recorded metadata. If only Monit configuration changed, run:
 
 ```sh
 sudo systemctl daemon-reload
 sudo monit -t -c /etc/monitrc
 sudo systemctl reload monit.service
 ```
+
+If the systemd execution policy changed, use `systemctl restart monit.service`
+after `daemon-reload` and syntax validation instead of reload. Restore the
+recorded active/enabled state from `service-state`, then repeat deployment
+acceptance. Retain the root-only transaction until alert delivery, service
+checks, and the rollback retention decision have been recorded privately;
+remove it only after that decision. Backup contents can include secrets and
+must never be copied into this repository or ordinary audit output.
 
 If Monit was a fresh deployment and must be removed from service, disable and
 stop `monit.service` first. Package removal is a separate reviewed action; do
@@ -267,6 +327,8 @@ legible.
 ## Official references
 
 - [Monit manual](https://mmonit.com/monit/documentation/monit.html)
+- [Monit 6.0.0 source, including the command runner's explicit umask](https://mmonit.com/monit/dist/monit-6.0.0.tar.gz)
+- [systemd execution environment and UMask](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html)
 - [Fedora package metadata for Monit](https://packages.fedoraproject.org/pkgs/monit/monit/)
 - [Red Hat SELinux administration](https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/9/html/using_selinux/index)
 - [logrotate manual](https://man7.org/linux/man-pages/man8/logrotate.8.html)
