@@ -809,12 +809,35 @@ Before committing, confirm that the diff contains none of the following:
 
 - private keys, certificates, ACME account state, or credentials;
 - real upstream IP addresses, ports, or internal DNS names;
-- customer or production hostnames that are not already public; or
+- client names, application identities, or deployment hostnames, even when
+  already public or used as rejection-test fixtures; or
 - generated logs, caches, PID files, temporary files, or local editor state.
 
 The root, `nginx/upstreams/`, and `nginx/trusted-proxies/` `.gitignore` files
 enforce the common cases, but they are not a substitute for reviewing the
 staged diff.
+
+Keep the private name pattern in the ignored root `.env`, using the
+`CONFIG_PRIVATE_IDENTIFIER_PATTERN` assignment documented in `.env.example`.
+Use synthetic names in public tests; do not embed real deny-lists, including
+names assembled from string fragments. The shared reader treats `.env` as
+data and never executes it. A process environment value takes precedence;
+an explicitly empty value disables the private-name scan.
+
+```sh
+tests/run-all-local
+# After staging, check the actual content that will be committed:
+python3 tests/client-neutrality.py --staged
+```
+
+The local suite and component checks use this same configuration. The scanner
+checks tracked paths and content, including existing PDF text and metadata
+(`pdftotext` and `pdfinfo` are required when scanning PDFs). Matching values
+are redacted from diagnostics. Without a configured pattern it explicitly
+reports a skipped private-name scan; public CI still exercises synthetic
+scanner tests and scans Git history for secrets. These checks do not replace
+diff review, detect arbitrary obfuscated identifiers, or remove earlier Git
+history. Newly created files must be staged to enter the tracked-file scan.
 
 This repository is available under the [MIT License](LICENSE).
 

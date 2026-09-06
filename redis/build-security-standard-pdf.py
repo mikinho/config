@@ -18,11 +18,16 @@ import hashlib
 import html
 import os
 import re
+import sys
 import tempfile
 import textwrap
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, Sequence
+
+# Resolve the shared validator for direct execution and importlib-based tests.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from private_identifiers import validate_text
 
 DOCUMENT_DATE: Final[str] = "August 28, 2026"
 DOCUMENT_VERSION: Final[str] = "1.3"
@@ -170,17 +175,8 @@ def validate_blocks(blocks: Sequence[MarkdownBlock]) -> None:
     missing = [heading for heading in REQUIRED_HEADINGS if heading not in headings]
     if missing:
         raise ValueError(f"canonical source is missing headings: {', '.join(missing)}")
-    source_text = "\n".join(block.text for block in blocks).lower()
-    forbidden = (
-        "omi" + "celo",
-        "vul" + "can",
-        "haven" + "side",
-        "om" + "redis",
-        "om" + "web",
-    )
-    present = [token for token in forbidden if token in source_text]
-    if present:
-        raise ValueError(f"canonical public standard contains client identifiers: {present}")
+    source_text = "\n".join(block.text for block in blocks)
+    validate_text(source_text, repository_root=Path(__file__).resolve().parents[1])
 
 
 def inline_markup(text: str) -> str:

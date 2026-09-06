@@ -13,11 +13,16 @@ import hashlib
 import html
 import os
 import re
+import sys
 import tempfile
 import textwrap
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, Sequence
+
+# Resolve the shared validator for direct execution and importlib-based tests.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from private_identifiers import validate_text
 
 DOCUMENT_DATE: Final[str] = "August 31, 2026"
 DOCUMENT_VERSION: Final[str] = "1.0"
@@ -194,17 +199,8 @@ def validate_blocks(blocks: Sequence[MarkdownBlock]) -> None:
     text_parts = [block.text for block in blocks]
     for block in blocks:
         text_parts.extend(cell for row in block.rows for cell in row)
-    source_text = "\n".join(text_parts).lower()
-    forbidden = (
-        "omi" + "celo",
-        "vul" + "can",
-        "haven" + "side",
-        "om" + "redis",
-        "om" + "web",
-    )
-    present = [token for token in forbidden if token in source_text]
-    if present:
-        raise ValueError(f"public standard contains client identifiers: {present}")
+    source_text = "\n".join(text_parts)
+    validate_text(source_text, repository_root=Path(__file__).resolve().parents[1])
 
 
 def inline_markup(text: str) -> str:

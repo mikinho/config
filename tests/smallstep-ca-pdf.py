@@ -11,13 +11,14 @@ from __future__ import annotations
 import contextlib
 import importlib.util
 import io
+import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from types import ModuleType
 from typing import Final
-
+from unittest import mock
 
 sys.dont_write_bytecode = True
 
@@ -27,7 +28,7 @@ RENDERER_PATH: Final = REPOSITORY_ROOT / "smallstep-ca" / "build-security-standa
 
 
 def load_renderer() -> ModuleType:
-    """Load the renderer without modifying the repository import path."""
+    """Load the renderer without running its command-line entry point."""
 
     spec = importlib.util.spec_from_file_location("smallstep_ca_pdf", RENDERER_PATH)
     if spec is None or spec.loader is None:
@@ -39,6 +40,8 @@ def load_renderer() -> ModuleType:
 
 
 RENDERER: Final = load_renderer()
+SYNTHETIC_IDENTIFIER: Final = "fixture-client.invalid"
+SYNTHETIC_PATTERN: Final = r"fixture-client\.invalid"
 
 
 def minimal_standard(extra_text: str = "") -> str:
@@ -108,6 +111,15 @@ command --flag
 class CanonicalBoundaryTests(unittest.TestCase):
     """Verify canonical-source and output-path safety gates."""
 
+    def setUp(self) -> None:
+        """Use a synthetic rule independently of the operator's environment."""
+
+        environment = mock.patch.dict(
+            os.environ, {"CONFIG_PRIVATE_IDENTIFIER_PATTERN": SYNTHETIC_PATTERN}
+        )
+        environment.start()
+        self.addCleanup(environment.stop)
+
     def test_required_heading_is_enforced(self) -> None:
         """Removing a critical section makes the source invalid."""
 
@@ -116,11 +128,22 @@ class CanonicalBoundaryTests(unittest.TestCase):
             RENDERER.validate_blocks(blocks)
 
     def test_private_identifier_is_rejected(self) -> None:
-        """The reusable public standard fails closed on deployment identifiers."""
+        """A configured synthetic identifier is rejected without disclosing it."""
 
-        blocks = RENDERER.parse_markdown(minimal_standard("A havenside deployment."))
-        with self.assertRaisesRegex(ValueError, "client identifiers"):
+        blocks = RENDERER.parse_markdown(minimal_standard(SYNTHETIC_IDENTIFIER))
+        with self.assertRaises(ValueError) as raised:
             RENDERER.validate_blocks(blocks)
+        self.assertNotIn(SYNTHETIC_IDENTIFIER, str(raised.exception))
+        self.assertNotIn(SYNTHETIC_PATTERN, str(raised.exception))
+
+    def test_private_identifier_in_table_is_rejected(self) -> None:
+        """Table cells pass through the same configured privacy boundary."""
+
+        table = f"| Name | Value |\n| --- | --- |\n| Endpoint | {SYNTHETIC_IDENTIFIER} |\n"
+        blocks = RENDERER.parse_markdown(minimal_standard(table))
+        with self.assertRaises(ValueError) as raised:
+            RENDERER.validate_blocks(blocks)
+        self.assertNotIn(SYNTHETIC_IDENTIFIER, str(raised.exception))
 
     def test_check_mode_requires_distinct_output(self) -> None:
         """The renderer cannot replace its own canonical Markdown source."""

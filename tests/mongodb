@@ -9,8 +9,6 @@ set -eu
 PROGRAM_NAME=${0##*/}
 SCRIPT_DIRECTORY=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 REPOSITORY_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIRECTORY/.." && pwd)
-LOCAL_ENVIRONMENT_FILE=$REPOSITORY_ROOT/.env
-CONFIG_PRIVATE_IDENTIFIER_PATTERN=
 MONGODB_DIRECTORY=$REPOSITORY_ROOT/mongodb
 INSTALLER=$MONGODB_DIRECTORY/install
 BUNDLE_BUILDER=$MONGODB_DIRECTORY/build-bundle
@@ -30,15 +28,6 @@ fail() {
     exit 1
 }
 
-load_local_environment() {
-    [ -e "$LOCAL_ENVIRONMENT_FILE" ] || return 0
-    [ -f "$LOCAL_ENVIRONMENT_FILE" ] && [ ! -L "$LOCAL_ENVIRONMENT_FILE" ] \
-        || fail "local environment must be a regular, non-symbolic-link file: $LOCAL_ENVIRONMENT_FILE"
-    # shellcheck source=/dev/null
-    . "$LOCAL_ENVIRONMENT_FILE"
-}
-
-load_local_environment
 
 assert_contains() {
     checked_file=$1
@@ -350,12 +339,7 @@ if grep -F '%{SIGPGP:pgpsig}' "$INSTALLER" >/dev/null 2>&1; then
     fail 'MongoDB installer still uses the empty SIGPGP field'
 fi
 
-if [ -n "$CONFIG_PRIVATE_IDENTIFIER_PATTERN" ] \
-    && grep -R -E -i -- "$CONFIG_PRIVATE_IDENTIFIER_PATTERN" \
-        "$MONGODB_DIRECTORY" >/dev/null 2>&1
-then
-    fail 'generic MongoDB component contains deployment-specific identifiers'
-fi
+python3 "$SCRIPT_DIRECTORY/client-neutrality.py" mongodb
 if grep -R -E -- '--password([ =]|$)' "$MONGODB_DIRECTORY" >/dev/null 2>&1; then
     fail 'MongoDB component places a password in a command-line option'
 fi

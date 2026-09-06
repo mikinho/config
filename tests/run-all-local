@@ -125,6 +125,10 @@ step "Validating repository script conventions..."
 step "Validating repository configuration conventions..."
 "$REPOSITORY_ROOT/tests/config-conventions"
 
+step "Validating private audit configuration and client-neutral tracked content..."
+PYTHONDONTWRITEBYTECODE=1 python3 "$REPOSITORY_ROOT/tests/private-identifiers.py"
+PYTHONDONTWRITEBYTECODE=1 python3 "$REPOSITORY_ROOT/tests/client-neutrality.py"
+
 step "Validating gold application deployment profiles..."
 python3 "$REPOSITORY_ROOT/tests/application-deployment-standard.py"
 python3 "$REPOSITORY_ROOT/deploy/application/validate_profile.py" \

@@ -194,8 +194,6 @@ assert_contains "$VERIFIER" 'installed intermediate must remain valid for at lea
 assert_contains "$VERIFIER" 'installed intermediate password must contain one value of at least 16 characters'
 assert_contains "$VERIFIER" '/health'
 
-if grep -Eri 'omicelo|havenside|vulcan|omredis|omweb' "$COMPONENT_DIRECTORY"; then
-    fail 'public Smallstep CA standard contains a private deployment identifier'
-fi
+python3 "$SCRIPT_DIRECTORY/client-neutrality.py" smallstep-ca
 
 printf 'Validated Smallstep CA package, offline-root, policy, lifetime, and listener contracts.\n'

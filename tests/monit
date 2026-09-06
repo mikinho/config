@@ -17,7 +17,6 @@ VERIFIER=$MONIT_DIRECTORY/verify
 VERSION_LIBRARY=$MONIT_DIRECTORY/lib/version.sh
 SECURITY_LIBRARY=$MONIT_DIRECTORY/lib/security.sh
 TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/config-monit-tests.XXXXXX")
-CONFIG_PRIVATE_IDENTIFIER_PATTERN=${CONFIG_PRIVATE_IDENTIFIER_PATTERN:-}
 
 cleanup() {
     if [ -d "$TEST_ROOT" ]; then
@@ -600,10 +599,6 @@ expect_failure 'running Monit process UMask is not 0077' \
 
 python3 "$MONIT_DIRECTORY/build-operations-standard-pdf.py" --check >/dev/null
 
-if [ -n "$CONFIG_PRIVATE_IDENTIFIER_PATTERN" ] \
-    && grep -Eri -- "$CONFIG_PRIVATE_IDENTIFIER_PATTERN" "$MONIT_DIRECTORY"
-then
-    fail 'public Monit standard contains a client-specific identifier'
-fi
+python3 "$SCRIPT_DIRECTORY/client-neutrality.py" monit
 
 printf 'Validated Monit installer, render, policies, verifier, and client-neutral boundaries.\n'
