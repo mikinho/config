@@ -79,8 +79,23 @@ review these facts:
 
 The setup accepts a provisioner JSON array. This initial standard supports
 only encrypted `JWK` provisioners. Each object must contain `type: "JWK"`, a
-nonempty name, a public `key` object, and a nonempty `encryptedKey`. Plaintext
-password fields are rejected.
+unique nonempty name, a public `key` object, and a nonempty compact-JWE
+`encryptedKey`. Public keys must use exactly `kty`, `crv`, `alg`, `use`, `kid`,
+`x`, and `y`; they must identify P-256/ES256 signing keys with unique key IDs.
+OpenSSL verifies that the encoded point belongs to P-256. Private JWK fields
+such as `d`, plaintext passwords, unknown fields, and provisioner options or
+templates are rejected. This prevents private signing material from reaching
+the CA's publicly readable provisioner endpoint.
+
+Optional provisioner `claims` may only narrow the selected authority limits.
+Their effective minimum must be at least five minutes; their effective default
+and maximum must not exceed the authority selections; minimum, default and
+maximum must remain ordered. Durations use positive integer seconds, minutes,
+or hours (`s`, `m`, `h`). Renewal may be disabled, but expired-certificate renewal,
+removal of Smallstep extensions and SSH claims are forbidden. The shared
+`validate-policy` command applies this same policy before setup and during
+installed verification. Encrypted provisioner-key/password pairing still needs
+the disposable issuance acceptance test; this validator does not decrypt it.
 
 The policy input is the value of `authority.policy`, not a whole `ca.json`.
 For example, this non-deployable documentation fixture scopes issuance to

@@ -12,10 +12,14 @@ SCRIPT_DIRECTORY=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 CA_TEMPLATE=$SCRIPT_DIRECTORY/templates/ca.json.in
 SYSTEMD_TEMPLATE=$SCRIPT_DIRECTORY/templates/step-ca.service.in
 SOURCE_VERIFIER=$SCRIPT_DIRECTORY/verify
+POLICY_VALIDATOR=$SCRIPT_DIRECTORY/validate-policy
+POLICY_FILTER=$SCRIPT_DIRECTORY/lib/policy.jq
 INSTALLED_VERIFIER=/usr/local/bin/verify-step-ca
 INSTALLED_POLICY_DIRECTORY=/usr/local/libexec/config-step-ca
 INSTALLED_CA_TEMPLATE=$INSTALLED_POLICY_DIRECTORY/templates/ca.json.in
 INSTALLED_SYSTEMD_TEMPLATE=$INSTALLED_POLICY_DIRECTORY/templates/step-ca.service.in
+INSTALLED_POLICY_VALIDATOR=$INSTALLED_POLICY_DIRECTORY/validate-policy
+INSTALLED_POLICY_FILTER=$INSTALLED_POLICY_DIRECTORY/lib/policy.jq
 
 CONFIGURATION_PATH=/etc/step-ca/config/ca.json
 ROOT_CERTIFICATE_TARGET=/etc/step-ca/certs/root_ca.crt
@@ -260,44 +264,10 @@ validate_public_source() {
 }
 
 validate_json_inputs() {
-    jq -e '
-        type == "array" and length > 0 and
-        all(.[];
-            type == "object" and .type == "JWK" and
-            (.name | type == "string" and length > 0) and
-            (.key | type == "object") and
-            .key.use == "sig" and .key.kty == "EC" and
-            .key.crv == "P-256" and .key.alg == "ES256" and
-            (.key.kid | type == "string" and length > 0) and
-            (.key.x | type == "string" and length > 0) and
-            (.key.y | type == "string" and length > 0) and
-            (.encryptedKey | type == "string" and
-                test("^[A-Za-z0-9_-]+(\\.[A-Za-z0-9_-]+){4}$")) and
-            (has("password") | not)
-        )
-    ' "$PROVISIONERS_FILE" >/dev/null \
-        || fail "provisioners file must contain only encrypted JWK provisioners"
-    jq -e '
-        type == "object" and keys == ["x509"] and
-        (.x509 | type == "object") and
-        (.x509 | (keys - ["allow", "allowWildcardNames", "deny"] | length == 0)) and
-        (.x509.allow | type == "object" and length > 0 and
-            all(to_entries[];
-                ((.key == "cn" or .key == "dns" or .key == "email" or
-                    .key == "ip" or .key == "uri") and
-                (.value | type == "array" and length > 0 and
-                    all(.[]; type == "string" and length > 0)))) and
-        ((.x509 | has("deny") | not) or
-            (.x509.deny | type == "object" and length > 0 and
-                all(to_entries[];
-                    ((.key == "cn" or .key == "dns" or .key == "email" or
-                        .key == "ip" or .key == "uri") and
-                    (.value | type == "array" and length > 0 and
-                        all(.[]; type == "string" and length > 0))))) and
-        (.x509.allowWildcardNames == false) and
-        (has("ssh") | not)
-    ' "$X509_POLICY_FILE" >/dev/null \
-        || fail "X.509 policy must be scoped, disable wildcard names, and omit SSH policy"
+    "$POLICY_VALIDATOR" --provisioners-file "$PROVISIONERS_FILE" \
+        --x509-policy-file "$X509_POLICY_FILE" --default-tls-hours "$DEFAULT_TLS_HOURS" \
+        --max-tls-hours "$MAX_TLS_HOURS" >/dev/null \
+        || fail "CA issuance policy failed shared validation"
 }
 
 render_configuration() {
@@ -331,7 +301,7 @@ render_service() {
     ' "$SYSTEMD_TEMPLATE" > "$output_path"
 }
 
-for source_path in "$CA_TEMPLATE" "$SYSTEMD_TEMPLATE" "$SOURCE_VERIFIER"; do
+for source_path in "$CA_TEMPLATE" "$SYSTEMD_TEMPLATE" "$SOURCE_VERIFIER" "$POLICY_VALIDATOR" "$POLICY_FILTER"; do
     validate_source "$source_path"
 done
 
@@ -448,7 +418,9 @@ done
 for policy_pair in \
     "verifier:$SOURCE_VERIFIER:$INSTALLED_VERIFIER" \
     "CA template:$CA_TEMPLATE:$INSTALLED_CA_TEMPLATE" \
-    "systemd template:$SYSTEMD_TEMPLATE:$INSTALLED_SYSTEMD_TEMPLATE"
+    "systemd template:$SYSTEMD_TEMPLATE:$INSTALLED_SYSTEMD_TEMPLATE" \
+    "issuance validator:$POLICY_VALIDATOR:$INSTALLED_POLICY_VALIDATOR" \
+    "issuance filter:$POLICY_FILTER:$INSTALLED_POLICY_FILTER"
 do
     policy_label=${policy_pair%%:*}
     policy_paths=${policy_pair#*:}

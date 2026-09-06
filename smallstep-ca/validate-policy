@@ -1,0 +1,123 @@
+#!/usr/bin/env sh
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
+# Read-only validation shared by first-install setup and deployed verification.
+# The protected temporary directory contains only public keys and policy input.
+set -eu
+set -f
+
+PROGRAM_NAME=${0##*/}
+SCRIPT_DIRECTORY=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+POLICY_FILTER=$SCRIPT_DIRECTORY/lib/policy.jq
+CONFIGURATION_FILE=
+PROVISIONERS_FILE=
+X509_POLICY_FILE=
+DEFAULT_TLS_HOURS=24
+MAX_TLS_HOURS=720
+MODE=validate
+TEMPORARY_DIRECTORY=
+
+fail() {
+    printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2
+    exit 1
+}
+
+cleanup() {
+    if [ -n "$TEMPORARY_DIRECTORY" ] && [ -d "$TEMPORARY_DIRECTORY" ]; then
+        rm -rf -- "$TEMPORARY_DIRECTORY"
+    fi
+}
+
+usage() {
+    cat <<EOF
+Usage:
+  $PROGRAM_NAME --check
+  $PROGRAM_NAME --configuration-file FILE [LIFETIME_OPTIONS]
+  $PROGRAM_NAME --provisioners-file FILE --x509-policy-file FILE [LIFETIME_OPTIONS]
+
+Lifetime options: --default-tls-hours HOURS --max-tls-hours HOURS
+Validates public-only P-256 provisioner keys, restricted effective claims, and
+the X.509 issuance policy. Does not print key material or change the CA.
+EOF
+}
+
+[ -f "$POLICY_FILTER" ] && [ ! -L "$POLICY_FILTER" ] \
+    || fail "issuance policy filter must be a regular, non-symbolic-link file"
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --check) MODE=check; shift ;;
+        --configuration-file) [ "$#" -ge 2 ] || fail "$1 requires a file"; CONFIGURATION_FILE=$2; shift 2 ;;
+        --provisioners-file) [ "$#" -ge 2 ] || fail "$1 requires a file"; PROVISIONERS_FILE=$2; shift 2 ;;
+        --x509-policy-file) [ "$#" -ge 2 ] || fail "$1 requires a file"; X509_POLICY_FILE=$2; shift 2 ;;
+        --default-tls-hours) [ "$#" -ge 2 ] || fail "$1 requires a value"; DEFAULT_TLS_HOURS=$2; shift 2 ;;
+        --max-tls-hours) [ "$#" -ge 2 ] || fail "$1 requires a value"; MAX_TLS_HOURS=$2; shift 2 ;;
+        --help | -h) usage; exit 0 ;;
+        *) fail "unknown argument: $1" ;;
+    esac
+done
+if [ "$MODE" = check ]; then
+    [ -z "$CONFIGURATION_FILE$PROVISIONERS_FILE$X509_POLICY_FILE" ] \
+        || fail "--check does not accept policy inputs"
+    printf 'Validated Smallstep issuance-policy sources.\n'
+    exit 0
+fi
+for duration in "$DEFAULT_TLS_HOURS" "$MAX_TLS_HOURS"; do
+    case "$duration" in '' | *[!0-9]* | 0*) fail "lifetimes must be positive decimal hours" ;; esac
+done
+for required_command in cat jq mktemp openssl rm tr; do
+    command -v "$required_command" >/dev/null 2>&1 || fail "required command not found: $required_command"
+done
+if [ -n "$CONFIGURATION_FILE" ]; then
+    [ -z "$PROVISIONERS_FILE$X509_POLICY_FILE" ] || fail "select configuration or separate policy inputs"
+    set -- "$CONFIGURATION_FILE"
+else
+    [ -n "$PROVISIONERS_FILE" ] && [ -n "$X509_POLICY_FILE" ] || fail "both policy input files are required"
+    set -- "$PROVISIONERS_FILE" "$X509_POLICY_FILE"
+fi
+for input_path in "$@"; do
+    [ -f "$input_path" ] && [ ! -L "$input_path" ] || fail "policy input must be a regular, non-symbolic-link file"
+done
+umask 077
+TEMPORARY_DIRECTORY=$(mktemp -d "${TMPDIR:-/tmp}/config-step-ca-policy.XXXXXX")
+trap cleanup EXIT HUP INT TERM
+if [ -n "$CONFIGURATION_FILE" ]; then
+    jq -s 'if length == 1 then .[0] |
+            {authority: {policy: .authority.policy, provisioners: .authority.provisioners}}
+        else error("configuration must contain one JSON value") end' \
+        "$CONFIGURATION_FILE" > "$TEMPORARY_DIRECTORY/policy.json" 2>/dev/null \
+        || fail "cannot parse the CA issuance policy"
+else
+    jq -n --slurpfile provisioners "$PROVISIONERS_FILE" --slurpfile policy "$X509_POLICY_FILE" \
+        'if ($provisioners | length) == 1 and ($policy | length) == 1 then
+            {authority: {provisioners: $provisioners[0], policy: $policy[0]}}
+        else error("each policy input must contain one JSON value") end' \
+        > "$TEMPORARY_DIRECTORY/policy.json" 2>/dev/null \
+        || fail "cannot parse the CA issuance policy"
+fi
+jq -e --argjson default_hours "$DEFAULT_TLS_HOURS" --argjson max_hours "$MAX_TLS_HOURS" \
+    -f "$POLICY_FILTER" "$TEMPORARY_DIRECTORY/policy.json" >/dev/null 2>&1 \
+    || fail "issuance policy requires public-only P-256 JWKs, scoped X.509 names, and claims that do not expand authority limits; options and unknown fields are forbidden"
+jq -c '.authority.provisioners[].key' "$TEMPORARY_DIRECTORY/policy.json" \
+    > "$TEMPORARY_DIRECTORY/keys.jsonl"
+while IFS= read -r public_key; do
+    printf '%s\n' "$public_key" > "$TEMPORARY_DIRECTORY/key.json"
+    # DER SubjectPublicKeyInfo for id-ecPublicKey + prime256v1 followed by an
+    # uncompressed 65-byte point. Schema checks guarantee canonical 32-byte X/Y.
+    printf '\060\131\060\023\006\007\052\206\110\316\075\002\001\006\010\052\206\110\316\075\003\001\007\003\102\000\004' \
+        > "$TEMPORARY_DIRECTORY/key.der"
+    for coordinate in x y; do
+        jq -jr --arg coordinate "$coordinate" '.[$coordinate] + "="' \
+            "$TEMPORARY_DIRECTORY/key.json" | tr '_-' '/+' \
+            > "$TEMPORARY_DIRECTORY/coordinate.base64"
+        openssl base64 -d -A -in "$TEMPORARY_DIRECTORY/coordinate.base64" \
+            >> "$TEMPORARY_DIRECTORY/key.der" 2>/dev/null \
+            || fail "cannot decode provisioner public-key coordinates"
+    done
+    openssl pkey -pubin -inform DER -in "$TEMPORARY_DIRECTORY/key.der" \
+        -pubcheck -noout >/dev/null 2>&1 \
+        || fail "provisioner public key is not a valid P-256 curve point"
+done < "$TEMPORARY_DIRECTORY/keys.jsonl"
+printf 'Validated public-only provisioner keys, effective lifetime limits, and X.509 issuance policy.\n'

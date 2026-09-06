@@ -176,7 +176,12 @@ expect_failure 'unknown argument: --root-private-key-file' \
 
 assert_contains "$SETUP" 'root private key must not exist on the online CA host'
 assert_contains "$SETUP" 'has("password") | not'
-assert_contains "$SETUP" '.type == "JWK"'
+# Match the literal shell invocation, not the test process environment.
+# shellcheck disable=SC2016
+assert_contains "$SETUP" '"$POLICY_VALIDATOR" --provisioners-file'
+# shellcheck disable=SC2016
+assert_contains "$VERIFIER" '"$POLICY_VALIDATOR" --configuration-file'
+node "$SCRIPT_DIRECTORY/smallstep-ca-policy.mjs"
 assert_contains "$SETUP" 'BEGIN ENCRYPTED PRIVATE KEY'
 assert_contains "$SETUP" 'CA:TRUE, pathlen:0'
 assert_contains "$SETUP" 'step must be a system account with the reviewed home and shell'
