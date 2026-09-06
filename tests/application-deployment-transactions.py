@@ -35,6 +35,7 @@ GATEWAY_TEST_ENV: Final = "EXAMPLE_NODE_APP_DEPLOY_GATEWAY_TESTING"
 SNAPSHOT_TEST_ENV: Final = "EXAMPLE_NODE_APP_MANIFEST_SNAPSHOT_TESTING"
 CLAIM_PATTERN: Final = r"^deploy-trigger-[0-9]+-[0-9a-f]{24}$"
 CANDIDATE_MODE: Final = 0o2755
+PRIVATE_PROCESS_UMASK: Final = 0o077
 
 
 def run(
@@ -43,7 +44,7 @@ def run(
     environment: Mapping[str, str] | None = None,
     timeout: float = 10.0,
 ) -> subprocess.CompletedProcess[str]:
-    """Run one bounded subprocess and return decoded output."""
+    """Run a bounded helper under the services' private creation policy."""
 
     child_environment = os.environ.copy()
     if environment is not None:
@@ -55,6 +56,7 @@ def run(
         text=True,
         env=child_environment,
         timeout=timeout,
+        umask=PRIVATE_PROCESS_UMASK,
     )
 
 
@@ -157,6 +159,7 @@ for command in sys.argv[3:]:
 
         root = self.root / "gateway"
         root.mkdir(mode=0o755)
+        root.chmod(0o755)
         inbox_mode = 0o770 if sys.platform == "darwin" else 0o2770
         for name, mode in (
             ("inbox", inbox_mode),
@@ -185,9 +188,8 @@ status = int(os.environ.get("FAKE_RRSYNC_STATUS", "0"))
 if status:
     raise SystemExit(status)
 (root / token).mkdir(mode=0o755)
-candidate_mode = os.environ.get("FAKE_RRSYNC_CANDIDATE_MODE")
-if candidate_mode:
-    (root / token).chmod(int(candidate_mode, 8))
+candidate_mode = os.environ.get("FAKE_RRSYNC_CANDIDATE_MODE", "755")
+(root / token).chmod(int(candidate_mode, 8))
 print("wrapper=" + "|".join(sys.argv[1:]))
 """,
             encoding="utf-8",
@@ -493,6 +495,50 @@ class TriggerTransactionTests(RenderedBundleTestCase):
             (root / "results" / f"{FIRST_TOKEN}.{claim}").read_bytes(),
             b"success\n",
         )
+
+
+class ProcessCreationPolicyTests(RenderedBundleTestCase):
+    """Verify that installed-policy acceptance detects stale running masks."""
+
+    def test_verifier_rejects_configured_and_running_mask_drift(self) -> None:
+        """A correct loaded unit cannot hide a stale or unreadable process mask."""
+
+        source = (self.bundle / "scripts" / "verify-host").read_text(encoding="utf-8")
+        start = source.index("verify_service_umask() {")
+        end = source.index("\nverify_systemd() {", start)
+        verifier_function = source[start:end]
+        program = r'''
+set -eu
+pass() { :; }
+fail() { printf '%s\n' "$*" >&2; exit 1; }
+systemctl() {
+    case "$4" in
+        UMask) printf '%s\n' "$TEST_CONFIGURED_MASK" ;;
+        MainPID) printf '%s\n' "$TEST_MAIN_PID" ;;
+        *) exit 1 ;;
+    esac
+}
+awk() { printf '%s\n' "$TEST_PROCESS_MASK"; }
+'''
+        cases = (
+            ("0077", "123", "0077", True),
+            ("0022", "123", "0077", False),
+            ("0077", "123", "0022", False),
+            ("0077", "123", "", False),
+            ("0077", "0", "", True),
+            ("0077", "", "", False),
+        )
+        for configured, pid, running, succeeds in cases:
+            with self.subTest(configured=configured, pid=pid, running=running):
+                result = run(
+                    ("bash", "-c", program + verifier_function + "\nverify_service_umask example.service"),
+                    environment={
+                        "TEST_CONFIGURED_MASK": configured,
+                        "TEST_MAIN_PID": pid,
+                        "TEST_PROCESS_MASK": running,
+                    },
+                )
+                self.assertEqual(result.returncode == 0, succeeds, result.stderr)
 
 
 class ManifestSnapshotTests(RenderedBundleTestCase):

@@ -201,6 +201,14 @@ top-level directories, and retain the maintenance guard.
 
 ## 8. Verification and evidence
 
+Live, candidate, finalizer, and recovery services MUST declare `UMask=0077`.
+Manual finalization and recovery MUST establish the same private default.
+Group-readable deployment results and committed state MUST receive their exact
+published modes explicitly; changing the default mask MUST NOT make completion
+evidence unreadable to the waiting gateway. Verification MUST check loaded
+unit masks and the mask of each running main process. A configured value alone
+does not prove that an existing process adopted changed execution policy.
+
 Each rendered bundle MUST include a non-mutating verifier that checks the live
 host against this contract. Verification MUST fail closed when a required tool,
 policy rule, label, unit, script, state object, or health probe is unavailable.

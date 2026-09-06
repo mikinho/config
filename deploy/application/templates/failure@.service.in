@@ -9,6 +9,7 @@ Description=Record failure of @@APPLICATION_TAG@@ deployment unit %i
 
 [Service]
 Type=oneshot
+UMask=0077
 ExecStart=/usr/bin/logger -p daemon.crit -t @@APPLICATION_TAG@@-deploy Deployment finalizer failed: %i
 NoNewPrivileges=yes
 PrivateTmp=yes

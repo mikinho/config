@@ -259,12 +259,35 @@ verify_rsync_contract() {
     done
 }
 
+verify_service_umask() {
+    local unit=$1 configured_mask main_pid process_mask
+    configured_mask="$(systemctl show "$unit" -p UMask --value 2>/dev/null || true)"
+    case "$configured_mask" in
+        0077 | 077) pass "private creation mask configured: $unit" ;;
+        *) fail "unit creation mask is not 0077: $unit" ;;
+    esac
+    main_pid="$(systemctl show "$unit" -p MainPID --value 2>/dev/null || true)"
+    if [[ "$main_pid" =~ ^[1-9][0-9]*$ ]]; then
+        process_mask="$(awk '$1 == "Umask:" { print $2 }' "/proc/$main_pid/status" 2>/dev/null || true)"
+        case "$process_mask" in
+            0077 | 077) pass "private creation mask running: $unit" ;;
+            *) fail "running process mask is not 0077: $unit; restart after reviewing execution-policy changes" ;;
+        esac
+    elif [[ "$main_pid" != 0 ]]; then
+        fail "cannot inspect main PID for creation policy: $unit"
+    fi
+}
+
 verify_systemd() {
+    local unit
     if systemd-analyze verify "${SYSTEMD_UNITS[@]/#//etc/systemd/system/}" >/dev/null; then
         pass "rendered systemd units verify"
     else
         fail "rendered systemd units fail systemd-analyze verify"
     fi
+    for unit in "$LIVE_SERVICE" "$FINALIZER_SERVICE" "$RECOVERY_SERVICE"; do
+        verify_service_umask "$unit"
+    done
     for unit in "$LIVE_SERVICE" "$PATH_UNIT" "$RECOVERY_SERVICE"; do
         systemctl is-enabled --quiet "$unit" \
             && pass "unit enabled: $unit" \
