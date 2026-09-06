@@ -153,6 +153,36 @@ jobs:
             exit 1
           fi
 
+  smallstep-runtime:
+    name: Smallstep issuance policy on ${{ matrix.image }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["rockylinux:9", "rockylinux:10"]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pinned packages and exercise disposable CA
+        run: |
+          docker run --rm \
+            --volume "$PWD:/workspace:ro" \
+            "${{ matrix.image }}" \
+            /bin/bash -euxo pipefail -c '
+              if grep --quiet "release 9" /etc/redhat-release; then
+                dnf module enable --assumeyes nodejs:22
+              fi
+              dnf install --assumeyes --allowerasing curl nodejs systemd
+              /workspace/smallstep-ca/install
+              /workspace/tests/smallstep-ca
+              node /workspace/tests/smallstep-ca-runtime.mjs
+            '
+
   redis-package:
     name: Redis 8.2.9 package and profiles on ${{ matrix.platform.name }}
     runs-on: ubuntu-24.04

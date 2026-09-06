@@ -389,12 +389,19 @@ generated content outside `/var/lib/nginx` must add only the required path with
 a systemd `ReadWritePaths=` drop-in. A build that enables PCRE JIT or another
 JIT-based dynamic module must override `MemoryDenyWriteExecute=` after review.
 
-The unit does not restrict nginx's capability bounding set or system-call
-allowlist. The privileged master must bind ports 80 and 443, change worker
-identity, raise file limits, and signal workers. Selecting `quic_bpf` also
-initializes an eBPF map and may require additional capabilities. Those controls
-require host-specific validation against the installed kernel, selected stubs,
-and nginx build. `LimitMEMLOCK=64M` is provided for the optional eBPF map.
+The unit bounds the master's capabilities to privileged binds, worker identity
+changes, log ownership and access, worker signals, and rlimits. Workers retain
+no effective or permitted capabilities. `SystemCallFilter=~@mount` denies mount
+operations without imposing a broader syscall allowlist. Selecting `quic_bpf`
+installs a separate capability extension; the mount denial remains active and
+`LimitMEMLOCK=64M` is available for the optional eBPF map. Validate either
+profile against the actual kernel, nginx build, and enforcing SELinux policy.
+
+Foreground execution preserves `UMask=0027`. The read-only startup checker uses
+`ExecStartPost=!` to inspect workers with root:root credentials while retaining
+its other restrictions; nginx itself remains root:nginx. Setup also checks
+that the active worker count matches the reviewed capacity inputs. See the
+[systemd runtime contract](systemd/README.md) for migration and verification.
 
 ## Site configuration contract
 
@@ -726,6 +733,12 @@ Repeat the consent, caching, headers, redirects, and HTML checks after each
 material application, plugin, theme, proxy, or CDN change.
 
 ## Validation
+
+The [Linux security acceptance checklist](deploy/security-acceptance.md)
+separates read-only inspection from service lifecycle tests on disposable
+hosts. It covers process masks, effective overrides, log rotation, certificate
+renewal, recovery evidence, and operational audit controls. Markdown is the
+canonical guidance; PDF snapshots are generated or refreshed only on request.
 
 GitHub Actions validates deployment profile coverage, exercises the installer,
 runs `nginx -t` against stable and mainline nginx.org packages on Rocky Linux

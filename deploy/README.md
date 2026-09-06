@@ -191,8 +191,9 @@ sudo deploy/install-host-tools
 ```
 
 `verify-deployment` performs a non-destructive, root-only audit of live host
-state, asserting Nginx version and configuration, local certificate file
-completeness and leaf expiration,
+state, asserting nginx version, configuration, loaded unit policy, running
+master/worker masks and capabilities, and log-directory traversal; local
+certificate file completeness and leaf expiration;
 synchronized time, active systemd units, non-persistent Bash history with
 same-session recall, generic terminal readiness, OpenSSH phase and
 authentication restrictions, Fail2ban runtime and topology policy, services
@@ -216,9 +217,19 @@ sudo /usr/local/bin/verify-deployment \
 sudo /usr/local/bin/verify-deployment --site example_wp --verbose
 ```
 
+Use `--quic-bpf` when that optional profile is selected; the default requires
+the smaller baseline capability set. The runtime helper is installed at
+`/usr/local/libexec/nginx-runtime-verify` by both nginx setup and the host-tool
+installer. It runs at nginx startup and during host verification.
+
 Repeat `--ignore-ip` for every administrative CIDR passed to host setup. Use
 `--ssh-phase prepare` only while both transition ports are intentionally
 active; final is the default. The verifier never changes host state.
+
+Use the [Linux security acceptance checklist](security-acceptance.md) for
+process masks, effective overrides, identity-based access tests, log rotation,
+certificate renewal, and recovery on disposable hosts. Record which runtime
+checks remain pending; a passing local suite is not live-host acceptance.
 
 `certbot-healthcheck` fails closed when the live tree is missing or empty, a
 discovered lineage has missing/unreadable/unparseable certificate material,
