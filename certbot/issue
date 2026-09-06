@@ -15,6 +15,8 @@ NGINX_CONFIG=/etc/nginx/nginx.conf
 NATIVE_CERTBOT=/bin/certbot
 SNAP_CERTBOT=/usr/local/bin/certbot
 HEALTHCHECK=/usr/local/bin/certbot-healthcheck
+STAGING_ACME_SERVER=https://acme-staging-v02.api.letsencrypt.org/directory
+PRODUCTION_ACME_SERVER=https://acme-v02.api.letsencrypt.org/directory
 
 MODE=apply
 BACKEND=native
@@ -42,6 +44,7 @@ Tests or obtains the first certificate lineage with the repository HTTP-01
 webroot. Staging uses Certbot's non-persistent --dry-run. Production requires
 an explicit assertion that the same names passed staging. Existing lineages
 are never modified; use 'certbot reconfigure' for a managed certificate.
+The selected environment pins the corresponding Let's Encrypt ACME endpoint.
 EOF
 }
 
@@ -120,10 +123,11 @@ validate_selection() {
         *) fail "unsupported Certbot backend: $BACKEND" ;;
     esac
     case "$ENVIRONMENT" in
-        staging) ;;
+        staging) ACME_SERVER=$STAGING_ACME_SERVER ;;
         production)
             [ "$STAGING_PASSED" = yes ] \
                 || fail "production issuance requires --staging-passed"
+            ACME_SERVER=$PRODUCTION_ACME_SERVER
             ;;
         '') fail "select exactly one issuance environment: --staging or --production" ;;
         *) fail "unsupported issuance environment: $ENVIRONMENT" ;;
@@ -149,7 +153,8 @@ build_certbot_command() {
         --cert-name "$PRIMARY_DOMAIN" \
         --webroot \
         --webroot-path "$ACME_WEBROOT" \
-        --preferred-challenges http
+        --preferred-challenges http \
+        --server "$ACME_SERVER"
     for issuance_domain in $DOMAINS; do
         set -- "$@" --domain "$issuance_domain"
     done
@@ -169,7 +174,8 @@ print_certbot_command() {
         --cert-name "$PRIMARY_DOMAIN" \
         --webroot \
         --webroot-path "$ACME_WEBROOT" \
-        --preferred-challenges http
+        --preferred-challenges http \
+        --server "$ACME_SERVER"
     for issuance_domain in $DOMAINS; do
         set -- "$@" --domain "$issuance_domain"
     done
@@ -253,7 +259,7 @@ print_plan() {
     if [ "$ENVIRONMENT" = production ]; then
         print_command \
             "$CERTBOT_BINARY" renew --cert-name "$PRIMARY_DOMAIN" --dry-run \
-            --no-random-sleep-on-renew
+            --no-random-sleep-on-renew --server "$STAGING_ACME_SERVER"
         print_command "$HEALTHCHECK"
     fi
     printf 'Plan complete; no certificate or host state was changed.\n'
@@ -265,7 +271,7 @@ issue_certificate() {
     build_certbot_command
     if [ "$ENVIRONMENT" = production ]; then
         "$CERTBOT_BINARY" renew --cert-name "$PRIMARY_DOMAIN" --dry-run \
-            --no-random-sleep-on-renew
+            --no-random-sleep-on-renew --server "$STAGING_ACME_SERVER"
         [ -x "$HEALTHCHECK" ] \
             || fail "certificate healthcheck is missing: $HEALTHCHECK"
         "$HEALTHCHECK"

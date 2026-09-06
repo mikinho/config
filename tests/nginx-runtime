@@ -7,6 +7,7 @@
 set -eu
 
 PROGRAM_NAME=${0##*/}
+SCRIPT_DIRECTORY=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 NGINX_PREFIX=${1:-/tmp/nginx-safe}
 NGINX_CONFIGURATION=nginx.conf
 NGINX_PID_FILE=/run/nginx/nginx.pid
@@ -14,13 +15,21 @@ NGINX_PID_FILE=/run/nginx/nginx.pid
 # Linux's loopback /8 reaches the wildcard listener without exposing CI ports.
 PUBLIC_EDGE_ADDRESS=127.0.0.2
 SAMPLE_ROOT=/var/www/sample_wp/wordpress
+NODE_ROOT=/var/www/sample_node/wwwroot
+NODE_SOCKET=/run/sample_node/sample_node.sock
+NODE_ACCESS_LOG=/var/log/nginx/sample_node.access.log
 STATIC_FAILURE_LOG=/var/log/nginx/static-asset-failures.log
 TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/config-nginx-runtime.XXXXXX")
 NGINX_PID=
+NODE_PID=
 
 cleanup() {
     if [ -n "$NGINX_PID" ] && kill -0 "$NGINX_PID" 2>/dev/null; then
         kill -QUIT "$NGINX_PID"
+    fi
+    if [ -n "$NODE_PID" ] && kill -0 "$NODE_PID" 2>/dev/null; then
+        kill -TERM "$NODE_PID"
+        wait "$NODE_PID" || true
     fi
 
     rm -rf -- "$TEST_ROOT"
@@ -66,6 +75,60 @@ assert_header() {
         || fail "$request_name omitted expected header: $expected_header"
 }
 
+assert_single_header() {
+    request_name=$1
+    header_name=$2
+    expected_header=$3
+
+    assert_header "$request_name" "$expected_header"
+    header_count=$(grep --ignore-case --count \
+        "^$header_name:" "$TEST_ROOT/$request_name.headers" || true)
+    [ "$header_count" -eq 1 ] \
+        || fail "$request_name returned $header_count $header_name headers"
+}
+
+assert_echo() {
+    node --input-type=module - "$TEST_ROOT/$1.body" "$2" "$3" <<'NODE'
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+
+const [bodyPath, expectedHost, expectedScheme] = process.argv.slice(2);
+const { headers, method } = JSON.parse(readFileSync(bodyPath, "utf8"));
+assert.equal(method, "GET");
+assert.equal(headers.host, expectedHost);
+assert.equal(headers["x-forwarded-host"], expectedHost);
+assert.equal(headers["x-real-ip"], "127.0.0.1");
+assert.equal(headers["x-forwarded-for"], "127.0.0.1");
+assert.equal(headers["x-forwarded-proto"], expectedScheme);
+assert.equal(headers.proxy, undefined);
+assert.match(headers["x-request-id"], /^[a-f0-9]{32}$/);
+NODE
+}
+
+start_node() {
+    node "$SCRIPT_DIRECTORY/fixtures/nginx-node-echo.mjs" "$NODE_SOCKET" \
+        >"$TEST_ROOT/node.log" 2>&1 &
+    NODE_PID=$!
+    retry_count=0
+    while [ ! -S "$NODE_SOCKET" ]; do
+        kill -0 "$NODE_PID" 2>/dev/null \
+            || fail 'Node Unix-socket fixture exited before becoming ready'
+        retry_count=$((retry_count + 1))
+        [ "$retry_count" -lt 100 ] \
+            || fail 'Node Unix-socket fixture did not become ready'
+        sleep 0.1
+    done
+    chown root:nginx "$NODE_SOCKET"
+    chmod 0660 "$NODE_SOCKET"
+}
+
+stop_node() {
+    kill -TERM "$NODE_PID"
+    wait "$NODE_PID" || fail 'Node Unix-socket fixture failed during shutdown'
+    NODE_PID=
+    [ ! -S "$NODE_SOCKET" ] || fail 'Node fixture left its socket behind'
+}
+
 stop_nginx() {
     if [ -z "$NGINX_PID" ] || ! kill -0 "$NGINX_PID" 2>/dev/null; then
         return
@@ -84,10 +147,24 @@ stop_nginx() {
 
 trap cleanup EXIT HUP INT TERM
 
+[ "$(uname -s)" = Linux ] && [ "$(id -u)" -eq 0 ] \
+    || fail 'runtime checks require the isolated Linux CI container as root'
+[ -f "$NGINX_PREFIX/INSTALL-PROFILE" ] \
+    || fail 'runtime checks require a rendered CI nginx profile'
+case $NGINX_PREFIX in
+    /tmp/nginx-safe | /tmp/nginx-cache) ;;
+    *) fail 'runtime checks only operate on the disposable CI profile paths' ;;
+esac
+
 install -d -m 0755 "$SAMPLE_ROOT"
 printf '%s\n' '<?php echo "application";' >"$SAMPLE_ROOT/index.php"
 printf '%s\n' 'body { color: black; }' >"$SAMPLE_ROOT/app.css"
 rm -f -- "$SAMPLE_ROOT/maintenance.html" "$STATIC_FAILURE_LOG"
+install -d -m 0755 "$NODE_ROOT/static" /run/sample_node
+printf '%s\n' 'body { color: navy; }' >"$NODE_ROOT/static/app.css"
+printf '%s\n' 'body { color: teal; }' >"$NODE_ROOT/static/app.0123456789abcdef.css"
+rm -f -- "$NODE_ROOT/maintenance.html" "$NODE_ACCESS_LOG"
+start_node
 
 /usr/sbin/nginx -p "$NGINX_PREFIX/" -c "$NGINX_CONFIGURATION"
 NGINX_PID=$(cat "$NGINX_PID_FILE")
@@ -104,6 +181,7 @@ status=$(request proxied \
     --header 'Host: runtime-edge.invalid' \
     --header 'Proxy: http://attacker.invalid' \
     --header 'X-Forwarded-For: 198.51.100.7' \
+    --header 'X-Forwarded-Host: attacker.invalid' \
     'http://127.0.0.1:18080/')
 assert_status 200 "$status" proxied
 grep --fixed-strings --line-regexp 'proxy=' "$TEST_ROOT/proxied.body" >/dev/null \
@@ -111,11 +189,116 @@ grep --fixed-strings --line-regexp 'proxy=' "$TEST_ROOT/proxied.body" >/dev/null
 grep --fixed-strings --line-regexp 'xff=127.0.0.1' \
     "$TEST_ROOT/proxied.body" >/dev/null \
     || fail 'client-supplied forwarding chain was not replaced'
+grep --fixed-strings --line-regexp 'xfh=runtime-edge.invalid' \
+    "$TEST_ROOT/proxied.body" >/dev/null \
+    || fail 'client-supplied forwarded host was not replaced'
 assert_header proxied "Content-Security-Policy: default-src 'none'"
 csp_count=$(grep --ignore-case --count \
     '^Content-Security-Policy:' "$TEST_ROOT/proxied.headers" || true)
 [ "$csp_count" -eq 1 ] \
     || fail "proxied response returned $csp_count Content-Security-Policy headers"
+
+status=$(request node_proxied \
+    --insecure \
+    --interface 127.0.0.1 \
+    --resolve "node.example.com:443:$PUBLIC_EDGE_ADDRESS" \
+    --header 'Proxy: http://attacker.invalid' \
+    --header 'X-Forwarded-For: 198.51.100.7' \
+    --header 'X-Forwarded-Host: attacker.invalid' \
+    --header 'X-Forwarded-Proto: http' \
+    --header 'X-Real-IP: 198.51.100.8' \
+    --header 'X-Request-Id: client-request-id' \
+    --header 'User-Agent: runtime "quoted" agent' \
+    --referer 'https://referrer.invalid/source?private=nginx-referer-canary' \
+    'https://node.example.com/runtime-proxy?private=nginx-query-canary')
+assert_status 200 "$status" node_proxied
+assert_echo node_proxied node.example.com https
+assert_single_header node_proxied Content-Security-Policy \
+    "Content-Security-Policy: frame-ancestors 'self'; base-uri 'self'"
+assert_header node_proxied 'X-Content-Type-Options: nosniff'
+
+status=$(request websocket_policy \
+    --header 'Host: runtime-edge.invalid' \
+    --header 'Proxy: http://attacker.invalid' \
+    --header 'X-Forwarded-For: 198.51.100.7' \
+    --header 'X-Forwarded-Host: attacker.invalid' \
+    --header 'X-Forwarded-Proto: https' \
+    --header 'X-Real-IP: 198.51.100.8' \
+    --header 'X-Request-Id: client-request-id' \
+    'http://127.0.0.1:18080/websocket-policy')
+assert_status 200 "$status" websocket_policy
+assert_echo websocket_policy runtime-edge.invalid http
+
+status=$(request node_application_policy \
+    --insecure \
+    --resolve "node.example.com:443:$PUBLIC_EDGE_ADDRESS" \
+    'https://node.example.com/application-policy')
+assert_status 200 "$status" node_application_policy
+assert_single_header node_application_policy Content-Security-Policy \
+    "Content-Security-Policy: default-src 'none'"
+assert_single_header node_application_policy Cache-Control \
+    'Cache-Control: private, no-store'
+
+status=$(request node_static \
+    --insecure \
+    --resolve "node.example.com:443:$PUBLIC_EDGE_ADDRESS" \
+    'https://node.example.com/static/app.css')
+assert_status 200 "$status" node_static
+assert_single_header node_static Cache-Control \
+    'Cache-Control: public, max-age=86400, stale-while-revalidate=604800'
+assert_header node_static 'Strict-Transport-Security: max-age=31536000'
+assert_header node_static 'X-Content-Type-Options: nosniff'
+assert_single_header node_static Content-Security-Policy \
+    "Content-Security-Policy: frame-ancestors 'self'; base-uri 'self'"
+grep --fixed-strings 'body { color: navy; }' "$TEST_ROOT/node_static.body" >/dev/null \
+    || fail 'Node static asset did not come from the site filesystem'
+
+status=$(request node_immutable \
+    --insecure \
+    --resolve "node.example.com:443:$PUBLIC_EDGE_ADDRESS" \
+    'https://node.example.com/static/app.0123456789abcdef.css')
+assert_status 200 "$status" node_immutable
+assert_single_header node_immutable Cache-Control \
+    'Cache-Control: public, max-age=31536000, immutable'
+
+status=$(request node_static_fallback \
+    --insecure \
+    --resolve "node.example.com:443:$PUBLIC_EDGE_ADDRESS" \
+    'https://node.example.com/static/missing.css?retained=yes')
+assert_status 200 "$status" node_static_fallback
+assert_single_header node_static_fallback Cache-Control \
+    'Cache-Control: private, no-store'
+node --input-type=module - "$TEST_ROOT/node_static_fallback.body" <<'NODE'
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+const body = JSON.parse(readFileSync(process.argv[2], "utf8"));
+assert.equal(body.url, "/static/missing.css?retained=yes");
+NODE
+
+stop_node
+status=$(request node_maintenance_missing \
+    --insecure \
+    --resolve "node.example.com:443:$PUBLIC_EDGE_ADDRESS" \
+    'https://node.example.com/application-offline')
+assert_status 503 "$status" node_maintenance_missing
+assert_header node_maintenance_missing 'Strict-Transport-Security: max-age=31536000'
+assert_header node_maintenance_missing 'X-Content-Type-Options: nosniff'
+
+printf '%s\n' 'Node fixture temporarily unavailable' >"$NODE_ROOT/maintenance.html"
+status=$(request node_maintenance_present \
+    --insecure \
+    --resolve "node.example.com:443:$PUBLIC_EDGE_ADDRESS" \
+    'https://node.example.com/application-offline')
+assert_status 502 "$status" node_maintenance_present
+grep --fixed-strings 'Node fixture temporarily unavailable' \
+    "$TEST_ROOT/node_maintenance_present.body" >/dev/null \
+    || fail 'Node outage did not serve the provisioned maintenance document'
+
+status=$(request node_maintenance_direct \
+    --insecure \
+    --resolve "node.example.com:443:$PUBLIC_EDGE_ADDRESS" \
+    'https://node.example.com/maintenance.html')
+assert_status 404 "$status" node_maintenance_direct
 
 status=$(request maintenance_missing \
     --insecure \
@@ -161,6 +344,30 @@ status=$(request robots_missing \
 assert_status 404 "$status" robots_missing
 
 stop_nginx
+
+node --input-type=module - "$NODE_ACCESS_LOG" "$TEST_ROOT/node_proxied.body" <<'NODE'
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+
+const [logPath, responsePath] = process.argv.slice(2);
+const log = readFileSync(logPath, "utf8");
+assert.ok(!log.includes("nginx-query-canary"), "query canary leaked to access log");
+assert.ok(!log.includes("nginx-referer-canary"), "referer canary leaked to access log");
+const records = log.trim().split("\n").map((line) => JSON.parse(line));
+const matching = records.filter((record) => record.request_path === "/runtime-proxy");
+assert.equal(matching.length, 1);
+const [record] = matching;
+const response = JSON.parse(readFileSync(responsePath, "utf8"));
+assert.equal(record.request_id, response.headers["x-request-id"]);
+assert.equal(record.host, "node.example.com");
+assert.equal(record.query_present, true);
+assert.equal(record.referer, "https://referrer.invalid/source");
+assert.equal(record.user_agent, 'runtime "quoted" agent');
+assert.equal(record.status, 200);
+const withoutQuery = records.find((entry) => entry.request_path === "/application-policy");
+assert.ok(withoutQuery, "application policy request missing from access log");
+assert.equal(withoutQuery.query_present, false);
+NODE
 
 grep --fixed-strings '"request_path":"/missing.css"' \
     "$STATIC_FAILURE_LOG" >/dev/null \

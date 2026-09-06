@@ -23,8 +23,10 @@ TimeoutStartSec=1h
 Environment=HOME=/var/lib/letsencrypt
 
 # Keep Certbot's exit status intact. ExecStopPost runs after both successful and
-# failed oneshot execution, so nginx still loads certificates from successful
-# partial renewals while the unit remains failed when any renewal failed.
+# failed oneshot execution, so nginx attempts to load successful partial
+# renewals while the unit remains failed when any renewal failed. The reload
+# command reports preflight/signal failures; verify the served certificate
+# separately to confirm nginx adopted the change.
 ExecStart=/bin/certbot renew --quiet --agree-tos
 ExecStopPost=/bin/systemctl reload nginx.service
 

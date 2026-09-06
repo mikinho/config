@@ -1,0 +1,252 @@
+#!/usr/bin/env sh
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
+# Execute the actual setup scripts with fixed paths redirected into a temporary
+# fixture. Every privileged command is mocked; this is not a Linux kernel test.
+set -eu
+
+PROGRAM_NAME=${0##*/}
+SCRIPT_DIRECTORY=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+REPOSITORY_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIRECTORY/.." && pwd)
+TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/config-nginx-setup.XXXXXX")
+FIXTURE_ROOT=$TEST_ROOT/repository
+SETUP=$FIXTURE_ROOT/nginx/setup
+HOST_SETUP=$FIXTURE_ROOT/deploy/setup-host
+COMMAND_LOG=$TEST_ROOT/commands
+export COMMAND_LOG
+NGINX_TEST_ROOT=$TEST_ROOT
+export NGINX_TEST_ROOT
+
+cleanup() { rm -rf -- "$TEST_ROOT"; }
+trap cleanup EXIT HUP INT TERM
+fail() { printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2; exit 1; }
+
+assert_contains() {
+    grep -F -- "$2" "$1" >/dev/null || fail "$1 is missing: $2"
+}
+
+assert_no_mutation() {
+    if grep -E '^(install |sysctl |systemctl (daemon-reload|restart|enable)|helper )' "$COMMAND_LOG" >/dev/null; then
+        fail 'preflight failure reached a mutating command'
+    fi
+}
+
+expect_failure() {
+    expected_message=$1
+    shift
+    if "$@" > "$TEST_ROOT/stdout" 2> "$TEST_ROOT/stderr"; then
+        fail "command unexpectedly succeeded: $*"
+    fi
+    assert_contains "$TEST_ROOT/stderr" "$expected_message"
+}
+
+reset_fixture() {
+    : > "$COMMAND_LOG"
+    rm -f "$TEST_ROOT/reloaded" "$TEST_ROOT/restarted"
+    printf '101\n' > "$TEST_ROOT/nginx.pid"
+}
+
+mkdir -p "$TEST_ROOT/bin" "$TEST_ROOT/proc/201" \
+    "$FIXTURE_ROOT/nginx" "$FIXTURE_ROOT/systemd/system" \
+    "$FIXTURE_ROOT/logrotate" "$FIXTURE_ROOT/sysctl" \
+    "$FIXTURE_ROOT/deploy/host-profiles"
+cp "$REPOSITORY_ROOT/systemd/system/nginx.service" "$FIXTURE_ROOT/systemd/system/"
+cp "$REPOSITORY_ROOT/logrotate/nginx" "$FIXTURE_ROOT/logrotate/"
+cp "$REPOSITORY_ROOT/sysctl/99-nginx-quic.conf" "$FIXTURE_ROOT/sysctl/"
+cp "$REPOSITORY_ROOT/deploy/host-profiles/edge-direct.profile" "$FIXTURE_ROOT/deploy/host-profiles/"
+cp "$REPOSITORY_ROOT/deploy/setup-host" "$HOST_SETUP"
+sed \
+    -e "s|^NGINX_UNIT_TARGET=.*|NGINX_UNIT_TARGET=$TEST_ROOT/nginx.service|" \
+    -e "s|^LOGROTATE_TARGET=.*|LOGROTATE_TARGET=$TEST_ROOT/logrotate|" \
+    -e "s|^SYSCTL_TARGET=.*|SYSCTL_TARGET=$TEST_ROOT/sysctl|" \
+    -e "s|^NGINX_BINARY=.*|NGINX_BINARY=$TEST_ROOT/bin/nginx|" \
+    -e "s|^NGINX_CONFIG=.*|NGINX_CONFIG=$TEST_ROOT/nginx.conf|" \
+    -e "s|^NGINX_PID_FILE=.*|NGINX_PID_FILE=$TEST_ROOT/nginx.pid|" \
+    -e "s|^PROC_ROOT=.*|PROC_ROOT=$TEST_ROOT/proc|" \
+    "$REPOSITORY_ROOT/nginx/setup" > "$SETUP"
+chmod 0755 "$SETUP" "$HOST_SETUP"
+printf '# reviewed configuration fixture\n' > "$TEST_ROOT/nginx.conf"
+
+cat > "$TEST_ROOT/bin/systemctl" <<'MOCK'
+#!/usr/bin/env sh
+set -eu
+printf 'systemctl %s\n' "$*" >> "$COMMAND_LOG"
+case "$*" in
+    'show --property=LoadState --value nginx.service')
+        if [ -f "$NGINX_TEST_ROOT/reloaded" ]; then printf 'loaded\n';
+        else printf '%s\n' "${NGINX_TEST_LOAD:-loaded}"; fi ;;
+    'show --property=NeedDaemonReload --value nginx.service') printf '%s\n' "${NGINX_TEST_STALE:-no}" ;;
+    'show --property=TasksMax --value nginx.service')
+        if [ -f "$NGINX_TEST_ROOT/reloaded" ]; then printf '%s\n' "${NGINX_TEST_NEW_LIMIT:-512}";
+        else printf '%s\n' "${NGINX_TEST_LIMIT-512}"; fi ;;
+    'show --property=MainPID --value nginx.service')
+        if [ -f "$NGINX_TEST_ROOT/restarted" ]; then printf '%s\n' "${NGINX_TEST_NEW_PID:-201}";
+        else printf '%s\n' "${NGINX_TEST_OLD_PID:-101}"; fi ;;
+    daemon-reload) : > "$NGINX_TEST_ROOT/reloaded" ;;
+    'restart nginx.service')
+        [ "${NGINX_TEST_RESTART_FAIL:-no}" = no ] || exit 1
+        : > "$NGINX_TEST_ROOT/restarted"
+        printf '%s\n' "${NGINX_TEST_FILE_PID:-201}" > "$NGINX_TEST_ROOT/nginx.pid"
+        printf 'NoNewPrivs:\t%s\n' "${NGINX_TEST_NNP:-1}" > "$NGINX_TEST_ROOT/proc/201/status"
+        ;;
+    'is-active --quiet nginx.service') [ "${NGINX_TEST_ACTIVE:-yes}" = yes ] ;;
+    'enable nginx.service') ;;
+    *) printf 'unexpected systemctl call: %s\n' "$*" >&2; exit 1 ;;
+esac
+MOCK
+cat > "$TEST_ROOT/bin/id" <<'MOCK'
+#!/usr/bin/env sh
+[ "$*" = -u ] || exit 1
+printf '0\n'
+MOCK
+cat > "$TEST_ROOT/bin/nginx" <<'MOCK'
+#!/usr/bin/env sh
+printf 'nginx %s\n' "$*" >> "$COMMAND_LOG"
+[ "${NGINX_TEST_BAD_CONFIG:-no}" = no ]
+MOCK
+cat > "$TEST_ROOT/bin/noop" <<'MOCK'
+#!/usr/bin/env sh
+printf '%s %s\n' "${0##*/}" "$*" >> "$COMMAND_LOG"
+MOCK
+cat > "$TEST_ROOT/bin/helper" <<'MOCK'
+#!/usr/bin/env sh
+printf 'helper %s %s\n' "$0" "$*" >> "$COMMAND_LOG"
+MOCK
+chmod 0755 "$TEST_ROOT/bin/"*
+for mock_command in install logrotate sysctl systemd-analyze restorecon; do
+    cp "$TEST_ROOT/bin/noop" "$TEST_ROOT/bin/$mock_command"
+done
+for fixture_helper in \
+    deploy/install-nginx deploy/install-host-tools deploy/verify-deployment \
+    selinux/install selinux/setup firewalld/install firewalld/setup \
+    ssh/install ssh/setup terminal/install terminal/verify shell/setup shell/verify \
+    certbot/setup fail2ban/install fail2ban/setup
+do
+    mkdir -p "$FIXTURE_ROOT/${fixture_helper%/*}"
+    cp "$TEST_ROOT/bin/helper" "$FIXTURE_ROOT/$fixture_helper"
+done
+PATH=$TEST_ROOT/bin:$PATH
+export PATH
+
+# Keep the shared ceiling and implementation synchronized without weakening it.
+assert_contains "$FIXTURE_ROOT/systemd/system/nginx.service" 'TasksMax=512'
+assert_contains "$SETUP" 'SHARED_TASKS_MAX=512'
+
+reset_fixture
+expect_failure 'apply requires reviewed --workers' "$SETUP"
+assert_no_mutation
+for invalid_count in 00 08 -1 1+1 1.0 32768 999999999999999999999; do
+    reset_fixture
+    expect_failure 'canonical decimal integers' "$SETUP" --capacity-check \
+        --workers "$invalid_count" --threads-per-worker 32 --tasks-budget 512
+    assert_no_mutation
+done
+expect_failure '--workers must be greater than zero' "$SETUP" --capacity-check \
+    --workers 0 --threads-per-worker 32 --tasks-budget 512
+expect_failure '--tasks-budget must be greater than zero' "$SETUP" --capacity-check \
+    --workers 1 --threads-per-worker 0 --tasks-budget 0
+
+reset_fixture
+expect_failure 'requires at least 544 tasks' "$SETUP" \
+    --workers 8 --threads-per-worker 32 --tasks-budget 1024
+assert_no_mutation
+expect_failure 'requires at least 1072 tasks' "$SETUP" --capacity-check \
+    --workers 16 --threads-per-worker 32 --tasks-budget 2048
+expect_failure 'operator-reviewed --tasks-budget is 279' "$SETUP" --capacity-check \
+    --workers 4 --threads-per-worker 32 --tasks-budget 279
+
+reset_fixture
+expect_failure 'checked budget is 279' env NGINX_TEST_LIMIT=279 "$SETUP" \
+    --workers 4 --threads-per-worker 32 --tasks-budget 512
+assert_no_mutation
+for unknown_limit in '' unknown 20%; do
+    expect_failure 'nginx TasksMax is unknown' env NGINX_TEST_LIMIT="$unknown_limit" "$SETUP" \
+        --capacity-check --workers 4 --threads-per-worker 32 --tasks-budget 512
+done
+expect_failure 'metadata is stale or unknown' env NGINX_TEST_STALE=yes "$SETUP" \
+    --capacity-check --workers 4 --threads-per-worker 32 --tasks-budget 512
+expect_failure 'load state is unsupported or unknown' env NGINX_TEST_LOAD=masked "$SETUP" \
+    --capacity-check --workers 4 --threads-per-worker 32 --tasks-budget 512
+
+for allowed_limit in 280 infinity 18446744073709551615; do
+    env NGINX_TEST_LIMIT="$allowed_limit" "$SETUP" --capacity-check \
+        --workers 4 --threads-per-worker 32 --tasks-budget 280 > "$TEST_ROOT/stdout"
+    assert_contains "$TEST_ROOT/stdout" 'required=280, budget=280'
+done
+"$SETUP" --capacity-check --workers 248 --threads-per-worker 0 --tasks-budget 512 \
+    > "$TEST_ROOT/stdout"
+assert_contains "$TEST_ROOT/stdout" 'required=512, budget=512'
+
+reset_fixture
+if env NGINX_TEST_RESTART_FAIL=yes "$SETUP" --workers 4 --threads-per-worker 32 \
+    --tasks-budget 512 > "$TEST_ROOT/stdout" 2> "$TEST_ROOT/stderr"; then
+    fail 'restart failure unexpectedly succeeded'
+fi
+if grep -F 'systemctl enable nginx.service' "$COMMAND_LOG" >/dev/null \
+    || grep -F 'Applied nginx host runtime settings' "$TEST_ROOT/stdout" >/dev/null; then
+    fail 'restart failure continued to enable or success'
+fi
+
+# The actual apply branch restarts existing and stopped/first-install services.
+for previous_pid in 101 0; do
+    reset_fixture
+    env NGINX_TEST_OLD_PID="$previous_pid" "$SETUP" \
+        --workers 4 --threads-per-worker 32 --tasks-budget 512 > "$TEST_ROOT/stdout"
+    assert_contains "$COMMAND_LOG" 'systemctl restart nginx.service'
+    assert_contains "$COMMAND_LOG" 'systemctl enable nginx.service'
+    assert_contains "$TEST_ROOT/stdout" 'Verified restarted nginx master PID 201'
+    if grep -E 'reload-or-restart|systemctl reload nginx' "$COMMAND_LOG" >/dev/null; then
+        fail 'host setup used a config reload instead of restart'
+    fi
+done
+reset_fixture
+env NGINX_TEST_LOAD=not-found "$SETUP" \
+    --workers 4 --threads-per-worker 32 --tasks-budget 512 > "$TEST_ROOT/stdout"
+assert_contains "$TEST_ROOT/stdout" 'Verified restarted nginx master PID 201'
+
+reset_fixture
+expect_failure 'pre-application validation' env NGINX_TEST_BAD_CONFIG=yes "$SETUP" \
+    --workers 4 --threads-per-worker 32 --tasks-budget 512
+if grep -E '^(install |sysctl |systemctl (daemon-reload|restart|enable))' "$COMMAND_LOG" >/dev/null; then
+    fail 'invalid nginx configuration reached runtime mutation'
+fi
+
+reset_fixture
+expect_failure 'checked budget is 279' env NGINX_TEST_NEW_LIMIT=279 "$SETUP" \
+    --workers 4 --threads-per-worker 32 --tasks-budget 512
+if grep -F 'systemctl restart nginx.service' "$COMMAND_LOG" >/dev/null; then
+    fail 'prospective insufficient unit budget reached restart'
+fi
+
+for failure_case in no-master same-master mismatched-file no-new-privileges inactive; do
+    reset_fixture
+    case "$failure_case" in
+        no-master) failure_variable=NGINX_TEST_NEW_PID=0; failure_message='has no master after restart' ;;
+        same-master) failure_variable=NGINX_TEST_NEW_PID=101; failure_message='master did not change' ;;
+        mismatched-file) failure_variable=NGINX_TEST_FILE_PID=999; failure_message='PID file does not match' ;;
+        no-new-privileges) failure_variable=NGINX_TEST_NNP=0; failure_message='does not have NoNewPrivileges' ;;
+        inactive) failure_variable=NGINX_TEST_ACTIVE=no; failure_message='is not active after restart' ;;
+    esac
+    expect_failure "$failure_message" env "$failure_variable" "$SETUP" \
+        --workers 4 --threads-per-worker 32 --tasks-budget 512
+    if grep -F 'Applied nginx host runtime settings' "$TEST_ROOT/stdout" >/dev/null; then
+        fail 'failed activation verification printed success'
+    fi
+done
+
+# Exercise the actual composed wrapper, including early capacity rejection.
+reset_fixture
+expect_failure 'checked budget is 279' env NGINX_TEST_LIMIT=279 "$HOST_SETUP" \
+    --profile edge-direct --environment TEST --ssh-phase none --ignore-ip 192.0.2.0/24 \
+    --nginx-workers 4 --nginx-threads-per-worker 32 --nginx-tasks-budget 512
+assert_no_mutation
+reset_fixture
+"$HOST_SETUP" --profile edge-direct --environment TEST --ssh-phase none --ignore-ip 192.0.2.0/24 \
+    --nginx-workers 4 --nginx-threads-per-worker 32 --nginx-tasks-budget 512 > "$TEST_ROOT/stdout"
+assert_contains "$TEST_ROOT/stdout" 'workers=4, threads-per-worker=32, required=280, budget=512'
+assert_contains "$COMMAND_LOG" 'systemctl restart nginx.service'
+
+printf 'Validated actual nginx/host setup capacity and restart branches with isolated command mocks.\n'

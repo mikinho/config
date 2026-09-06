@@ -93,6 +93,7 @@ deploy/setup-host \
     --plan \
     --profile edge-direct \
     --environment PROD \
+    --nginx-workers 4 --nginx-threads-per-worker 32 --nginx-tasks-budget 512 \
     --ssh-phase prepare \
     --authorized-key-ready \
     --ignore-ip 192.0.2.0/24
@@ -103,12 +104,23 @@ Repeat `--ignore-ip` for each trusted administrative IPv4 or IPv6 CIDR. Add
 a non-default existing firewalld zone, and `--quic-bpf` only when the reviewed
 nginx render selected that profile.
 
+The examples assume a reviewed configuration with four workers, 32 total
+pool threads per worker, and 512 available tasks. These values are assertions,
+not tuning settings: inspect the actual nginx configuration, CPU count for
+automatic workers, and shared/ancestor cgroup headroom before supplying them.
+Apply requires all three sizing inputs and checks capacity before changing
+packages or host configuration. nginx host setup performs a planned restart,
+not a reload, to activate newly installed systemd restrictions; schedule a
+maintenance window and retain a tested recovery path. See
+[`../nginx/README.md#host-runtime-setup`](../nginx/README.md#host-runtime-setup).
+
 Apply preparation as root while retaining the existing SSH session:
 
 ```sh
 sudo deploy/setup-host \
     --profile edge-direct \
     --environment PROD \
+    --nginx-workers 4 --nginx-threads-per-worker 32 --nginx-tasks-budget 512 \
     --ssh-phase prepare \
     --authorized-key-ready \
     --ignore-ip 192.0.2.0/24
@@ -119,7 +131,8 @@ watch both. It also installs the selected Certbot backend and its renewal and
 health timers. Before finalization, use the staging-then-production workflow
 in [`../certbot/README.md`](../certbot/README.md), install the resulting
 certificate paths in the reviewed site, run `nginx -t`, and reload nginx.
-Final verification fails closed when no valid managed certificate exists.
+Final verification fails closed when a certificate file is missing,
+unparseable, or too close to expiration; it does not prove served TLS validity.
 
 Prove a new key-authenticated, non-root login on port 2356. From that new
 session, preview and apply finalization:
@@ -129,12 +142,14 @@ deploy/setup-host \
     --plan \
     --profile edge-direct \
     --environment PROD \
+    --nginx-workers 4 --nginx-threads-per-worker 32 --nginx-tasks-budget 512 \
     --ssh-phase finalize \
     --ignore-ip 192.0.2.0/24
 
 sudo deploy/setup-host \
     --profile edge-direct \
     --environment PROD \
+    --nginx-workers 4 --nginx-threads-per-worker 32 --nginx-tasks-budget 512 \
     --ssh-phase finalize \
     --ignore-ip 192.0.2.0/24
 ```
@@ -176,7 +191,8 @@ sudo deploy/install-host-tools
 ```
 
 `verify-deployment` performs a non-destructive, root-only audit of live host
-state, asserting Nginx version and configuration, certificate validity,
+state, asserting Nginx version and configuration, local certificate file
+completeness and leaf expiration,
 synchronized time, active systemd units, non-persistent Bash history with
 same-session recall, generic terminal readiness, OpenSSH phase and
 authentication restrictions, Fail2ban runtime and topology policy, services
@@ -204,9 +220,16 @@ Repeat `--ignore-ip` for every administrative CIDR passed to host setup. Use
 `--ssh-phase prepare` only while both transition ports are intentionally
 active; final is the default. The verifier never changes host state.
 
-`certbot-healthcheck` fails closed when the live tree is missing, empty, or
-contains an invalid certificate. JSON output requires `jq`; file output is
-published atomically and refuses symbolic-link destinations.
+`certbot-healthcheck` fails closed when the live tree is missing or empty, a
+discovered lineage has missing/unreadable/unparseable certificate material,
+or a certificate approaches expiration. Valid archive symlinks are supported;
+a healthy certificate does not hide another broken lineage. JSON output
+requires `jq`; file output is published atomically and refuses symbolic-link
+destinations. Failed inspections replace prior healthy reports with failure
+status. Consumers must also detect stale/missed reports; see
+[`../certbot/README.md#reports-and-freshness`](../certbot/README.md#reports-and-freshness).
+Use a private expected-lineage inventory to detect entirely removed directories
+and a separate endpoint probe to verify served TLS, hostname, and trust.
 
 ## Profiles
 

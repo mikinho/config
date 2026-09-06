@@ -23,22 +23,39 @@ LOGROTATE_TARGET=/etc/logrotate.d/nginx
 SYSCTL_TARGET=/etc/sysctl.d/99-nginx-quic.conf
 NGINX_BINARY=/usr/sbin/nginx
 NGINX_CONFIG=/etc/nginx/nginx.conf
+NGINX_PID_FILE=/run/nginx/nginx.pid
+PROC_ROOT=/proc
+# Keep this in step with the shared unit. Host overrides may reduce this budget;
+# setup never assumes a larger local override is safe for a shared baseline.
+SHARED_TASKS_MAX=512
+HELPER_TASK_RESERVE=16
 
 MODE=apply
 ZONE=public
 QUIC_BPF=no
+WORKERS=
+THREADS_PER_WORKER=
+TASKS_BUDGET=
 
 usage() {
     cat <<EOF
 Usage:
   $PROGRAM_NAME --check
-  $PROGRAM_NAME --plan [--zone NAME] [--quic-bpf]
-  sudo $PROGRAM_NAME [--zone NAME] [--quic-bpf]
+  $PROGRAM_NAME --plan [--workers N --threads-per-worker N --tasks-budget N] [--zone NAME] [--quic-bpf]
+  $PROGRAM_NAME --capacity-check --workers N --threads-per-worker N --tasks-budget N
+  sudo $PROGRAM_NAME --workers N --threads-per-worker N --tasks-budget N [--zone NAME] [--quic-bpf]
 
 Applies the host-level runtime settings around an already assembled and
 reviewed /etc/nginx tree: SELinux, firewalld, systemd, QUIC sysctl limits,
 logrotate, and host verification tools. It never renders over /etc/nginx.
 Install the exact reviewed nginx configuration first and ensure nginx -t passes.
+Apply requires operator-reviewed worker and total per-worker pool-thread counts
+matching that configuration. For worker_processes auto, inspect the host CPU
+count (getconf _NPROCESSORS_ONLN); sum all configured/default thread pools.
+--tasks-budget asserts reviewed available task capacity, including ancestor
+cgroup limits and other services sharing them; it does not change any limit.
+This command RESTARTS nginx, including an already active service: schedule a
+maintenance window. A config-only reload cannot activate new systemd sandboxing.
 EOF
 }
 
@@ -76,6 +93,85 @@ validate_zone() {
     esac
 }
 
+validate_capacity_inputs() {
+    [ -n "$WORKERS" ] && [ -n "$THREADS_PER_WORKER" ] && [ -n "$TASKS_BUDGET" ] \
+        || fail "apply requires reviewed --workers N, --threads-per-worker N, and --tasks-budget N matching the selected nginx configuration and host"
+    # Bound arithmetic to signed 32-bit shell implementations and reject octal,
+    # signs, whitespace, and expressions before any arithmetic expansion.
+    for capacity_value in "$WORKERS" "$THREADS_PER_WORKER" "$TASKS_BUDGET"; do
+        case "$capacity_value" in
+            '' | *[!0-9]* | 0[0-9]*) fail "capacity counts must be canonical decimal integers from 0 to 32767" ;;
+        esac
+        [ "${#capacity_value}" -le 5 ] && [ "$capacity_value" -le 32767 ] \
+            || fail "capacity counts must be canonical decimal integers from 0 to 32767"
+    done
+    [ "$WORKERS" -gt 0 ] || fail "--workers must be greater than zero"
+    [ "$TASKS_BUDGET" -gt 0 ] || fail "--tasks-budget must be greater than zero"
+    REQUIRED_TASKS=$((2 * WORKERS * (1 + THREADS_PER_WORKER) + HELPER_TASK_RESERVE))
+    [ "$REQUIRED_TASKS" -le "$SHARED_TASKS_MAX" ] \
+        || fail "nginx requires at least $REQUIRED_TASKS tasks (two worker generations plus $HELPER_TASK_RESERVE helper tasks); shared TasksMax=$SHARED_TASKS_MAX. Review worker/thread-pool sizing before applying"
+    [ "$REQUIRED_TASKS" -le "$TASKS_BUDGET" ] \
+        || fail "nginx requires at least $REQUIRED_TASKS tasks, but operator-reviewed --tasks-budget is $TASKS_BUDGET"
+}
+
+check_live_capacity() {
+    validate_capacity_inputs
+    command -v systemctl >/dev/null 2>&1 || fail "required command not found: systemctl"
+    capacity_budget=$SHARED_TASKS_MAX
+    [ "$TASKS_BUDGET" -ge "$capacity_budget" ] || capacity_budget=$TASKS_BUDGET
+    capacity_load=$(systemctl show --property=LoadState --value nginx.service) \
+        || fail "cannot inspect nginx unit load state for capacity preflight"
+    case "$capacity_load" in
+        not-found) capacity_limit=infinity ;;
+        loaded)
+            capacity_reload=$(systemctl show --property=NeedDaemonReload --value nginx.service) \
+                || fail "cannot inspect nginx manager metadata for capacity preflight"
+            [ "$capacity_reload" = no ] \
+                || fail "nginx manager metadata is stale or unknown; review unit/drop-ins and reload systemd before capacity preflight"
+            capacity_limit=$(systemctl show --property=TasksMax --value nginx.service) \
+                || fail "cannot inspect nginx TasksMax; review host task limits before applying"
+            ;;
+        *) fail "nginx unit load state is unsupported or unknown: $capacity_load" ;;
+    esac
+    case "$capacity_limit" in
+        infinity) ;;
+        '' | *[!0-9]*) fail "nginx TasksMax is unknown; review host task limits before applying" ;;
+        *)
+            # systemd can return an unsigned 64-bit value; avoid shell overflow.
+            capacity_budget=$(LC_ALL=C awk -v limit="$capacity_limit" -v budget="$capacity_budget" \
+                'BEGIN { printf "%.0f\n", (limit < budget ? limit : budget) }')
+            ;;
+    esac
+    [ "$REQUIRED_TASKS" -le "$capacity_budget" ] \
+        || fail "nginx requires at least $REQUIRED_TASKS tasks (two worker generations plus $HELPER_TASK_RESERVE helper tasks), but checked budget is $capacity_budget; review host task limits and worker/thread-pool sizing"
+    printf 'Reviewed nginx sizing: workers=%s, threads-per-worker=%s, required=%s, budget=%s.\n' \
+        "$WORKERS" "$THREADS_PER_WORKER" "$REQUIRED_TASKS" "$capacity_budget"
+}
+
+read_master_pid() {
+    master_pid=$(systemctl show --property=MainPID --value nginx.service) \
+        || fail "cannot read nginx MainPID"
+    case "$master_pid" in
+        '' | *[!0-9]*) fail "nginx MainPID is unknown" ;;
+    esac
+}
+
+verify_restarted_master() {
+    systemctl is-active --quiet nginx.service || fail "nginx is not active after restart"
+    read_master_pid
+    [ "$master_pid" != 0 ] || fail "nginx has no master after restart"
+    [ "$master_pid" != "$previous_master_pid" ] \
+        || fail "nginx master did not change; installed systemd sandbox activation is unverified"
+    [ -f "$NGINX_PID_FILE" ] && [ "$(cat "$NGINX_PID_FILE")" = "$master_pid" ] \
+        || fail "nginx PID file does not match the restarted master"
+    [ -r "$PROC_ROOT/$master_pid/status" ] \
+        || fail "cannot inspect restarted nginx master restrictions"
+    awk '$1 == "NoNewPrivs:" && $2 == "1" { found = 1 } END { exit !found }' \
+        "$PROC_ROOT/$master_pid/status" \
+        || fail "restarted nginx master does not have NoNewPrivileges active"
+    printf 'Verified restarted nginx master PID %s with NoNewPrivileges active.\n' "$master_pid"
+}
+
 validate_target_file() {
     nginx_target=$1
     if [ -e "$nginx_target" ] || [ -L "$nginx_target" ]; then
@@ -85,6 +181,7 @@ validate_target_file() {
 }
 
 validate_live_host() {
+    check_live_capacity
     [ "$(id -u)" -eq 0 ] || fail "run as root or use --plan"
     for nginx_command in install logrotate sysctl systemctl systemd-analyze; do
         command -v "$nginx_command" >/dev/null 2>&1 \
@@ -106,6 +203,14 @@ validate_live_host() {
 }
 
 print_plan() {
+    if [ -n "$WORKERS$THREADS_PER_WORKER$TASKS_BUDGET" ]; then
+        validate_capacity_inputs
+        printf 'Reviewed sizing inputs: workers=%s, threads-per-worker=%s; requires %s tasks within shared ceiling %s.\n' \
+            "$WORKERS" "$THREADS_PER_WORKER" "$REQUIRED_TASKS" "$SHARED_TASKS_MAX"
+        printf 'Operator-reviewed task budget: %s. Apply must also check the loaded unit TasksMax; this plan does not inspect the host.\n' "$TASKS_BUDGET"
+    else
+        printf 'Apply requires reviewed --workers N, --threads-per-worker N, and --tasks-budget N; capacity is NOT verified by this plan.\n'
+    fi
     printf '+ %s --verify-host\n' "$NGINX_RENDERER"
     if [ "$QUIC_BPF" = yes ]; then
         "$SELINUX_SETUP" --plan --component nginx --quic-bpf
@@ -121,12 +226,20 @@ print_plan() {
     printf '+ systemctl daemon-reload\n'
     printf '+ systemd-analyze --man=no verify nginx.service\n'
     printf '+ %s -t -q -c %s\n' "$NGINX_BINARY" "$NGINX_CONFIG"
-    printf '+ systemctl reload-or-restart nginx.service\n'
+    printf 'A planned nginx restart is required to activate the installed systemd sandbox; allow a service interruption.\n'
+    printf '+ recheck effective task budget after daemon-reload\n'
+    printf '+ systemctl restart nginx.service\n'
+    printf '+ verify active fresh master, PID file, and /proc NoNewPrivs\n'
     printf '+ systemctl enable nginx.service\n'
 }
 
 apply_runtime() {
     validate_live_host
+    previous_master_pid=0
+    if [ "$capacity_load" = loaded ]; then
+        read_master_pid
+        previous_master_pid=$master_pid
+    fi
     if [ "$QUIC_BPF" = yes ]; then
         "$SELINUX_SETUP" --component nginx --quic-bpf
     else
@@ -147,7 +260,10 @@ apply_runtime() {
     systemctl daemon-reload
     systemd-analyze --man=no verify nginx.service
     "$NGINX_BINARY" -t -q -c "$NGINX_CONFIG"
-    systemctl reload-or-restart nginx.service
+    check_live_capacity
+    printf 'Restarting nginx to activate the installed systemd runtime settings.\n'
+    systemctl restart nginx.service
+    verify_restarted_master
     systemctl enable nginx.service
     logrotate --debug "$LOGROTATE_TARGET" >/dev/null
     printf 'Applied nginx host runtime settings in firewalld zone %s.\n' "$ZONE"
@@ -164,6 +280,26 @@ while [ "$#" -gt 0 ]; do
             [ "$MODE" = apply ] || fail "select exactly one mode"
             MODE=plan
             shift
+            ;;
+        --capacity-check)
+            [ "$MODE" = apply ] || fail "select exactly one mode"
+            MODE=capacity-check
+            shift
+            ;;
+        --workers)
+            [ "$#" -ge 2 ] || fail "--workers requires a count"
+            WORKERS=$2
+            shift 2
+            ;;
+        --threads-per-worker)
+            [ "$#" -ge 2 ] || fail "--threads-per-worker requires a count"
+            THREADS_PER_WORKER=$2
+            shift 2
+            ;;
+        --tasks-budget)
+            [ "$#" -ge 2 ] || fail "--tasks-budget requires a count"
+            TASKS_BUDGET=$2
+            shift 2
             ;;
         --quic-bpf)
             QUIC_BPF=yes
@@ -186,11 +322,13 @@ validate_sources
 validate_zone
 if [ "$MODE" = check ]; then
     [ "$QUIC_BPF" = no ] || fail "--check does not accept --quic-bpf"
+    [ -z "$WORKERS$THREADS_PER_WORKER$TASKS_BUDGET" ] || fail "--check does not accept capacity inputs"
     printf 'Validated nginx setup sources and component dependencies.\n'
     exit 0
 fi
 
 case "$MODE" in
+    capacity-check) check_live_capacity ;;
     plan)
         printf 'nginx runtime setup: zone=%s, quic-bpf=%s\n' "$ZONE" "$QUIC_BPF"
         print_plan

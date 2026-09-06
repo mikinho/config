@@ -70,10 +70,7 @@ server {
 
     error_page 502 503 504 /maintenance.html;
 
-    location = /maintenance.html {
-        internal;
-        root /var/www/sample_node/wwwroot;
-    }
+    include includes/maintenance.conf;
 
     # Static assets: served directly by nginx with fallback cache control.
     location ~* ^/(css|js|img|fonts|static)/ {

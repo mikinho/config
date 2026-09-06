@@ -40,19 +40,79 @@ Validate the composed behavior on the target service after every change:
 
 ## Installation
 
-Install the common nginx and optional PHP-FPM units first:
+For nginx, prefer `nginx/setup` or the composed `deploy/setup-host` command.
+Both require reviewed worker, thread-pool, and task-budget inputs before apply
+and explicitly **restart nginx**, even when it is already active. Schedule an
+interruption: `daemon-reload` updates systemd's configuration, while nginx's HUP
+reload retains its existing master and cannot activate new process sandboxing.
+Config-only deployments and certificate renewal still use the preflighted
+`ExecReload` path; they do not need a service restart.
+
+Review the assembled `nginx -T` output on the host. For `worker_processes auto`,
+`getconf _NPROCESSORS_ONLN` is a starting point for the CPU count; confirm what
+the installed nginx build will use. Sum the thread counts of **all** pools
+initialized per worker, including the implicit `default` pool (32 threads)
+when selected by `aio threads`. Do not assume a custom configuration has one
+pool. Pass the reviewed values as `--workers` and `--threads-per-worker` to
+`nginx/setup`, or `--nginx-workers` and `--nginx-threads-per-worker` to
+`deploy/setup-host`.
+
+The third input, `--tasks-budget` (or `--nginx-tasks-budget`), is the operator's
+reviewed available task capacity after accounting for ancestor cgroup limits
+and other services sharing those limits. It does not change a limit. Setup
+uses the smallest of that assertion, the shared `TasksMax=512`, and the loaded
+unit's `TasksMax` when present. Stale manager metadata and unknown loaded limits
+fail closed. The same check runs before mutation and after `daemon-reload`,
+before restart. Read-only planning does not certify the live host's capacity.
+If `LoadState=not-found` before the first unit installation, the reviewed
+operator budget and shared ceiling govern that initial check; the installed
+unit is checked again after `daemon-reload`. A masked, broken, or otherwise
+unknown unit state is rejected. The supported nginx binary and reviewed
+configuration must already be installed; this is not an nginx package installer.
+
+The sizing check requires `2 × workers × (1 + threads-per-worker) + 16` tasks:
+two worker generations plus a 16-task reserve for the master, helpers, and
+short-lived service commands. Four workers with one 32-thread pool require
+280 tasks; eight require 544 and fail the shared 512 ceiling. This is headroom
+for **one** overlapping reload, not a bound on repeated reloads while old
+workers are still draining. Wait for the prior generation to exit; increase
+the reviewed reserve/budget through a separately validated design if the host
+needs more. Do not remove the task cap to make preflight pass. A larger
+host-specific limit is a separate reviewed change; these shared setup commands
+deliberately retain their conservative 512 ceiling.
+
+Use `nginx/setup --capacity-check --workers 4 --threads-per-worker 32
+--tasks-budget 512` only after confirming those illustrative values match the
+selected configuration and host. Inputs are canonical decimal integers up to
+32767; workers and task budget must be positive, and zero pool threads is valid
+only when the selected nginx configuration initializes no thread pools.
+
+The manual equivalent also needs the same capacity and host-policy review.
+Install the common nginx and optional PHP-FPM units, then perform the planned
+restart rather than assuming `enable --now` replaces an active master:
 
 ```sh
 install -m 0644 systemd/system/nginx.service /etc/systemd/system/nginx.service
 install -m 0644 systemd/system/php-fpm@.service /etc/systemd/system/php-fpm@.service
 systemctl daemon-reload
-systemctl enable --now nginx.service
+systemd-analyze verify nginx.service
+/usr/sbin/nginx -t -q -c /etc/nginx/nginx.conf
+systemctl restart nginx.service
+systemctl enable nginx.service
 ```
 
 On SELinux-enforcing hosts, run `selinux/apply-nginx-policy` before the first
 start so the unit's runtime directories are created with the right labels and
-the QUIC listener and worker rlimits are permitted. Mask or remove any
-distribution-provided nginx unit before enabling this one.
+the QUIC listener and worker rlimits are permitted. The same-named unit in
+`/etc/systemd/system` overrides the distribution unit; do not mask `nginx.service`,
+which would prevent the replacement from starting too.
+
+After restart, setup checks service activity, a fresh nonzero master PID,
+agreement with `/run/nginx/nginx.pid`, and `NoNewPrivs: 1` in that master's
+`/proc` status. These are targeted activation checks, not proof of every sandbox
+or SELinux rule. On the target Linux host, also inspect the composed unit and
+mount restrictions, test intended reads/writes and upstream connections, and
+exercise a graceful reload under representative traffic before acceptance.
 
 Choose exactly one Certbot backend. Both use the repository's `certbot.timer`
 and the common `certbot-healthcheck.timer`; do not leave a distribution or
@@ -130,8 +190,10 @@ for the renewal service; it does not uninstall or disable the Certbot CLI. The
 repository timer can still start `snap.certbot.renew.service` explicitly. The
 matching service drop-in restores the native backend's nginx ordering,
 one-hour timeout, restrictive umask, partial-renewal reload, and visible
-reload-failure behavior. Do not also install an executable Certbot deploy hook
-that reloads nginx.
+reload-command failure behavior. Successful preflight and HUP signaling do
+not prove asynchronous configuration or certificate adoption by nginx;
+inspect its error log and the certificate on a fresh TLS connection. Do not
+also install an executable Certbot deploy hook that reloads nginx.
 
 The native units locate their binaries at `/usr/sbin/nginx`, `/sbin/php-fpm`,
 `/bin/certbot`, and `/bin/systemctl`. The Snap backend delegates execution to

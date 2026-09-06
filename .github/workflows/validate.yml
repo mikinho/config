@@ -98,6 +98,7 @@ jobs:
       - name: Validate installer and profile coverage
         run: |
           actionlint -color
+          node --test tests/nginx-node-echo.test.mjs
           tests/run-all-local
 
       - name: Exercise a full profile render
@@ -309,6 +310,7 @@ jobs:
           deploy/install-nginx \
             --output build/ci-safe \
             --profile gzip \
+            --profile nodejs-proxy \
             --profile trusted-proxy \
             --profile websocket
           test ! -e build/ci-safe/stubs/http/fastcgi-cache.conf
@@ -317,6 +319,12 @@ jobs:
           install -m 0644 \
             nginx/sites/sample_wp.conf.example \
             build/ci-safe/sites/sample_wp.conf
+          # Activate the actual Node sample under a separate reserved name.
+          # Keep its socket, locations, includes, and certificate paths intact.
+          sed \
+            's/server_name example.com www.example.com;/server_name node.example.com www.node.example.com;/' \
+            nginx/sites/sample_node.conf.example \
+            > build/ci-safe/sites/sample_node.conf
           printf '%s\n' \
             'server {' \
             '    listen 127.0.0.1:8080;' \
@@ -333,7 +341,7 @@ jobs:
             '    server_name runtime-backend.invalid;' \
             '    add_header_inherit off;' \
             "    add_header Content-Security-Policy \"default-src 'none'\" always;" \
-            "    return 200 \"proxy=\$http_proxy\\nxff=\$http_x_forwarded_for\\n\";" \
+            "    return 200 \"proxy=\$http_proxy\\nxff=\$http_x_forwarded_for\\nxfh=\$http_x_forwarded_host\\n\";" \
             '}' \
             'server {' \
             '    listen 127.0.0.1:18080;' \
@@ -342,12 +350,17 @@ jobs:
             '        include includes/proxy-common.conf;' \
             '        proxy_pass http://127.0.0.1:18081;' \
             '    }' \
+            '    location /websocket-policy {' \
+            '        include includes/proxy-websocket.conf;' \
+            '        proxy_pass http://sample_node_upstream;' \
+            '    }' \
             '}' \
             > build/ci-safe/sites/runtime-policy.conf
 
           deploy/install-nginx \
             --output build/ci-cache \
             --profile gzip \
+            --profile nodejs-proxy \
             --profile trusted-proxy \
             --profile websocket \
             --profile wordpress-cache
@@ -362,6 +375,9 @@ jobs:
           cp \
             build/ci-safe/sites/runtime-policy.conf \
             build/ci-cache/sites/runtime-policy.conf
+          cp \
+            build/ci-safe/sites/sample_node.conf \
+            build/ci-cache/sites/sample_node.conf
           sed -i \
             's|includes/wordpress-by-tag.conf|includes/wordpress-cache-by-tag.conf|' \
             build/ci-cache/sites/sample_wp.conf
@@ -369,7 +385,7 @@ jobs:
             'include includes/wordpress-cache-by-tag.conf;' \
             build/ci-cache/sites/sample_wp.conf
 
-      - name: Test nginx configuration
+      - name: Test nginx configuration and Node Unix-socket runtime
         run: |
           docker run --rm \
             --env EXPECTED_NGINX_VERSION="${{ matrix.version }}" \
@@ -393,10 +409,12 @@ jobs:
               if [ "${EXPECTED_NGINX_VERSION}" = latest ]; then
                 nginx_package=nginx
               fi
+              dnf module enable --assumeyes nodejs:22
               dnf install --assumeyes \
                 ca-certificates \
                 curl-minimal \
                 "${nginx_package}" \
+                nodejs \
                 openssl
               openssl version
               nginx -v
@@ -431,7 +449,7 @@ jobs:
                   -sha256 \
                   -days 1 \
                   -subj "/CN=example.com" \
-                  -addext "subjectAltName=DNS:example.com,DNS:www.example.com" \
+                  -addext "subjectAltName=DNS:example.com,DNS:www.example.com,DNS:node.example.com,DNS:www.node.example.com" \
                   -keyout /etc/letsencrypt/live/example.com/privkey.pem \
                   -out /etc/letsencrypt/live/example.com/fullchain.pem
               )

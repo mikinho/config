@@ -61,6 +61,8 @@ RestrictSUIDSGID=yes
 SystemCallArchitectures=native
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 MemoryDenyWriteExecute=yes
+# Includes worker threads, not just processes. nginx/setup requires reviewed
+# worker/pool sizing with room for two generations and helpers before applying.
 TasksMax=512
 
 # CapabilityBoundingSet and SystemCallFilter are intentionally not constrained

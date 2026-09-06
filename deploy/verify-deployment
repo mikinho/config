@@ -286,13 +286,13 @@ check_clock_synchronization() {
 }
 
 check_certificate_health() {
-    printf 'Checking managed certificate validity and expiration...\n'
+    printf 'Checking managed certificate files and leaf expiration...\n'
     if [ ! -x "$CERTBOT_HEALTHCHECK" ]; then
         fail_msg "certificate healthcheck is missing: $CERTBOT_HEALTHCHECK"
         return
     fi
     if certificate_report=$("$CERTBOT_HEALTHCHECK" 2>&1); then
-        pass_msg "all managed certificates are valid beyond the warning threshold"
+        pass_msg "discovered certificate files are parseable and their leaf expiry exceeds the warning threshold"
         if [ -n "$certificate_report" ]; then
             while IFS= read -r certificate_line; do
                 info_msg "$certificate_line"

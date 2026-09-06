@@ -69,19 +69,27 @@ it in the root README's stub-dependency table and covered by a profile.
   asset and `robots.txt` requests remain quiet, while their 4xx and 5xx responses
   use the dedicated privacy-minimized `static-asset-failures.log`.
 - Shared proxy includes treat this nginx instance as the public edge. They
-  overwrite `X-Real-IP` and `X-Forwarded-For` with `$remote_addr`; never append
+  set `Host` and `X-Forwarded-Host` to `$host` and overwrite `X-Real-IP` and
+  `X-Forwarded-For` with `$remote_addr`; never append
   an untrusted incoming forwarding chain, and strip the legacy `Proxy` request
   header before it reaches an application environment. The trusted-proxy
   profile may update `$remote_addr` only from explicitly trusted immediate
-  peers.
+  peers. Both the ordinary HTTP and WebSocket variants replace a supplied
+  `X-Request-Id` with nginx's `$request_id` for access-log correlation.
 - `includes/relativeurls.conf` is a legacy opt-in, not shared WordPress policy.
   Do not enable response-body URL rewriting on an SEO-indexed site instead of
   generating correct absolute canonical and alternate-language URLs.
 
-CI also starts the rendered safe profile and verifies these response-level
-contracts: HTTPS redirection, inherited baseline headers, application CSP
-preservation, untrusted forwarding-header replacement, internal-only
-maintenance responses, and failure-only static asset logging.
+CI starts the rendered safe profile with the actual Node sample connected to
+an isolated Unix-socket echo fixture. Its checks cover HTTPS redirection,
+replacement of untrusted proxy, host, address and request-id headers, inherited
+security headers, application CSP and cache-policy preservation, direct static
+responses, and missing-static-file fallback to the application. Stopping the
+fixture checks maintenance responses with and without the optional file and
+denies direct access to that internal document. JSON access-log assertions
+correlate the upstream request id, parse escaped values, and check that query
+and Referer canaries are omitted. The separate WordPress checks retain
+failure-only static asset logging coverage.
 
 ## Host runtime setup
 
@@ -89,8 +97,9 @@ After a reviewed render has been assembled at `/etc/nginx` and the exact live
 tree passes `nginx -t`, apply its surrounding host settings with:
 
 ```sh
-nginx/setup --plan
-sudo nginx/setup
+# Illustrative reviewed sizing, not automatic tuning:
+nginx/setup --plan --workers 4 --threads-per-worker 32 --tasks-budget 512
+sudo nginx/setup --workers 4 --threads-per-worker 32 --tasks-budget 512
 ```
 
 The setup entry point verifies the installed nginx binary and live
@@ -100,6 +109,20 @@ QUIC sysctl limits, and host verification tools. Add `--quic-bpf` only when
 the rendered nginx profile selected that feature. It never copies, renders,
 or deletes anything under `/etc/nginx`; the reviewed tree remains a separate
 deployment transaction.
+
+The three sizing values must match the selected configuration and available
+host/ancestor task capacity. They do not change nginx worker or pool settings.
+`worker_processes auto` requires reviewing the target host's CPU count; include
+all configured pools in the total threads per worker. Setup reserves two
+worker generations plus 16 helper tasks and retains the shared `TasksMax=512`
+ceiling. Review worker/pool sizing if the calculated requirement exceeds the
+available budget. Overlapping more than one graceful reload needs additional
+headroom or operational serialization; this check is not a runtime guarantee.
+
+Applying host setup performs a planned restart to activate the installed
+systemd execution restrictions, checks a fresh master and its `NoNewPrivs`
+state, and can interrupt service. Schedule the operation and retain a recovery
+plan. Configuration-only updates still use nginx's validated reload path.
 
 `sites/sample_wp.conf.example` matches the `sample_wp` PHP-FPM pool and systemd
 instance. Replace its domains, certificate paths, and site tag, then install it
@@ -112,10 +135,15 @@ Node.js reverse-proxied applications with static asset cache fallbacks.
 Render a profile and syntax-check it exactly as CI does, or run
 `sudo nginx -t -c /etc/nginx/nginx.conf` on the target host. CI exercises
 `nginx -t` for every push against the pinned stable and mainline nginx.org
-packages on Rocky Linux 9. It activates `sample_wp.conf.example` only in the
-ephemeral CI tree and generates a one-day self-signed certificate, so the
-complete public WordPress site is parsed without making it part of an installed
-baseline. It starts the safe profile for response-level policy checks, then
-replaces the site's routing include with the cached variant and parses that
-configuration too. A change that adds a directive must stay within the root
-README's syntax floor or advance it deliberately.
+packages on Rocky Linux 9, plus the latest stable package as a drift check.
+It activates both `sample_wp.conf.example` and `sample_node.conf.example` only
+in the ephemeral CI tree and generates a one-day self-signed certificate. The
+Node sample receives a separate reserved domain while retaining its socket,
+locations and shared includes. A Node 22 fixture serves that Unix socket; it
+opens no IP listener. CI starts the safe profile for response-level policy
+checks, then replaces the WordPress routing include with the cached variant
+and parses that configuration too. Fixture behavior can also be checked with
+`node --test tests/nginx-node-echo.test.mjs`; the full `tests/nginx-runtime`
+command requires the prepared, disposable Linux CI container. A change that
+adds a directive must stay within the root README's syntax floor or advance
+it deliberately.

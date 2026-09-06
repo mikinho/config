@@ -65,6 +65,7 @@ assert_contains "$TEST_ROOT/staging.plan" 'environment=staging, backend=native, 
 assert_contains "$TEST_ROOT/staging.plan" 'through 127.0.0.2 for every requested name'
 assert_contains "$TEST_ROOT/staging.plan" '/bin/certbot certonly --non-interactive --agree-tos'
 assert_contains "$TEST_ROOT/staging.plan" '--preferred-challenges http'
+assert_contains "$TEST_ROOT/staging.plan" '--server https://acme-staging-v02.api.letsencrypt.org/directory'
 assert_contains "$TEST_ROOT/staging.plan" '--domain example.com --domain www.example.com --dry-run'
 assert_not_contains "$TEST_ROOT/staging.plan" 'certbot-healthcheck'
 
@@ -79,9 +80,71 @@ assert_not_contains "$TEST_ROOT/staging.plan" 'certbot-healthcheck'
 assert_contains "$TEST_ROOT/production.plan" 'environment=production, backend=snap, primary=example.com'
 assert_contains "$TEST_ROOT/production.plan" '/usr/local/bin/certbot certonly'
 assert_contains "$TEST_ROOT/production.plan" \
-    '/usr/local/bin/certbot renew --cert-name example.com --dry-run --no-random-sleep-on-renew'
+    '--preferred-challenges http --server https://acme-v02.api.letsencrypt.org/directory'
+assert_contains "$TEST_ROOT/production.plan" \
+    '/usr/local/bin/certbot renew --cert-name example.com --dry-run --no-random-sleep-on-renew --server https://acme-staging-v02.api.letsencrypt.org/directory'
 assert_contains "$TEST_ROOT/production.plan" '/usr/local/bin/certbot-healthcheck'
 assert_not_contains "$TEST_ROOT/production.plan" '--domain example.com --dry-run'
+
+# Exercise the real command construction and issuance sequence with a recording
+# Certbot boundary. Only host validation and the HTTP-01 probe are stubbed out;
+# no certificate authority, system service, or production directory is touched.
+sed '/^while \[ "\$#" -gt 0 \]; do/,$d' "$ISSUER" > "$TEST_ROOT/issuer-functions"
+cat > "$TEST_ROOT/record-certbot" <<'EOF'
+#!/usr/bin/env sh
+set -eu
+command_name=$1
+shift
+server=$(sed -n 's/^server = //p' "$FAKE_CERTBOT_CONFIG")
+dry_run=no
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --server) server=$2; shift 2 ;;
+        --dry-run) dry_run=yes; shift ;;
+        *) shift ;;
+    esac
+done
+printf 'command=%s server=%s dry_run=%s\n' "$command_name" "$server" "$dry_run" >> "$FAKE_CERTBOT_CALLS"
+EOF
+cat > "$TEST_ROOT/record-healthcheck" <<'EOF'
+#!/usr/bin/env sh
+exit 0
+EOF
+chmod 0755 "$TEST_ROOT/record-certbot" "$TEST_ROOT/record-healthcheck"
+
+for selected_environment in staging production; do
+    case "$selected_environment" in
+        staging) conflicting_server=https://acme-v02.api.letsencrypt.org/directory ;;
+        production) conflicting_server=https://acme-staging-v02.api.letsencrypt.org/directory ;;
+    esac
+    printf 'server = %s\n' "$conflicting_server" > "$TEST_ROOT/cli.ini"
+    FAKE_CERTBOT_CONFIG="$TEST_ROOT/cli.ini" \
+    FAKE_CERTBOT_CALLS="$TEST_ROOT/$selected_environment.calls" \
+        sh -c '
+            . "$1/issuer-functions"
+            ENVIRONMENT=$2
+            CERTBOT_BINARY=$1/record-certbot
+            HEALTHCHECK=$1/record-healthcheck
+            EMAIL=ops@example.com
+            DOMAINS=example.com
+            PRIMARY_DOMAIN=example.com
+            STAGING_PASSED=yes
+            validate_selection
+            validate_live_host() { :; }
+            verify_local_webroot() { :; }
+            issue_certificate
+        ' issue-test "$TEST_ROOT" "$selected_environment" > "$TEST_ROOT/$selected_environment.result"
+done
+assert_contains "$TEST_ROOT/staging.calls" \
+    'command=certonly server=https://acme-staging-v02.api.letsencrypt.org/directory dry_run=yes'
+[ "$(wc -l < "$TEST_ROOT/staging.calls" | tr -d ' ')" = 1 ] \
+    || fail 'staging unexpectedly ran an additional Certbot operation'
+assert_contains "$TEST_ROOT/production.calls" \
+    'command=certonly server=https://acme-v02.api.letsencrypt.org/directory dry_run=no'
+assert_contains "$TEST_ROOT/production.calls" \
+    'command=renew server=https://acme-staging-v02.api.letsencrypt.org/directory dry_run=yes'
+[ "$(wc -l < "$TEST_ROOT/production.calls" | tr -d ' ')" = 2 ] \
+    || fail 'production did not issue once and test renewal once'
 
 expect_failure \
     'production issuance requires --staging-passed' \
@@ -140,4 +203,4 @@ expect_failure \
     '--check does not accept issuance options' \
     "$ISSUER" --check --backend snap
 
-printf 'Validated plan-first Certbot first-lineage issuance.\n'
+printf 'Validated Certbot issuance plans and execution with explicit ACME endpoints.\n'

@@ -86,6 +86,7 @@ if command -v shellcheck >/dev/null 2>&1; then
         "$REPOSITORY_ROOT/tests/fail2ban-installer" \
         "$REPOSITORY_ROOT/tests/health-verifiers" \
         "$REPOSITORY_ROOT/tests/host-setup" \
+        "$REPOSITORY_ROOT/tests/nginx-setup" \
         "$REPOSITORY_ROOT/tests/nginx-runtime" \
         "$REPOSITORY_ROOT/tests/mongodb" \
         "$REPOSITORY_ROOT/tests/mongodb-el9" \
@@ -139,6 +140,9 @@ step "Running Fail2ban installer routing tests..."
 
 step "Running component and host setup tests..."
 "$REPOSITORY_ROOT/tests/host-setup"
+
+step "Running isolated nginx capacity and restart regression tests..."
+"$REPOSITORY_ROOT/tests/nginx-setup"
 
 step "Running interactive shell history tests..."
 "$REPOSITORY_ROOT/tests/shell-history"

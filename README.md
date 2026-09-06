@@ -608,8 +608,11 @@ Certbot reports a partial renewal failure. This is intentional: certificates
 that did renew successfully must be loaded even when another certificate in
 the same run did not renew. The reload runs from `ExecStopPost`, so Certbot's
 original nonzero status is preserved rather than ignored. A failed nginx
-reload also causes the unit to fail visibly. Do not install an executable
-Certbot deploy hook that also reloads nginx; it would duplicate this action and
+reload command also causes the unit to fail visibly. A successful command
+confirms the preflight and HUP signal, not asynchronous adoption by nginx.
+Check the nginx error log and inspect the certificate on a fresh TLS connection
+to the intended endpoint before claiming the replacement is served. Do not
+install an executable Certbot deploy hook that also reloads nginx; it would duplicate this action and
 split its audit evidence between Certbot and systemd.
 
 The timer checks at midnight and noon in the host's local time with up to six
@@ -620,9 +623,28 @@ after the host returns.
 
 An independent `certbot-healthcheck.timer` runs daily at 03:00 local time with
 up to two hours of randomized delay. Its read-only service checks every
-managed lineage and fails when a certificate is invalid or within 30 days of
-expiry. Connect failed-unit state to the host's monitoring system; alert
-transport and credentials are deployment state rather than repository config.
+lineage directory and fails when certificate material is missing, unreadable,
+unparsable, or within 30 days of expiry. A healthy lineage does not hide a broken
+one; valid Certbot archive symlinks remain supported. This is an expiration and
+completeness check, not chain, hostname, private-key, or served-certificate
+verification. Entirely removed lineages require a deployment-owned expected
+inventory to detect. Connect failed-unit state to the host's monitoring
+system; alert transport and credentials are deployment state rather than
+repository config.
+
+The first-lineage issuance wrapper pins the selected Let's Encrypt ACME server
+explicitly. Staging uses the staging directory plus `--dry-run`; production
+uses the production directory only after the operator's staging assertion.
+An inherited `cli.ini` server setting must not change the selected environment.
+
+For monitoring integration, test actual failure and recovery notification
+delivery, missed runs, and report freshness as well as certificate expiry.
+Use a separately confined, deployment-owned TLS probe for the hostname and
+endpoint clients reach; do not relax the disk check's network isolation.
+Provider credentials, endpoint inventory, and alert destinations stay private.
+Proactive alerts for renewal failures, rejected reloads, and actionable nginx
+or application log failures are a separate integration: writing a log or
+running a timer does not demonstrate that a notification was delivered.
 
 The included nginx HTTP listener serves `/.well-known/acme-challenge/` from
 `/var/www/letsencrypt`. Certificates and account data under `/etc/letsencrypt`
@@ -707,7 +729,10 @@ material application, plugin, theme, proxy, or CDN change.
 
 GitHub Actions validates deployment profile coverage, exercises the installer,
 runs `nginx -t` against stable and mainline nginx.org packages on Rocky Linux
-9, exercises security and failure behavior against a running nginx, checks the
+9, exercises security and failure behavior against a running nginx, including
+the Node sample over a Unix socket, forwarded host/address replacement,
+request-ID correlation, static/maintenance responses, and query-redacted JSON
+access logs. The workflow also checks the
 units, logrotate policy, non-persistent shell history, two-stage SSH ports,
 firewalld/SELinux assets, Fail2ban topology policy, and standard host plans on
 Rocky Linux 9 and CentOS Stream 10, builds the pinned rsync bridge as an

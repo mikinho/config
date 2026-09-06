@@ -38,6 +38,9 @@ AUTHORIZED_KEY_READY=no
 CONSOLE_CONFIRMED=no
 CERTBOT_BACKEND=native
 QUIC_BPF=no
+NGINX_WORKERS=
+NGINX_THREADS_PER_WORKER=
+NGINX_TASKS_BUDGET=
 IGNORE_IPS=
 OS_RELEASE_FILE=/etc/os-release
 OS_RELEASE_OVERRIDDEN=no
@@ -51,9 +54,11 @@ Usage:
       --ignore-ip CIDR [--ignore-ip CIDR ...] \\
       [--authorized-key-ready] [--console-confirmed] \\
       [--certbot-backend native|snap] [--zone NAME] [--quic-bpf] \\
+      [--nginx-workers N --nginx-threads-per-worker N --nginx-tasks-budget N] \\
       [--os-release FILE]
   sudo $PROGRAM_NAME --profile edge-direct|edge-proxied \\
       --environment PROD|TEST|DEV --ssh-phase prepare|finalize|none \\
+      --nginx-workers N --nginx-threads-per-worker N --nginx-tasks-budget N \\
       --ignore-ip CIDR [--ignore-ip CIDR ...] \\
       [--authorized-key-ready] [--console-confirmed] \\
       [--certbot-backend native|snap] [--zone NAME] [--quic-bpf]
@@ -65,6 +70,9 @@ new key-authenticated 2356 session. 'none' leaves SSH untouched and assumes it
 is already finalized. The selected profile controls Fail2ban nginx jails.
 --environment is a required operator assertion stored as the trusted shell
 prompt classification; it is never inferred from the hostname.
+Apply requires reviewed nginx sizing and a planned nginx restart. Worker and
+thread counts must match the selected nginx configuration; the task budget
+asserts reviewed available capacity under ancestor/shared cgroup constraints.
 EOF
 }
 
@@ -180,6 +188,10 @@ validate_selection() {
     if [ "$OS_RELEASE_OVERRIDDEN" = yes ] && [ "$MODE" != plan ]; then
         fail "--os-release is accepted only with --plan"
     fi
+    if [ "$MODE" = apply ]; then
+        [ -n "$NGINX_WORKERS" ] && [ -n "$NGINX_THREADS_PER_WORKER" ] && [ -n "$NGINX_TASKS_BUDGET" ] \
+            || fail "apply requires reviewed --nginx-workers N, --nginx-threads-per-worker N, and --nginx-tasks-budget N"
+    fi
 }
 
 run_platform_installer() {
@@ -217,6 +229,9 @@ run_nginx_setup() {
     else
         set -- "$NGINX_SETUP" --zone "$ZONE"
     fi
+    [ -z "$NGINX_WORKERS" ] || set -- "$@" --workers "$NGINX_WORKERS"
+    [ -z "$NGINX_THREADS_PER_WORKER" ] || set -- "$@" --threads-per-worker "$NGINX_THREADS_PER_WORKER"
+    [ -z "$NGINX_TASKS_BUDGET" ] || set -- "$@" --tasks-budget "$NGINX_TASKS_BUDGET"
     [ "$QUIC_BPF" = yes ] && set -- "$@" --quic-bpf
     "$@"
 }
@@ -269,6 +284,15 @@ run_host_verifier() {
 preflight_selection() {
     # Exercise every child parser and source boundary before an applying run
     # can change packages or live configuration.
+    if [ "$MODE" = apply ]; then
+        set -- "$NGINX_SETUP" --capacity-check \
+            --workers "$NGINX_WORKERS" --threads-per-worker "$NGINX_THREADS_PER_WORKER"
+        [ -z "$NGINX_TASKS_BUDGET" ] || set -- "$@" --tasks-budget "$NGINX_TASKS_BUDGET"
+        "$@"
+    elif [ -n "$NGINX_WORKERS$NGINX_THREADS_PER_WORKER$NGINX_TASKS_BUDGET" ]; then
+        # Reject malformed/insufficient supplied sizing before printing any plan.
+        run_nginx_setup >/dev/null
+    fi
     "$SELINUX_INSTALL" --check >/dev/null
     "$FIREWALL_INSTALL" --check >/dev/null
     "$SSH_INSTALL" --check >/dev/null
@@ -361,6 +385,21 @@ while [ "$#" -gt 0 ]; do
             OS_RELEASE_OVERRIDDEN=yes
             shift 2
             ;;
+        --nginx-workers)
+            [ "$#" -ge 2 ] || fail "--nginx-workers requires a count"
+            NGINX_WORKERS=$2
+            shift 2
+            ;;
+        --nginx-threads-per-worker)
+            [ "$#" -ge 2 ] || fail "--nginx-threads-per-worker requires a count"
+            NGINX_THREADS_PER_WORKER=$2
+            shift 2
+            ;;
+        --nginx-tasks-budget)
+            [ "$#" -ge 2 ] || fail "--nginx-tasks-budget requires a count"
+            NGINX_TASKS_BUDGET=$2
+            shift 2
+            ;;
         --plan)
             [ "$MODE" = apply ] || fail "select exactly one mode"
             MODE=plan
@@ -395,7 +434,7 @@ done
 
 validate_dependencies
 if [ "$MODE" = check ]; then
-    [ -z "$PROFILE$ENVIRONMENT$SSH_PHASE$IGNORE_IPS" ] \
+    [ -z "$PROFILE$ENVIRONMENT$SSH_PHASE$IGNORE_IPS$NGINX_WORKERS$NGINX_THREADS_PER_WORKER$NGINX_TASKS_BUDGET" ] \
         || fail "--check does not accept host-selection options"
     validate_all_profiles
     "$SELINUX_INSTALL" --check >/dev/null

@@ -17,15 +17,17 @@ CERT_COUNT=0
 EXPIRING_COUNT=0
 OUTPUT_BUFFER=
 OUTPUT_TMP=
+REPORT_READY=no
 
 usage() {
     cat <<EOF
 Usage:
   $PROGRAM_NAME [OPTIONS]
 
-Evaluates TLS certificate expiration and validity for Let's Encrypt certificates.
+Checks local Let's Encrypt certificate files and their leaf expiration dates.
 Calculates remaining time, extracts Subject and Issuer details, and emits text,
 JSON, or Prometheus-compatible reports for monitoring agents.
+This does not verify trust, hostname matching, or the certificate served by nginx.
 
 Options:
   --live-dir DIR      Path to Let's Encrypt live directory (default: /etc/letsencrypt/live)
@@ -35,14 +37,30 @@ Options:
   --help, -h          Show this help message
 
 Exit Status:
-  0 if at least one valid certificate is inspected and all certificates have
+  0 if at least one certificate is parseable and all inspected lineages have
     at least warn-days remaining.
-  1 if certificate state is absent, invalid, near expiry, or expired.
+  1 if certificate files are absent, unparseable, near expiry, or expired.
+
+Reports include the observation time. Alert on failed or stale checks; an old
+report is not evidence that this command is still running successfully.
 EOF
 }
 
 fail() {
     printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2
+    # Replace a previous successful file report after an inspection failure.
+    # Disable this branch first so a publication error cannot recurse.
+    if [ "$REPORT_READY" = yes ]; then
+        REPORT_READY=no
+        case "$FORMAT" in
+            text) OUTPUT_BUFFER="[FAILED] Certificate file or expiry check incomplete at Unix time $CURRENT_EPOCH" ;;
+            json)
+                OUTPUT_BUFFER="{\"certificates\":[],\"total\":null,\"expiring\":null,\"checked_at_epoch\":$CURRENT_EPOCH,\"complete\":false,\"healthy\":false}"
+                ;;
+            prometheus) OUTPUT_BUFFER=$(prometheus_status 0 0) ;;
+        esac
+        write_output
+    fi
     exit 1
 }
 
@@ -66,6 +84,19 @@ $output_line"
     fi
 }
 
+prometheus_status() {
+    printf '%s\n' \
+        '# HELP certbot_healthcheck_complete Whether every discovered lineage was inspected' \
+        '# TYPE certbot_healthcheck_complete gauge' \
+        "certbot_healthcheck_complete $1" \
+        '# HELP certbot_healthcheck_success Whether a complete check found no expiring certificates' \
+        '# TYPE certbot_healthcheck_success gauge' \
+        "certbot_healthcheck_success $2" \
+        '# HELP certbot_healthcheck_timestamp_seconds Unix time of this observation' \
+        '# TYPE certbot_healthcheck_timestamp_seconds gauge' \
+        "certbot_healthcheck_timestamp_seconds $CURRENT_EPOCH"
+}
+
 expiry_epoch() {
     expiry_value=$1
     if parsed_epoch=$(LC_ALL=C date -u -d "$expiry_value" +%s 2>/dev/null); then
@@ -79,12 +110,8 @@ expiry_epoch() {
     return 1
 }
 
-write_output() {
-    if [ -z "$OUTPUT_FILE" ]; then
-        printf '%s\n' "$OUTPUT_BUFFER"
-        return
-    fi
-
+validate_output() {
+    [ -n "$OUTPUT_FILE" ] || return 0
     output_parent=${OUTPUT_FILE%/*}
     if [ "$output_parent" = "$OUTPUT_FILE" ]; then
         output_parent=.
@@ -97,6 +124,17 @@ write_output() {
         fail "output parent must be an existing real directory: $output_parent"
     fi
     [ ! -L "$OUTPUT_FILE" ] || fail "refusing symbolic-link output: $OUTPUT_FILE"
+    if [ -e "$OUTPUT_FILE" ] && [ ! -f "$OUTPUT_FILE" ]; then
+        fail "output target must be a regular file: $OUTPUT_FILE"
+    fi
+}
+
+write_output() {
+    if [ -z "$OUTPUT_FILE" ]; then
+        printf '%s\n' "$OUTPUT_BUFFER"
+        return
+    fi
+    validate_output
 
     OUTPUT_TMP=$(mktemp "$output_parent/.$output_name.XXXXXX") \
         || fail "could not create temporary output beside $OUTPUT_FILE"
@@ -143,6 +181,10 @@ done
 case "$WARN_DAYS" in
     '' | *[!0-9]*) fail "--warn-days must be an integer from 0 to $MAX_WARN_DAYS" ;;
 esac
+# POSIX arithmetic treats a leading zero as octal on some supported shells.
+while [ "${WARN_DAYS#0}" != "$WARN_DAYS" ] && [ "$WARN_DAYS" != 0 ]; do
+    WARN_DAYS=${WARN_DAYS#0}
+done
 [ "$WARN_DAYS" -le "$MAX_WARN_DAYS" ] \
     || fail "--warn-days must be an integer from 0 to $MAX_WARN_DAYS"
 
@@ -151,8 +193,11 @@ case "$FORMAT" in
     *) fail "unsupported format: $FORMAT (choose text, json, or prometheus)" ;;
 esac
 
-command -v openssl >/dev/null 2>&1 || fail "openssl binary not found in PATH"
+validate_output
 command -v date >/dev/null 2>&1 || fail "date binary not found in PATH"
+CURRENT_EPOCH=$(date -u +%s) || fail "could not read the current UTC time"
+REPORT_READY=yes
+command -v openssl >/dev/null 2>&1 || fail "openssl binary not found in PATH"
 if [ "$FORMAT" = json ]; then
     command -v jq >/dev/null 2>&1 || fail "jq binary is required for JSON output"
 fi
@@ -162,23 +207,32 @@ if [ ! -d "$LIVE_DIR" ] || [ -L "$LIVE_DIR" ]; then
 fi
 
 WARN_SECONDS=$((WARN_DAYS * SECONDS_PER_DAY))
-CURRENT_EPOCH=$(date -u +%s) || fail "could not read the current UTC time"
 
 case "$FORMAT" in
     json) OUTPUT_BUFFER='{"certificates":[' ;;
     prometheus)
         OUTPUT_BUFFER='# HELP certbot_certificate_expiry_seconds Time until certificate expiration in seconds
-# TYPE certbot_certificate_expiry_seconds gauge'
+# TYPE certbot_certificate_expiry_seconds gauge
+# HELP certbot_certificate_expiry_timestamp_seconds Unix time of leaf certificate expiration
+# TYPE certbot_certificate_expiry_timestamp_seconds gauge'
         ;;
     text) OUTPUT_BUFFER= ;;
 esac
 
 FIRST_JSON_ENTRY=1
 
-for cert_path in "$LIVE_DIR"/*/fullchain.pem; do
-    [ -f "$cert_path" ] || continue
-
-    domain_dir=${cert_path%/*}
+for domain_dir in "$LIVE_DIR"/*; do
+    # Certbot's live root also contains a README. Every directory is a lineage;
+    # a dangling lineage link is a failure rather than an absent glob match.
+    if [ ! -d "$domain_dir" ]; then
+        [ ! -L "$domain_dir" ] || fail "certificate lineage is not a directory: $domain_dir"
+        continue
+    fi
+    cert_path=$domain_dir/fullchain.pem
+    # Certbot normally links fullchain.pem into archive/. Follow a valid link,
+    # but reject missing, dangling, unreadable, and non-file certificate paths.
+    [ -f "$cert_path" ] && [ -r "$cert_path" ] \
+        || fail "certificate file is missing or unreadable: $cert_path"
     domain_name=${domain_dir##*/}
     case "$domain_name" in
         '' | *[!A-Za-z0-9._*-]*) fail "unsafe certificate lineage name: $domain_name" ;;
@@ -246,17 +300,30 @@ for cert_path in "$LIVE_DIR"/*/fullchain.pem; do
         prometheus)
             append_output "$(printf 'certbot_certificate_expiry_seconds{domain="%s"} %s' \
                 "$domain_name" "$remaining_seconds")"
+            append_output "$(printf 'certbot_certificate_expiry_timestamp_seconds{domain="%s"} %s' \
+                "$domain_name" "$expiry_epoch_value")"
             ;;
     esac
 done
 
 [ "$CERT_COUNT" -gt 0 ] || fail "no certificates found under live directory: $LIVE_DIR"
 
-if [ "$FORMAT" = json ]; then
-    OUTPUT_BUFFER="$OUTPUT_BUFFER],\"total\":$CERT_COUNT,\"expiring\":$EXPIRING_COUNT}"
+healthy_json=true
+healthy_number=1
+if [ "$EXPIRING_COUNT" -ne 0 ]; then
+    healthy_json=false
+    healthy_number=0
 fi
+case "$FORMAT" in
+    json)
+        OUTPUT_BUFFER="$OUTPUT_BUFFER],\"total\":$CERT_COUNT,\"expiring\":$EXPIRING_COUNT,\"checked_at_epoch\":$CURRENT_EPOCH,\"complete\":true,\"healthy\":$healthy_json}"
+        ;;
+    prometheus) append_output "$(prometheus_status 1 "$healthy_number")" ;;
+    text) append_output "Checked at Unix time $CURRENT_EPOCH; inspected $CERT_COUNT certificate lineage(s)." ;;
+esac
 
 write_output
+REPORT_READY=no
 
 [ "$EXPIRING_COUNT" -eq 0 ] || exit 1
 exit 0

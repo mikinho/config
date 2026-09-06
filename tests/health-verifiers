@@ -85,6 +85,9 @@ grep -F 'Issuer:' "$TEST_ROOT/report.txt" >/dev/null
 jq -e '
     .total == 1
     and .expiring == 0
+    and .complete == true
+    and .healthy == true
+    and (.checked_at_epoch | type == "number" and . > 0)
     and .certificates[0].domain == "example.test"
     and (.certificates[0].subject | type == "string" and length > 0)
     and (.certificates[0].issuer | type == "string" and length > 0)
@@ -97,6 +100,11 @@ jq -e '
     --format prometheus > "$TEST_ROOT/report.prom"
 grep -Eq '^certbot_certificate_expiry_seconds\{domain="example[.]test"\} [0-9]+$' \
     "$TEST_ROOT/report.prom"
+grep -Eq '^certbot_certificate_expiry_timestamp_seconds\{domain="example[.]test"\} [0-9]+$' \
+    "$TEST_ROOT/report.prom"
+grep -Fx 'certbot_healthcheck_complete 1' "$TEST_ROOT/report.prom" >/dev/null
+grep -Fx 'certbot_healthcheck_success 1' "$TEST_ROOT/report.prom" >/dev/null
+grep -Eq '^certbot_healthcheck_timestamp_seconds [0-9]+$' "$TEST_ROOT/report.prom"
 
 "$CERTBOT_HEALTHCHECK" \
     --live-dir "$TEST_ROOT/live" \
@@ -117,6 +125,10 @@ expect_failure \
     --warn-days 1 \
     --output "$TEST_ROOT/symlink-output"
 [ ! -s "$TEST_ROOT/output-victim" ] || fail "healthcheck followed a symbolic-link output"
+mkdir "$TEST_ROOT/output-directory"
+expect_failure 'output target must be a regular file' \
+    "$CERTBOT_HEALTHCHECK" --live-dir "$TEST_ROOT/live" --output "$TEST_ROOT/output-directory"
+rmdir "$TEST_ROOT/output-directory"
 
 printf '%s\n' 'not a certificate' > "$TEST_ROOT/invalid-live/bad.test/fullchain.pem"
 expect_failure \
@@ -125,6 +137,75 @@ expect_failure \
 expect_failure \
     '' \
     "$CERTBOT_HEALTHCHECK" --live-dir "$TEST_ROOT/live" --warn-days 3650
+
+# Certbot's live/fullchain links into archive are valid input. A README in the
+# live root is metadata, while every lineage directory must contain a file.
+mkdir -p "$TEST_ROOT/archive/example.test" "$TEST_ROOT/mixed-live/example.test"
+cp "$TEST_ROOT/live/example.test/fullchain.pem" "$TEST_ROOT/archive/example.test/fullchain1.pem"
+ln -s ../../archive/example.test/fullchain1.pem "$TEST_ROOT/mixed-live/example.test/fullchain.pem"
+printf 'Certificate lineage metadata\n' > "$TEST_ROOT/mixed-live/README"
+"$CERTBOT_HEALTHCHECK" --live-dir "$TEST_ROOT/mixed-live" --warn-days 0008 --format json \
+    > "$TEST_ROOT/symlink-report.json"
+jq -e '.total == 1 and .complete == true and .healthy == true' "$TEST_ROOT/symlink-report.json" >/dev/null
+
+for report_format in text json prometheus; do
+    output_report=$TEST_ROOT/mixed-report.$report_format
+    "$CERTBOT_HEALTHCHECK" --live-dir "$TEST_ROOT/mixed-live" --format "$report_format" \
+        --output "$output_report"
+    mkdir "$TEST_ROOT/mixed-live/missing.test"
+    expect_failure 'certificate file is missing or unreadable' \
+        "$CERTBOT_HEALTHCHECK" --live-dir "$TEST_ROOT/mixed-live" --format "$report_format" \
+        --output "$output_report"
+    case "$report_format" in
+        text)
+            grep -F '[FAILED]' "$output_report" >/dev/null
+            if grep -F '[OK]' "$output_report" >/dev/null; then
+                fail 'failed inspection retained a successful text report'
+            fi
+            ;;
+        json)
+            jq -e '.complete == false and .healthy == false and .total == null
+                and .expiring == null and .certificates == [] and .checked_at_epoch > 0' \
+                "$output_report" >/dev/null
+            ;;
+        prometheus)
+            grep -Fx 'certbot_healthcheck_complete 0' "$output_report" >/dev/null
+            grep -Fx 'certbot_healthcheck_success 0' "$output_report" >/dev/null
+            if grep -F 'certbot_certificate_expiry_seconds{' "$output_report" >/dev/null; then
+                fail 'failed inspection retained successful certificate metrics'
+            fi
+            ;;
+    esac
+    rmdir "$TEST_ROOT/mixed-live/missing.test"
+done
+
+mkdir "$TEST_ROOT/mixed-live/broken.test"
+ln -s ../../archive/missing/fullchain1.pem "$TEST_ROOT/mixed-live/broken.test/fullchain.pem"
+expect_failure 'certificate file is missing or unreadable' \
+    "$CERTBOT_HEALTHCHECK" --live-dir "$TEST_ROOT/mixed-live"
+rm "$TEST_ROOT/mixed-live/broken.test/fullchain.pem"
+mkdir "$TEST_ROOT/mixed-live/broken.test/fullchain.pem"
+expect_failure 'certificate file is missing or unreadable' \
+    "$CERTBOT_HEALTHCHECK" --live-dir "$TEST_ROOT/mixed-live"
+rmdir "$TEST_ROOT/mixed-live/broken.test/fullchain.pem"
+printf 'not a certificate\n' > "$TEST_ROOT/mixed-live/broken.test/fullchain.pem"
+expect_failure 'could not parse certificate expiry' \
+    "$CERTBOT_HEALTHCHECK" --live-dir "$TEST_ROOT/mixed-live" --format json \
+    --output "$TEST_ROOT/published-report.json"
+jq -e '.complete == false and .healthy == false and .certificates == []' \
+    "$TEST_ROOT/published-report.json" >/dev/null
+rm "$TEST_ROOT/mixed-live/broken.test/fullchain.pem"
+rmdir "$TEST_ROOT/mixed-live/broken.test"
+ln -s ../missing-lineage "$TEST_ROOT/mixed-live/dangling.test"
+expect_failure 'certificate lineage is not a directory' \
+    "$CERTBOT_HEALTHCHECK" --live-dir "$TEST_ROOT/mixed-live"
+rm "$TEST_ROOT/mixed-live/dangling.test"
+
+expect_failure '' "$CERTBOT_HEALTHCHECK" --live-dir "$TEST_ROOT/mixed-live" --warn-days 3650 \
+    --format prometheus --output "$TEST_ROOT/expiring.prom"
+grep -Fx 'certbot_healthcheck_complete 1' "$TEST_ROOT/expiring.prom" >/dev/null
+grep -Fx 'certbot_healthcheck_success 0' "$TEST_ROOT/expiring.prom" >/dev/null
+grep -F 'certbot_certificate_expiry_timestamp_seconds{' "$TEST_ROOT/expiring.prom" >/dev/null
 
 require_root_function=$(extract_function require_root "$HOST_VERIFIER")
 root_result=$(sh -c "

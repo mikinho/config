@@ -108,10 +108,13 @@ sudo certbot/issue --production --staging-passed \
 ```
 
 Add `--backend snap` to every command when that backend is installed. Staging
-uses Certbot's non-persistent `--dry-run`; `--staging-passed` is an explicit
-operator assertion that the production names match the successful test. The
-helper rejects wildcard names because they require a deployment-specific
-DNS-01 plugin and protected provider credentials.
+uses Certbot's non-persistent `--dry-run` with the explicit Let's Encrypt
+staging endpoint. Production issuance explicitly selects the production
+endpoint; its follow-up renewal dry run selects staging again. These command
+line selections override a conflicting `server` default in `cli.ini`.
+`--staging-passed` is an explicit operator assertion that the production names
+match the successful test. The helper rejects wildcard names because they
+require a deployment-specific DNS-01 plugin and protected provider credentials.
 
 Add the resulting `/etc/letsencrypt/live/DOMAIN/` paths to the reviewed site
 configuration, run `/usr/sbin/nginx -t`, and reload nginx only after that test
@@ -126,7 +129,8 @@ invocation on the host.
 Then validate renewal and expiry monitoring:
 
 ```sh
-sudo certbot renew --dry-run
+sudo certbot renew --dry-run \
+    --server https://acme-staging-v02.api.letsencrypt.org/directory
 sudo systemctl start certbot.service
 sudo systemctl list-timers --no-pager | grep -Ei 'certbot|letsencrypt'
 sudo /usr/local/bin/certbot-healthcheck
@@ -137,10 +141,52 @@ For the Snap backend, start `snap.certbot.renew.service` instead of
 `certbot.service`. See [`../systemd/README.md`](../systemd/README.md) for the
 complete backend contract, sandbox rationale, and runtime checks.
 
-The daily health service exits nonzero when any managed certificate is
-missing, invalid, or within 30 days of expiry. It intentionally has no email,
-webhook, or vendor-specific notification credential; host monitoring must
-alert on a failed `certbot-healthcheck.service` unit.
+The daily health service inspects each lineage directory present in the live
+tree. It exits nonzero when that tree is missing or empty, a lineage's
+`fullchain.pem` is missing, unreadable, or unparseable, or a leaf certificate is
+within 30 days of expiry. Valid Certbot links into the archive are supported;
+dangling links are failures. Detecting a lineage whose entire directory was
+removed requires a separately maintained inventory or endpoint check.
+
+This is a local file and expiration check. It does not establish chain trust,
+hostname matching, the start of a certificate's validity period, private-key
+pairing, or which certificate nginx currently serves. Keep this service's
+network confinement and add a separate deployment-owned HTTPS check using the
+intended SNI/hostname, trusted chain, and expiry threshold. After a renewal or
+reload, verify a fresh TLS connection reaches the expected certificate; a
+successful reload command alone does not prove nginx adopted it.
+
+The units intentionally contain no email, webhook, or vendor-specific
+notification credential. Private host monitoring must cover failed renewal
+and healthcheck units, missing or overdue scheduled runs, and the served HTTPS
+endpoint. Add those checks and protected notification settings through the
+deployment's Monit fragments or existing monitoring system, then verify both
+a controlled failure notification and its recovery. Keep service restart
+ownership with systemd.
+
+### Reports and freshness
+
+`certbot-healthcheck --format json` includes `checked_at_epoch`, `complete`,
+and `healthy`. A complete inspection can be unhealthy because a certificate
+is near expiry. An incomplete inspection reports `complete: false`,
+`healthy: false`, empty certificate results, and unknown (`null`) counts.
+
+Prometheus reports include `certbot_healthcheck_complete`,
+`certbot_healthcheck_success`, and `certbot_healthcheck_timestamp_seconds`.
+Each inspected certificate has an absolute
+`certbot_certificate_expiry_timestamp_seconds` metric. The existing
+`certbot_certificate_expiry_seconds` metric remains available as the remaining
+time **at observation**, not a clock that updates between runs.
+
+With `--output`, an inspection failure atomically replaces the previous report
+with failure status and removes its certificate results. Argument errors,
+failure to obtain the observation time, process termination, or an unwritable
+output destination can leave an older file in place. Consumers must alert on
+nonzero command status, missing or incomplete reports, unhealthy status, and
+an observation timestamp older than their allowed collection interval. File
+existence or a previously successful value alone is insufficient. Keep the
+freshness allowance consistent with the daily timer's jitter and the host's
+expected downtime.
 
 ## Switching backends
 
