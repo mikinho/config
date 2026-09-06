@@ -1,0 +1,166 @@
+#!/usr/bin/env sh
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
+# Real Linux/systemd acceptance for the startup checker's execution context.
+# Run only on an explicitly disposable CI host, never on a deployment host.
+set -eu
+
+PROGRAM_NAME=${0##*/}
+SCRIPT_DIRECTORY=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+REPOSITORY_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIRECTORY/.." && pwd)
+UNIT_SOURCE=$REPOSITORY_ROOT/systemd/system/nginx.service
+VERIFIER_SOURCE=$REPOSITORY_ROOT/nginx/verify-runtime
+TEST_DIRECTORY=
+UNIT_NAME=
+UNIT_PATH=
+UNIT_INSTALLED=no
+
+usage() {
+    cat <<EOF
+Usage: $PROGRAM_NAME --check
+       sudo $PROGRAM_NAME --disposable-ci-host
+
+--check validates fixture sources without changing the host. Execution requires
+GITHUB_ACTIONS=true, root, Linux with systemd as PID 1, /usr/sbin/nginx, and an
+existing nginx user/group. It creates and cleans up one uniquely named service,
+its managed directories, and a private fixture tree under /run. No production
+unit is changed. This gate proves Linux/systemd behavior, not EL9 SELinux policy.
+EOF
+}
+
+fail() { printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2; exit 1; }
+
+cleanup() {
+    if [ "$UNIT_INSTALLED" = yes ]; then
+        systemctl stop "$UNIT_NAME" >/dev/null 2>&1 || :
+        systemctl clean --what=runtime,state,logs "$UNIT_NAME" >/dev/null 2>&1 || :
+        systemctl reset-failed "$UNIT_NAME" >/dev/null 2>&1 || :
+        rm -f -- "$UNIT_PATH"
+        systemctl daemon-reload >/dev/null 2>&1 || :
+    fi
+    [ -z "$TEST_DIRECTORY" ] || rm -rf -- "$TEST_DIRECTORY"
+}
+
+diagnostics() {
+    systemctl --no-pager --full status "$UNIT_NAME" >&2 || :
+    journalctl --no-pager -u "$UNIT_NAME" -o cat >&2 || :
+}
+
+assert_contains() {
+    grep -F -- "$2" "$1" >/dev/null || fail "$1 is missing: $2"
+}
+
+expect_wrong_worker_count() {
+    asserted_count=$1
+    if "$TEST_DIRECTORY/verify" --workers "$asserted_count" --timeout-seconds 0 \
+        > "$TEST_DIRECTORY/count.stdout" 2> "$TEST_DIRECTORY/count.stderr"; then
+        fail "two actual workers unexpectedly satisfied --workers $asserted_count"
+    fi
+    assert_contains "$TEST_DIRECTORY/count.stderr" "expected exactly $asserted_count"
+}
+
+[ "$#" -eq 1 ] || { usage >&2; exit 1; }
+case "$1" in
+    --help | -h) usage; exit 0 ;;
+    --check | --disposable-ci-host) mode=$1 ;;
+    *) fail "unknown argument: $1" ;;
+esac
+for source_file in "$UNIT_SOURCE" "$VERIFIER_SOURCE"; do
+    [ -f "$source_file" ] && [ ! -L "$source_file" ] || fail "source must be a real file: $source_file"
+done
+[ -x "$VERIFIER_SOURCE" ] || fail 'runtime verifier source must be executable'
+# The literal systemd variable is part of the source contract, not this shell.
+# shellcheck disable=SC2016
+assert_contains "$UNIT_SOURCE" 'ExecStartPost=!/usr/local/libexec/nginx-runtime-verify --master-pid $MAINPID'
+assert_contains "$UNIT_SOURCE" 'Group=nginx'
+assert_contains "$UNIT_SOURCE" 'ProtectProc=invisible'
+if grep -E '^CapabilityBoundingSet=.*CAP_SYS_PTRACE' "$UNIT_SOURCE" >/dev/null; then
+    fail 'the regression must not grant ptrace to nginx'
+fi
+if [ "$mode" = --check ]; then
+    printf 'Validated sources for the disposable Linux/systemd runtime regression.\n'
+    exit 0
+fi
+
+[ "${GITHUB_ACTIONS:-false}" = true ] || fail 'execution is restricted to an explicitly disposable GitHub Actions host'
+[ "$(uname -s)" = Linux ] || fail 'execution requires Linux'
+[ "$(id -u)" -eq 0 ] || fail 'execution requires root on a disposable CI host'
+[ "$(cat /proc/1/comm)" = systemd ] || fail 'execution requires systemd as PID 1'
+[ -x /usr/sbin/nginx ] || fail '/usr/sbin/nginx is required'
+for required_command in curl getent install journalctl mktemp sed setpriv systemctl; do
+    command -v "$required_command" >/dev/null 2>&1 || fail "required command not found: $required_command"
+done
+id nginx >/dev/null 2>&1 || fail 'nginx user is required'
+getent group nginx >/dev/null || fail 'nginx group is required'
+
+TEST_DIRECTORY=$(mktemp -d /run/config-nginx-systemd.XXXXXX)
+trap cleanup EXIT HUP INT TERM
+chmod 0755 "$TEST_DIRECTORY"
+fixture_name=${TEST_DIRECTORY##*/}-service
+UNIT_NAME=$fixture_name.service
+UNIT_PATH=/run/systemd/system/$UNIT_NAME
+[ ! -e "$UNIT_PATH" ] && [ ! -L "$UNIT_PATH" ] || fail 'generated fixture unit already exists'
+
+# Reuse the actual repository unit and verifier. Only names/paths are rebased;
+# Restart=no prevents an expected failure from becoming a retry loop.
+sed \
+    -e "s|^NGINX_PID_FILE=.*|NGINX_PID_FILE=/run/$fixture_name/nginx.pid|" \
+    -e "s|^NGINX_LOG_DIRECTORY=.*|NGINX_LOG_DIRECTORY=/var/log/$fixture_name|" \
+    "$VERIFIER_SOURCE" > "$TEST_DIRECTORY/verify"
+chmod 0755 "$TEST_DIRECTORY/verify"
+sed \
+    -e 's|/usr/sbin/%p|/usr/sbin/nginx|g' \
+    -e "s|/etc/%p/%p.conf|$TEST_DIRECTORY/nginx.conf|g" \
+    -e "s|/usr/local/libexec/nginx-runtime-verify|$TEST_DIRECTORY/verify|g" \
+    -e "s|%p|$fixture_name|g" \
+    -e 's|^Restart=on-failure$|Restart=no|' \
+    "$UNIT_SOURCE" > "$TEST_DIRECTORY/positive.service"
+cat > "$TEST_DIRECTORY/nginx.conf" <<EOF
+user nginx nginx;
+worker_processes 2;
+pid /run/$fixture_name/nginx.pid;
+error_log /var/log/$fixture_name/error.log warn;
+events { worker_connections 16; }
+http {
+    access_log off;
+    server {
+        listen unix:/run/$fixture_name/http.sock;
+        location / { return 200 "fixture-ready\\n"; }
+    }
+}
+EOF
+install -m 0644 "$TEST_DIRECTORY/positive.service" "$UNIT_PATH"
+UNIT_INSTALLED=yes
+systemctl daemon-reload
+if ! systemctl start "$UNIT_NAME"; then
+    diagnostics
+    fail 'current ! startup verifier failed under the real unit sandbox'
+fi
+systemctl is-active --quiet "$UNIT_NAME" || fail 'fixture is not active after startup verification'
+"$TEST_DIRECTORY/verify" --workers 2 --timeout-seconds 0
+expect_wrong_worker_count 1
+expect_wrong_worker_count 3
+curl --fail --silent --show-error --max-time 5 \
+    --unix-socket "/run/$fixture_name/http.sock" http://localhost/ \
+    > "$TEST_DIRECTORY/http.stdout"
+assert_contains "$TEST_DIRECTORY/http.stdout" 'fixture-ready'
+
+# Removing ! must reproduce the cross-UID /proc failure. This makes the test
+# fail if ProtectProc is ignored, root group membership accidentally bypasses
+# it, or the test environment otherwise fails to exercise the actual boundary.
+systemctl stop "$UNIT_NAME"
+sed 's|^ExecStartPost=!|ExecStartPost=|' "$TEST_DIRECTORY/positive.service" \
+    > "$TEST_DIRECTORY/negative.service"
+install -m 0644 "$TEST_DIRECTORY/negative.service" "$UNIT_PATH"
+systemctl daemon-reload
+if systemctl start "$UNIT_NAME"; then
+    diagnostics
+    fail 'removing the checker credential exception unexpectedly passed startup'
+fi
+journalctl --no-pager -u "$UNIT_NAME" -o cat > "$TEST_DIRECTORY/journal"
+assert_contains "$TEST_DIRECTORY/journal" 'nginx has 0 active workers; expected at least 1'
+
+printf 'Validated real nginx startup, exact worker counts, and the ProtectProc checker credential boundary under systemd.\n'

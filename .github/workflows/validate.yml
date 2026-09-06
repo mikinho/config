@@ -308,6 +308,39 @@ jobs:
               test -f rsync-3.5.0-0.2.mikinho.el9.src.rpm
             '
 
+  certbot-parser:
+    name: Certbot ${{ matrix.version }} effective issuance options
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ["3.1.0", "4.2.0", "5.7.0"]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Exercise real parser without CA requests or host configuration
+        env:
+          CERTBOT_VERSION: ${{ matrix.version }}
+        run: |
+          python3.12 -m venv "$RUNNER_TEMP/certbot-parser"
+          # Certbot 3.1's parser imports APIs removed by newer dependencies.
+          # These pins model its legacy parser only, not deployment packages.
+          if [ "$CERTBOT_VERSION" = 3.1.0 ]; then
+            "$RUNNER_TEMP/certbot-parser/bin/python" -m pip install \
+              --disable-pip-version-check \
+              "josepy==1.15.0" "PyOpenSSL==24.3.0" \
+              "cryptography==44.0.3" "setuptools==80.10.2"
+          fi
+          "$RUNNER_TEMP/certbot-parser/bin/python" -m pip install \
+            --disable-pip-version-check \
+            "certbot==$CERTBOT_VERSION" "acme==$CERTBOT_VERSION" "ConfigArgParse==1.7.6"
+          "$RUNNER_TEMP/certbot-parser/bin/python" tests/certbot-parser.py
+
   nginx:
     name: nginx ${{ matrix.version }} on Rocky Linux 9
     runs-on: ubuntu-24.04
@@ -499,6 +532,31 @@ jobs:
                 /tmp/nginx-cache/sites/sample_wp.conf
               nginx -t -p /tmp/nginx-cache/ -c nginx.conf
             '
+
+  nginx-systemd-runtime:
+    # A real systemd manager is needed here: parser checks and proc-shaped
+    # fixture files cannot exercise ProtectProc or ExecStartPost credentials.
+    # This hosted-kernel gate does not replace EL9/enforcing-SELinux acceptance.
+    name: nginx startup sandbox (disposable Linux host)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install fixture dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends nginx curl util-linux
+          getent group nginx >/dev/null || sudo groupadd --system nginx
+          id nginx >/dev/null 2>&1 ||
+            sudo useradd --system --gid nginx --no-create-home --shell /usr/sbin/nologin nginx
+
+      - name: Exercise real startup and checker credential regression
+        run: sudo env GITHUB_ACTIONS=true tests/nginx-systemd-runtime --disposable-ci-host
 
   systemd:
     name: Units on ${{ matrix.target }}

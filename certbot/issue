@@ -15,6 +15,10 @@ NGINX_CONFIG=/etc/nginx/nginx.conf
 NATIVE_CERTBOT=/bin/certbot
 SNAP_CERTBOT=/usr/local/bin/certbot
 HEALTHCHECK=/usr/local/bin/certbot-healthcheck
+CERTBOT_CONFIG_DIR=/etc/letsencrypt
+CERTBOT_WORK_DIR=/var/lib/letsencrypt
+CERTBOT_LOGS_DIR=/var/log/letsencrypt
+SYSTEM_CERTBOT_CONFIG=/etc/letsencrypt/cli.ini
 STAGING_ACME_SERVER=https://acme-staging-v02.api.letsencrypt.org/directory
 PRODUCTION_ACME_SERVER=https://acme-v02.api.letsencrypt.org/directory
 
@@ -45,6 +49,8 @@ webroot. Staging uses Certbot's non-persistent --dry-run. Production requires
 an explicit assertion that the same names passed staging. Existing lineages
 are never modified; use 'certbot reconfigure' for a managed certificate.
 The selected environment pins the corresponding Let's Encrypt ACME endpoint.
+Inherited cli.ini files must not contain staging, test-cert, or dry-run settings,
+including false values; remove those mode controls from global defaults first.
 EOF
 }
 
@@ -143,9 +149,68 @@ select_certbot_binary() {
     esac
 }
 
+validate_inherited_config_file() {
+    inherited_config=$1
+    if [ ! -e "$inherited_config" ] && [ ! -L "$inherited_config" ]; then
+        return
+    fi
+    [ -f "$inherited_config" ] && [ -r "$inherited_config" ] && [ ! -L "$inherited_config" ] \
+        || fail "inherited Certbot configuration must be a readable non-symlink file: $inherited_config"
+    # ConfigArgParse accepts bare flags, optional -- prefixes, and =, :, or
+    # whitespace separators. Reject mode controls regardless of their value:
+    # false values and aliases are not reliable overrides of another file.
+    # Do not print configuration values, which may contain private settings.
+    if LC_ALL=C awk '
+        { sub(/\r$/, "") }
+        /\r/ { exit 2 }
+        /^[[:space:]]*(#|;|\[|---)/ { next }
+        /[^[:print:][:space:]]/ { exit 2 }
+        /^[[:space:]]*(--)?(staging|test[-_]cert|dry[-_]run)([[:space:]:=]|$)/ { exit 1 }
+    ' "$inherited_config"; then
+        return
+    else
+        inherited_status=$?
+    fi
+    case "$inherited_status" in
+        1) fail "remove staging, test-cert, and dry-run settings from inherited Certbot configuration: $inherited_config" ;;
+        *) fail "inherited Certbot configuration must use readable ASCII settings with LF or CRLF lines: $inherited_config" ;;
+    esac
+}
+
+resolve_user_config() {
+    # Match Certbot's documented XDG source without accepting paths whose glob
+    # or tilde expansion could select files other than the one checked here.
+    if [ "${XDG_CONFIG_HOME+x}" = x ]; then
+        certbot_user_directory=$XDG_CONFIG_HOME
+    else
+        [ -n "${HOME:-}" ] || fail "HOME must identify an absolute home directory"
+        certbot_user_directory=$HOME/.config
+    fi
+    case "$certbot_user_directory" in
+        /*) ;;
+        *) fail "Certbot user configuration directory must be absolute" ;;
+    esac
+    case "$certbot_user_directory" in
+        *\** | *\?* | *\[* | *\]*)
+            fail "Certbot user configuration directory must not contain glob characters"
+            ;;
+    esac
+    USER_CERTBOT_CONFIG=$certbot_user_directory/letsencrypt/cli.ini
+}
+
+validate_inherited_config() {
+    resolve_user_config
+    validate_inherited_config_file "$SYSTEM_CERTBOT_CONFIG"
+    validate_inherited_config_file "$USER_CERTBOT_CONFIG"
+}
+
+run_certbot() {
+    validate_inherited_config
+    "$CERTBOT_BINARY" "$@"
+}
+
 build_certbot_command() {
     set -- \
-        "$CERTBOT_BINARY" \
         certonly \
         --non-interactive \
         --agree-tos \
@@ -154,14 +219,17 @@ build_certbot_command() {
         --webroot \
         --webroot-path "$ACME_WEBROOT" \
         --preferred-challenges http \
-        --server "$ACME_SERVER"
+        --server "$ACME_SERVER" \
+        --config-dir "$CERTBOT_CONFIG_DIR" \
+        --work-dir "$CERTBOT_WORK_DIR" \
+        --logs-dir "$CERTBOT_LOGS_DIR"
     for issuance_domain in $DOMAINS; do
         set -- "$@" --domain "$issuance_domain"
     done
     if [ "$ENVIRONMENT" = staging ]; then
         set -- "$@" --dry-run
     fi
-    "$@"
+    run_certbot "$@"
 }
 
 print_certbot_command() {
@@ -175,7 +243,10 @@ print_certbot_command() {
         --webroot \
         --webroot-path "$ACME_WEBROOT" \
         --preferred-challenges http \
-        --server "$ACME_SERVER"
+        --server "$ACME_SERVER" \
+        --config-dir "$CERTBOT_CONFIG_DIR" \
+        --work-dir "$CERTBOT_WORK_DIR" \
+        --logs-dir "$CERTBOT_LOGS_DIR"
     for issuance_domain in $DOMAINS; do
         set -- "$@" --domain "$issuance_domain"
     done
@@ -213,8 +284,8 @@ validate_live_host() {
         || fail "nginx configuration must be a regular file: $NGINX_CONFIG"
     [ -d "$ACME_WEBROOT" ] && [ ! -L "$ACME_WEBROOT" ] \
         || fail "ACME webroot must be a real directory: $ACME_WEBROOT"
-    [ ! -e "/etc/letsencrypt/renewal/$PRIMARY_DOMAIN.conf" ] \
-        && [ ! -L "/etc/letsencrypt/renewal/$PRIMARY_DOMAIN.conf" ] \
+    [ ! -e "$CERTBOT_CONFIG_DIR/renewal/$PRIMARY_DOMAIN.conf" ] \
+        && [ ! -L "$CERTBOT_CONFIG_DIR/renewal/$PRIMARY_DOMAIN.conf" ] \
         || fail "certificate lineage already exists; use certbot reconfigure: $PRIMARY_DOMAIN"
     systemctl is-active --quiet nginx.service \
         || fail "nginx.service must be active for HTTP-01 validation"
@@ -253,13 +324,16 @@ verify_local_webroot() {
 print_plan() {
     printf 'Certbot first-lineage plan: environment=%s, backend=%s, primary=%s\n' \
         "$ENVIRONMENT" "$BACKEND" "$PRIMARY_DOMAIN"
+    printf '+ reject staging, test-cert, and dry-run directives in system and user cli.ini defaults before Certbot runs\n'
     printf '+ verify active nginx serves %s/.well-known/acme-challenge/ through %s for every requested name\n' \
         "$ACME_WEBROOT" "$HTTP_PROBE_ADDRESS"
     print_certbot_command
     if [ "$ENVIRONMENT" = production ]; then
         print_command \
             "$CERTBOT_BINARY" renew --cert-name "$PRIMARY_DOMAIN" --dry-run \
-            --no-random-sleep-on-renew --server "$STAGING_ACME_SERVER"
+            --no-random-sleep-on-renew --server "$STAGING_ACME_SERVER" \
+            --config-dir "$CERTBOT_CONFIG_DIR" --work-dir "$CERTBOT_WORK_DIR" \
+            --logs-dir "$CERTBOT_LOGS_DIR"
         print_command "$HEALTHCHECK"
     fi
     printf 'Plan complete; no certificate or host state was changed.\n'
@@ -267,11 +341,14 @@ print_plan() {
 
 issue_certificate() {
     validate_live_host
+    validate_inherited_config
     verify_local_webroot
     build_certbot_command
     if [ "$ENVIRONMENT" = production ]; then
-        "$CERTBOT_BINARY" renew --cert-name "$PRIMARY_DOMAIN" --dry-run \
-            --no-random-sleep-on-renew --server "$STAGING_ACME_SERVER"
+        run_certbot renew --cert-name "$PRIMARY_DOMAIN" --dry-run \
+            --no-random-sleep-on-renew --server "$STAGING_ACME_SERVER" \
+            --config-dir "$CERTBOT_CONFIG_DIR" --work-dir "$CERTBOT_WORK_DIR" \
+            --logs-dir "$CERTBOT_LOGS_DIR"
         [ -x "$HEALTHCHECK" ] \
             || fail "certificate healthcheck is missing: $HEALTHCHECK"
         "$HEALTHCHECK"

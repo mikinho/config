@@ -179,6 +179,15 @@ denies. On the target Linux host, inspect the composed unit, effective mount
 filter and capabilities, test intended reads/writes and upstream connections,
 and exercise graceful reload and log rotation under representative traffic.
 
+The `nginx-systemd-runtime` CI job runs the real unit and verifier on a
+disposable Linux host using fixture-only paths and a Unix HTTP socket. It
+checks successful startup and exact worker-count assertions, then removes only
+the checker's `!` prefix and requires the cross-UID `/proc` failure. This
+negative case prevents a host that ignores `ProtectProc` from producing a
+false pass. `tests/nginx-systemd-runtime --check` is read-only source validation;
+it is not the Linux runtime test. The hosted Ubuntu kernel gate does not prove
+the target EL9 build, optional QUIC BPF profile, or enforcing SELinux policy.
+
 The ordinary capability allowlist covers privileged binds, worker identity
 changes, log ownership and access, worker signals, and rlimits. Ambient
 capabilities are empty; workers must have no effective or permitted capabilities.

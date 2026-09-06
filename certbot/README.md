@@ -112,6 +112,30 @@ uses Certbot's non-persistent `--dry-run` with the explicit Let's Encrypt
 staging endpoint. Production issuance explicitly selects the production
 endpoint; its follow-up renewal dry run selects staging again. These command
 line selections override a conflicting `server` default in `cli.ini`.
+The helper also rejects `staging`, `test-cert`, and `dry-run` directives in
+`/etc/letsencrypt/cli.ini` and the invoking user's
+`$XDG_CONFIG_HOME/letsencrypt/cli.ini` (or `$HOME/.config/letsencrypt/cli.ini`
+when XDG is unset). This includes false
+values, leading `--` forms, and underscore spellings: an explicit production
+`--server` alone does not neutralize inherited testing mode, and a false alias
+in another file is not a reliable override. Remove these mode directives from
+global defaults and select the environment through `issue` instead. The helper
+never edits those files or prints their settings.
+
+Other global defaults remain available, but active settings must use ASCII
+text with LF or CRLF line endings so alternative Unicode whitespace or bare
+carriage-return separators cannot bypass the guard. Configuration
+files must be readable regular files, not symbolic links. `HOME` (when XDG is
+unset) and any explicit `XDG_CONFIG_HOME` must identify absolute paths without
+glob characters; an empty explicit XDG value is rejected. The official classic
+Snap preserves the invoking user's home directory and uses the same sources.
+The helper explicitly pins config, work, and log directories to
+`/etc/letsencrypt`, `/var/lib/letsencrypt`, and `/var/log/letsencrypt`, keeping
+issuance and renewal aligned with its existing-lineage guard and installed
+units. A deployment needing other directories requires a separately reviewed
+workflow. `--plan` describes these checks without reading host configuration;
+apply rechecks the files before each Certbot invocation.
+
 `--staging-passed` is an explicit operator assertion that the production names
 match the successful test. The helper rejects wildcard names because they
 require a deployment-specific DNS-01 plugin and protected provider credentials.
@@ -215,3 +239,17 @@ repository.
 - [Snap on Red Hat Enterprise Linux](https://snapcraft.io/docs/tutorials/install-the-daemon/red-hat/)
 - [Snap on CentOS Stream](https://snapcraft.io/docs/tutorials/install-the-daemon/centos/)
 - [Snap on Rocky Linux](https://snapcraft.io/docs/tutorials/install-the-daemon/rocky-linux/)
+- [Certbot global configuration](https://eff-certbot.readthedocs.io/en/stable/using.html#configuration-file)
+- [Certbot testing-mode post-processing](https://github.com/certbot/certbot/blob/v5.7.0/certbot/src/certbot/_internal/cli/cli_utils.py)
+- [Classic Snap environment behavior](https://snapcraft.io/docs/reference/development/environment-variables/#home)
+
+## Parser regression check
+
+`tests/certbot-issue` checks the portable helper and its preflight rejection
+paths. `python3 tests/certbot-parser.py` additionally exercises the **actual
+installed Certbot parser**, using only temporary configuration and webroot
+directories. It never calls a Certbot command handler, certificate authority,
+host service, or deployment hook. Run it in an isolated Python environment
+with Certbot and the matching `acme` version installed. Keep this separate from
+live issuance and repeat it when upgrading the selected Certbot package or
+Snap; EPEL 9 and 10 can carry different Certbot generations.

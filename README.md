@@ -793,7 +793,8 @@ sudo systemctl --no-pager show snap.certbot.renew.service \
 sudo systemctl --no-pager show certbot.timer certbot-healthcheck.timer \
     -p Unit -p TimersCalendar -p RandomizedDelayUSec -p Persistent
 sudo systemctl list-timers --no-pager | grep -Ei 'certbot|letsencrypt'
-sudo certbot renew --dry-run
+sudo certbot renew --dry-run \
+    --server https://acme-staging-v02.api.letsencrypt.org/directory
 sudo /usr/local/bin/certbot-healthcheck
 ```
 

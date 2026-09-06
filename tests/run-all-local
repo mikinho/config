@@ -93,6 +93,7 @@ if command -v shellcheck >/dev/null 2>&1; then
         "$REPOSITORY_ROOT/tests/nginx-setup" \
         "$REPOSITORY_ROOT/tests/nginx-runtime" \
         "$REPOSITORY_ROOT/tests/nginx-runtime-verifier" \
+        "$REPOSITORY_ROOT/tests/nginx-systemd-runtime" \
         "$REPOSITORY_ROOT/tests/mongodb" \
         "$REPOSITORY_ROOT/tests/mongodb-el9" \
         "$REPOSITORY_ROOT/tests/monit" \
@@ -150,6 +151,7 @@ step "Running component and host setup tests..."
 step "Running isolated nginx capacity and restart regression tests..."
 "$REPOSITORY_ROOT/tests/nginx-setup"
 "$REPOSITORY_ROOT/tests/nginx-runtime-verifier"
+"$REPOSITORY_ROOT/tests/nginx-systemd-runtime" --check
 
 step "Running interactive shell history tests..."
 "$REPOSITORY_ROOT/tests/shell-history"

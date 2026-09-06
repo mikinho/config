@@ -4,6 +4,9 @@
 # Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
 #
 
+# Runtime shell snippets below intentionally preserve positional expansions.
+# shellcheck disable=SC2016
+
 set -eu
 
 PROGRAM_NAME=${0##*/}
@@ -66,6 +69,7 @@ assert_contains "$TEST_ROOT/staging.plan" 'through 127.0.0.2 for every requested
 assert_contains "$TEST_ROOT/staging.plan" '/bin/certbot certonly --non-interactive --agree-tos'
 assert_contains "$TEST_ROOT/staging.plan" '--preferred-challenges http'
 assert_contains "$TEST_ROOT/staging.plan" '--server https://acme-staging-v02.api.letsencrypt.org/directory'
+assert_contains "$TEST_ROOT/staging.plan" '--config-dir /etc/letsencrypt --work-dir /var/lib/letsencrypt --logs-dir /var/log/letsencrypt'
 assert_contains "$TEST_ROOT/staging.plan" '--domain example.com --domain www.example.com --dry-run'
 assert_not_contains "$TEST_ROOT/staging.plan" 'certbot-healthcheck'
 
@@ -97,14 +101,21 @@ command_name=$1
 shift
 server=$(sed -n 's/^server = //p' "$FAKE_CERTBOT_CONFIG")
 dry_run=no
+config_dir=uncontrolled
+work_dir=uncontrolled
+logs_dir=uncontrolled
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --server) server=$2; shift 2 ;;
         --dry-run) dry_run=yes; shift ;;
+        --config-dir) config_dir=$2; shift 2 ;;
+        --work-dir) work_dir=$2; shift 2 ;;
+        --logs-dir) logs_dir=$2; shift 2 ;;
         *) shift ;;
     esac
 done
-printf 'command=%s server=%s dry_run=%s\n' "$command_name" "$server" "$dry_run" >> "$FAKE_CERTBOT_CALLS"
+printf 'command=%s server=%s dry_run=%s config=%s work=%s logs=%s\n' \
+    "$command_name" "$server" "$dry_run" "$config_dir" "$work_dir" "$logs_dir" >> "$FAKE_CERTBOT_CALLS"
 EOF
 cat > "$TEST_ROOT/record-healthcheck" <<'EOF'
 #!/usr/bin/env sh
@@ -129,6 +140,9 @@ for selected_environment in staging production; do
             DOMAINS=example.com
             PRIMARY_DOMAIN=example.com
             STAGING_PASSED=yes
+            SYSTEM_CERTBOT_CONFIG=$1/cli.ini
+            USER_CERTBOT_CONFIG=$1/user-cli.ini
+            resolve_user_config() { :; }
             validate_selection
             validate_live_host() { :; }
             verify_local_webroot() { :; }
@@ -145,6 +159,67 @@ assert_contains "$TEST_ROOT/production.calls" \
     'command=renew server=https://acme-staging-v02.api.letsencrypt.org/directory dry_run=yes'
 [ "$(wc -l < "$TEST_ROOT/production.calls" | tr -d ' ')" = 2 ] \
     || fail 'production did not issue once and test renewal once'
+for executed_calls in "$TEST_ROOT/staging.calls" "$TEST_ROOT/production.calls"; do
+    if grep -F 'uncontrolled' "$executed_calls" >/dev/null; then
+        fail 'an executed Certbot command omitted a managed state directory'
+    fi
+    assert_contains "$executed_calls" \
+        'config=/etc/letsencrypt work=/var/lib/letsencrypt logs=/var/log/letsencrypt'
+done
+
+# No global mode directive is acceptable, including false settings and aliases.
+# These checks call the production guard without reading any host configuration.
+for inherited_setting in \
+    'staging = true' 'test-cert: true' '--dry-run' 'dry-run yes' \
+    '  --staging = false' 'test-cert = off' 'dry-run = 0' \
+    'test_cert = true' '--dry_run = true'
+do
+    printf '%s\n' "$inherited_setting" > "$TEST_ROOT/conflicting.ini"
+    expect_failure 'remove staging, test-cert, and dry-run settings' \
+        sh -c '. "$1/issuer-functions"; validate_inherited_config_file "$1/conflicting.ini"' \
+        config-test "$TEST_ROOT"
+done
+printf '# staging = true\n; dry-run = true\n[settings]\nserver = https://acme.example.invalid/directory\n' \
+    > "$TEST_ROOT/benign.ini"
+sh -c '. "$1/issuer-functions"; validate_inherited_config_file "$1/benign.ini"' \
+    config-test "$TEST_ROOT"
+ln -s "$TEST_ROOT/not-present" "$TEST_ROOT/dangling.ini"
+expect_failure 'inherited Certbot configuration must be a readable non-symlink file' \
+    sh -c '. "$1/issuer-functions"; validate_inherited_config_file "$1/dangling.ini"' \
+    config-test "$TEST_ROOT"
+mkdir "$TEST_ROOT/config-directory"
+expect_failure 'inherited Certbot configuration must be a readable non-symlink file' \
+    sh -c '. "$1/issuer-functions"; validate_inherited_config_file "$1/config-directory"' \
+    config-test "$TEST_ROOT"
+ln -s "$TEST_ROOT/benign.ini" "$TEST_ROOT/readable-symlink.ini"
+expect_failure 'inherited Certbot configuration must be a readable non-symlink file' \
+    sh -c '. "$1/issuer-functions"; validate_inherited_config_file "$1/readable-symlink.ini"' \
+    config-test "$TEST_ROOT"
+if [ "$(id -u)" -ne 0 ]; then
+    cp "$TEST_ROOT/benign.ini" "$TEST_ROOT/unreadable.ini"
+    chmod 0000 "$TEST_ROOT/unreadable.ini"
+    expect_failure 'inherited Certbot configuration must be a readable non-symlink file' \
+        sh -c '. "$1/issuer-functions"; validate_inherited_config_file "$1/unreadable.ini"' \
+        config-test "$TEST_ROOT"
+    chmod 0600 "$TEST_ROOT/unreadable.ini"
+fi
+
+for config_source in system user; do
+    printf 'staging = true\n' > "$TEST_ROOT/$config_source-conflict.ini"
+    expect_failure 'remove staging, test-cert, and dry-run settings' \
+        sh -c '
+            . "$1/issuer-functions"
+            SYSTEM_CERTBOT_CONFIG=$1/absent-system.ini
+            USER_CERTBOT_CONFIG=$1/absent-user.ini
+            case "$2" in
+                system) SYSTEM_CERTBOT_CONFIG=$1/system-conflict.ini ;;
+                user) USER_CERTBOT_CONFIG=$1/user-conflict.ini ;;
+            esac
+            resolve_user_config() { :; }
+            CERTBOT_BINARY=$1/not-an-executable
+            run_certbot certonly
+        ' config-test "$TEST_ROOT" "$config_source"
+done
 
 expect_failure \
     'production issuance requires --staging-passed' \
