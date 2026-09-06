@@ -46,6 +46,7 @@ SERVER_HOST=
 TLS_CERTIFICATE_FILE=
 TLS_PRIVATE_KEY_FILE=
 TLS_CA_FILE=
+MINIMUM_TLS_SECONDS=3600
 ALLOWED_CLIENT_FILE=
 TEMPORARY_DIRECTORY=
 
@@ -63,6 +64,8 @@ Required verification options:
 
 For an exact configuration comparison, also supply --maxmemory-mib MIB.
 Network verification requires --server-host HOST and --tls-ca-file FILE.
+--minimum-tls-seconds SECONDS selects the remaining lifetime margin (default:
+3600; range: 300-2592000), independently of expiry alerts and renewal scheduling.
 Exact network-policy comparison additionally uses --bind-address,
 --tls-certificate-file, --tls-private-key-file, and --allowed-client-file.
 EOF
@@ -113,6 +116,7 @@ while [ "$#" -gt 0 ]; do
         --tls-certificate-file) TLS_CERTIFICATE_FILE=${2:?--tls-certificate-file requires a value}; shift 2 ;;
         --tls-private-key-file) TLS_PRIVATE_KEY_FILE=${2:?--tls-private-key-file requires a value}; shift 2 ;;
         --tls-ca-file) TLS_CA_FILE=${2:?--tls-ca-file requires a value}; shift 2 ;;
+        --minimum-tls-seconds) MINIMUM_TLS_SECONDS=${2:?--minimum-tls-seconds requires a value}; shift 2 ;;
         --allowed-client-file) ALLOWED_CLIENT_FILE=${2:?--allowed-client-file requires a value}; shift 2 ;;
         --help | -h) usage; exit 0 ;;
         *) fail "unknown argument: $1" ;;
@@ -151,6 +155,7 @@ case "$MODEL" in
     *) fail "--model must be local or network" ;;
 esac
 redis_validate_data_profile "$DATA_PROFILE"
+redis_validate_minimum_tls_seconds "$MINIMUM_TLS_SECONDS"
 redis_validate_safe_name "administrative user" "$ADMIN_USER"
 redis_validate_safe_name "application user" "$APPLICATION_USER"
 [ "$ADMIN_USER" != "$APPLICATION_USER" ] \
@@ -287,6 +292,8 @@ if [ -n "$ALLOWED_CLIENT_FILE" ]; then
 fi
 
 if [ "$MODEL" = network ]; then
+    openssl x509 -checkend "$MINIMUM_TLS_SECONDS" -noout -in "$TLS_CERTIFICATE_FILE" >/dev/null \
+        || fail "TLS certificate has less than $MINIMUM_TLS_SECONDS seconds remaining"
     redis_verify_local_tls_service_identity \
         "$SERVER_HOST" "$TLS_CA_FILE" "$TLS_CERTIFICATE_FILE" \
         "$TEMPORARY_DIRECTORY/served-tls-transcript" \
@@ -421,20 +428,7 @@ grep -Fx 'NoNewPrivileges=yes' "$TEMPORARY_DIRECTORY/systemd.properties" >/dev/n
     || fail "effective Redis unit must enable NoNewPrivileges"
 grep -Fx 'ProtectSystem=strict' "$TEMPORARY_DIRECTORY/systemd.properties" >/dev/null \
     || fail "effective Redis unit must set ProtectSystem=strict"
-effective_ip_deny=$(systemctl show redis.service --property=IPAddressDeny --value)
-effective_default_deny=yes
-case "$effective_ip_deny" in
-    any) ;;
-    *)
-        for required_network in '0.0.0.0/0' '::/0'; do
-            printf '%s\n' "$effective_ip_deny" | tr ' ' '\n' \
-                | grep -Fx "$required_network" >/dev/null \
-                || effective_default_deny=no
-        done
-        ;;
-esac
-[ "$effective_default_deny" = yes ] \
-    || fail "effective Redis unit must default-deny IPv4 and IPv6 addresses"
+redis_verify_effective_systemd_policy "$SYSTEMD_POLICY_PATH"
 
 [ "$(sysctl -n vm.overcommit_memory 2>/dev/null)" = 1 ] \
     || fail "vm.overcommit_memory must be 1"
@@ -442,6 +436,9 @@ redis_main_pid=$(systemctl show redis.service --property=MainPID --value)
 case "$redis_main_pid" in
     '' | 0 | *[!0-9]*) fail "cannot identify the active Redis process" ;;
 esac
+awk '$1 == "Umask:" && $2 == "0077" { valid = 1 } END { exit valid ? 0 : 1 }' \
+    "/proc/$redis_main_pid/status" \
+    || fail "running Redis process must use umask 0077"
 awk '$1 == "THP_enabled:" && $2 == 0 { disabled = 1 } \
     END { exit disabled ? 0 : 1 }' "/proc/$redis_main_pid/status" \
     || fail "Redis process must disable Transparent Huge Pages"

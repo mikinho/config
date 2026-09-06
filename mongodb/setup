@@ -28,7 +28,7 @@ KEY_FILE_PATH=/etc/mongod.keyfile
 DATA_DIRECTORY=/var/lib/mongo
 LOG_DIRECTORY=/var/log/mongodb
 MONGODB_PORT=27017
-TLS_MINIMUM_REMAINING_SECONDS=172800
+TLS_MINIMUM_REMAINING_SECONDS=3600
 
 MODE=apply
 PHASE=
@@ -92,6 +92,7 @@ Expose-network options:
   --application-password-file FILE
   --bind-address PRIVATE_IPV4 --member-host TLS_DNS_NAME
   --tls-certificate-key-file FILE --tls-ca-file FILE
+  --minimum-tls-seconds SECONDS (default: 3600; range: 300-2592000)
   --network-controls-confirmed
 
 Initialize is intentionally limited to a new, empty data directory and creates
@@ -322,6 +323,13 @@ reject_initialize_only_options() {
 }
 
 validate_selection() {
+    case "$TLS_MINIMUM_REMAINING_SECONDS" in
+        '' | *[!0-9]* | 0*) fail "--minimum-tls-seconds must be a positive decimal integer" ;;
+    esac
+    [ "${#TLS_MINIMUM_REMAINING_SECONDS}" -le 7 ] \
+        && [ "$TLS_MINIMUM_REMAINING_SECONDS" -ge 300 ] \
+        && [ "$TLS_MINIMUM_REMAINING_SECONDS" -le 2592000 ] \
+        || fail "--minimum-tls-seconds must be between 300 and 2592000"
     case "$PHASE" in
         initialize)
             validate_common_identity_selection
@@ -386,6 +394,7 @@ validate_selection() {
 }
 
 print_plan() {
+    printf 'Certificate acceptance margin for network operations: %s seconds remaining.\n' "$TLS_MINIMUM_REMAINING_SECONDS"
     case "$PHASE" in
         initialize)
             printf '1. Require MongoDB 8.0, an inactive and disabled service, and an empty %s.\n' "$DATA_DIRECTORY"
@@ -542,6 +551,7 @@ verify_local_model() {
 verify_network_model() {
     "$VERIFIER" \
         --model network \
+        --minimum-tls-seconds "$TLS_MINIMUM_REMAINING_SECONDS" \
         --replica-set "$REPLICA_SET" \
         --admin-user "$ADMIN_USER" \
         --admin-password-file "$ADMIN_PASSWORD_FILE" \
@@ -711,7 +721,7 @@ validate_tls_server_identity() {
         || fail "TLS certificate does not cover member host $MEMBER_HOST"
     openssl x509 -in "$TLS_CERTIFICATE_KEY_FILE" -noout \
         -checkend "$TLS_MINIMUM_REMAINING_SECONDS" >/dev/null \
-        || fail "TLS server certificate expires within 48 hours"
+        || fail "TLS server certificate has less than $TLS_MINIMUM_REMAINING_SECONDS seconds remaining"
 }
 
 expose_network_model() {
@@ -787,6 +797,7 @@ while [ "$#" -gt 0 ]; do
         --member-host) [ "$#" -ge 2 ] || fail "--member-host requires a value"; MEMBER_HOST=$2; shift 2 ;;
         --tls-certificate-key-file) [ "$#" -ge 2 ] || fail "--tls-certificate-key-file requires a value"; TLS_CERTIFICATE_KEY_FILE=$2; shift 2 ;;
         --tls-ca-file) [ "$#" -ge 2 ] || fail "--tls-ca-file requires a value"; TLS_CA_FILE=$2; shift 2 ;;
+        --minimum-tls-seconds) [ "$#" -ge 2 ] || fail "--minimum-tls-seconds requires a value"; TLS_MINIMUM_REMAINING_SECONDS=$2; shift 2 ;;
         --network-controls-confirmed) NETWORK_CONTROLS_CONFIRMED=yes; shift ;;
         --help | -h) usage; exit 0 ;;
         *) fail "unknown argument: $1" ;;

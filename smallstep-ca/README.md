@@ -225,6 +225,16 @@ exact socket-bind permission, and default-deny IP filtering.
 External firewalls remain mandatory because a service sandbox is not a network
 segmentation substitute.
 
+Verification compares the loaded unit's mask, core sandbox properties, and
+complete IP allow/deny sets with this policy, then checks the running process's
+`Umask: 0077`. Equivalent overlapping IPv4 prefixes and systemd's `localhost`
+expansion are normalized; an extra allowed source or permissive drop-in fails.
+The private database directory remains explicitly mode `0700`.
+The supported hierarchy is `system.slice` with empty `IPAddressAllow` lists on
+both `system.slice` and the root slice; parent allowlists can broaden child
+access. Kernel cgroup-BPF enforcement still requires an actual denied-source
+traffic test. Matching systemd properties alone does not prove packet filtering.
+
 ## Verify and collect acceptance evidence
 
 Run the verifier after setup, package upgrades, configuration changes, restore

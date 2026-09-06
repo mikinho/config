@@ -17,6 +17,7 @@ CA_TEMPLATE_SOURCE=$SCRIPT_DIRECTORY/templates/ca.json.in
 SYSTEMD_TEMPLATE_SOURCE=$SCRIPT_DIRECTORY/templates/step-ca.service.in
 POLICY_VALIDATOR_SOURCE=$SCRIPT_DIRECTORY/validate-policy
 POLICY_FILTER_SOURCE=$SCRIPT_DIRECTORY/lib/policy.jq
+SYSTEMD_LIBRARY_SOURCE=$SCRIPT_DIRECTORY/lib/systemd.sh
 POLICY_DIRECTORY=/usr/local/libexec/config-step-ca
 VERIFIER_TARGET=/usr/local/bin/verify-step-ca
 
@@ -75,7 +76,7 @@ validate_manifest() {
 for source_path in \
     "$PLATFORM_LIBRARY" "$PACKAGE_MANIFEST" "$VERIFIER_SOURCE" \
     "$CA_TEMPLATE_SOURCE" "$SYSTEMD_TEMPLATE_SOURCE" \
-    "$POLICY_VALIDATOR_SOURCE" "$POLICY_FILTER_SOURCE"
+    "$POLICY_VALIDATOR_SOURCE" "$POLICY_FILTER_SOURCE" "$SYSTEMD_LIBRARY_SOURCE"
 do
     validate_source "$source_path"
 done
@@ -208,6 +209,7 @@ install -d -o root -g root -m 0755 /usr/local/bin "$POLICY_DIRECTORY" \
     "$POLICY_DIRECTORY/templates" "$POLICY_DIRECTORY/lib"
 install -o root -g root -m 0755 "$POLICY_VALIDATOR_SOURCE" "$POLICY_DIRECTORY/validate-policy"
 install -o root -g root -m 0644 "$POLICY_FILTER_SOURCE" "$POLICY_DIRECTORY/lib/policy.jq"
+install -o root -g root -m 0644 "$SYSTEMD_LIBRARY_SOURCE" "$POLICY_DIRECTORY/lib/systemd.sh"
 install -o root -g root -m 0755 "$VERIFIER_SOURCE" "$VERIFIER_TARGET"
 install -o root -g root -m 0644 "$PACKAGE_MANIFEST" \
     "$POLICY_DIRECTORY/packages.manifest"

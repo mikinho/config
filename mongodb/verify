@@ -24,7 +24,7 @@ DATA_DIRECTORY=/var/lib/mongo
 LOG_DIRECTORY=/var/log/mongodb
 LOGROTATE_PATH=/etc/logrotate.d/mongodb
 MONGODB_PORT=27017
-TLS_MINIMUM_REMAINING_SECONDS=172800
+TLS_MINIMUM_REMAINING_SECONDS=3600
 
 MODE=verify
 MODEL=
@@ -54,6 +54,7 @@ Usage:
       --application-password-file FILE \
       --member-host HOST --bind-address PRIVATE_IPV4 \
       --tls-ca-file FILE --tls-certificate-key-file FILE
+      [--minimum-tls-seconds SECONDS] (default: 3600; range: 300-2592000)
 
 Verifies MongoDB 8.0, an initialized writable single-node replica set,
 authentication and least-privilege application identity, configuration and
@@ -177,6 +178,13 @@ validate_password_file() {
 }
 
 validate_selection() {
+    case "$TLS_MINIMUM_REMAINING_SECONDS" in
+        '' | *[!0-9]* | 0*) fail "--minimum-tls-seconds must be a positive decimal integer" ;;
+    esac
+    [ "${#TLS_MINIMUM_REMAINING_SECONDS}" -le 7 ] \
+        && [ "$TLS_MINIMUM_REMAINING_SECONDS" -ge 300 ] \
+        && [ "$TLS_MINIMUM_REMAINING_SECONDS" -le 2592000 ] \
+        || fail "--minimum-tls-seconds must be between 300 and 2592000"
     validate_safe_name "replica-set name" "$REPLICA_SET"
     validate_safe_name "administrative user" "$ADMIN_USER"
     validate_safe_name "application user" "$APPLICATION_USER"
@@ -413,7 +421,7 @@ verify_tls_files() {
         || fail "TLS certificate does not cover $MEMBER_HOST"
     openssl x509 -in "$TLS_CERTIFICATE_KEY_FILE" -noout \
         -checkend "$TLS_MINIMUM_REMAINING_SECONDS" >/dev/null \
-        || fail "TLS server certificate expires within 48 hours"
+        || fail "TLS server certificate has less than $TLS_MINIMUM_REMAINING_SECONDS seconds remaining"
 }
 
 report_host_advisories() {
@@ -490,6 +498,7 @@ while [ "$#" -gt 0 ]; do
         --bind-address) [ "$#" -ge 2 ] || fail "--bind-address requires a value"; BIND_ADDRESS=$2; shift 2 ;;
         --tls-ca-file) [ "$#" -ge 2 ] || fail "--tls-ca-file requires a value"; TLS_CA_FILE=$2; shift 2 ;;
         --tls-certificate-key-file) [ "$#" -ge 2 ] || fail "--tls-certificate-key-file requires a value"; TLS_CERTIFICATE_KEY_FILE=$2; shift 2 ;;
+        --minimum-tls-seconds) [ "$#" -ge 2 ] || fail "--minimum-tls-seconds requires a value"; TLS_MINIMUM_REMAINING_SECONDS=$2; shift 2 ;;
         --help | -h) usage; exit 0 ;;
         *) fail "unknown argument: $1" ;;
     esac
@@ -518,6 +527,11 @@ mongod --version 2>/dev/null | grep -Eq 'db version v8\.0\.29([.-]|$)' \
     || fail "MongoDB 8.0.29 is required"
 systemctl is-enabled --quiet mongod.service || fail "mongod.service is not enabled"
 systemctl is-active --quiet mongod.service || fail "mongod.service is not active"
+mongodb_main_pid=$(systemctl show mongod.service --property=MainPID --value)
+case "$mongodb_main_pid" in '' | 0 | *[!0-9]*) fail "mongod.service has no live main process" ;; esac
+awk '$1 == "Umask:" && $2 == "0077" { valid = 1 } END { exit valid ? 0 : 1 }' \
+    "/proc/$mongodb_main_pid/status" \
+    || fail "running MongoDB process must use umask 0077"
 open_file_limit=$(systemctl show mongod.service --property=LimitNOFILE --value)
 case "$open_file_limit" in
     infinity) ;;

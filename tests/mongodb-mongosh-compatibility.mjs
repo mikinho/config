@@ -198,7 +198,7 @@ function testReconfigureObjectAuthentication() {
     });
 }
 
-function testAuthenticatedVerifierObjectAuthentication() {
+function testAuthenticatedVerifierObjectAuthentication(honorSystemUmask = false, processUmask = 0o077) {
     const applicationDatabase = {
         runCommand: () => ({
             ok: 1,
@@ -271,6 +271,9 @@ function testAuthenticatedVerifierObjectAuthentication() {
             }
             if (command.enableLocalhostAuthBypass) {
                 return { enableLocalhostAuthBypass: false, ok: 1 };
+            }
+            if (command.honorSystemUmask) {
+                return { honorSystemUmask, processUmask, ok: 1 };
             }
             throw new Error("Unexpected mocked administrative command.");
         },
@@ -373,6 +376,8 @@ testAddApplicationUserObjectAuthentication();
 testBackupUserObjectAuthenticationAndVerification();
 testReconfigureObjectAuthentication();
 testAuthenticatedVerifierObjectAuthentication();
+assert.throws(() => testAuthenticatedVerifierObjectAuthentication(true, 0o077), /honorSystemUmask=false/u);
+assert.throws(() => testAuthenticatedVerifierObjectAuthentication(false, 0o022), /processUmask=0077/u);
 testThrownApplicationAuthorizationDenial();
 testThrownUnauthenticatedAuthorizationDenial();
 testUnexpectedUnauthenticatedFailureIsRejected();

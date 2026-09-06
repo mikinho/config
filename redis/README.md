@@ -40,6 +40,14 @@ rollback gates pass. Use Rocky Linux 9 for a rebuild or planned OS migration.
 
 ## Security baseline
 
+The verifier checks the loaded unit's `UMask=0077`, the process umask, and the
+complete effective IP allow/deny sets. Redis must use `system.slice`; neither
+`system.slice` nor the root slice may add `IPAddressAllow` entries, because
+parent allowlists can broaden a child unit's access. The explicitly managed
+runtime directory remains `0750`, and the administrative socket remains `0700`.
+Kernel cgroup-BPF enforcement still requires an actual denied-source traffic
+test; matching systemd properties alone does not prove packet filtering.
+
 All four configurations enforce the same security controls:
 
 - Redis runs under the vendor `redis` account, hardened systemd policy, and
@@ -316,6 +324,15 @@ private keys, DNS results, firewall rule identifiers, and dated connection
 tests in the private deployment evidence set.
 
 ## Zero-downtime TLS certificate adoption
+
+Setup, verification, and the reload helper accept `--minimum-tls-seconds`
+(default `3600`, allowed range `300` through `2592000`). This is the minimum
+remaining lifetime required for acceptance, not the certificate lifetime or a
+renewal trigger. The one-hour default supports the CA's 24-hour certificates.
+Renew well before that margin, allow for repeated failures and operator recovery,
+and alert independently of this acceptance check. Pass the same selected margin
+to deployment and renewal commands; do not lengthen leaf certificates merely to
+satisfy an acceptance threshold. Setup forwards the selection to verification.
 
 Redis 8.2 can replace its in-memory OpenSSL context through the runtime
 `tls-cert-file` configuration without stopping its listeners or disconnecting

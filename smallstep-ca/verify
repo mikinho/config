@@ -13,10 +13,12 @@ if [ -f "$SCRIPT_DIRECTORY/templates/step-ca.service.in" ]; then
     SYSTEMD_TEMPLATE=$SCRIPT_DIRECTORY/templates/step-ca.service.in
     PACKAGE_MANIFEST=$SCRIPT_DIRECTORY/packages.manifest
     POLICY_VALIDATOR=$SCRIPT_DIRECTORY/validate-policy
+    SYSTEMD_LIBRARY=$SCRIPT_DIRECTORY/lib/systemd.sh
 else
     SYSTEMD_TEMPLATE=/usr/local/libexec/config-step-ca/templates/step-ca.service.in
     PACKAGE_MANIFEST=/usr/local/libexec/config-step-ca/packages.manifest
     POLICY_VALIDATOR=/usr/local/libexec/config-step-ca/validate-policy
+    SYSTEMD_LIBRARY=/usr/local/libexec/config-step-ca/lib/systemd.sh
 fi
 
 CONFIGURATION_PATH=/etc/step-ca/config/ca.json
@@ -189,6 +191,9 @@ render_service() {
 validate_source "$SYSTEMD_TEMPLATE"
 validate_source "$PACKAGE_MANIFEST"
 validate_source "$POLICY_VALIDATOR"
+validate_source "$SYSTEMD_LIBRARY"
+# shellcheck disable=SC1090
+. "$SYSTEMD_LIBRARY"
 ALLOWED_NETWORK_FILE=$(mktemp "${TMPDIR:-/tmp}/config-step-ca-verify-networks.XXXXXX")
 : > "$ALLOWED_NETWORK_FILE"
 trap cleanup EXIT HUP INT TERM
@@ -328,6 +333,9 @@ systemctl is-enabled --quiet step-ca.service || fail "step-ca.service is not ena
 systemctl is-active --quiet step-ca.service || fail "step-ca.service is not active"
 main_pid=$(systemctl show --property MainPID --value step-ca.service)
 case "$main_pid" in '' | 0 | *[!0-9]*) fail "step-ca.service has no live main process" ;; esac
+step_ca_verify_effective_unit "$ALLOWED_NETWORK_FILE"
+awk '$1 == "Umask:" && $2 == "0077" { valid = 1 } END { exit valid ? 0 : 1 }' \
+    "/proc/$main_pid/status" || fail "running step-ca process must use umask 0077"
 
 resolved_addresses=$(getent ahostsv4 "$SERVER_NAME" | awk '{ print $1 }' | sort -u)
 [ "$resolved_addresses" = "$BIND_ADDRESS" ] \

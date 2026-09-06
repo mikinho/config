@@ -14,12 +14,14 @@ SYSTEMD_TEMPLATE=$SCRIPT_DIRECTORY/templates/step-ca.service.in
 SOURCE_VERIFIER=$SCRIPT_DIRECTORY/verify
 POLICY_VALIDATOR=$SCRIPT_DIRECTORY/validate-policy
 POLICY_FILTER=$SCRIPT_DIRECTORY/lib/policy.jq
+SYSTEMD_LIBRARY=$SCRIPT_DIRECTORY/lib/systemd.sh
 INSTALLED_VERIFIER=/usr/local/bin/verify-step-ca
 INSTALLED_POLICY_DIRECTORY=/usr/local/libexec/config-step-ca
 INSTALLED_CA_TEMPLATE=$INSTALLED_POLICY_DIRECTORY/templates/ca.json.in
 INSTALLED_SYSTEMD_TEMPLATE=$INSTALLED_POLICY_DIRECTORY/templates/step-ca.service.in
 INSTALLED_POLICY_VALIDATOR=$INSTALLED_POLICY_DIRECTORY/validate-policy
 INSTALLED_POLICY_FILTER=$INSTALLED_POLICY_DIRECTORY/lib/policy.jq
+INSTALLED_SYSTEMD_LIBRARY=$INSTALLED_POLICY_DIRECTORY/lib/systemd.sh
 
 CONFIGURATION_PATH=/etc/step-ca/config/ca.json
 ROOT_CERTIFICATE_TARGET=/etc/step-ca/certs/root_ca.crt
@@ -301,7 +303,7 @@ render_service() {
     ' "$SYSTEMD_TEMPLATE" > "$output_path"
 }
 
-for source_path in "$CA_TEMPLATE" "$SYSTEMD_TEMPLATE" "$SOURCE_VERIFIER" "$POLICY_VALIDATOR" "$POLICY_FILTER"; do
+for source_path in "$CA_TEMPLATE" "$SYSTEMD_TEMPLATE" "$SOURCE_VERIFIER" "$POLICY_VALIDATOR" "$POLICY_FILTER" "$SYSTEMD_LIBRARY"; do
     validate_source "$source_path"
 done
 
@@ -420,7 +422,8 @@ for policy_pair in \
     "CA template:$CA_TEMPLATE:$INSTALLED_CA_TEMPLATE" \
     "systemd template:$SYSTEMD_TEMPLATE:$INSTALLED_SYSTEMD_TEMPLATE" \
     "issuance validator:$POLICY_VALIDATOR:$INSTALLED_POLICY_VALIDATOR" \
-    "issuance filter:$POLICY_FILTER:$INSTALLED_POLICY_FILTER"
+    "issuance filter:$POLICY_FILTER:$INSTALLED_POLICY_FILTER" \
+    "effective unit policy:$SYSTEMD_LIBRARY:$INSTALLED_SYSTEMD_LIBRARY"
 do
     policy_label=${policy_pair%%:*}
     policy_paths=${policy_pair#*:}

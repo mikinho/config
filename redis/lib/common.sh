@@ -11,6 +11,93 @@ REDIS_APPLICATION_COMMAND_RULES='-@all +@read +@write +@transaction -@admin -@da
 REDIS_LOCAL_TLS_PROBE_ADDRESS=127.0.0.1
 REDIS_TLS_PORT=6379
 
+redis_validate_minimum_tls_seconds() {
+    case "$1" in '' | *[!0-9]* | 0*) fail "--minimum-tls-seconds must be a positive decimal integer" ;; esac
+    [ "${#1}" -le 7 ] && [ "$1" -ge 300 ] && [ "$1" -le 2592000 ] \
+        || fail "--minimum-tls-seconds must be between 300 and 2592000"
+}
+
+# systemd expands localhost/any and may omit /32 on individual IPv4 addresses.
+# Preserve all other tokens so an unexpected address cannot disappear silently.
+redis_normalize_ip_policy() {
+    awk '
+        function address_value(address, octets, octet, value) {
+            split(address, octets, "."); value = 0
+            for (octet = 1; octet <= 4; octet++) value = value * 256 + octets[octet]
+            return value
+        }
+        function emit(token, parts, prefix, size, first) {
+            if (token == "localhost") { emit("127.0.0.0/8"); emit("::1/128"); return }
+            if (token == "any") { emit("0.0.0.0/0"); emit("::/0"); return }
+            if (token == "::1") token = "::1/128"
+            split(token, parts, "/")
+            if (parts[1] ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ &&
+                (parts[2] == "" || (parts[2] ~ /^[0-9]+$/ && parts[2] <= 32))) {
+                prefix = parts[2] == "" ? 32 : parts[2]
+                size = 2 ^ (32 - prefix)
+                first = int(address_value(parts[1]) / size) * size
+                printf "4 %.0f %.0f\n", first, first + size - 1
+            } else print "6 " token
+        }
+        { for (field = 1; field <= NF; field++) emit($field) }
+    ' | LC_ALL=C sort -k1,1 -k2,2n -k3,3n | awk '
+        function flush() { if (active) printf "4 %.0f %.0f\n", first, last; active = 0 }
+        $1 == "4" {
+            if (active && $2 <= last + 1) { if ($3 > last) last = $3 }
+            else { flush(); first = $2; last = $3; active = 1 }
+            next
+        }
+        {
+            flush()
+            if ($2 == "::/0") ipv6_all = 1
+            if ($0 != previous) ipv6[++ipv6_count] = $0
+            previous = $0
+        }
+        END {
+            flush()
+            if (ipv6_all) print "6 ::/0"
+            else for (entry = 1; entry <= ipv6_count; entry++) print ipv6[entry]
+        }
+    '
+}
+
+redis_verify_effective_systemd_policy() {
+    redis_managed_policy=$1
+    [ "$(systemctl show redis.service --property=Slice --value)" = system.slice ] \
+        || fail "Redis must run in the reviewed system.slice hierarchy"
+    for redis_parent_slice in system.slice -.slice; do
+        redis_parent_allow=$(systemctl show --property=IPAddressAllow --value -- "$redis_parent_slice") \
+            || fail "cannot inspect the Redis parent-slice IP allowlist"
+        [ -z "$redis_parent_allow" ] \
+            || fail "Redis parent slices must not broaden IPAddressAllow"
+    done
+    redis_expected_allow=$(awk -F= '$1 == "IPAddressAllow" { print $2 }' "$redis_managed_policy")
+    [ -n "$redis_expected_allow" ] || fail "managed Redis unit has no allowed network policy"
+    for redis_allowed_network in $redis_expected_allow; do
+        case "$redis_allowed_network" in
+            localhost) ;;
+            */32) redis_validate_private_ipv4 "managed allowed address" "${redis_allowed_network%/32}" ;;
+            *) fail "managed Redis allowlist must contain only localhost and exact private /32 addresses" ;;
+        esac
+    done
+    redis_expected_allow=$(printf '%s\n' "$redis_expected_allow" | redis_normalize_ip_policy)
+    [ -n "$redis_expected_allow" ] || fail "cannot normalize the managed Redis IP allowlist"
+    redis_effective_allow=$(systemctl show redis.service --property=IPAddressAllow --value) \
+        || fail "cannot read the effective Redis IP allowlist"
+    redis_effective_allow=$(printf '%s\n' "$redis_effective_allow" | redis_normalize_ip_policy)
+    [ "$redis_effective_allow" = "$redis_expected_allow" ] \
+        || fail "effective Redis IP allowlist differs from the managed policy"
+    redis_effective_deny=$(systemctl show redis.service --property=IPAddressDeny --value) \
+        || fail "cannot read the effective Redis IP denylist"
+    redis_effective_deny=$(printf '%s\n' "$redis_effective_deny" | redis_normalize_ip_policy)
+    redis_expected_deny=$(printf 'any\n' | redis_normalize_ip_policy)
+    [ -n "$redis_expected_deny" ] || fail "cannot normalize the Redis default-deny policy"
+    [ "$redis_effective_deny" = "$redis_expected_deny" ] \
+        || fail "effective Redis unit must default-deny IPv4 and IPv6 addresses"
+    [ "$(systemctl show redis.service --property=UMask --value)" = 0077 ] \
+        || fail "effective Redis unit must set UMask=0077"
+}
+
 redis_validate_safe_name() {
     redis_name_label=$1
     redis_name_value=$2

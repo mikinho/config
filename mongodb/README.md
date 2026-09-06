@@ -221,10 +221,11 @@ controls before exposing a listener:
    address.
 2. A CA-issued server certificate whose SAN covers that name, stored with its
    matching, unencrypted private key in one `mongod:mongod` mode `0400` PEM
-   file. The certificate must have more than 48 hours of validity remaining.
+   file. The certificate must have more than the selected acceptance margin of
+   validity remaining: one hour by default, supporting 24-hour service leaves.
    Filesystem protection replaces an interactive passphrase because systemd
    must start unattended. Short-lived certificates require automated renewal
-   early enough to preserve that 48-hour acceptance margin.
+   early enough to preserve the selected acceptance margin.
 3. The public CA chain in one `root:root` mode `0644` file.
 4. Persistent firewall or upstream controls allowing TCP 27017 only from the
    exact application-host sources. Do not enable a broad `mongodb` service,
@@ -291,6 +292,21 @@ Do not perform an in-place downgrade from a rapid release to 8.0. Build a new
 MongoDB-supported migration path.
 
 ## Verification and operations
+
+Network setup and verification accept `--minimum-tls-seconds` (default `3600`,
+range `300` through `2592000`). Setup forwards the selected margin to the
+verifier. This margin is an acceptance floor; certificate renewal must run well
+before it, with independent expiry alerts and enough time for retries and
+operator recovery. Retain the chosen value in the private deployment procedure.
+
+MongoDB's vendor unit is retained without a repository UMask override. MongoDB
+defaults to `honorSystemUmask=false` and a `processUmask` of octal `0077`, masking
+group and other permissions itself before creating files. Verification checks
+both effective parameters (`processUmask` is returned as decimal `63`) and the
+running process's `Umask: 0077`. It separately verifies existing data/log paths
+and the logrotate-created `0640` log file; an umask does not change existing
+permissions or replace explicit directory and log creation modes. See the
+[MongoDB file-creation parameters](https://www.mongodb.com/docs/manual/reference/parameters/#mongodb-parameter-param.honorSystemUmask).
 
 Run the installed verifier on the database host after setup, certificate
 renewal, package maintenance, firewall work, and any user or configuration

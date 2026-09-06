@@ -76,6 +76,14 @@ write_os_release() {
 
 trap cleanup EXIT HUP INT TERM
 
+redis_validate_minimum_tls_seconds 300
+redis_validate_minimum_tls_seconds 3600
+redis_validate_minimum_tls_seconds 2592000
+validate_margin_fixture() ( redis_validate_minimum_tls_seconds "$1"; )
+expect_failure 'between 300 and 2592000' validate_margin_fixture 299
+expect_failure 'between 300 and 2592000' validate_margin_fixture 2592001
+expect_failure 'positive decimal integer' validate_margin_fixture 03600
+
 for entry_point in \
     "$BUNDLE_BUILDER" "$INSTALLER" "$SETUP" "$VERIFIER" "$TLS_RELOADER" \
     "$EL9_TEST" "$RUNTIME_TEST" "$PACKAGE_TEST"
@@ -201,7 +209,9 @@ assert_contains "$TEST_ROOT/add-network.plan" \
     --tls-ca-file /etc/pki/redis/ca-chain.crt \
     --allowed-client-address 10.20.30.21 \
     --allowed-client-address 10.20.30.22 \
+    --minimum-tls-seconds 7200 \
     --network-controls-confirmed > "$TEST_ROOT/expose-network.plan"
+assert_contains "$TEST_ROOT/expose-network.plan" '7200 seconds remaining'
 assert_contains "$TEST_ROOT/expose-network.plan" \
     'Replace plaintext TCP with TLS-only port 6379 on 127.0.0.1,10.20.30.40'
 assert_contains "$TEST_ROOT/expose-network.plan" \
@@ -216,7 +226,9 @@ assert_contains "$TEST_ROOT/expose-network.plan" \
     --tls-certificate-file /etc/pki/redis/server.crt \
     --tls-private-key-file /etc/pki/redis/server.key \
     --tls-ca-file /etc/pki/redis/ca-chain.crt \
+    --minimum-tls-seconds 7200 \
     > "$TEST_ROOT/reload-tls.plan"
+assert_contains "$TEST_ROOT/reload-tls.plan" '7200 seconds remaining'
 assert_contains "$TEST_ROOT/reload-tls.plan" \
     'atomically replaces its in-memory TLS context'
 assert_contains "$TEST_ROOT/reload-tls.plan" \
@@ -336,7 +348,8 @@ assert_contains "$REDIS_DIRECTORY/lib/common.sh" '+client|info'
 assert_contains "$TLS_RELOADER" 'CONFIG SET tls-cert-file'
 assert_contains "$TLS_RELOADER" 'Redis process ID changed during TLS reload'
 assert_contains "$VERIFIER" 'ps -e -o label= -o comm='
-assert_contains "$VERIFIER" "for required_network in '0.0.0.0/0' '::/0'"
+assert_contains "$VERIFIER" 'redis_verify_effective_systemd_policy'
+assert_contains "$VERIFIER" 'running Redis process must use umask 0077'
 assert_contains "$VERIFIER" 'for (field_number = 2; field_number <= NF; field_number += 1)'
 assert_contains "$SETUP" "-h \"\$REDIS_LOCAL_TLS_PROBE_ADDRESS\" -p \"\$REDIS_TLS_PORT\""
 assert_contains "$VERIFIER" "-h \"\$REDIS_LOCAL_TLS_PROBE_ADDRESS\" -p \"\$REDIS_TLS_PORT\""

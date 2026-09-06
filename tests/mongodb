@@ -198,7 +198,9 @@ assert_contains "$TEST_ROOT/add-local-user.plan" \
     --tls-certificate-key-file /etc/pki/mongodb/server.pem \
     --tls-ca-file /etc/pki/mongodb/ca.pem \
     --network-controls-confirmed \
+    --minimum-tls-seconds 7200 \
     > "$TEST_ROOT/expose-network.plan"
+assert_contains "$TEST_ROOT/expose-network.plan" '7200 seconds remaining'
 assert_contains "$TEST_ROOT/expose-network.plan" \
     'Install a TLS-required listener on 127.0.0.1,10.20.30.40'
 assert_contains "$TEST_ROOT/expose-network.plan" \
@@ -326,11 +328,11 @@ assert_contains "$INSTALLER" '%{RSAHEADER:pgpsig}'
 assert_contains "$INSTALLER" 'rpmkeys --checksig'
 assert_contains "$INSTALLER" 'enabled=0'
 assert_contains "$INSTALLER" 'Validated root-owned immutable MongoDB deployment bundle.'
-assert_contains "$SETUP" 'TLS_MINIMUM_REMAINING_SECONDS=172800'
-assert_contains "$SETUP" 'TLS server certificate expires within 48 hours'
+assert_contains "$SETUP" 'TLS_MINIMUM_REMAINING_SECONDS=3600'
+assert_contains "$SETUP" '--minimum-tls-seconds'
 assert_contains "$SETUP" "-untrusted \"\$TLS_CERTIFICATE_KEY_FILE\""
-assert_contains "$VERIFIER" 'TLS_MINIMUM_REMAINING_SECONDS=172800'
-assert_contains "$VERIFIER" 'TLS server certificate expires within 48 hours'
+assert_contains "$VERIFIER" 'TLS_MINIMUM_REMAINING_SECONDS=3600'
+assert_contains "$VERIFIER" 'running MongoDB process must use umask 0077'
 assert_contains "$VERIFIER" "-untrusted \"\$TLS_CERTIFICATE_KEY_FILE\""
 # shellcheck disable=SC2016
 assert_contains "$VERIFIER" 'require_directory_identity "$DATA_DIRECTORY" mongod:mongod:750'

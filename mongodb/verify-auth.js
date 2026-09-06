@@ -133,6 +133,21 @@
         throw new Error("enableLocalhostAuthBypass is not disabled.");
     }
 
+    // MongoDB deliberately replaces group/other umask bits independently of
+    // the vendor systemd unit. getParameter reports processUmask numerically.
+    const fileCreationPolicy = adminDatabase.runCommand({
+        getParameter: 1,
+        honorSystemUmask: 1,
+        processUmask: 1,
+    });
+    if (
+        fileCreationPolicy.ok !== 1 ||
+        fileCreationPolicy.honorSystemUmask !== false ||
+        fileCreationPolicy.processUmask !== 0o077
+    ) {
+        throw new Error("MongoDB must use honorSystemUmask=false and processUmask=0077.");
+    }
+
     const applicationDatabase = process.env.MONGODB_APPLICATION_DATABASE;
     const applicationUser = process.env.MONGODB_APPLICATION_USER;
     const users = adminDatabase
