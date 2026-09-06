@@ -208,6 +208,10 @@ published modes explicitly; changing the default mask MUST NOT make completion
 evidence unreadable to the waiting gateway. Verification MUST check loaded
 unit masks and the mask of each running main process. A configured value alone
 does not prove that an existing process adopted changed execution policy.
+Candidate verification MUST inspect the template through a non-started
+representative instance and check every currently loaded candidate instance,
+including instance-specific overrides and running process masks. Inspection or
+enumeration failures MUST fail verification.
 
 Each rendered bundle MUST include a non-mutating verifier that checks the live
 host against this contract. Verification MUST fail closed when a required tool,

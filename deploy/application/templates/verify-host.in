@@ -27,6 +27,8 @@ readonly LIVE_SERVICE="@@LIVE_SERVICE@@"
 readonly FINALIZER_SERVICE="@@FINALIZER_SERVICE@@"
 readonly PATH_UNIT="@@FINALIZER_PATH@@"
 readonly RECOVERY_SERVICE="@@RECOVERY_SERVICE@@"
+readonly CANDIDATE_SERVICE="@@CANDIDATE_SERVICE@@"
+readonly CANDIDATE_UNIT_PREFIX="@@CANDIDATE_UNIT_PREFIX@@"
 readonly GATEWAY_PROGRAM="@@GATEWAY_PROGRAM@@"
 readonly SOURCE_REVISION="@@SOURCE_REVISION@@"
 readonly BUNDLE_ID="@@BUNDLE_ID@@"
@@ -260,13 +262,24 @@ verify_rsync_contract() {
 }
 
 verify_service_umask() {
-    local unit=$1 configured_mask main_pid process_mask
-    configured_mask="$(systemctl show "$unit" -p UMask --value 2>/dev/null || true)"
+    local unit=$1 load_state configured_mask main_pid process_mask
+    if ! load_state="$(systemctl show "$unit" -p LoadState --value 2>/dev/null)" \
+        || [[ "$load_state" != loaded ]]; then
+        fail "cannot inspect loaded service creation policy: $unit"
+        return
+    fi
+    if ! configured_mask="$(systemctl show "$unit" -p UMask --value 2>/dev/null)"; then
+        fail "cannot inspect unit creation mask: $unit"
+        return
+    fi
     case "$configured_mask" in
         0077 | 077) pass "private creation mask configured: $unit" ;;
         *) fail "unit creation mask is not 0077: $unit" ;;
     esac
-    main_pid="$(systemctl show "$unit" -p MainPID --value 2>/dev/null || true)"
+    if ! main_pid="$(systemctl show "$unit" -p MainPID --value 2>/dev/null)"; then
+        fail "cannot inspect main PID for creation policy: $unit"
+        return
+    fi
     if [[ "$main_pid" =~ ^[1-9][0-9]*$ ]]; then
         process_mask="$(awk '$1 == "Umask:" { print $2 }' "/proc/$main_pid/status" 2>/dev/null || true)"
         case "$process_mask" in
@@ -276,6 +289,45 @@ verify_service_umask() {
     elif [[ "$main_pid" != 0 ]]; then
         fail "cannot inspect main PID for creation policy: $unit"
     fi
+}
+
+verify_candidate_umasks() {
+    local probe="$CANDIDATE_UNIT_PREFIX@umask-policy-check.service"
+    local fragment drop_ins loaded_candidates unit _remainder
+    # An empty template is not a loadable service instance. Inspect a reserved
+    # instance without starting it, and ensure instance overrides cannot hide
+    # the template's policy. Real deployment instance IDs use 24 hex digits.
+    if ! fragment="$(systemctl show "$probe" -p FragmentPath --value 2>/dev/null)" \
+        || [[ "$fragment" != "/etc/systemd/system/$CANDIDATE_SERVICE" ]]; then
+        fail "cannot inspect reviewed candidate template through $probe"
+        return
+    fi
+    if ! drop_ins="$(systemctl show "$probe" -p DropInPaths --value 2>/dev/null)"; then
+        fail "cannot inspect candidate template drop-ins: $probe"
+        return
+    fi
+    case "$drop_ins" in
+        # systemd also searches shortened unit prefixes while keeping the
+        # instance name, such as app-@umask-policy-check.service.d/.
+        *"@umask-policy-check.service.d/"*)
+            fail "reserved candidate policy instance has instance-specific drop-ins: $probe"
+            return
+            ;;
+    esac
+    verify_service_umask "$probe"
+    if ! loaded_candidates="$(LC_ALL=C systemctl list-units --all --plain \
+        --no-legend --full --type=service "$CANDIDATE_UNIT_PREFIX@*.service" 2>/dev/null)"; then
+        fail "cannot enumerate loaded candidate services"
+        return
+    fi
+    while read -r unit _remainder; do
+        [[ -n "$unit" ]] || continue
+        case "$unit" in
+            "$probe") continue ;;
+            "$CANDIDATE_UNIT_PREFIX"@?*.service) verify_service_umask "$unit" ;;
+            *) fail "unexpected unit while inspecting candidate creation masks: $unit" ;;
+        esac
+    done <<<"$loaded_candidates"
 }
 
 verify_systemd() {
@@ -288,6 +340,7 @@ verify_systemd() {
     for unit in "$LIVE_SERVICE" "$FINALIZER_SERVICE" "$RECOVERY_SERVICE"; do
         verify_service_umask "$unit"
     done
+    verify_candidate_umasks
     for unit in "$LIVE_SERVICE" "$PATH_UNIT" "$RECOVERY_SERVICE"; do
         systemctl is-enabled --quiet "$unit" \
             && pass "unit enabled: $unit" \

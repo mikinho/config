@@ -513,6 +513,7 @@ pass() { :; }
 fail() { printf '%s\n' "$*" >&2; exit 1; }
 systemctl() {
     case "$4" in
+        LoadState) printf 'loaded\n' ;;
         UMask) printf '%s\n' "$TEST_CONFIGURED_MASK" ;;
         MainPID) printf '%s\n' "$TEST_MAIN_PID" ;;
         *) exit 1 ;;
@@ -539,6 +540,155 @@ awk() { printf '%s\n' "$TEST_PROCESS_MASK"; }
                     },
                 )
                 self.assertEqual(result.returncode == 0, succeeds, result.stderr)
+
+    def candidate_verification(
+        self, environment: Mapping[str, str]
+    ) -> subprocess.CompletedProcess[str]:
+        """Run the rendered systemd checks against a bounded manager fixture."""
+
+        source = (self.bundle / "scripts" / "verify-host").read_text(encoding="utf-8")
+        declarations = "\n".join(
+            line for line in source.splitlines()
+            if line.startswith(("readonly CANDIDATE_SERVICE=", "readonly CANDIDATE_UNIT_PREFIX="))
+        )
+        start = source.index("verify_service_umask() {")
+        end = source.index("\nfcontext_type() {", start)
+        program = r'''
+set -eu
+FAILURES=0
+LIVE_SERVICE=example.service
+FINALIZER_SERVICE=example-finalize.service
+RECOVERY_SERVICE=example-recover.service
+PATH_UNIT=example-finalize.path
+APP_DIR=$TEST_APP_DIR
+SYSTEMD_UNITS=()
+pass() { :; }
+fail() { printf '%s\n' "$*" >&2; FAILURES=$((FAILURES + 1)); }
+systemd-analyze() { return 0; }
+systemctl() {
+    if [[ "$1" == list-units ]]; then
+        [[ "$TEST_ENUMERATION_FAIL" == no ]] || return 1
+        printf '%s\n' "$TEST_LOADED_CANDIDATES"
+        return
+    fi
+    [[ "$1" == show ]] || return 0
+    local unit=$2 property=$4
+    case "$property" in
+        FragmentPath) printf '%s\n' "$TEST_PROBE_FRAGMENT" ;;
+        DropInPaths) printf '%s\n' "$TEST_PROBE_DROP_INS" ;;
+        LoadState)
+            if [[ "$unit" == "$CANDIDATE_UNIT_PREFIX@umask-policy-check.service" ]]; then
+                printf '%s\n' "$TEST_PROBE_LOAD_STATE"
+            else
+                printf 'loaded\n'
+            fi
+            ;;
+        UMask)
+            if [[ "$unit" == "$CANDIDATE_UNIT_PREFIX@umask-policy-check.service" ]]; then
+                printf '%s\n' "$TEST_TEMPLATE_MASK"
+                [[ "$TEST_MASK_INSPECTION_FAIL" == no ]] || return 1
+            elif [[ "$unit" == "$TEST_TARGET_INSTANCE" ]]; then
+                printf '%s\n' "$TEST_INSTANCE_MASK"
+            else
+                printf '0077\n'
+            fi
+            ;;
+        MainPID)
+            if [[ "$unit" == "$TEST_TARGET_INSTANCE" ]]; then
+                printf '%s\n' "$TEST_INSTANCE_PID"
+            else
+                printf '0\n'
+            fi
+            ;;
+        ActiveState) printf 'inactive\n' ;;
+        *) return 1 ;;
+    esac
+}
+awk() { printf '%s\n' "$TEST_PROCESS_MASK"; }
+'''
+        fixture_environment = {
+            "TEST_APP_DIR": str(self.root),
+            "TEST_ENUMERATION_FAIL": "no",
+            "TEST_LOADED_CANDIDATES": "",
+            "TEST_PROBE_FRAGMENT": "/etc/systemd/system/example_node_app-candidate@.service",
+            "TEST_PROBE_DROP_INS": "",
+            "TEST_PROBE_LOAD_STATE": "loaded",
+            "TEST_TEMPLATE_MASK": "0077",
+            "TEST_MASK_INSPECTION_FAIL": "no",
+            "TEST_TARGET_INSTANCE": "example_node_app-candidate@aaaaaaaaaaaaaaaaaaaaaaaa.service",
+            "TEST_INSTANCE_MASK": "0077",
+            "TEST_INSTANCE_PID": "0",
+            "TEST_PROCESS_MASK": "0077",
+            **environment,
+        }
+        return run(
+            (
+                "bash", "-c", declarations + "\n" + program + source[start:end]
+                + '\nverify_systemd\n[[ "$FAILURES" == 0 ]]',
+            ),
+            environment=fixture_environment,
+        )
+
+    def test_candidate_template_and_loaded_instance_masks(self) -> None:
+        """Template drift and every loaded instance participate in acceptance."""
+
+        instances = (
+            "example_node_app-candidate@bbbbbbbbbbbbbbbbbbbbbbbb.service loaded inactive dead first\n"
+            "example_node_app-candidate@aaaaaaaaaaaaaaaaaaaaaaaa.service loaded active running second"
+        )
+        cases = (
+            ("inactive template", {}, True, ""),
+            ("loaded instances", {"TEST_LOADED_CANDIDATES": instances}, True, ""),
+            ("template override", {"TEST_TEMPLATE_MASK": "0022"}, False, "unit creation mask"),
+            (
+                "instance override",
+                {"TEST_LOADED_CANDIDATES": instances, "TEST_INSTANCE_MASK": "0022"},
+                False, "unit creation mask",
+            ),
+            (
+                "stale running candidate",
+                {"TEST_LOADED_CANDIDATES": instances, "TEST_INSTANCE_PID": "123", "TEST_PROCESS_MASK": "0022"},
+                False, "running process mask",
+            ),
+            (
+                "unreadable running candidate",
+                {"TEST_LOADED_CANDIDATES": instances, "TEST_INSTANCE_PID": "123", "TEST_PROCESS_MASK": ""},
+                False, "running process mask",
+            ),
+        )
+        for description, environment, succeeds, diagnostic in cases:
+            with self.subTest(description=description):
+                result = self.candidate_verification(environment)
+                self.assertEqual(result.returncode == 0, succeeds, result.stderr)
+                if diagnostic:
+                    self.assertIn(diagnostic, result.stderr)
+
+    def test_candidate_policy_inspection_fails_closed(self) -> None:
+        """Unavailable enumeration or a masked template cannot produce a pass."""
+
+        cases = (
+            ({"TEST_ENUMERATION_FAIL": "yes"}, "cannot enumerate"),
+            ({"TEST_PROBE_LOAD_STATE": "not-found"}, "cannot inspect loaded service"),
+            ({"TEST_MASK_INSPECTION_FAIL": "yes"}, "cannot inspect unit creation mask"),
+            ({"TEST_LOADED_CANDIDATES": "unrelated.service loaded active running"}, "unexpected unit"),
+            (
+                {"TEST_PROBE_FRAGMENT": "/etc/systemd/system/example_node_app-candidate@umask-policy-check.service"},
+                "cannot inspect reviewed candidate template",
+            ),
+            (
+                {"TEST_PROBE_DROP_INS": "/etc/systemd/system/example_node_app-candidate@umask-policy-check.service.d/override.conf"},
+                "instance-specific drop-ins",
+            ),
+            (
+                {"TEST_PROBE_DROP_INS": "/etc/systemd/system/example_node_app-@umask-policy-check.service.d/override.conf"},
+                "instance-specific drop-ins",
+            ),
+        )
+        for environment, diagnostic in cases:
+            with self.subTest(environment=environment):
+                result = self.candidate_verification(environment)
+                self.assertNotEqual(result.returncode, 0, result.stderr)
+                self.assertIn(diagnostic, result.stderr)
 
 
 class ManifestSnapshotTests(RenderedBundleTestCase):
