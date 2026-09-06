@@ -218,6 +218,61 @@ printf '%s\\n' \"\$FAILED_CHECKS\"
 ")
 [ "$root_result" = 1 ] || fail "host verifier did not reject a non-root caller"
 
+# Exercise the production delegation function so unit checks cannot hide a
+# failing process check, and BPF permissions require an explicit expectation.
+nginx_runtime_function=$(extract_function check_nginx_runtime "$HOST_VERIFIER")
+cat > "$TEST_ROOT/nginx-runtime-verify" <<'EOF'
+#!/bin/sh
+[ "${NGINX_QUIC_BPF:-}" = no ] || exit 1
+printf '%s\n' "$*" > "$RUNTIME_ARGUMENTS"
+[ "$RUNTIME_RESULT" = pass ] || { printf 'running mask drift\n'; exit 1; }
+printf 'runtime accepted\n'
+EOF
+chmod 0755 "$TEST_ROOT/nginx-runtime-verify"
+cat > "$TEST_ROOT/nginx-runtime-harness" <<'EOF'
+FAILED_CHECKS=0
+fail_msg() { FAILED_CHECKS=$((FAILED_CHECKS + 1)); }
+pass_msg() { :; }
+stat() { printf 'root:root:755:1\n'; }
+systemctl() {
+    case "$3" in
+        --property=Type) printf 'exec\n' ;;
+        --property=User) printf '\n' ;;
+        --property=Group) printf 'nginx\n' ;;
+        --property=SupplementaryGroups) printf 'nginx\n' ;;
+        --property=UMask) printf '%s\n' "$LOADED_MASK" ;;
+        --property=NoNewPrivileges) printf 'yes\n' ;;
+        --property=ProtectSystem) printf 'strict\n' ;;
+        --property=MainPID) printf '123\n' ;;
+        *) exit 1 ;;
+    esac
+}
+EOF
+printf '%s\n' "$nginx_runtime_function" >> "$TEST_ROOT/nginx-runtime-harness"
+printf '%s\n' 'check_nginx_runtime' 'printf "%s\n" "$FAILED_CHECKS"' \
+    >> "$TEST_ROOT/nginx-runtime-harness"
+for runtime_case in baseline bpf loaded-drift running-drift; do
+    runtime_mask=0027
+    runtime_result=pass
+    runtime_bpf=no
+    runtime_expected_failures=0
+    case "$runtime_case" in
+        bpf) runtime_bpf=yes ;;
+        loaded-drift) runtime_mask=0000; runtime_expected_failures=1 ;;
+        running-drift) runtime_result=fail; runtime_expected_failures=1 ;;
+    esac
+    runtime_failures=$(NGINX_RUNTIME_VERIFIER="$TEST_ROOT/nginx-runtime-verify" \
+        LOADED_MASK="$runtime_mask" RUNTIME_RESULT="$runtime_result" \
+        RUNTIME_ARGUMENTS="$TEST_ROOT/runtime-arguments" QUIC_BPF="$runtime_bpf" \
+        sh "$TEST_ROOT/nginx-runtime-harness")
+    [ "$runtime_failures" = "$runtime_expected_failures" ] \
+        || fail "nginx runtime delegation did not enforce $runtime_case"
+    expected_arguments='--master-pid 123 --timeout-seconds 0'
+    [ "$runtime_bpf" = no ] || expected_arguments="$expected_arguments --quic-bpf"
+    [ "$(cat "$TEST_ROOT/runtime-arguments")" = "$expected_arguments" ] \
+        || fail "nginx runtime delegation used incorrect $runtime_case arguments"
+done
+
 mkdir -p "$TEST_ROOT/mock-bin"
 for tool_name in selinuxenabled getenforce sestatus semanage getsebool; do
     # The mock must inspect its own invoked basename at test runtime.

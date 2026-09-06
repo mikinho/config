@@ -90,6 +90,11 @@ denies direct access to that internal document. JSON access-log assertions
 correlate the upstream request id, parse escaped values, and check that query
 and Referer canaries are omitted. The separate WordPress checks retain
 failure-only static asset logging coverage.
+The runtime fixture uses foreground nginx with `UMask=0027` and a root-owned
+`root:nginx 0750` logs directory. It verifies process masks, worker log-file
+reopening after USR1, continued writes to the current log only, missing-file
+recreation at `0640`, and mask retention across HUP. The container does not run
+the full systemd sandbox or enforcing SELinux.
 
 ## Host runtime setup
 
@@ -110,6 +115,31 @@ the rendered nginx profile selected that feature. It never copies, renders,
 or deletes anything under `/etc/nginx`; the reviewed tree remains a separate
 deployment transaction.
 
+The service keeps its root master in the foreground (`Type=exec`, `daemon off`)
+to preserve the configured `0027` mask, with primary group `nginx` so workers
+can traverse `root:nginx 0750` logs. Before restarting, setup changes only the
+groups of existing root-owned runtime/state/log parent directories. This
+prevents systemd's ownership migration from recursively changing existing
+cache files and rotated logs. Unexpected ownership, symbolic links, or
+group/other-writable parents fail preflight. The manual migration is documented
+in [systemd](../systemd/README.md); do not replace the unit alone on an existing
+installation. The service supplies `daemon off` itself, so the nginx tree must
+not duplicate a `daemon` directive.
+
+The root UID comes from the system manager's default, with explicit
+`Group=nginx` and `SupplementaryGroups=nginx`. This removes inherited root
+supplementary-group access and avoids systemd 257 dropping `CAP_SETUID` when
+an explicit `User=root` is combined with seccomp restrictions. The checker
+requires the exact master capability set and nginx-only supplementary group;
+see the [execution contract](../systemd/README.md) for the source and details.
+
+The ordinary master uses an explicit capability allowlist and denies mount
+syscalls. `--quic-bpf` additionally installs the reviewed BPF capability
+extension while preserving that mount denial. An ordinary apply retires only
+the unchanged repository-owned BPF extension; it refuses a locally modified
+file. Confirm the selected profile and validating kernel/nginx/SELinux behavior
+before applying either contract.
+
 The three sizing values must match the selected configuration and available
 host/ancestor task capacity. They do not change nginx worker or pool settings.
 `worker_processes auto` requires reviewing the target host's CPU count; include
@@ -120,8 +150,9 @@ available budget. Overlapping more than one graceful reload needs additional
 headroom or operational serialization; this check is not a runtime guarantee.
 
 Applying host setup performs a planned restart to activate the installed
-systemd execution restrictions, checks a fresh master and its `NoNewPrivs`
-state, and can interrupt service. Schedule the operation and retain a recovery
+systemd execution restrictions and can interrupt service. `ExecStartPost`
+performs bounded readiness/security checks on every start; setup additionally
+checks a fresh master and the reviewed worker count. Schedule the operation and retain a recovery
 plan. Configuration-only updates still use nginx's validated reload path.
 
 `sites/sample_wp.conf.example` matches the `sample_wp` PHP-FPM pool and systemd
@@ -147,3 +178,14 @@ and parses that configuration too. Fixture behavior can also be checked with
 command requires the prepared, disposable Linux CI container. A change that
 adds a directive must stay within the root README's syntax floor or advance
 it deliberately.
+
+`tests/nginx-runtime-verifier` covers the actual read-only checker with isolated
+process-status fixtures, including startup delay, timeout, unexpected masks or
+capabilities, missing workers, and log-directory traversal denial.
+`tests/nginx-setup` covers the setup flow with privileged commands mocked,
+including preservation of existing cache descendants during parent-group
+migration. Neither substitutes for a booted Linux unit test. On a target host,
+run `/usr/local/libexec/nginx-runtime-verify --workers REVIEWED_COUNT` (add
+`--quic-bpf` only for that profile), inspect `systemctl show`'s capability and
+syscall policies, and verify application traffic, actual log rotation, reload,
+and graceful shutdown. Review `systemd-analyze security` as an advisory report.

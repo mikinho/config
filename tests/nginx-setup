@@ -29,7 +29,7 @@ assert_contains() {
 }
 
 assert_no_mutation() {
-    if grep -E '^(install |sysctl |systemctl (daemon-reload|restart|enable)|helper )' "$COMMAND_LOG" >/dev/null; then
+    if grep -E '^(chgrp |install |sysctl |systemctl (daemon-reload|restart|enable)|helper )' "$COMMAND_LOG" >/dev/null; then
         fail 'preflight failure reached a mutating command'
     fi
 }
@@ -46,26 +46,32 @@ expect_failure() {
 reset_fixture() {
     : > "$COMMAND_LOG"
     rm -f "$TEST_ROOT/reloaded" "$TEST_ROOT/restarted"
-    printf '101\n' > "$TEST_ROOT/nginx.pid"
 }
 
-mkdir -p "$TEST_ROOT/bin" "$TEST_ROOT/proc/201" \
+mkdir -p "$TEST_ROOT/bin" \
+    "$TEST_ROOT/managed/run" "$TEST_ROOT/managed/lock" \
+    "$TEST_ROOT/managed/state/cache" "$TEST_ROOT/managed/logs" \
     "$FIXTURE_ROOT/nginx" "$FIXTURE_ROOT/systemd/system" \
+    "$FIXTURE_ROOT/nginx/templates" \
     "$FIXTURE_ROOT/logrotate" "$FIXTURE_ROOT/sysctl" \
     "$FIXTURE_ROOT/deploy/host-profiles"
 cp "$REPOSITORY_ROOT/systemd/system/nginx.service" "$FIXTURE_ROOT/systemd/system/"
+cp "$REPOSITORY_ROOT/nginx/templates/quic-bpf.service.conf" "$FIXTURE_ROOT/nginx/templates/"
 cp "$REPOSITORY_ROOT/logrotate/nginx" "$FIXTURE_ROOT/logrotate/"
 cp "$REPOSITORY_ROOT/sysctl/99-nginx-quic.conf" "$FIXTURE_ROOT/sysctl/"
 cp "$REPOSITORY_ROOT/deploy/host-profiles/edge-direct.profile" "$FIXTURE_ROOT/deploy/host-profiles/"
 cp "$REPOSITORY_ROOT/deploy/setup-host" "$HOST_SETUP"
 sed \
     -e "s|^NGINX_UNIT_TARGET=.*|NGINX_UNIT_TARGET=$TEST_ROOT/nginx.service|" \
+    -e "s|^QUIC_DROPIN_TARGET=.*|QUIC_DROPIN_TARGET=$TEST_ROOT/nginx.service.d/10-quic-bpf.conf|" \
     -e "s|^LOGROTATE_TARGET=.*|LOGROTATE_TARGET=$TEST_ROOT/logrotate|" \
     -e "s|^SYSCTL_TARGET=.*|SYSCTL_TARGET=$TEST_ROOT/sysctl|" \
     -e "s|^NGINX_BINARY=.*|NGINX_BINARY=$TEST_ROOT/bin/nginx|" \
     -e "s|^NGINX_CONFIG=.*|NGINX_CONFIG=$TEST_ROOT/nginx.conf|" \
-    -e "s|^NGINX_PID_FILE=.*|NGINX_PID_FILE=$TEST_ROOT/nginx.pid|" \
-    -e "s|^PROC_ROOT=.*|PROC_ROOT=$TEST_ROOT/proc|" \
+    -e "s|^NGINX_RUNTIME_DIRECTORY=.*|NGINX_RUNTIME_DIRECTORY=$TEST_ROOT/managed/run|" \
+    -e "s|^NGINX_LOCK_DIRECTORY=.*|NGINX_LOCK_DIRECTORY=$TEST_ROOT/managed/lock|" \
+    -e "s|^NGINX_STATE_DIRECTORY=.*|NGINX_STATE_DIRECTORY=$TEST_ROOT/managed/state|" \
+    -e "s|^NGINX_LOG_DIRECTORY=.*|NGINX_LOG_DIRECTORY=$TEST_ROOT/managed/logs|" \
     "$REPOSITORY_ROOT/nginx/setup" > "$SETUP"
 chmod 0755 "$SETUP" "$HOST_SETUP"
 printf '# reviewed configuration fixture\n' > "$TEST_ROOT/nginx.conf"
@@ -89,8 +95,6 @@ case "$*" in
     'restart nginx.service')
         [ "${NGINX_TEST_RESTART_FAIL:-no}" = no ] || exit 1
         : > "$NGINX_TEST_ROOT/restarted"
-        printf '%s\n' "${NGINX_TEST_FILE_PID:-201}" > "$NGINX_TEST_ROOT/nginx.pid"
-        printf 'NoNewPrivs:\t%s\n' "${NGINX_TEST_NNP:-1}" > "$NGINX_TEST_ROOT/proc/201/status"
         ;;
     'is-active --quiet nginx.service') [ "${NGINX_TEST_ACTIVE:-yes}" = yes ] ;;
     'enable nginx.service') ;;
@@ -115,8 +119,37 @@ cat > "$TEST_ROOT/bin/helper" <<'MOCK'
 #!/usr/bin/env sh
 printf 'helper %s %s\n' "$0" "$*" >> "$COMMAND_LOG"
 MOCK
+cat > "$TEST_ROOT/bin/stat" <<'MOCK'
+#!/usr/bin/env sh
+case "$1 $2" in
+    '-c %u') printf '%s\n' "${NGINX_TEST_DIRECTORY_UID:-0}" ;;
+    '-c %a') printf '%s\n' "${NGINX_TEST_DIRECTORY_MODE:-750}" ;;
+    *) exit 1 ;;
+esac
+MOCK
+cat > "$TEST_ROOT/bin/chgrp" <<'MOCK'
+#!/usr/bin/env sh
+# Refuse recursion: only an exact managed parent is authorized for migration.
+[ "$#" -eq 2 ] && [ "$1" = nginx ] || exit 1
+case "$2" in
+    "$NGINX_TEST_ROOT/managed/run" | "$NGINX_TEST_ROOT/managed/lock" | \
+    "$NGINX_TEST_ROOT/managed/state" | "$NGINX_TEST_ROOT/managed/logs") ;;
+    *) exit 1 ;;
+esac
+printf 'chgrp %s\n' "$*" >> "$COMMAND_LOG"
+MOCK
+cat > "$FIXTURE_ROOT/nginx/verify-runtime" <<'MOCK'
+#!/usr/bin/env sh
+printf 'runtime-verify %s\n' "$*" >> "$COMMAND_LOG"
+[ "${NGINX_QUIC_BPF:-}" = no ] || exit 1
+[ "${NGINX_TEST_RUNTIME_FAIL:-no}" = no ] || {
+    printf 'nginx worker does not retain Umask 0027\n' >&2
+    exit 1
+}
+MOCK
+chmod 0755 "$FIXTURE_ROOT/nginx/verify-runtime"
 chmod 0755 "$TEST_ROOT/bin/"*
-for mock_command in install logrotate sysctl systemd-analyze restorecon; do
+for mock_command in install logrotate setpriv sysctl systemd-analyze restorecon; do
     cp "$TEST_ROOT/bin/noop" "$TEST_ROOT/bin/$mock_command"
 done
 for fixture_helper in \
@@ -134,6 +167,29 @@ export PATH
 # Keep the shared ceiling and implementation synchronized without weakening it.
 assert_contains "$FIXTURE_ROOT/systemd/system/nginx.service" 'TasksMax=512'
 assert_contains "$SETUP" 'SHARED_TASKS_MAX=512'
+assert_contains "$FIXTURE_ROOT/systemd/system/nginx.service" 'ExecStartPost=!/usr/local/libexec/nginx-runtime-verify'
+assert_contains "$FIXTURE_ROOT/systemd/system/nginx.service" 'SupplementaryGroups=nginx'
+if grep '^User=' "$FIXTURE_ROOT/systemd/system/nginx.service" >/dev/null; then
+    fail 'nginx must use the system manager default root UID to retain CAP_SETUID'
+fi
+
+# Fail before mutation when migration would trust an unexpected directory.
+reset_fixture
+expect_failure 'must be root-owned' env NGINX_TEST_DIRECTORY_UID=991 "$SETUP" \
+    --workers 4 --threads-per-worker 32 --tasks-budget 512
+assert_no_mutation
+reset_fixture
+expect_failure 'must not permit group/other writes' env NGINX_TEST_DIRECTORY_MODE=0777 "$SETUP" \
+    --workers 4 --threads-per-worker 32 --tasks-budget 512
+assert_no_mutation
+reset_fixture
+mv "$TEST_ROOT/managed/logs" "$TEST_ROOT/managed/logs-real"
+ln -s "$TEST_ROOT/managed/logs-real" "$TEST_ROOT/managed/logs"
+expect_failure 'must be a real directory' "$SETUP" \
+    --workers 4 --threads-per-worker 32 --tasks-budget 512
+assert_no_mutation
+rm "$TEST_ROOT/managed/logs"
+mv "$TEST_ROOT/managed/logs-real" "$TEST_ROOT/managed/logs"
 
 reset_fixture
 expect_failure 'apply requires reviewed --workers' "$SETUP"
@@ -198,9 +254,24 @@ for previous_pid in 101 0; do
     assert_contains "$COMMAND_LOG" 'systemctl restart nginx.service'
     assert_contains "$COMMAND_LOG" 'systemctl enable nginx.service'
     assert_contains "$TEST_ROOT/stdout" 'Verified restarted nginx master PID 201'
+    assert_contains "$COMMAND_LOG" "runtime-verify --master-pid 201 --previous-master-pid $previous_pid --workers 4"
     if grep -E 'reload-or-restart|systemctl reload nginx' "$COMMAND_LOG" >/dev/null; then
         fail 'host setup used a config reload instead of restart'
     fi
+done
+
+# Existing cache contents/modes survive the top-level-only migration. The
+# command fixture rejects any recursive chgrp or non-parent target outright.
+printf 'cached response\n' > "$TEST_ROOT/managed/state/cache/private-entry"
+chmod 0600 "$TEST_ROOT/managed/state/cache/private-entry"
+descendant_before=$(ls -ln "$TEST_ROOT/managed/state/cache/private-entry")
+reset_fixture
+env NGINX_QUIC_BPF=yes "$SETUP" --workers 4 --threads-per-worker 32 --tasks-budget 512 > "$TEST_ROOT/stdout"
+[ "$(ls -ln "$TEST_ROOT/managed/state/cache/private-entry")" = "$descendant_before" ] \
+    || fail 'directory group migration changed an existing cached descendant'
+assert_contains "$TEST_ROOT/managed/state/cache/private-entry" 'cached response'
+for managed_parent in run lock state logs; do
+    assert_contains "$COMMAND_LOG" "chgrp nginx $TEST_ROOT/managed/$managed_parent"
 done
 reset_fixture
 env NGINX_TEST_LOAD=not-found "$SETUP" \
@@ -221,13 +292,12 @@ if grep -F 'systemctl restart nginx.service' "$COMMAND_LOG" >/dev/null; then
     fail 'prospective insufficient unit budget reached restart'
 fi
 
-for failure_case in no-master same-master mismatched-file no-new-privileges inactive; do
+for failure_case in no-master same-master runtime-security inactive; do
     reset_fixture
     case "$failure_case" in
         no-master) failure_variable=NGINX_TEST_NEW_PID=0; failure_message='has no master after restart' ;;
         same-master) failure_variable=NGINX_TEST_NEW_PID=101; failure_message='master did not change' ;;
-        mismatched-file) failure_variable=NGINX_TEST_FILE_PID=999; failure_message='PID file does not match' ;;
-        no-new-privileges) failure_variable=NGINX_TEST_NNP=0; failure_message='does not have NoNewPrivileges' ;;
+        runtime-security) failure_variable=NGINX_TEST_RUNTIME_FAIL=yes; failure_message='does not retain Umask 0027' ;;
         inactive) failure_variable=NGINX_TEST_ACTIVE=no; failure_message='is not active after restart' ;;
     esac
     expect_failure "$failure_message" env "$failure_variable" "$SETUP" \
@@ -236,6 +306,22 @@ for failure_case in no-master same-master mismatched-file no-new-privileges inac
         fail 'failed activation verification printed success'
     fi
 done
+
+# Profile-specific capabilities are explicit and local overrides are preserved.
+reset_fixture
+"$SETUP" --workers 4 --threads-per-worker 32 --tasks-budget 512 --quic-bpf > "$TEST_ROOT/stdout"
+assert_contains "$COMMAND_LOG" 'quic-bpf.service.conf'
+assert_contains "$COMMAND_LOG" 'runtime-verify --master-pid 201 --previous-master-pid 101 --workers 4 --quic-bpf'
+mkdir -p "$TEST_ROOT/nginx.service.d"
+printf '# administrator override\n' > "$TEST_ROOT/nginx.service.d/10-quic-bpf.conf"
+reset_fixture
+expect_failure 'QUIC capability drop-in has local changes' "$SETUP" \
+    --workers 4 --threads-per-worker 32 --tasks-budget 512
+assert_no_mutation
+cp "$FIXTURE_ROOT/nginx/templates/quic-bpf.service.conf" "$TEST_ROOT/nginx.service.d/10-quic-bpf.conf"
+reset_fixture
+"$SETUP" --workers 4 --threads-per-worker 32 --tasks-budget 512 > "$TEST_ROOT/stdout"
+[ ! -e "$TEST_ROOT/nginx.service.d/10-quic-bpf.conf" ] || fail 'owned BPF extension was not retired'
 
 # Exercise the actual composed wrapper, including early capacity rejection.
 reset_fixture

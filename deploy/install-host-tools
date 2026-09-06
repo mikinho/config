@@ -9,6 +9,7 @@ set -eu
 PROGRAM_NAME=${0##*/}
 SCRIPT_DIRECTORY=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 TARGET_DIRECTORY=/usr/local/bin
+LIBEXEC_DIRECTORY=/usr/local/libexec
 
 usage() {
     cat <<EOF
@@ -16,9 +17,9 @@ Usage:
   sudo $PROGRAM_NAME
   $PROGRAM_NAME --check
 
-Installs the reviewed host verifier and certificate healthcheck as root-owned,
-non-writable executables under $TARGET_DIRECTORY. --check validates repository
-sources without modifying the host.
+Installs the reviewed host verifier and certificate healthcheck under
+$TARGET_DIRECTORY and nginx runtime verifier under $LIBEXEC_DIRECTORY,
+as root-owned executables. --check validates sources without modifying the host.
 EOF
 }
 
@@ -35,17 +36,18 @@ validate_source() {
 }
 
 validate_target_directory() {
-    if [ ! -d "$TARGET_DIRECTORY" ] || [ -L "$TARGET_DIRECTORY" ]; then
-        fail "target must be a real directory: $TARGET_DIRECTORY"
+    checked_directory=$1
+    if [ ! -d "$checked_directory" ] || [ -L "$checked_directory" ]; then
+        fail "target must be a real directory: $checked_directory"
     fi
-    target_identity=$(stat -Lc '%U:%G:%a' "$TARGET_DIRECTORY" 2>/dev/null) \
-        || fail "cannot inspect target directory: $TARGET_DIRECTORY"
+    target_identity=$(stat -Lc '%U:%G:%a' "$checked_directory" 2>/dev/null) \
+        || fail "cannot inspect target directory: $checked_directory"
     target_owner_group=${target_identity%:*}
     target_mode=${target_identity##*:}
     [ "$target_owner_group" = root:root ] \
-        || fail "$TARGET_DIRECTORY must be owned by root:root"
+        || fail "$checked_directory must be owned by root:root"
     [ "$target_mode" = 755 ] \
-        || fail "$TARGET_DIRECTORY must have mode 0755 (found $target_mode)"
+        || fail "$checked_directory must have mode 0755 (found $target_mode)"
 }
 
 install_tool() {
@@ -80,6 +82,7 @@ done
 
 validate_source "$SCRIPT_DIRECTORY/verify-deployment"
 validate_source "$SCRIPT_DIRECTORY/certbot-healthcheck"
+validate_source "$SCRIPT_DIRECTORY/../nginx/verify-runtime"
 
 if [ "$mode" = check ]; then
     printf 'Validated host-tool repository sources.\n'
@@ -89,8 +92,18 @@ fi
 [ "$(id -u)" -eq 0 ] || fail "run as root"
 command -v install >/dev/null 2>&1 || fail "install command not found"
 command -v cmp >/dev/null 2>&1 || fail "cmp command not found"
-validate_target_directory
+validate_target_directory /usr/local
+validate_target_directory "$TARGET_DIRECTORY"
+if [ ! -e "$LIBEXEC_DIRECTORY" ] && [ ! -L "$LIBEXEC_DIRECTORY" ]; then
+    install -d -o root -g root -m 0755 "$LIBEXEC_DIRECTORY"
+fi
+validate_target_directory "$LIBEXEC_DIRECTORY"
 install_tool "$SCRIPT_DIRECTORY/verify-deployment" "$TARGET_DIRECTORY/verify-deployment"
 install_tool "$SCRIPT_DIRECTORY/certbot-healthcheck" "$TARGET_DIRECTORY/certbot-healthcheck"
+install_tool "$SCRIPT_DIRECTORY/../nginx/verify-runtime" "$LIBEXEC_DIRECTORY/nginx-runtime-verify"
+if command -v restorecon >/dev/null 2>&1; then
+    restorecon -F "$TARGET_DIRECTORY/verify-deployment" \
+        "$TARGET_DIRECTORY/certbot-healthcheck" "$LIBEXEC_DIRECTORY/nginx-runtime-verify"
+fi
 
-printf 'Installed root-owned host tools under %s.\n' "$TARGET_DIRECTORY"
+printf 'Installed root-owned host tools under %s and %s.\n' "$TARGET_DIRECTORY" "$LIBEXEC_DIRECTORY"

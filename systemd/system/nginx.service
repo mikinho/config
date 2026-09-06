@@ -13,8 +13,13 @@ StartLimitIntervalSec=60s
 StartLimitBurst=3
 
 [Service]
-Type=forking
-PIDFile=%t/%p/%p.pid
+Type=exec
+# Retain the system manager's default root UID. Explicit User=root makes
+# systemd 257's seccomp setup drop CAP_SETUID before nginx can spawn workers.
+Group=nginx
+# Set the complete supplementary list explicitly so nginx does not retain the
+# manager's group 0 access to otherwise hidden /proc entries.
+SupplementaryGroups=nginx
 
 UMask=0027
 RuntimeDirectory=%p lock/%p
@@ -24,14 +29,22 @@ StateDirectoryMode=0755
 LogsDirectory=%p
 LogsDirectoryMode=0750
 
-ExecStartPre=/usr/sbin/%p -t -q -c /etc/%p/%p.conf
-ExecStart=/usr/sbin/%p -c /etc/%p/%p.conf
-ExecReload=/usr/sbin/%p -t -q -c /etc/%p/%p.conf
+ExecStartPre=/usr/sbin/%p -t -q -c /etc/%p/%p.conf -g "daemon off;"
+# Daemonization resets nginx's umask to zero. Keep the supervised master in
+# the foreground so the master and workers retain the file-creation policy.
+ExecStart=/usr/sbin/%p -c /etc/%p/%p.conf -g "daemon off;"
+# Keep only the checker under the manager's root:root credentials. Its gid 0
+# can inspect cross-UID worker /proc entries with ProtectProc=invisible; the
+# ! prefix preserves the other sandbox/capability controls. nginx stays
+# root:nginx and receives neither CAP_SYS_PTRACE nor supplementary group root.
+ExecStartPost=!/usr/local/libexec/nginx-runtime-verify --master-pid $MAINPID
+ExecReload=/usr/sbin/%p -t -q -c /etc/%p/%p.conf -g "daemon off;"
 ExecReload=/bin/kill -s HUP $MAINPID
 
 KillSignal=SIGQUIT
 KillMode=mixed
 TimeoutStopSec=60s
+TimeoutStartSec=30s
 Restart=on-failure
 RestartSec=5s
 
@@ -65,11 +78,15 @@ MemoryDenyWriteExecute=yes
 # worker/pool sizing with room for two generations and helpers before applying.
 TasksMax=512
 
-# CapabilityBoundingSet and SystemCallFilter are intentionally not constrained
-# here. The root master must bind privileged ports, change worker identity,
-# raise resource limits and signal workers. A deployment selecting quic_bpf
-# may need additional BPF capabilities. Tightening either setting requires
-# validation against the target kernel, selected stubs, and nginx build.
+# The master binds privileged ports, changes worker identities, manages log
+# ownership, signals workers and sets rlimits. Workers drop effective caps.
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_KILL CAP_SETGID CAP_SETUID CAP_NET_BIND_SERVICE CAP_SYS_RESOURCE
+AmbientCapabilities=
+# Keep mounts blocked even when the optional QUIC BPF drop-in grants the
+# kernel-dependent CAP_SYS_ADMIN fallback; otherwise it can undo read-only
+# mount protections. This deny-list leaves ordinary nginx syscalls available.
+SystemCallFilter=~@mount
+SystemCallErrorNumber=EPERM
 
 [Install]
 WantedBy=multi-user.target

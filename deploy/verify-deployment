@@ -11,6 +11,8 @@ set -f
 NGINX_BINARY=/usr/sbin/nginx
 NGINX_CONFIG=/etc/nginx/nginx.conf
 NGINX_VERSION_FLOOR=1.29.3
+NGINX_RUNTIME_VERIFIER=/usr/local/libexec/nginx-runtime-verify
+QUIC_BPF=no
 
 BACKEND=auto
 ZONE=public
@@ -51,6 +53,7 @@ Options:
   --ssh-phase PHASE   Expected SSH state: 'prepare' or 'final' (default: final)
   --ignore-ip CIDR    Expected Fail2ban administrative CIDR; repeat as needed
   --site SITE_TAG     Validate per-site PHP-FPM socket and systemd instance
+  --quic-bpf          Expect the reviewed optional nginx QUIC BPF capability set
   --verbose, -v       Show detailed diagnostic outputs for each check
   --help, -h          Show this help message
 
@@ -332,6 +335,34 @@ resolve_certbot_backend() {
     esac
 }
 
+check_nginx_runtime() {
+    if [ ! -f "$NGINX_RUNTIME_VERIFIER" ] || [ -L "$NGINX_RUNTIME_VERIFIER" ] \
+        || [ ! -x "$NGINX_RUNTIME_VERIFIER" ] \
+        || [ "$(stat -Lc '%U:%G:%a:%h' "$NGINX_RUNTIME_VERIFIER" 2>/dev/null)" != root:root:755:1 ]; then
+        fail_msg 'nginx runtime verifier must be a root:root 0755 executable with one link; run deploy/install-host-tools'
+        return
+    fi
+    for nginx_property in Type:exec User: Group:nginx SupplementaryGroups:nginx UMask:0027 NoNewPrivileges:yes ProtectSystem:strict; do
+        nginx_property_name=${nginx_property%%:*}
+        nginx_expected_value=${nginx_property#*:}
+        nginx_loaded_value=$(systemctl show nginx.service --property="$nginx_property_name" --value 2>/dev/null) || nginx_loaded_value=
+        if [ "$nginx_loaded_value" != "$nginx_expected_value" ]; then
+            fail_msg "nginx $nginx_property_name must be $nginx_expected_value (found $nginx_loaded_value)"
+        fi
+    done
+    nginx_master_pid=$(systemctl show nginx.service --property=MainPID --value 2>/dev/null) || nginx_master_pid=
+    case "$nginx_master_pid" in
+        '' | 0 | *[!0-9]*) fail_msg 'nginx has no running systemd main PID'; return ;;
+    esac
+    set -- "$NGINX_RUNTIME_VERIFIER" --master-pid "$nginx_master_pid" --timeout-seconds 0
+    [ "$QUIC_BPF" = no ] || set -- "$@" --quic-bpf
+    if nginx_runtime_result=$(NGINX_QUIC_BPF=no "$@" 2>&1); then
+        pass_msg "$nginx_runtime_result"
+    else
+        fail_msg "$nginx_runtime_result"
+    fi
+}
+
 check_systemd_services() {
     printf 'Checking systemd services and timers...\n'
     if ! command -v systemctl >/dev/null 2>&1; then
@@ -341,6 +372,7 @@ check_systemd_services() {
 
     if systemctl is-active --quiet nginx.service 2>/dev/null; then
         pass_msg "nginx.service is active"
+        check_nginx_runtime
     else
         fail_msg "nginx.service is not active"
     fi
@@ -838,6 +870,10 @@ while [ "$#" -gt 0 ]; do
             ;;
         --verbose | -v)
             VERBOSE=1
+            shift
+            ;;
+        --quic-bpf)
+            QUIC_BPF=yes
             shift
             ;;
         --zone)

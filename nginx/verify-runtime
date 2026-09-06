@@ -1,0 +1,192 @@
+#!/usr/bin/env sh
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
+# Read-only startup acceptance for the repository's Linux nginx service.
+# A foreground Type=exec master is not ready merely because execve succeeded.
+set -eu
+
+PROGRAM_NAME=${0##*/}
+PROC_ROOT=/proc
+NGINX_PID_FILE=/run/nginx/nginx.pid
+NGINX_LOG_DIRECTORY=/var/log/nginx
+TEST_BINARY=/usr/bin/test
+MASTER_PID=
+PREVIOUS_MASTER_PID=
+EXPECTED_WORKERS=1
+EXACT_WORKERS=no
+TIMEOUT_SECONDS=10
+QUIC_BPF=${NGINX_QUIC_BPF:-no}
+# Keep these aligned with nginx.service and its optional QUIC BPF drop-in.
+BASE_CAPABILITIES=00000000010004eb
+QUIC_CAPABILITIES=000000c0012014eb
+LAST_ERROR='nginx startup has not been inspected'
+
+usage() {
+    cat <<EOF
+Usage: $PROGRAM_NAME [--master-pid PID] [--previous-master-pid PID]
+       [--workers N] [--timeout-seconds N] [--quic-bpf]
+
+Checks the live Linux nginx master, active workers, effective process security,
+and root-owned log-directory traversal without changing service or file state.
+Run as root. Defaults to the managed PID file, at least one active worker, and
+ten seconds of startup polling. --workers requires exactly the reviewed count,
+not merely a minimum, so extra workers cannot bypass the reviewed task budget.
+The QUIC BPF expectation can also come from the managed service environment.
+EOF
+}
+
+fail() { printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2; exit 1; }
+pending() { LAST_ERROR=$*; return 1; }
+
+validate_number() {
+    case "$2" in
+        '' | *[!0-9]* | 0[0-9]*) fail "$1 must be a canonical decimal integer" ;;
+    esac
+    [ "${#2}" -le 7 ] || fail "$1 is too large"
+}
+
+status_field() {
+    # /proc fields are kernel-owned single lines. A process exiting during
+    # inspection is a retryable startup condition, never successful evidence.
+    awk -v key="$2:" '$1 == key { $1 = ""; sub(/^[ \t]+/, ""); print; exit }' "$1" 2>/dev/null
+}
+
+check_process_security() {
+    security_pid=$1
+    security_role=$2
+    security_status=$PROC_ROOT/$security_pid/status
+    [ -r "$security_status" ] || { pending "$security_role PID $security_pid has no readable status"; return 1; }
+    [ "$(status_field "$security_status" Umask)" = 0027 ] \
+        || { pending "$security_role PID $security_pid does not retain Umask 0027"; return 1; }
+    [ "$(status_field "$security_status" NoNewPrivs)" = 1 ] \
+        || { pending "$security_role PID $security_pid does not have NoNewPrivileges active"; return 1; }
+    [ "$(status_field "$security_status" Seccomp)" = 2 ] \
+        || { pending "$security_role PID $security_pid does not have seccomp filtering active"; return 1; }
+    observed_bounding=$(status_field "$security_status" CapBnd)
+    [ "$observed_bounding" = "$EXPECTED_CAPABILITIES" ] \
+        || { pending "$security_role PID $security_pid has an unexpected capability bounding set: CapBnd=$observed_bounding, expected $EXPECTED_CAPABILITIES"; return 1; }
+    if [ "$security_role" = master ]; then
+        expected_effective=$EXPECTED_CAPABILITIES
+        expected_uid=0
+    else
+        expected_effective=0000000000000000
+        expected_uid=$NGINX_UID
+    fi
+    observed_effective=$(status_field "$security_status" CapEff)
+    observed_permitted=$(status_field "$security_status" CapPrm)
+    observed_ambient=$(status_field "$security_status" CapAmb)
+    [ "$observed_effective" = "$expected_effective" ] \
+        && [ "$observed_permitted" = "$expected_effective" ] \
+        && [ "$observed_ambient" = 0000000000000000 ] \
+        || { pending "$security_role PID $security_pid has unexpected effective, permitted, or ambient capabilities: CapEff=$observed_effective CapPrm=$observed_permitted CapAmb=$observed_ambient; expected CapEff=$expected_effective CapPrm=$expected_effective CapAmb=0000000000000000"; return 1; }
+    # All four IDs must agree, including filesystem IDs used for access checks.
+    process_uids=$(status_field "$security_status" Uid)
+    process_gids=$(status_field "$security_status" Gid)
+    [ "$(printf '%s\n' "$process_uids" | tr '\t' ' ' | tr -s ' ')" = "$expected_uid $expected_uid $expected_uid $expected_uid" ] \
+        && [ "$(printf '%s\n' "$process_gids" | tr '\t' ' ' | tr -s ' ')" = "$NGINX_GID $NGINX_GID $NGINX_GID $NGINX_GID" ] \
+        || { pending "$security_role PID $security_pid has an unexpected user or group identity"; return 1; }
+    if [ "$security_role" = master ]; then
+        observed_groups=$(status_field "$security_status" Groups)
+        [ "$observed_groups" = "$NGINX_GID" ] \
+            || { pending "master PID $security_pid has unexpected supplementary groups: Groups=$observed_groups; expected $NGINX_GID"; return 1; }
+    fi
+}
+
+inspect_runtime() {
+    observed_pid=$MASTER_PID
+    if [ -z "$observed_pid" ]; then
+        observed_pid=$(cat "$NGINX_PID_FILE" 2>/dev/null) \
+            || { pending 'nginx PID file is not ready'; return 1; }
+    fi
+    case "$observed_pid" in
+        '' | 0 | *[!0-9]*) pending 'nginx has no valid master PID'; return 1 ;;
+    esac
+    [ "$observed_pid" != "$PREVIOUS_MASTER_PID" ] \
+        || { pending 'nginx master did not change after restart'; return 1; }
+    [ -f "$NGINX_PID_FILE" ] && [ ! -L "$NGINX_PID_FILE" ] \
+        && [ "$(cat "$NGINX_PID_FILE" 2>/dev/null)" = "$observed_pid" ] \
+        || { pending 'nginx PID file does not match the supervised master'; return 1; }
+    master_title=$(tr '\000' ' ' 2>/dev/null < "$PROC_ROOT/$observed_pid/cmdline") \
+        || { pending 'nginx master command line is not ready'; return 1; }
+    case "$master_title" in
+        'nginx: master process '*) ;;
+        *) pending 'supervised master does not identify itself as nginx'; return 1 ;;
+    esac
+    check_process_security "$observed_pid" master || return 1
+    [ -d "$NGINX_LOG_DIRECTORY" ] && [ ! -L "$NGINX_LOG_DIRECTORY" ] \
+        && [ "$(stat -c '%u:%g:%a' "$NGINX_LOG_DIRECTORY" 2>/dev/null)" = "0:$NGINX_GID:750" ] \
+        || { pending 'nginx log directory must be root:nginx with mode 0750'; return 1; }
+    setpriv --reuid "$NGINX_UID" --regid "$NGINX_GID" --init-groups \
+        -- "$TEST_BINARY" -x "$NGINX_LOG_DIRECTORY" \
+        || { pending 'nginx worker identity cannot traverse the log directory'; return 1; }
+    children=$(cat "$PROC_ROOT/$observed_pid/task/$observed_pid/children" 2>/dev/null) \
+        || { pending 'nginx master child list is not ready'; return 1; }
+    active_workers=0
+    for child_pid in $children; do
+        case "$child_pid" in
+            '' | *[!0-9]*) pending 'nginx master child list is invalid'; return 1 ;;
+        esac
+        child_title=$(tr '\000' ' ' 2>/dev/null < "$PROC_ROOT/$child_pid/cmdline" | sed 's/ *$//') || continue
+        # Exclude cache helpers and old workers draining after a reload.
+        [ "$child_title" = 'nginx: worker process' ] || continue
+        check_process_security "$child_pid" worker || return 1
+        active_workers=$((active_workers + 1))
+    done
+    if [ "$EXACT_WORKERS" = yes ]; then
+        [ "$active_workers" -eq "$EXPECTED_WORKERS" ] \
+            || { pending "nginx has $active_workers active workers; expected exactly $EXPECTED_WORKERS"; return 1; }
+    else
+        [ "$active_workers" -ge "$EXPECTED_WORKERS" ] \
+            || { pending "nginx has $active_workers active workers; expected at least $EXPECTED_WORKERS"; return 1; }
+    fi
+    # Catch master death or PID replacement during the composed observation.
+    [ -r "$PROC_ROOT/$observed_pid/status" ] \
+        && [ "$(cat "$NGINX_PID_FILE" 2>/dev/null)" = "$observed_pid" ] \
+        || { pending 'nginx master changed or exited during inspection'; return 1; }
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --master-pid | --previous-master-pid | --workers | --timeout-seconds)
+            [ "$#" -ge 2 ] || fail "$1 requires a value"
+            validate_number "$1" "$2"
+            case "$1" in
+                --master-pid) [ "$2" -gt 0 ] || fail 'master PID must be positive'; MASTER_PID=$2 ;;
+                --previous-master-pid) PREVIOUS_MASTER_PID=$2 ;;
+                --workers)
+                    [ "$2" -gt 0 ] && [ "$2" -le 32767 ] || fail 'workers must be from 1 to 32767'
+                    EXPECTED_WORKERS=$2
+                    EXACT_WORKERS=yes
+                    ;;
+                --timeout-seconds) [ "$2" -le 300 ] || fail 'timeout must be from 0 to 300 seconds'; TIMEOUT_SECONDS=$2 ;;
+            esac
+            shift 2
+            ;;
+        --quic-bpf) QUIC_BPF=yes; shift ;;
+        --help | -h) usage; exit 0 ;;
+        *) fail "unknown argument: $1" ;;
+    esac
+done
+case "$QUIC_BPF" in
+    no) EXPECTED_CAPABILITIES=$BASE_CAPABILITIES ;;
+    yes) EXPECTED_CAPABILITIES=$QUIC_CAPABILITIES ;;
+    *) fail 'NGINX_QUIC_BPF must be yes or no' ;;
+esac
+for required_command in awk cat id setpriv stat tr sed sleep; do
+    command -v "$required_command" >/dev/null 2>&1 || fail "required command not found: $required_command"
+done
+[ "$(id -u)" -eq 0 ] || fail 'run as root to inspect nginx process security'
+NGINX_UID=$(id -u nginx) || fail 'nginx user is unavailable'
+NGINX_GID=$(id -g nginx) || fail 'nginx group is unavailable'
+
+remaining_attempts=$TIMEOUT_SECONDS
+while ! inspect_runtime; do
+    [ "$remaining_attempts" -gt 0 ] || fail "$LAST_ERROR"
+    remaining_attempts=$((remaining_attempts - 1))
+    sleep 1
+done
+printf 'Verified nginx master PID %s and %s active worker(s): Umask 0027, identities, process restrictions, and log-directory traversal.\n' \
+    "$observed_pid" "$active_workers"

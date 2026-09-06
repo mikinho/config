@@ -1,0 +1,181 @@
+#!/usr/bin/env sh
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
+# Exercise the read-only verifier against kernel-shaped fixtures. No systemd,
+# Linux namespaces, service users, or host permission changes are simulated.
+set -eu
+PROGRAM_NAME=${0##*/}
+SCRIPT_DIRECTORY=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+REPOSITORY_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIRECTORY/.." && pwd)
+TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/config-nginx-verifier.XXXXXX")
+export TEST_ROOT
+VERIFY=$TEST_ROOT/verify
+BASE_CAPABILITIES=00000000010004eb
+QUIC_CAPABILITIES=000000c0012014eb
+
+cleanup() { rm -rf -- "$TEST_ROOT"; }
+trap cleanup EXIT HUP INT TERM
+fail() { printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2; exit 1; }
+assert_contains() { grep -F -- "$2" "$1" >/dev/null || fail "missing expected text: $2"; }
+expect_failure() {
+    expected_message=$1
+    shift
+    if "$@" > "$TEST_ROOT/stdout" 2> "$TEST_ROOT/stderr"; then fail 'invalid runtime unexpectedly passed'; fi
+    assert_contains "$TEST_ROOT/stderr" "$expected_message"
+}
+
+write_process() {
+    fixture_process_pid=$1
+    fixture_process_role=$2
+    if [ "$fixture_process_role" = master ]; then process_uid=0; effective_caps=$BASE_CAPABILITIES;
+    else process_uid=991; effective_caps=0000000000000000; fi
+    mkdir -p "$TEST_ROOT/proc/$fixture_process_pid"
+    cat > "$TEST_ROOT/proc/$fixture_process_pid/status" <<EOF
+Name:	nginx
+Umask:	0027
+Uid:	$process_uid	$process_uid	$process_uid	$process_uid
+Gid:	990	990	990	990
+Groups:	990
+CapBnd:	$BASE_CAPABILITIES
+CapEff:	$effective_caps
+CapPrm:	$effective_caps
+CapAmb:	0000000000000000
+NoNewPrivs:	1
+Seccomp:	2
+EOF
+    if [ "$fixture_process_role" = master ]; then
+        printf 'nginx: master process /usr/sbin/nginx -g daemon off;\000' > "$TEST_ROOT/proc/$fixture_process_pid/cmdline"
+    else
+        printf 'nginx: worker process\000' > "$TEST_ROOT/proc/$fixture_process_pid/cmdline"
+    fi
+}
+
+reset_fixture() {
+    rm -rf -- "$TEST_ROOT/proc"
+    mkdir -p "$TEST_ROOT/proc/101/task/101"
+    write_process 101 master
+    write_process 201 worker
+    write_process 202 worker
+    write_process 301 worker
+    write_process 401 worker
+    printf 'nginx: cache manager process\000' > "$TEST_ROOT/proc/301/cmdline"
+    printf 'nginx: worker process is shutting down\000' > "$TEST_ROOT/proc/401/cmdline"
+    printf '201 202 301 401\n' > "$TEST_ROOT/proc/101/task/101/children"
+    printf '101\n' > "$TEST_ROOT/nginx.pid"
+    rm -f "$TEST_ROOT/slept"
+    : > "$TEST_ROOT/commands"
+}
+
+replace_status() {
+    awk -v key="$2:" -v value="$3" '$1 == key { print key "\t" value; next } { print }' \
+        "$TEST_ROOT/proc/$1/status" > "$TEST_ROOT/new-status"
+    mv "$TEST_ROOT/new-status" "$TEST_ROOT/proc/$1/status"
+}
+
+mkdir -p "$TEST_ROOT/bin" "$TEST_ROOT/logs"
+sed \
+    -e "s|^PROC_ROOT=.*|PROC_ROOT=$TEST_ROOT/proc|" \
+    -e "s|^NGINX_PID_FILE=.*|NGINX_PID_FILE=$TEST_ROOT/nginx.pid|" \
+    -e "s|^NGINX_LOG_DIRECTORY=.*|NGINX_LOG_DIRECTORY=$TEST_ROOT/logs|" \
+    "$REPOSITORY_ROOT/nginx/verify-runtime" > "$VERIFY"
+chmod 0755 "$VERIFY"
+cat > "$TEST_ROOT/bin/id" <<'MOCK'
+#!/usr/bin/env sh
+case "$*" in
+    -u) printf '%s\n' "${TEST_CALLER_UID:-0}" ;;
+    '-u nginx') printf '991\n' ;;
+    '-g nginx') printf '990\n' ;;
+    *) exit 1 ;;
+esac
+MOCK
+cat > "$TEST_ROOT/bin/stat" <<'MOCK'
+#!/usr/bin/env sh
+[ "$*" = "-c %u:%g:%a $TEST_ROOT/logs" ] || exit 1
+printf '%s\n' "${TEST_LOG_METADATA:-0:990:750}"
+MOCK
+cat > "$TEST_ROOT/bin/setpriv" <<'MOCK'
+#!/usr/bin/env sh
+[ "$*" = "--reuid 991 --regid 990 --init-groups -- /usr/bin/test -x $TEST_ROOT/logs" ] || exit 1
+printf 'worker traversal\n' >> "$TEST_ROOT/commands"
+[ "${TEST_TRAVERSAL_DENIED:-no}" = no ]
+MOCK
+cat > "$TEST_ROOT/bin/sleep" <<'MOCK'
+#!/usr/bin/env sh
+[ "$*" = 1 ] || exit 1
+printf 'wait\n' >> "$TEST_ROOT/commands"
+: > "$TEST_ROOT/slept"
+if [ "${TEST_DELAYED_WORKERS:-no}" = yes ]; then
+    printf '201 202\n' > "$TEST_ROOT/proc/101/task/101/children"
+fi
+MOCK
+chmod 0755 "$TEST_ROOT/bin/"*
+PATH=$TEST_ROOT/bin:$PATH
+export PATH
+
+reset_fixture
+"$VERIFY" --timeout-seconds 0 --workers 2 > "$TEST_ROOT/stdout"
+assert_contains "$TEST_ROOT/stdout" 'master PID 101 and 2 active worker(s)'
+expect_failure 'expected exactly 3' "$VERIFY" --workers 3 --timeout-seconds 0
+expect_failure 'expected exactly 1' "$VERIFY" --workers 1 --timeout-seconds 0
+# Default readiness remains a minimum; the explicit sizing assertion is exact.
+"$VERIFY" --timeout-seconds 0 > "$TEST_ROOT/stdout"
+assert_contains "$TEST_ROOT/stdout" 'master PID 101 and 2 active worker(s)'
+expect_failure 'master did not change' "$VERIFY" --previous-master-pid 101 --timeout-seconds 0
+expect_failure 'PID file does not match' "$VERIFY" --master-pid 202 --timeout-seconds 0
+expect_failure 'run as root' env TEST_CALLER_UID=501 "$VERIFY" --timeout-seconds 0
+expect_failure 'root:nginx with mode 0750' env TEST_LOG_METADATA=0:0:750 "$VERIFY" --timeout-seconds 0
+expect_failure 'root:nginx with mode 0750' env TEST_LOG_METADATA=991:990:750 "$VERIFY" --timeout-seconds 0
+expect_failure 'root:nginx with mode 0750' env TEST_LOG_METADATA=0:990:755 "$VERIFY" --timeout-seconds 0
+expect_failure 'cannot traverse' env TEST_TRAVERSAL_DENIED=yes "$VERIFY" --timeout-seconds 0
+
+for process_pid in 101 201; do
+    for bad_field in Umask NoNewPrivs Seccomp CapBnd CapEff CapPrm CapAmb Uid Gid; do
+        reset_fixture
+        case "$bad_field" in
+            Umask) bad_value=0000; expected='does not retain Umask 0027' ;;
+            NoNewPrivs) bad_value=0; expected='does not have NoNewPrivileges' ;;
+            Seccomp) bad_value=0; expected='does not have seccomp filtering' ;;
+            CapBnd) bad_value=000001ffffffffff; expected='unexpected capability bounding set' ;;
+            CapEff | CapPrm | CapAmb) bad_value=0000000000000001; expected='unexpected effective, permitted, or ambient capabilities' ;;
+            Uid | Gid) bad_value='0 0 0 991'; expected='unexpected user or group identity' ;;
+        esac
+        replace_status "$process_pid" "$bad_field" "$bad_value"
+        expect_failure "$expected" "$VERIFY" --timeout-seconds 0
+        case "$bad_field" in
+            CapBnd | CapEff | CapPrm | CapAmb)
+                assert_contains "$TEST_ROOT/stderr" "$bad_field=$bad_value"
+                ;;
+        esac
+    done
+done
+reset_fixture
+replace_status 101 Groups '0 990'
+expect_failure 'unexpected supplementary groups: Groups=0 990; expected 990' "$VERIFY" --timeout-seconds 0
+reset_fixture
+: > "$TEST_ROOT/proc/101/task/101/children"
+env TEST_DELAYED_WORKERS=yes "$VERIFY" --workers 2 --timeout-seconds 2 > "$TEST_ROOT/stdout"
+[ -f "$TEST_ROOT/slept" ] || fail 'foreground startup was not polled'
+assert_contains "$TEST_ROOT/stdout" '2 active worker(s)'
+reset_fixture
+: > "$TEST_ROOT/proc/101/task/101/children"
+expect_failure 'expected at least 1' "$VERIFY" --timeout-seconds 2
+[ "$(grep -c '^wait$' "$TEST_ROOT/commands")" -eq 2 ] || fail 'polling did not honor its bound'
+
+reset_fixture
+for process_pid in 101 201 202; do replace_status "$process_pid" CapBnd "$QUIC_CAPABILITIES"; done
+replace_status 101 CapEff "$QUIC_CAPABILITIES"
+replace_status 101 CapPrm "$QUIC_CAPABILITIES"
+expect_failure 'unexpected capability bounding set' "$VERIFY" --timeout-seconds 0
+"$VERIFY" --quic-bpf --timeout-seconds 0 > "$TEST_ROOT/stdout"
+env NGINX_QUIC_BPF=yes "$VERIFY" --timeout-seconds 0 > "$TEST_ROOT/stdout"
+expect_failure 'must be yes or no' env NGINX_QUIC_BPF=maybe "$VERIFY"
+for invalid_value in 00 08 -1 1.5 '1+1'; do
+    expect_failure 'canonical decimal integer' "$VERIFY" --timeout-seconds "$invalid_value"
+done
+expect_failure 'timeout must be from 0 to 300' "$VERIFY" --timeout-seconds 301
+expect_failure 'workers must be from 1 to 32767' "$VERIFY" --workers 0
+
+printf 'Validated nginx runtime identity, mask, capability, directory, and bounded readiness checks with isolated fixtures.\n'

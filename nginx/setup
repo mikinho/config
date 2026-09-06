@@ -15,16 +15,22 @@ HOST_TOOL_INSTALLER=$REPOSITORY_ROOT/deploy/install-host-tools
 SELINUX_SETUP=$REPOSITORY_ROOT/selinux/setup
 FIREWALL_SETUP=$REPOSITORY_ROOT/firewalld/setup
 NGINX_UNIT_SOURCE=$REPOSITORY_ROOT/systemd/system/nginx.service
+RUNTIME_VERIFIER_SOURCE=$SCRIPT_DIRECTORY/verify-runtime
+QUIC_DROPIN_SOURCE=$SCRIPT_DIRECTORY/templates/quic-bpf.service.conf
 LOGROTATE_SOURCE=$REPOSITORY_ROOT/logrotate/nginx
 SYSCTL_SOURCE=$REPOSITORY_ROOT/sysctl/99-nginx-quic.conf
 
 NGINX_UNIT_TARGET=/etc/systemd/system/nginx.service
+QUIC_DROPIN_TARGET=/etc/systemd/system/nginx.service.d/10-quic-bpf.conf
 LOGROTATE_TARGET=/etc/logrotate.d/nginx
 SYSCTL_TARGET=/etc/sysctl.d/99-nginx-quic.conf
 NGINX_BINARY=/usr/sbin/nginx
 NGINX_CONFIG=/etc/nginx/nginx.conf
-NGINX_PID_FILE=/run/nginx/nginx.pid
-PROC_ROOT=/proc
+NGINX_RUNTIME_DIRECTORY=/run/nginx
+NGINX_LOCK_DIRECTORY=/run/lock/nginx
+NGINX_STATE_DIRECTORY=/var/lib/nginx
+NGINX_LOG_DIRECTORY=/var/log/nginx
+SCRATCH_DIRECTORY=
 # Keep this in step with the shared unit. Host overrides may reduce this budget;
 # setup never assumes a larger local override is safe for a shared baseline.
 SHARED_TASKS_MAX=512
@@ -56,6 +62,8 @@ count (getconf _NPROCESSORS_ONLN); sum all configured/default thread pools.
 cgroup limits and other services sharing them; it does not change any limit.
 This command RESTARTS nginx, including an already active service: schedule a
 maintenance window. A config-only reload cannot activate new systemd sandboxing.
+--quic-bpf also selects the reviewed BPF capability extension; mount syscalls
+remain denied. Omitting it retires only an unchanged repository-owned drop-in.
 EOF
 }
 
@@ -63,6 +71,11 @@ fail() {
     printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2
     exit 1
 }
+
+cleanup() {
+    [ -z "$SCRATCH_DIRECTORY" ] || rm -rf -- "$SCRATCH_DIRECTORY"
+}
+trap cleanup EXIT HUP INT TERM
 
 validate_regular_source() {
     nginx_source=$1
@@ -83,6 +96,8 @@ validate_sources() {
     validate_executable_source "$SELINUX_SETUP"
     validate_executable_source "$FIREWALL_SETUP"
     validate_regular_source "$NGINX_UNIT_SOURCE"
+    validate_executable_source "$RUNTIME_VERIFIER_SOURCE"
+    validate_regular_source "$QUIC_DROPIN_SOURCE"
     validate_regular_source "$LOGROTATE_SOURCE"
     validate_regular_source "$SYSCTL_SOURCE"
 }
@@ -162,14 +177,70 @@ verify_restarted_master() {
     [ "$master_pid" != 0 ] || fail "nginx has no master after restart"
     [ "$master_pid" != "$previous_master_pid" ] \
         || fail "nginx master did not change; installed systemd sandbox activation is unverified"
-    [ -f "$NGINX_PID_FILE" ] && [ "$(cat "$NGINX_PID_FILE")" = "$master_pid" ] \
-        || fail "nginx PID file does not match the restarted master"
-    [ -r "$PROC_ROOT/$master_pid/status" ] \
-        || fail "cannot inspect restarted nginx master restrictions"
-    awk '$1 == "NoNewPrivs:" && $2 == "1" { found = 1 } END { exit !found }' \
-        "$PROC_ROOT/$master_pid/status" \
-        || fail "restarted nginx master does not have NoNewPrivileges active"
-    printf 'Verified restarted nginx master PID %s with NoNewPrivileges active.\n' "$master_pid"
+    set -- "$RUNTIME_VERIFIER_SOURCE" --master-pid "$master_pid" \
+        --previous-master-pid "$previous_master_pid" --workers "$WORKERS"
+    [ "$QUIC_BPF" = no ] || set -- "$@" --quic-bpf
+    NGINX_QUIC_BPF=no "$@"
+    systemctl is-active --quiet nginx.service || fail "nginx exited during startup verification"
+    printf 'Verified restarted nginx master PID %s and reviewed worker count.\n' "$master_pid"
+}
+
+validate_quic_dropin() {
+    validate_target_file "$QUIC_DROPIN_TARGET"
+    if [ -e "$QUIC_DROPIN_TARGET" ]; then
+        cmp -s "$QUIC_DROPIN_SOURCE" "$QUIC_DROPIN_TARGET" \
+            || fail "QUIC capability drop-in has local changes; review and preserve it before setup: $QUIC_DROPIN_TARGET"
+    fi
+    dropin_parent=${QUIC_DROPIN_TARGET%/*}
+    [ ! -L "$dropin_parent" ] || fail "QUIC capability drop-in parent must not be a symlink"
+}
+
+verify_unit_source() {
+    # The runtime helper may not be installed on first setup. Verify a scratch
+    # copy with only that executable path redirected to the reviewed source;
+    # this retains the pre-mutation systemd parser/executable validation gate.
+    SCRATCH_DIRECTORY=$(mktemp -d "${TMPDIR:-/tmp}/nginx-unit-preflight.XXXXXX")
+    verifier_replacement=$(printf '%s' "$RUNTIME_VERIFIER_SOURCE" | sed 's/[\\&|]/\\&/g')
+    sed "s|^ExecStartPost=!/usr/local/libexec/nginx-runtime-verify |ExecStartPost=!\"$verifier_replacement\" |" \
+        "$NGINX_UNIT_SOURCE" > "$SCRATCH_DIRECTORY/nginx.service"
+    if [ "$QUIC_BPF" = yes ]; then
+        mkdir "$SCRATCH_DIRECTORY/nginx.service.d"
+        cp "$QUIC_DROPIN_SOURCE" "$SCRATCH_DIRECTORY/nginx.service.d/10-quic-bpf.conf"
+    fi
+    systemd-analyze --man=no verify "$SCRATCH_DIRECTORY/nginx.service" \
+        || fail "repository nginx unit failed pre-application validation"
+    cleanup
+    SCRATCH_DIRECTORY=
+}
+
+validate_managed_directories() {
+    for managed_directory in "$NGINX_RUNTIME_DIRECTORY" "$NGINX_LOCK_DIRECTORY" \
+        "$NGINX_STATE_DIRECTORY" "$NGINX_LOG_DIRECTORY"; do
+        if [ -e "$managed_directory" ] || [ -L "$managed_directory" ]; then
+            [ -d "$managed_directory" ] && [ ! -L "$managed_directory" ] \
+                || fail "managed nginx path must be a real directory: $managed_directory"
+            [ "$(stat -c '%u' "$managed_directory")" = 0 ] \
+                || fail "managed nginx directory must be root-owned before group migration: $managed_directory"
+            directory_mode=$(stat -c '%a' "$managed_directory")
+            case "$directory_mode" in
+                [0-7][0-7][0-7] | [0-7][0-7][0-7][0-7]) ;;
+                *) fail "cannot inspect managed nginx directory mode: $managed_directory" ;;
+            esac
+            [ "$((0$directory_mode & 0022))" -eq 0 ] \
+                || fail "managed nginx directory must not permit group/other writes: $managed_directory"
+        fi
+    done
+}
+
+migrate_directory_groups() {
+    # Changing Group= would make systemd recursively chown existing state and
+    # logs when their parent ownership differs. Align only the root-owned
+    # parents first; preserve cached-file and rotated-log descendant ownership.
+    validate_managed_directories
+    for managed_directory in "$NGINX_RUNTIME_DIRECTORY" "$NGINX_LOCK_DIRECTORY" \
+        "$NGINX_STATE_DIRECTORY" "$NGINX_LOG_DIRECTORY"; do
+        [ ! -d "$managed_directory" ] || chgrp nginx "$managed_directory"
+    done
 }
 
 validate_target_file() {
@@ -183,7 +254,7 @@ validate_target_file() {
 validate_live_host() {
     check_live_capacity
     [ "$(id -u)" -eq 0 ] || fail "run as root or use --plan"
-    for nginx_command in install logrotate sysctl systemctl systemd-analyze; do
+    for nginx_command in chgrp cmp install logrotate mktemp sed setpriv stat sysctl systemctl systemd-analyze; do
         command -v "$nginx_command" >/dev/null 2>&1 \
             || fail "required command not found: $nginx_command"
     done
@@ -191,13 +262,14 @@ validate_live_host() {
     [ -f "$NGINX_CONFIG" ] && [ ! -L "$NGINX_CONFIG" ] \
         || fail "live nginx configuration must be a regular file: $NGINX_CONFIG"
     validate_target_file "$NGINX_UNIT_TARGET"
+    validate_quic_dropin
+    validate_managed_directories
     validate_target_file "$LOGROTATE_TARGET"
     validate_target_file "$SYSCTL_TARGET"
     "$NGINX_RENDERER" --verify-host
-    "$NGINX_BINARY" -t -q -c "$NGINX_CONFIG" \
+    "$NGINX_BINARY" -t -q -c "$NGINX_CONFIG" -g 'daemon off;' \
         || fail "live nginx configuration failed pre-application validation"
-    systemd-analyze --man=no verify "$NGINX_UNIT_SOURCE" \
-        || fail "repository nginx unit failed pre-application validation"
+    verify_unit_source
     logrotate --debug "$LOGROTATE_SOURCE" >/dev/null \
         || fail "repository logrotate policy failed validation"
 }
@@ -219,17 +291,23 @@ print_plan() {
     fi
     "$FIREWALL_SETUP" --plan --service nginx --zone "$ZONE"
     printf '+ install -D -o root -g root -m 0644 %s %s\n' "$NGINX_UNIT_SOURCE" "$NGINX_UNIT_TARGET"
+    if [ "$QUIC_BPF" = yes ]; then
+        printf '+ install reviewed QUIC BPF capability drop-in %s at %s\n' "$QUIC_DROPIN_SOURCE" "$QUIC_DROPIN_TARGET"
+    else
+        printf '+ retire %s only if it matches the repository-owned drop-in\n' "$QUIC_DROPIN_TARGET"
+    fi
     printf '+ install -D -o root -g root -m 0644 %s %s\n' "$LOGROTATE_SOURCE" "$LOGROTATE_TARGET"
     printf '+ install -D -o root -g root -m 0644 %s %s\n' "$SYSCTL_SOURCE" "$SYSCTL_TARGET"
     printf '+ %s\n' "$HOST_TOOL_INSTALLER"
+    printf '+ migrate existing root-owned runtime/state/log parent groups to nginx without recursion\n'
     printf '+ sysctl --load=%s\n' "$SYSCTL_TARGET"
     printf '+ systemctl daemon-reload\n'
     printf '+ systemd-analyze --man=no verify nginx.service\n'
-    printf '+ %s -t -q -c %s\n' "$NGINX_BINARY" "$NGINX_CONFIG"
+    printf '+ %s -t -q -c %s -g "daemon off;"\n' "$NGINX_BINARY" "$NGINX_CONFIG"
     printf 'A planned nginx restart is required to activate the installed systemd sandbox; allow a service interruption.\n'
     printf '+ recheck effective task budget after daemon-reload\n'
     printf '+ systemctl restart nginx.service\n'
-    printf '+ verify active fresh master, PID file, and /proc NoNewPrivs\n'
+    printf '+ verify active fresh master, reviewed workers, Umask, capabilities, seccomp, and log-directory access\n'
     printf '+ systemctl enable nginx.service\n'
 }
 
@@ -247,9 +325,15 @@ apply_runtime() {
     fi
     "$FIREWALL_SETUP" --service nginx --zone "$ZONE"
     install -D -o root -g root -m 0644 "$NGINX_UNIT_SOURCE" "$NGINX_UNIT_TARGET"
+    if [ "$QUIC_BPF" = yes ]; then
+        install -D -o root -g root -m 0644 "$QUIC_DROPIN_SOURCE" "$QUIC_DROPIN_TARGET"
+    elif [ -e "$QUIC_DROPIN_TARGET" ]; then
+        rm -- "$QUIC_DROPIN_TARGET"
+    fi
     install -D -o root -g root -m 0644 "$LOGROTATE_SOURCE" "$LOGROTATE_TARGET"
     install -D -o root -g root -m 0644 "$SYSCTL_SOURCE" "$SYSCTL_TARGET"
     "$HOST_TOOL_INSTALLER"
+    migrate_directory_groups
     if command -v restorecon >/dev/null 2>&1; then
         restorecon -RF \
             "$NGINX_UNIT_TARGET" \
@@ -259,7 +343,7 @@ apply_runtime() {
     sysctl "--load=$SYSCTL_TARGET"
     systemctl daemon-reload
     systemd-analyze --man=no verify nginx.service
-    "$NGINX_BINARY" -t -q -c "$NGINX_CONFIG"
+    "$NGINX_BINARY" -t -q -c "$NGINX_CONFIG" -g 'daemon off;'
     check_live_capacity
     printf 'Restarting nginx to activate the installed systemd runtime settings.\n'
     systemctl restart nginx.service

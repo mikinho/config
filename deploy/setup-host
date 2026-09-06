@@ -275,6 +275,7 @@ run_host_verifier() {
         --zone "$ZONE" \
         --topology "$TOPOLOGY" \
         --ssh-phase final
+    [ "$QUIC_BPF" = no ] || set -- "$@" --quic-bpf
     for verifier_ignore_ip in $IGNORE_IPS; do
         set -- "$@" --ignore-ip "$verifier_ignore_ip"
     done

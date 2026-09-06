@@ -415,7 +415,8 @@ jobs:
                 curl-minimal \
                 "${nginx_package}" \
                 nodejs \
-                openssl
+                openssl \
+                util-linux
               openssl version
               nginx -v
               if [ "${EXPECTED_NGINX_VERSION}" != latest ]; then
@@ -533,6 +534,8 @@ jobs:
                 exit 1
               fi
               install -D -m 0755 /usr/bin/true /usr/sbin/nginx
+              install -D -m 0755 /workspace/nginx/verify-runtime \
+                /usr/local/libexec/nginx-runtime-verify
               install -D -m 0755 /usr/bin/true /sbin/php-fpm
               install -D -m 0755 /usr/bin/true /bin/certbot
               install -D -m 0755 \

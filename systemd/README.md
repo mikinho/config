@@ -38,6 +38,26 @@ Validate the composed behavior on the target service after every change:
 5. Exercise restart and reload paths plus the public or local health check.
 6. Confirm the mandatory-access-control domain and labels remain correct.
 
+`UMask=` supplies a process's initial file-creation mask. It does not change
+existing files, override an application's explicit `chmod` or socket ACL, or
+stop the process changing its own mask. Directory modes are independent of the
+mask. Verify the running process and newly created output, including after
+reload and rotation; checking `systemctl show -p UMask` alone is insufficient.
+
+| Service | Mask and composed access contract |
+| --- | --- |
+| nginx | `0027`; foreground root master, primary group `nginx`; nginx workers; root-owned logs directory `root:nginx 0750`, new logs `0640`. |
+| PHP-FPM | `0022` deliberately keeps public uploads readable by nginx. Private application and session directories remain `0700`. Runtime `0711` permits traversal to the known socket, whose `0660` mode and nginx ACL control connection access. |
+| Certbot | `0077` for secret-bearing operations. The webroot authenticator explicitly creates publicly readable HTTP-01 tokens; those tokens are not private keys. |
+| Certificate healthcheck | `0077` by default; optional report output is explicitly `0644` monitoring metadata. Choose its parent directory's access accordingly. |
+
+Do not globally tighten the PHP mask or runtime directory without supplying the
+matching nginx group or ACL access. nginx runtime and state parents retain
+`0755` for conventional PID discovery and worker traversal into nginx-owned
+temporary/cache subdirectories; private payloads are protected at those child
+paths. The log directory additionally denies discovery and traversal to other
+users. Review any local ACLs as part of that directory contract.
+
 ## Installation
 
 For nginx, prefer `nginx/setup` or the composed `deploy/setup-host` command.
@@ -92,11 +112,25 @@ Install the common nginx and optional PHP-FPM units, then perform the planned
 restart rather than assuming `enable --now` replaces an active master:
 
 ```sh
+install -D -o root -g root -m 0755 nginx/verify-runtime /usr/local/libexec/nginx-runtime-verify
+restorecon /usr/local/libexec/nginx-runtime-verify
 install -m 0644 systemd/system/nginx.service /etc/systemd/system/nginx.service
 install -m 0644 systemd/system/php-fpm@.service /etc/systemd/system/php-fpm@.service
+# One-time migration: change only the managed directory parents. systemd can
+# recursively chown descendants if a managed parent's ownership differs.
+# Preserve existing nginx-owned cache entries and rotated-log ownership.
+for nginx_directory in /run/nginx /run/lock/nginx /var/lib/nginx /var/log/nginx; do
+    if [ -e "$nginx_directory" ] || [ -L "$nginx_directory" ]; then
+        [ -d "$nginx_directory" ] && [ ! -L "$nginx_directory" ] || exit 1
+        [ "$(stat -c '%u' "$nginx_directory")" = 0 ] || exit 1
+        nginx_directory_mode=$(stat -c '%a' "$nginx_directory")
+        [ "$((0$nginx_directory_mode & 0022))" -eq 0 ] || exit 1
+        chgrp nginx "$nginx_directory"
+    fi
+done
 systemctl daemon-reload
 systemd-analyze verify nginx.service
-/usr/sbin/nginx -t -q -c /etc/nginx/nginx.conf
+/usr/sbin/nginx -t -q -c /etc/nginx/nginx.conf -g 'daemon off;'
 systemctl restart nginx.service
 systemctl enable nginx.service
 ```
@@ -107,12 +141,58 @@ the QUIC listener and worker rlimits are permitted. The same-named unit in
 `/etc/systemd/system` overrides the distribution unit; do not mask `nginx.service`,
 which would prevent the replacement from starting too.
 
-After restart, setup checks service activity, a fresh nonzero master PID,
-agreement with `/run/nginx/nginx.pid`, and `NoNewPrivs: 1` in that master's
-`/proc` status. These are targeted activation checks, not proof of every sandbox
-or SELinux rule. On the target Linux host, also inspect the composed unit and
-mount restrictions, test intended reads/writes and upstream connections, and
-exercise a graceful reload under representative traffic before acceptance.
+nginx now runs with `Type=exec` and `daemon off`, preserving `UMask=0027` in
+the root master and its workers. nginx's daemonization otherwise calls
+`umask(0)`. The unit supplies this global directive for start and configuration
+checks; do not duplicate a `daemon` directive in the nginx configuration.
+
+The unit deliberately leaves `User=` unset, using the system manager's default
+root UID, and sets `Group=nginx` and `SupplementaryGroups=nginx`. The explicit
+supplementary list removes inherited group zero access. An explicit `User=root`
+triggers systemd 257's seccomp setup to drop `CAP_SETUID`, preventing nginx from
+creating unprivileged workers under `NoNewPrivileges`; the default root UID
+avoids that transition without adding ambient capabilities. The runtime
+checker requires the root master to retain its exact reviewed capabilities and
+only the nginx supplementary group. See the
+[systemd execution source](https://github.com/systemd/systemd/blob/v257/src/core/exec-invoke.c#L4804-L4865).
+
+`ExecStartPost=!` runs only the installed read-only checker with the manager's
+root:root credentials, retaining its other sandbox and capability restrictions.
+Group zero lets that checker inspect workers through `ProtectProc=invisible`;
+the nginx master remains root:nginx without extra ptrace capability or root
+supplementary-group access. The verifier waits up to
+ten seconds for the managed PID file and at least one active worker, checking
+master/worker identity, effective mask, capability sets, `NoNewPrivs`, seccomp
+activation, and nginx's ability to traverse the root-owned log directory.
+Failure fails service startup, so ordered dependents do not mistake successful
+`execve` for readiness. The helper needs `setpriv` from `util-linux` and ordinary
+Linux `/proc` access. Setup additionally checks a fresh master and exactly the
+reviewed worker count: an explicit `--workers N` rejects both missing and extra
+workers, while the default startup check requires at least one. Setup also
+migrates existing root-owned directory groups without
+recursing into their contents. Unexpected ownership, writable parents or
+symbolic links fail setup before host mutation.
+
+These are targeted observations, not proof of every sandbox or SELinux rule.
+In particular, `Seccomp: 2` confirms a filter exists, not which syscalls it
+denies. On the target Linux host, inspect the composed unit, effective mount
+filter and capabilities, test intended reads/writes and upstream connections,
+and exercise graceful reload and log rotation under representative traffic.
+
+The ordinary capability allowlist covers privileged binds, worker identity
+changes, log ownership and access, worker signals, and rlimits. Ambient
+capabilities are empty; workers must have no effective or permitted capabilities.
+`SystemCallFilter=~@mount` prevents privileged processes undoing the read-only
+mount restrictions. A `quic_bpf` deployment explicitly installs
+`nginx/templates/quic-bpf.service.conf` at
+`/etc/systemd/system/nginx.service.d/10-quic-bpf.conf`, adding `CAP_NET_ADMIN`,
+`CAP_BPF`, `CAP_PERFMON`, and the kernel-dependent `CAP_SYS_ADMIN` fallback.
+The mount denial stays active in this profile. `nginx/setup --quic-bpf` selects
+that extension and the existing SELinux BPF policy together; an ordinary apply
+retires only an unchanged repository-owned capability drop-in. Locally changed
+drop-ins require review before setup can proceed. Validate QUIC BPF on each
+target kernel/nginx build with enforcing SELinux; do not add capabilities to
+the ordinary profile to accommodate one optional feature.
 
 Choose exactly one Certbot backend. Both use the repository's `certbot.timer`
 and the common `certbot-healthcheck.timer`; do not leave a distribution or
@@ -224,9 +304,11 @@ Never edit the installed unit in place; use
   systemd override plus a review of SELinux
   `httpd_execmem`; otherwise one containment layer still blocks executable
   writable mappings.
-- For nginx, tightening `CapabilityBoundingSet=` or adding `SystemCallFilter=`
-  is worthwhile but host-specific; validate against the installed kernel,
-  selected stubs, and nginx build before deploying, and revalidate on upgrades.
+- For nginx, preserve the capability allowlist and mount-syscall denial.
+  Optional QUIC BPF uses the managed extension described above. A different
+  capability contract also requires reviewing the runtime verifier's expected
+  sets; an unexpected local enlargement intentionally fails startup. A broader
+  syscall allowlist remains a separate compatibility-tested change.
 - Native Certbot deployments using non-webroot authenticators or hooks that
   write elsewhere need the smallest necessary additions to
   `certbot.service`. Review Snap-specific changes against its generated
@@ -261,7 +343,8 @@ sudo systemctl --no-pager show certbot.timer certbot-healthcheck.timer \
 sudo systemctl list-timers --no-pager | grep -Ei 'certbot|letsencrypt'
 sudo systemd-analyze verify php-fpm@SITE_TAG.service
 sudo systemd-analyze security nginx.service php-fpm@SITE_TAG.service
-sudo certbot renew --dry-run
+sudo certbot renew --dry-run \
+    --server https://acme-staging-v02.api.letsencrypt.org/directory
 sudo /usr/local/bin/certbot-healthcheck
 sudo systemctl start certbot-healthcheck.service
 ```

@@ -26,6 +26,7 @@ NODE_PID=
 cleanup() {
     if [ -n "$NGINX_PID" ] && kill -0 "$NGINX_PID" 2>/dev/null; then
         kill -QUIT "$NGINX_PID"
+        wait "$NGINX_PID" || true
     fi
     if [ -n "$NODE_PID" ] && kill -0 "$NODE_PID" 2>/dev/null; then
         kill -TERM "$NODE_PID"
@@ -142,7 +143,72 @@ stop_nginx() {
             || fail 'nginx did not stop after SIGQUIT'
         sleep 0.1
     done
+    wait "$NGINX_PID" || fail 'foreground nginx exited unsuccessfully'
     NGINX_PID=
+}
+
+start_nginx() {
+    # Match foreground execution, mask and log ownership of the actual unit.
+    # Container execution does not validate its systemd capability/seccomp set.
+    (
+        umask 0027
+        exec setpriv --reuid 0 --regid nginx --init-groups --no-new-privs \
+            /usr/sbin/nginx -p "$NGINX_PREFIX/" -c "$NGINX_CONFIGURATION" -g 'daemon off;'
+    ) &
+    NGINX_PID=$!
+    retry_count=0
+    until [ -f "$NGINX_PID_FILE" ] && [ "$(cat "$NGINX_PID_FILE")" = "$NGINX_PID" ] \
+        && [ -n "$(cat "/proc/$NGINX_PID/task/$NGINX_PID/children" 2>/dev/null)" ]; do
+        kill -0 "$NGINX_PID" 2>/dev/null || fail 'foreground nginx exited during startup'
+        retry_count=$((retry_count + 1))
+        [ "$retry_count" -lt 100 ] || fail 'foreground nginx did not publish its PID and workers'
+        sleep 0.1
+    done
+}
+
+assert_process_masks() {
+    mask_children=$(cat "/proc/$NGINX_PID/task/$NGINX_PID/children")
+    for inspected_pid in "$NGINX_PID" $mask_children; do
+        if ! awk '$1 == "Umask:" && $2 == "0027" { found = 1 } END { exit !found }' \
+            "/proc/$inspected_pid/status" 2>/dev/null; then
+            # A draining worker may disappear during the observation.
+            [ "$inspected_pid" != "$NGINX_PID" ] && [ ! -e "/proc/$inspected_pid/status" ] \
+                || fail "nginx PID $inspected_pid lost Umask 0027"
+        fi
+    done
+}
+
+workers_reopened_log() {
+    reopened_workers=0
+    reopen_children=$(cat "/proc/$NGINX_PID/task/$NGINX_PID/children")
+    for inspected_pid in $reopen_children; do
+        worker_title=$(tr '\000' ' ' 2>/dev/null < "/proc/$inspected_pid/cmdline" | sed 's/ *$//')
+        [ "$worker_title" = 'nginx: worker process' ] || continue
+        worker_reopened=no
+        for worker_fd in /proc/"$inspected_pid"/fd/*; do
+            if [ "$(readlink "$worker_fd" 2>/dev/null)" = "$NODE_ACCESS_LOG" ]; then
+                worker_reopened=yes
+                break
+            fi
+        done
+        [ "$worker_reopened" = yes ] || return 1
+        reopened_workers=$((reopened_workers + 1))
+    done
+    [ "$reopened_workers" -gt 0 ]
+}
+
+request_rotation_canary() {
+    rotation_canary=$1
+    status=$(request "$rotation_canary" --insecure \
+        --resolve "node.example.com:443:$PUBLIC_EDGE_ADDRESS" \
+        "https://node.example.com/$rotation_canary")
+    assert_status 200 "$status" "$rotation_canary"
+    retry_count=0
+    until grep -F -- "\"request_path\":\"/$rotation_canary\"" "$NODE_ACCESS_LOG" >/dev/null; do
+        retry_count=$((retry_count + 1))
+        [ "$retry_count" -lt 100 ] || fail 'nginx did not flush the canary into its current log'
+        sleep 0.1
+    done
 }
 
 trap cleanup EXIT HUP INT TERM
@@ -165,11 +231,11 @@ printf '%s\n' 'body { color: navy; }' >"$NODE_ROOT/static/app.css"
 printf '%s\n' 'body { color: teal; }' >"$NODE_ROOT/static/app.0123456789abcdef.css"
 rm -f -- "$NODE_ROOT/maintenance.html" "$NODE_ACCESS_LOG"
 start_node
-
-/usr/sbin/nginx -p "$NGINX_PREFIX/" -c "$NGINX_CONFIGURATION"
-NGINX_PID=$(cat "$NGINX_PID_FILE")
-kill -0 "$NGINX_PID" 2>/dev/null \
-    || fail 'nginx did not start'
+install -d -o root -g nginx -m 0750 /var/log/nginx
+setpriv --reuid nginx --regid nginx --init-groups -- test -x /var/log/nginx \
+    || fail 'nginx identity cannot traverse its root-owned log directory'
+start_nginx
+assert_process_masks
 
 status=$(request redirect \
     --resolve "example.com:80:$PUBLIC_EDGE_ADDRESS" \
@@ -379,5 +445,48 @@ if grep --fixed-strings '"request_path":"/app.css"' \
     "$STATIC_FAILURE_LOG" >/dev/null; then
     fail 'successful static asset was written to the failure-only log'
 fi
+
+# Exercise both create-0640 rotation and nginx's missing-file recreation.
+# This reproduces logrotate's filesystem and USR1 sequence; the real systemctl
+# dispatch and the full unit sandbox still require a booted Linux test host.
+start_node
+start_nginx
+request_rotation_canary rotation_before
+for rotation_case in created recreated; do
+    rotated_log=$NODE_ACCESS_LOG.$rotation_case
+    mv "$NODE_ACCESS_LOG" "$rotated_log"
+    if [ "$rotation_case" = created ]; then
+        install -o nginx -g nginx -m 0640 /dev/null "$NODE_ACCESS_LOG"
+    fi
+    kill -USR1 "$NGINX_PID"
+    retry_count=0
+    until workers_reopened_log; do
+        retry_count=$((retry_count + 1))
+        [ "$retry_count" -lt 100 ] || fail 'nginx workers retained rotated log descriptors'
+        sleep 0.1
+    done
+    [ "$(stat -c '%u:%g:%a' "$NODE_ACCESS_LOG")" = "$(id -u nginx):$(id -g nginx):640" ] \
+        || fail 'reopened nginx log did not retain nginx:nginx mode 0640'
+    rotated_size=$(wc -c < "$rotated_log")
+    request_rotation_canary "rotation_$rotation_case"
+    [ "$(wc -c < "$rotated_log")" = "$rotated_size" ] \
+        || fail 'nginx continued writing into a rotated log'
+    assert_process_masks
+done
+
+# A HUP must preserve the foreground master and masks while replacing workers.
+old_workers=$(cat "/proc/$NGINX_PID/task/$NGINX_PID/children")
+kill -HUP "$NGINX_PID"
+retry_count=0
+while [ "$(cat "/proc/$NGINX_PID/task/$NGINX_PID/children")" = "$old_workers" ]; do
+    retry_count=$((retry_count + 1))
+    [ "$retry_count" -lt 100 ] || fail 'nginx did not replace workers after reload'
+    sleep 0.1
+done
+[ "$(cat "$NGINX_PID_FILE")" = "$NGINX_PID" ] || fail 'reload replaced the foreground master'
+assert_process_masks
+request_rotation_canary rotation_after_reload
+stop_nginx
+stop_node
 
 printf '%s\n' 'nginx runtime policy checks passed'
