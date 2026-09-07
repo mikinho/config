@@ -17,6 +17,7 @@ TEST_BINARY=/usr/bin/test
 MODE=runtime
 STARTUP_GATE=no
 POLICY_COMMAND_TIMEOUT=5
+QUERY_TIMEOUT=5
 MASTER_PID=
 PREVIOUS_MASTER_PID=
 EXPECTED_WORKERS=1
@@ -27,7 +28,7 @@ QUIC_BPF=${NGINX_QUIC_BPF:-no}
 BASE_CAPABILITIES=00000000010004eb
 QUIC_CAPABILITIES=000000c0012014eb
 LAST_ERROR='nginx startup has not been inspected'
-MONOTONIC_SECONDS=0
+MONOTONIC_CENTISECONDS=0
 STALE_METADATA_WARNED=no
 required_syscalls=
 
@@ -51,7 +52,10 @@ syscall group. --policy-only checks that composed policy before service start.
 readiness polling and service-manager queries alike. Conditions that resolve on
 their own (a PID file or worker not yet present, a manager query that did not
 answer within $POLICY_COMMAND_TIMEOUT seconds) are retried once per second until the
-window closes; policy violations fail immediately. 0 performs a single attempt.
+window closes; policy violations fail immediately. Queries are capped by the
+remaining window; forced command cleanup can take one additional second, but
+late results never count as success. 0 performs a single attempt with separate
+five-second query limits instead of an overall readiness window.
 
 --startup marks the unit's own ExecStartPost invocation. The loaded policy it
 inspects is exactly what the new master received, so on-disk unit changes that
@@ -64,27 +68,56 @@ fail() { printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2; exit 1; }
 warn() { printf '%s: warning: %s\n' "$PROGRAM_NAME" "$*" >&2; }
 pending() { LAST_ERROR=$*; return 1; }
 
-read_monotonic_seconds() {
+read_monotonic_time() {
     # /proc/uptime follows CLOCK_BOOTTIME, so a wall-clock step during startup
     # can neither shorten nor stretch the verification window.
-    read -r MONOTONIC_SECONDS _ < "$PROC_ROOT/uptime" \
+    read -r clock_value _ < "$PROC_ROOT/uptime" \
         || fail "cannot read the monotonic clock from $PROC_ROOT/uptime"
-    MONOTONIC_SECONDS=${MONOTONIC_SECONDS%%.*}
-    case "$MONOTONIC_SECONDS" in
-        '' | *[!0-9]*) fail "cannot interpret the monotonic clock from $PROC_ROOT/uptime" ;;
+    case "$clock_value" in
+        *.[0-9][0-9]) ;;
+        *) fail "cannot interpret the monotonic clock from $PROC_ROOT/uptime" ;;
     esac
+    clock_seconds=${clock_value%.*}
+    clock_fraction=${clock_value#*.}
+    case "$clock_seconds" in
+        '' | *[!0-9]* | 0[0-9]*) fail "cannot interpret the monotonic clock from $PROC_ROOT/uptime" ;;
+    esac
+    # Linux reports hundredths. Preserve them when shortening the last query;
+    # rounding down to seconds can otherwise give it almost a second too long.
+    MONOTONIC_CENTISECONDS=$((clock_seconds * 100 + 1$clock_fraction - 100))
+}
+
+window_open() {
+    [ "$TIMEOUT_SECONDS" -gt 0 ] || return 0
+    read_monotonic_time
+    [ "$MONOTONIC_CENTISECONDS" -lt "$deadline" ]
+}
+
+prepare_manager_query() {
+    QUERY_TIMEOUT=$POLICY_COMMAND_TIMEOUT
+    [ "$TIMEOUT_SECONDS" -gt 0 ] || return 0
+    window_open || { pending "verification window expired before $1"; return 1; }
+    remaining_centiseconds=$((deadline - MONOTONIC_CENTISECONDS))
+    if [ "$remaining_centiseconds" -lt "$((POLICY_COMMAND_TIMEOUT * 100))" ]; then
+        if [ "$((remaining_centiseconds % 100))" -eq 0 ]; then
+            QUERY_TIMEOUT=$((remaining_centiseconds / 100))
+        else
+            QUERY_TIMEOUT=$(printf '%s.%02d' "$((remaining_centiseconds / 100))" "$((remaining_centiseconds % 100))")
+        fi
+    fi
 }
 
 manager_query() {
-    # Bound every service-manager round trip so this check can never hang the
-    # start job. The caller decides whether a missed deadline is retryable.
-    LC_ALL=C SYSTEMD_COLORS=0 timeout --kill-after=1 "$POLICY_COMMAND_TIMEOUT" "$@" 2>/dev/null
+    # The caller computes the remaining budget outside command substitution,
+    # so diagnostics retain the actual timeout used by this particular query.
+    LC_ALL=C SYSTEMD_COLORS=0 timeout --kill-after=1 "$QUERY_TIMEOUT" "$@" 2>/dev/null
 }
 
 describe_query_status() {
+    if [ "$QUERY_TIMEOUT" = 1 ]; then time_unit=second; else time_unit=seconds; fi
     case "$1" in
-        124) printf 'did not answer within %s seconds' "$POLICY_COMMAND_TIMEOUT" ;;
-        137) printf 'ignored its %s-second deadline and was killed' "$POLICY_COMMAND_TIMEOUT" ;;
+        124) printf 'did not answer within %s %s' "$QUERY_TIMEOUT" "$time_unit" ;;
+        137) printf 'ignored its %s-second deadline and was killed' "$QUERY_TIMEOUT" ;;
         *) printf 'exited with status %s' "$1" ;;
     esac
 }
@@ -129,6 +162,7 @@ expand_mount_group() {
     # The expansion is deterministic, so one successful result serves every
     # retry of the surrounding check.
     [ -z "$required_syscalls" ] || return 0
+    prepare_manager_query 'systemd-analyze syscall-filter' || return 1
     query_status=0
     mount_group=$(manager_query systemd-analyze syscall-filter @mount) || query_status=$?
     [ "$query_status" -eq 0 ] \
@@ -152,6 +186,7 @@ check_systemd_policy() {
     # alone also occurs when unrelated settings install filters but @mount was
     # cleared. A manager that does not answer in time is a retryable condition;
     # a policy that answers wrongly is not.
+    prepare_manager_query 'systemctl show' || return 1
     query_status=0
     unit_policy=$(manager_query systemctl --no-pager show \
         --property=LoadState,NeedDaemonReload,SystemCallFilter,SystemCallErrorNumber,MainPID \
@@ -300,6 +335,7 @@ inspect_service() {
     # Re-read the composed policy on every attempt so the master compared
     # against MainPID is the one the manager reports right now.
     check_systemd_policy || return 1
+    window_open || { pending 'verification window expired after policy inspection'; return 1; }
     [ "$MODE" = policy ] || inspect_runtime
 }
 
@@ -346,14 +382,20 @@ fi
 
 # One monotonic deadline covers manager queries and process inspection, so the
 # unit's TimeoutStartSec= budget stays predictable however many attempts run.
-read_monotonic_seconds
-deadline=$((MONOTONIC_SECONDS + TIMEOUT_SECONDS))
-attempts=1
-while ! inspect_service; do
-    read_monotonic_seconds
-    [ "$MONOTONIC_SECONDS" -lt "$deadline" ] \
-        || fail "$LAST_ERROR after $attempts attempt(s) within the $TIMEOUT_SECONDS-second window"
+read_monotonic_time
+deadline=$((MONOTONIC_CENTISECONDS + TIMEOUT_SECONDS * 100))
+attempts=0
+while :; do
+    window_open \
+        || fail "$LAST_ERROR after $attempts attempt(s); the $TIMEOUT_SECONDS-second window expired"
     attempts=$((attempts + 1))
+    if inspect_service; then
+        window_open || fail "verification completed outside the $TIMEOUT_SECONDS-second window"
+        break
+    fi
+    if [ "$TIMEOUT_SECONDS" -eq 0 ] || ! window_open; then
+        fail "$LAST_ERROR after $attempts attempt(s); the $TIMEOUT_SECONDS-second window expired"
+    fi
     sleep 1
 done
 if [ "$MODE" = policy ]; then

@@ -149,17 +149,23 @@ ceiling, which fits the shipped `aio threads` pool for up to 61 workers. Review
 worker/pool sizing if the calculated requirement exceeds the available budget:
 a ceiling that is too small surfaces as workers failing thread creation during
 a reload, not as a clean refusal. `worker_shutdown_timeout 300s` in the shared
-configuration bounds each superseded generation, closing connections still
-open after five minutes; overlapping more than one graceful reload inside that
+configuration asks each superseded generation to close its remaining
+connections after five minutes; overlapping more than one graceful reload inside that
 window still needs additional headroom or operational serialization. This
 check is not a runtime guarantee.
+
+When first adding or shortening `worker_shutdown_timeout`, plan a restart or
+explicitly drain and verify the exit of every worker created under the previous
+setting. HUP gives the timeout only to replacement workers; an existing
+generation retains its previous value, including no timeout at all. Do not
+assume waiting five minutes after that first reload clears the old generation.
 
 Applying host setup performs a planned restart to activate the installed
 systemd execution restrictions and can interrupt service. `ExecStartPost`
 performs bounded readiness/security checks on every start; setup additionally
 checks the composed mount filter before restarting, then a fresh master and the
 reviewed worker count. Schedule the operation and retain a recovery
-plan. Configuration-only updates still use nginx's validated reload path.
+plan. Other configuration-only updates use nginx's validated reload path.
 
 `sites/sample_wp.conf.example` matches the `sample_wp` PHP-FPM pool and systemd
 instance. Replace its domains, certificate paths, and site tag, then install it
@@ -203,6 +209,13 @@ After changing execution policy, restart nginx before accepting runtime
 verification. A standalone check reads the current composed policy; it cannot
 prove that an unchanged master adopted filters from a later daemon-reload.
 
+The container rotation regression gives `CAP_SYS_PTRACE` only to its test
+controller and removes it from nginx's bounding set before launch. An explicit
+descriptor-access preflight distinguishes an unreadable `/proc/PID/fd` from
+failed log reopening. The disposable systemd regression overrides all package
+temporary paths within its managed state directory and uses a short timeout to
+test both first adoption through reload and workers that inherited the timeout.
+
 The runtime checker compares PID 1's expanded `SystemCallFilter` against the
 target's own `systemd-analyze syscall-filter @mount` group. Every member must
 remain denied, and `SystemCallErrorNumber=EPERM` must remain set. This gate
@@ -214,5 +227,8 @@ fails closed everywhere except the unit's own `--startup` gate, which logs a
 warning because the loaded policy is what the new master received (see the
 [systemd runtime contract](../systemd/README.md)). The installed host verifier
 invokes the same check without `--startup`. The helper uses `systemctl`,
-`systemd-analyze`, and coreutils `timeout`, with five-second command deadlines
-and one additional second before forced cleanup.
+`systemd-analyze`, and coreutils `timeout`. Every command is limited to the
+smaller of five seconds and the remaining overall window; forced cleanup can
+take one additional second. Late query or process-inspection results cannot
+pass verification. `--timeout-seconds 0` instead makes one attempt, with each
+query independently limited to five seconds and no readiness retries.

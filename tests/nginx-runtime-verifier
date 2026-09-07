@@ -51,7 +51,8 @@ capability_bit() {
 capability_mask() {
     capability_mask_value=0
     for capability_unit in "$@"; do
-        for capability_name in $(sed -n 's/^CapabilityBoundingSet=//p' "$capability_unit"); do
+        capability_names=$(sed -n 's/^CapabilityBoundingSet=//p' "$capability_unit")
+        for capability_name in $capability_names; do
             capability_bit_value=$(capability_bit "$capability_name") || exit 1
             capability_mask_value=$((capability_mask_value | (1 << capability_bit_value)))
         done
@@ -64,7 +65,10 @@ QUIC_CAPABILITIES=$(capability_mask "$REPOSITORY_ROOT/systemd/system/nginx.servi
 [ "$BASE_CAPABILITIES" != "$QUIC_CAPABILITIES" ] || fail 'the QUIC drop-in adds no capabilities'
 for constant_name in BASE_CAPABILITIES QUIC_CAPABILITIES; do
     verifier_constant=$(sed -n "s/^$constant_name=//p" "$REPOSITORY_ROOT/nginx/verify-runtime")
-    eval "unit_constant=\$$constant_name"
+    case "$constant_name" in
+        BASE_CAPABILITIES) unit_constant=$BASE_CAPABILITIES ;;
+        QUIC_CAPABILITIES) unit_constant=$QUIC_CAPABILITIES ;;
+    esac
     [ "$verifier_constant" = "$unit_constant" ] \
         || fail "nginx/verify-runtime $constant_name is $verifier_constant but the unit files require $unit_constant"
 done
@@ -168,12 +172,14 @@ cat > "$TEST_ROOT/bin/setpriv" <<'MOCK'
 #!/usr/bin/env sh
 [ "$*" = "--reuid 991 --regid 990 --init-groups -- /usr/bin/test -x $TEST_ROOT/logs" ] || exit 1
 printf 'worker traversal\n' >> "$TEST_ROOT/commands"
+"$TEST_ROOT/advance-clock" "${TEST_INSPECTION_DELAY:-0}"
 [ "${TEST_TRAVERSAL_DENIED:-no}" = no ]
 MOCK
 cat > "$TEST_ROOT/advance-clock" <<'MOCK'
 #!/usr/bin/env sh
 read -r fixture_seconds _ < "$TEST_ROOT/proc/uptime"
-printf '%s.00 4000.00\n' "$((${fixture_seconds%%.*} + $1))" > "$TEST_ROOT/proc/uptime"
+LC_ALL=C awk -v before="$fixture_seconds" -v elapsed="$1" \
+    'BEGIN { printf "%.2f 4000.00\n", before + elapsed }' > "$TEST_ROOT/proc/uptime"
 MOCK
 cat > "$TEST_ROOT/bin/sleep" <<'MOCK'
 #!/usr/bin/env sh
@@ -187,18 +193,34 @@ fi
 MOCK
 cat > "$TEST_ROOT/bin/timeout" <<'MOCK'
 #!/usr/bin/env sh
-[ "$1 $2" = '--kill-after=1 5' ] || exit 1
+[ "$1" = '--kill-after=1' ] || exit 1
+query_limit=$2
+awk -v limit="$query_limit" 'BEGIN { exit !(limit >= 0.01 && limit <= 5) }' || exit 1
 shift 2
+printf 'budget %s %s\n' "$1" "$query_limit" >> "$TEST_ROOT/commands"
+read -r fixture_seconds _ < "$TEST_ROOT/proc/uptime"
+if [ "$1" = systemctl ] && [ "${fixture_seconds%%.*}" -lt "${TEST_MANAGER_RECOVER_AFTER:-0}" ]; then
+    printf 'unavailable systemctl\n' >> "$TEST_ROOT/commands"
+    exit 1
+fi
 if [ -f "$TEST_ROOT/stalls" ]; then
     read -r remaining_stalls < "$TEST_ROOT/stalls"
     if [ "$remaining_stalls" -gt 0 ]; then
         printf '%s\n' "$((remaining_stalls - 1))" > "$TEST_ROOT/stalls"
         printf 'stall %s\n' "$1" >> "$TEST_ROOT/commands"
-        "$TEST_ROOT/advance-clock" 6
+        "$TEST_ROOT/advance-clock" "$query_limit"
+        "$TEST_ROOT/advance-clock" 1
         exit 124
     fi
 fi
 printf 'query %s\n' "$1" >> "$TEST_ROOT/commands"
+query_delay=${TEST_QUERY_DELAY:-0}
+if awk -v delay="$query_delay" -v limit="$query_limit" 'BEGIN { exit !(delay >= limit) }' \
+    && [ "${TEST_IGNORE_QUERY_TIMEOUT:-no}" = no ]; then
+    "$TEST_ROOT/advance-clock" "$query_limit"
+    exit 124
+fi
+"$TEST_ROOT/advance-clock" "$query_delay"
 exec "$@"
 MOCK
 cat > "$TEST_ROOT/bin/systemctl" <<'MOCK'
@@ -248,7 +270,7 @@ expect_failure 'does not accept process assertions or --startup' "$VERIFY" --pol
 # retried until the window closes, then reported with the attempt count.
 reset_fixture
 expect_failure 'cannot inspect the composed' env TEST_MANAGER_UNAVAILABLE=yes "$VERIFY" --policy-only
-assert_contains "$TEST_ROOT/stderr" 'systemctl show exited with status 1 after 11 attempt(s) within the 10-second window'
+assert_contains "$TEST_ROOT/stderr" 'systemctl show exited with status 1 after 10 attempt(s); the 10-second window expired'
 [ "$(count_commands wait)" -eq 10 ] || fail 'an unavailable manager was not retried across the default window'
 reset_fixture
 expect_failure 'must be loaded' env TEST_UNIT_LOAD=not-found "$VERIFY" --policy-only
@@ -258,7 +280,7 @@ assert_contains "$TEST_ROOT/stderr" 'run systemctl daemon-reload, then restart n
 expect_failure 'manager metadata is unknown' env TEST_UNIT_STALE=maybe "$VERIFY" --policy-only
 reset_fixture
 expect_failure 'cannot expand the local' env TEST_ANALYZE_UNAVAILABLE=yes "$VERIFY" --policy-only --timeout-seconds 3
-assert_contains "$TEST_ROOT/stderr" 'systemd-analyze exited with status 1 after 4 attempt(s) within the 3-second window'
+assert_contains "$TEST_ROOT/stderr" 'systemd-analyze exited with status 1 after 3 attempt(s); the 3-second window expired'
 expect_failure 'cannot interpret the local' env TEST_ANALYZE_MALFORMED=yes "$VERIFY" --policy-only
 expect_failure 'must retain SystemCallErrorNumber=EPERM' env TEST_SYSCALL_ERRNO=0 "$VERIFY" --policy-only
 # Stalled queries consume their deadline and kill grace on the fixture clock:
@@ -272,8 +294,8 @@ assert_contains "$TEST_ROOT/stdout" 'master PID 101 and 2 active worker(s)'
 [ "$(count_commands wait)" -eq 2 ] || fail 'manager retries did not pause between attempts'
 reset_fixture
 stall_manager_queries 2
-expect_failure 'systemctl show did not answer within 5 seconds' "$VERIFY" --timeout-seconds 10
-assert_contains "$TEST_ROOT/stderr" 'after 2 attempt(s) within the 10-second window'
+expect_failure 'systemctl show did not answer within 3 seconds' "$VERIFY" --timeout-seconds 10
+assert_contains "$TEST_ROOT/stderr" 'after 2 attempt(s); the 10-second window expired'
 reset_fixture
 stall_manager_queries 1
 expect_failure 'did not answer within 5 seconds' "$VERIFY" --timeout-seconds 0
@@ -282,6 +304,44 @@ reset_fixture
 stall_manager_queries 1
 expect_success "$VERIFY" --policy-only --timeout-seconds 10
 assert_contains "$TEST_ROOT/stdout" 'composed mount-syscall denial'
+# Slow successful commands consume the same overall window. The final command
+# is shortened, and a result delivered late cannot turn expiry into success.
+reset_fixture
+expect_success env TEST_QUERY_DELAY=4 "$VERIFY" --policy-only --timeout-seconds 10
+assert_contains "$TEST_ROOT/proc/uptime" '1008.00'
+reset_fixture
+expect_failure 'systemd-analyze did not answer within 3 seconds' env TEST_QUERY_DELAY=4 \
+    "$VERIFY" --policy-only --timeout-seconds 7
+assert_contains "$TEST_ROOT/commands" 'budget systemd-analyze 3'
+assert_contains "$TEST_ROOT/proc/uptime" '1007.00'
+reset_fixture
+expect_failure 'systemd-analyze did not answer within 0.25 seconds' env TEST_QUERY_DELAY=0.75 \
+    "$VERIFY" --policy-only --timeout-seconds 1
+assert_contains "$TEST_ROOT/commands" 'budget systemd-analyze 0.25'
+assert_contains "$TEST_ROOT/proc/uptime" '1001.00'
+reset_fixture
+expect_failure 'systemctl show did not answer within 1 second' \
+    env TEST_MANAGER_RECOVER_AFTER=1009 TEST_QUERY_DELAY=4 \
+    "$VERIFY" --policy-only --timeout-seconds 10
+[ "$(count_commands 'query systemd-analyze')" -eq 0 ] || fail 'a query started after the window expired'
+assert_contains "$TEST_ROOT/proc/uptime" '1010.00'
+reset_fixture
+expect_failure 'window expired before systemd-analyze' \
+    env TEST_QUERY_DELAY=10 TEST_IGNORE_QUERY_TIMEOUT=yes \
+    "$VERIFY" --policy-only --timeout-seconds 10
+[ "$(count_commands 'query systemd-analyze')" -eq 0 ] || fail 'a late successful query allowed another command'
+reset_fixture
+expect_failure 'verification completed outside the 2-second window' \
+    env TEST_INSPECTION_DELAY=3 "$VERIFY" --timeout-seconds 2
+reset_fixture
+expect_success env TEST_QUERY_DELAY=4 "$VERIFY" --policy-only --timeout-seconds 0
+assert_contains "$TEST_ROOT/proc/uptime" '1008.00'
+[ ! -f "$TEST_ROOT/slept" ] || fail 'single-attempt mode retried'
+for malformed_clock in 12 01.00 1.2 1.000 1.2.00; do
+    reset_fixture
+    printf '%s 4000.00\n' "$malformed_clock" > "$TEST_ROOT/proc/uptime"
+    expect_failure 'cannot interpret the monotonic clock' "$VERIFY" --policy-only
+done
 # The @mount expansion is cached once obtained; only systemctl is re-queried.
 reset_fixture
 : > "$TEST_ROOT/proc/101/task/101/children"

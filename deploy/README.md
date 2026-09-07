@@ -63,6 +63,13 @@ If using `rsync`, apply `--delete` only to the exact managed `includes/` and
 `stubs/` directories, never to `/etc/nginx` as a whole. This prevents stale
 fragments without deleting package, certificate, or deployment-local state.
 
+First adding or shortening `worker_shutdown_timeout` requires a planned restart,
+or explicitly draining and verifying the exit of all workers created under the
+previous setting. A reload does not apply the new timeout to those workers.
+Changes to systemd execution policy also require a restart. See the
+[nginx runtime setup contract](../nginx/README.md#host-runtime-setup) before
+choosing the activation method.
+
 ## Standard host setup
 
 `setup-host` composes the supported-OS component installers with their

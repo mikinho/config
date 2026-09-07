@@ -116,24 +116,33 @@ test, all of which run inside the service cgroup. Four workers with one
 32-thread pool require 280 tasks, eight require 544, and sixty-two require
 4108, which exceeds the shared 4096 ceiling. That ceiling admits the shipped
 `aio threads` pool for two generations up to 61 workers, or three generations
-up to 41, while remaining below systemd's `DefaultTasksMax` of 15% of
-`kernel.pid_max` (about 629k with the 4194304 `pid_max` systemd installs, and
-still under the 4915 of a legacy 32768 `pid_max`), so it continues to contain
-runaway thread or process creation without forcing hosts with more CPUs than a
-512 ceiling allowed to disable `aio threads` or pin `worker_processes`.
+up to 41. It bounds runaway task creation while accommodating the reviewed
+threaded workload. It is not necessarily smaller than `DefaultTasksMax`:
+systemd defaults that setting to 15% of the minimum of `kernel.pid_max`,
+`kernel.threads-max`, and the root cgroup's `pids.max`, which may be much smaller
+in a container. The operator must still review the available ancestor capacity.
 
 An undersized ceiling does not fail safe: new workers that cannot create their
 pool threads exit and are respawned by the master until the previous generation
 drains, so the gate exists to keep that sizing mistake out of production. The
 model is headroom for **one** overlapping reload. The shipped configuration
-sets `worker_shutdown_timeout 300s` so a superseded generation cannot outlive
-five minutes on long-lived connections; repeated reloads inside that window
+sets `worker_shutdown_timeout 300s` so a superseded generation attempts to close
+remaining connections after five minutes; repeated reloads inside that window
 still stack generations, so serialize reloads or wait for the prior generation
 to exit. A site that raises the timeout must revisit the task budget with it.
 Do not remove the task cap to make preflight pass. Hosts needing more than 61
 threaded workers pin `worker_processes` or take a larger ceiling as a separate
 reviewed unit change; these shared setup commands deliberately hold the 4096
 ceiling.
+
+First adoption or shortening of this timeout needs a planned restart, or
+explicit draining and verified exit of all workers created with the previous
+setting. A graceful reload only gives the new value to replacement workers;
+the original generation retains its old configuration, potentially with no
+shutdown timeout. Waiting for the new timeout alone does not establish that
+the old generation has exited. The same capacity preflight deliberately rejects
+an older loaded task limit that is too small; review and activate the new unit
+ceiling before retrying setup on such a host.
 
 Use `nginx/setup --capacity-check --workers 4 --threads-per-worker 32
 --tasks-budget 512` only after confirming those illustrative values match the
@@ -203,8 +212,9 @@ master/worker identity, effective mask, capability sets, `NoNewPrivs`, seccomp
 activation, the composed mount denial, and nginx's ability to traverse the
 root-owned log directory. Failure fails service startup, so ordered dependents
 do not mistake successful `execve` for readiness. `TimeoutStartSec=60s`
-budgets the configuration test, `execve`, that window, and at most one
-in-flight manager query with its one-second kill grace. The helper needs
+budgets the configuration test, `execve`, that window, and one second of forced
+query-cleanup grace. Each query receives at most the remaining window, and
+neither a late query nor late process inspection can return success. The helper needs
 `setpriv` from `util-linux`, coreutils `timeout`, systemd's inspection tools,
 and ordinary Linux `/proc` access.
 
@@ -232,10 +242,13 @@ fail verification even if `/proc` reports `Seccomp: 2`; stale manager metadata
 fails every invocation except the unit's own `--startup` gate described above.
 `nginx/setup` invokes `--policy-only` after daemon-reload and before stopping
 the existing master; startup and the installed host verifier repeat this check.
-Policy commands have five-second deadlines and a one-second forced-kill grace,
+Policy commands have a maximum five-second deadline, shortened to the remaining
+overall window, and a one-second forced-kill grace,
 and a query that misses its deadline is retried within the same window rather
 than failing on the first attempt. The expanded `@mount` group is deterministic
 and is read once per run; the composed unit policy is re-read on every attempt.
+`--timeout-seconds 0` is deliberately different: one attempt with independent
+five-second query deadlines and no readiness retries.
 
 These are targeted observations, not proof of every sandbox or SELinux rule.
 The checker reads the composed policy rather than dumping a running process's
@@ -245,6 +258,9 @@ upstream connections, plus graceful reload and rotation under real traffic.
 
 The `nginx-systemd-runtime` CI job runs the real unit and verifier on a
 disposable Linux host using fixture-only paths and a Unix HTTP socket. It
+overrides all nginx temporary paths under its managed state directory, then
+uses a two-second drain timeout to prove that the first HUP leaves pre-timeout
+workers unchanged while a later HUP retires workers that inherited the timeout. It
 checks successful startup and exact worker-count assertions, then edits the
 unit on disk without `daemon-reload` and requires the restart to succeed with
 the gate's warning while an operator run rejects the same drift. It then

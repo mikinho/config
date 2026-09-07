@@ -48,8 +48,8 @@ KillSignal=SIGQUIT
 KillMode=mixed
 TimeoutStopSec=60s
 # Start budget: the configuration test, execve, then the checker's ten-second
-# monotonic window plus at most one in-flight five-second manager query and
-# its one-second kill grace. The remainder absorbs slow configuration loads.
+# monotonic window plus one second of forced query-cleanup grace. Each query
+# is capped by the remaining window. The remainder absorbs slow config loads.
 TimeoutStartSec=60s
 Restart=on-failure
 RestartSec=5s
@@ -83,8 +83,8 @@ MemoryDenyWriteExecute=yes
 # Counts worker threads, not just processes: with the shipped `aio threads`
 # default pool each worker is 33 tasks, and a graceful reload doubles them
 # while the old generation drains. 4096 admits two generations for up to 61
-# workers (three for 41) yet stays below systemd's DefaultTasksMax of 15% of
-# kernel.pid_max, so runaway thread or process creation is still contained.
+# workers (three for 41) while still bounding runaway task creation. This is
+# a workload budget; DefaultTasksMax varies with kernel and root-cgroup limits.
 # nginx/setup keeps SHARED_TASKS_MAX equal to this and refuses reviewed
 # worker/pool sizing that does not fit, instead of letting new workers fail
 # thread creation mid-reload.
