@@ -140,6 +140,35 @@ This review concerns HTTP response bodies. TLS
 [`ssl_certificate_compression`](https://nginx.org/en/docs/http/ngx_http_ssl_module.html#ssl_certificate_compression)
 compresses handshake certificates and is a separate feature.
 
+## Optional transport and compression profiles
+
+Select `brotli` to install both the main-context module loaders and the HTTP
+compression policy. The dynamic modules must match the installed nginx build;
+verify the exact assembled tree with `nginx -t` after package changes. Keep
+`gzip` selected for clients that do not negotiate Brotli. `brotli_static on`
+serves existing `.br` siblings; it does not generate compressed assets.
+
+TLS certificate compression in `stubs/http/tls.conf` is independent of HTTP
+response compression. The optional `post-quantum` profile selects hybrid TLS
+groups when the linked TLS library supports them. Validate negotiation with a
+capable client, since a successful syntax check alone does not prove either
+feature is used.
+
+The `quic-bpf` profile enables kernel routing of QUIC packets for connection
+migration. It requires Linux 5.7 or newer, the matching systemd capability
+extension, and the repository's SELinux BPF policy on enforcing hosts. Apply
+the host setup with `--quic-bpf` and restart to activate the execution policy;
+copying the nginx stub and reloading alone is insufficient. See the
+[nginx HTTP/3 directives](https://nginx.org/en/docs/http/ngx_http_v3_module.html#quic_bpf)
+for the feature's scope. Additional package modules, TLS early data, trusted
+proxy handling, and application caching require their own use case and review;
+a package subscription does not select those features.
+
+When changing an installed profile selection, update `INSTALL-PROFILE` from a
+matching `deploy/install-nginx` render together with the selected stubs. Preserve
+the deployment's site definitions, upstreams, certificates, and QUIC key; a
+profile change is not a replacement of the entire live tree.
+
 ## Host runtime setup
 
 After a reviewed render has been assembled at `/etc/nginx` and the exact live
@@ -216,6 +245,34 @@ instance. Replace its domains, certificate paths, and site tag, then install it
 as `sites/SITE_TAG.conf`; only the installed `*.conf` copy becomes active.
 `sites/sample_node.conf.example` provides the corresponding reference for
 Node.js reverse-proxied applications with static asset cache fallbacks.
+
+## Package upgrades
+
+Before changing nginx packages or vendors, retain the installed configuration,
+service unit and drop-ins, repository selection, and recovery packages. Keep
+the intended stable or mainline channel explicit and install dynamic modules
+that match the selected nginx build. Inspect package scripts as well as their
+file payloads: a vendor's legacy binary-upgrade hook may fail under the managed
+foreground service, leaving the old master running after the package
+transaction succeeds. A configuration reload does not replace that binary;
+plan a restart and verify the executable used by the new master.
+
+After the package transaction and before stopping nginx, recheck the managed
+runtime, lock, state, and log parent directories described above. RPM payloads
+can reset a parent group, including `/var/log/nginx`, to `root`. For this unit,
+restore only validated root-owned parent groups to `nginx` using the same
+nonrecursive migration as host setup. Do not recursively change cache entries
+or rotated logs. A mismatched parent can cause systemd directory setup to fail
+before nginx's configuration test runs.
+
+Review any `.rpmnew` files against the managed configuration, validate the
+assembled tree with the installed binary, and confirm that selected optional
+profiles still have their module, capability, and SELinux prerequisites. After
+the planned restart, compare `/proc/$(systemctl show nginx -p MainPID --value)/exe`
+with `/usr/sbin/nginx`, run the runtime checker with the selected BPF expectation,
+and check application responses and compression negotiation. Package version
+output and an active service alone do not establish that the new binary and
+features are serving traffic.
 
 ## Validation
 
