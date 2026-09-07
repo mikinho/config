@@ -558,7 +558,7 @@ class CoreRendererTests(unittest.TestCase):
             finalizer = (bundle / "systemd/example_deploy.service").read_text()
             self.assertIn("ExecStopPost=", finalizer)
             self.assertIn(" --recover", finalizer)
-            self.assertIn("OnFailure=example_deploy-failure@%n.service", finalizer)
+            self.assertIn("OnFailure=example_deploy-failure@%N.service", finalizer)
             self.assertNotIn("RestrictSUIDSGID", finalizer)
 
             recovery = (

@@ -30,7 +30,7 @@ RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 CapabilityBoundingSet=
 AmbientCapabilities=
 ReadWritePaths=
-ReadWritePaths=/var/lib/redis /var/log/redis /run/redis
-ReadOnlyPaths=/etc/redis
+ReadWritePaths=%S/%p %L/%p %t/%p
+ReadOnlyPaths=%E/%p
 IPAddressDeny=any
 @IP_ADDRESS_ALLOW@

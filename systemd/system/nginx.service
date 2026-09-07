@@ -29,10 +29,10 @@ StateDirectoryMode=0755
 LogsDirectory=%p
 LogsDirectoryMode=0750
 
-ExecStartPre=/usr/sbin/%p -t -q -c /etc/%p/%p.conf -g "daemon off;"
+ExecStartPre=/usr/sbin/%p -t -q -c %E/%p/%p.conf -g "daemon off;"
 # Daemonization resets nginx's umask to zero. Keep the supervised master in
 # the foreground so the master and workers retain the file-creation policy.
-ExecStart=/usr/sbin/%p -c /etc/%p/%p.conf -g "daemon off;"
+ExecStart=/usr/sbin/%p -c %E/%p/%p.conf -g "daemon off;"
 # Keep only the checker under the manager's root:root credentials. Its gid 0
 # can inspect cross-UID worker /proc entries with ProtectProc=invisible; the
 # ! prefix preserves the other sandbox/capability controls. nginx stays
@@ -41,7 +41,7 @@ ExecStart=/usr/sbin/%p -c /etc/%p/%p.conf -g "daemon off;"
 # master received, so unit files edited without daemon-reload log a warning
 # instead of turning the start into a failure. Operator runs still fail closed.
 ExecStartPost=!/usr/local/libexec/nginx-runtime-verify --master-pid $MAINPID --startup
-ExecReload=/usr/sbin/%p -t -q -c /etc/%p/%p.conf -g "daemon off;"
+ExecReload=/usr/sbin/%p -t -q -c %E/%p/%p.conf -g "daemon off;"
 ExecReload=/bin/kill -s HUP $MAINPID
 
 KillSignal=SIGQUIT

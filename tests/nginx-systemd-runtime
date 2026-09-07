@@ -129,7 +129,7 @@ sed \
 chmod 0755 "$TEST_DIRECTORY/verify"
 sed \
     -e 's|/usr/sbin/%p|/usr/sbin/nginx|g' \
-    -e "s|/etc/%p/%p.conf|$TEST_DIRECTORY/nginx.conf|g" \
+    -e "s|%E/%p/%p.conf|$TEST_DIRECTORY/nginx.conf|g" \
     -e "s|/usr/local/libexec/nginx-runtime-verify|$TEST_DIRECTORY/verify|g" \
     -e "s|%p|$fixture_name|g" \
     -e 's|^Restart=on-failure$|Restart=no|' \

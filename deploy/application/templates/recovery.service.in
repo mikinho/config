@@ -16,7 +16,7 @@ UMask=0077
 ExecStart=@@SECURE_ROOT@@/scripts/post-deploy --recover-pointer
 RemainAfterExit=yes
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-Environment=HOME=/root
+Environment=HOME=%h
 PrivateTmp=yes
 ProtectHome=yes
 NoNewPrivileges=yes

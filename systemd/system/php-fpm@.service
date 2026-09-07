@@ -22,8 +22,8 @@ UMask=0022
 
 # /sbin/php-fpm is an administrator-owned, version-neutral contract. On hosts
 # using parallel Remi packages it resolves to the selected versioned binary.
-ExecStartPre=/sbin/php-fpm --test --fpm-config /etc/php-fpm.d/sites/%i.conf
-ExecStart=/sbin/php-fpm --nodaemonize --force-stderr --fpm-config /etc/php-fpm.d/sites/%i.conf
+ExecStartPre=/sbin/php-fpm --test --fpm-config %E/php-fpm.d/sites/%i.conf
+ExecStart=/sbin/php-fpm --nodaemonize --force-stderr --fpm-config %E/php-fpm.d/sites/%i.conf
 ExecReload=/bin/kill -USR2 $MAINPID
 
 KillSignal=SIGQUIT
@@ -41,7 +41,7 @@ StateDirectoryMode=0700
 
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=php-fpm-%i
+SyslogIdentifier=%p-%i
 
 # Baseline containment. Runtime and session state are writable through the
 # managed directories above. Every application write path is instance-specific

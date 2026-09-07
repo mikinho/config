@@ -4,21 +4,24 @@ Documentation=https://smallstep.com/docs/step-ca
 Documentation=https://smallstep.com/docs/step-ca/certificate-authority-server-production
 After=network-online.target
 Wants=network-online.target
-ConditionFileNotEmpty=/etc/step-ca/config/ca.json
-ConditionFileNotEmpty=/etc/step-ca/certs/root_ca.crt
-ConditionFileNotEmpty=/etc/step-ca/certs/intermediate_ca.crt
-ConditionFileNotEmpty=/etc/step-ca/secrets/intermediate_ca_key
-ConditionFileNotEmpty=/etc/step-ca/secrets/intermediate-password
+ConditionFileNotEmpty=%E/%p/config/ca.json
+ConditionFileNotEmpty=%E/%p/certs/root_ca.crt
+ConditionFileNotEmpty=%E/%p/certs/intermediate_ca.crt
+ConditionFileNotEmpty=%E/%p/secrets/intermediate_ca_key
+ConditionFileNotEmpty=%E/%p/secrets/intermediate-password
 
 [Service]
 Type=simple
 User=step
 Group=step
 UMask=0077
-Environment=STEPPATH=/etc/step-ca
-WorkingDirectory=/var/lib/step-ca
-LoadCredential=intermediate.password:/etc/step-ca/secrets/intermediate-password
-ExecStart=/usr/bin/step-ca /etc/step-ca/config/ca.json --password-file ${CREDENTIALS_DIRECTORY}/intermediate.password
+# %p is the unit prefix, step-ca, so every path below follows the unit name.
+# The credential path stays ${CREDENTIALS_DIRECTORY}: the %d specifier only
+# exists from systemd 251, below this repository's 249 floor.
+Environment=STEPPATH=%E/%p
+WorkingDirectory=%S/%p
+LoadCredential=intermediate.password:%E/%p/secrets/intermediate-password
+ExecStart=/usr/bin/step-ca %E/%p/config/ca.json --password-file ${CREDENTIALS_DIRECTORY}/intermediate.password
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5s
@@ -36,8 +39,8 @@ ProtectKernelTunables=yes
 ProtectProc=invisible
 ProcSubset=pid
 ProtectSystem=strict
-ReadOnlyPaths=/etc/step-ca
-ReadWritePaths=/var/lib/step-ca
+ReadOnlyPaths=%E/%p
+ReadWritePaths=%S/%p
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 RestrictNamespaces=yes
 RestrictRealtime=yes

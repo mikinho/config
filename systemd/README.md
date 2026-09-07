@@ -8,6 +8,25 @@ design rationale and cross-component contracts are documented in the
 Installable units live under `systemd/system/` to mirror their destination
 under `/etc/systemd/system/`; repository-only documentation remains here.
 
+## Specifiers
+
+Units and drop-ins derive managed paths from the unit name and the manager's
+directory roots rather than repeating them: `%p` (unit prefix) and `%i`
+(instance) name the service, and `%E`, `%S`, `%L`, and `%t` resolve to `/etc`,
+`/var/lib`, `/var/log`, and `/run` for the system manager, without a trailing
+slash, so `%E/%p/%p.conf` is `/etc/nginx/nginx.conf`. A drop-in resolves
+against the unit it extends, so `php-fpm@sample_wp.service.d/` can use `%i`
+and a copy under another instance name adapts itself. Every specifier used
+here exists in systemd 249, the syntax floor, and is resolved by the settings
+that carry it (`Exec*=`, `Environment=`, `Read*Paths=`, the `*Directory=`
+settings, `WorkingDirectory=`, `SyslogIdentifier=`, `LoadCredential=`,
+`Condition*=`, and path-unit paths); `tests/nginx-systemd-runtime` and the
+setup preflights run `systemd-analyze verify` on the results. Two limits are
+deliberate: `%d` (the credentials directory) only exists from systemd 251, so
+`step-ca.service` keeps `${CREDENTIALS_DIRECTORY}`, and dependency settings
+such as `OnFailure=` accept only the name-safe subset (`%i %j %n %N %p` and
+host identity), never directory specifiers.
+
 ## Runtime directory modes
 
 Choose `RuntimeDirectoryMode=` from the operations each identity needs; do not

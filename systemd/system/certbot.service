@@ -20,7 +20,7 @@ Type=oneshot
 # Renewal may involve multiple certificates and slow ACME responses.
 UMask=0077
 TimeoutStartSec=1h
-Environment=HOME=/var/lib/letsencrypt
+Environment=HOME=%S/letsencrypt
 
 # Keep Certbot's exit status intact. ExecStopPost runs after both successful and
 # failed oneshot execution, so nginx attempts to load successful partial

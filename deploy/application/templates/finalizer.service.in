@@ -8,7 +8,7 @@
 Description=Finalize @@APPLICATION_TAG@@ deployment
 After=network-online.target
 Wants=network-online.target
-OnFailure=@@FAILURE_SERVICE_PREFIX@@%n.service
+OnFailure=@@FAILURE_SERVICE_PREFIX@@%N.service
 
 [Service]
 Type=oneshot
@@ -17,7 +17,7 @@ UMask=0077
 ExecStart=@@SECURE_ROOT@@/scripts/post-deploy
 ExecStopPost=@@SECURE_ROOT@@/scripts/post-deploy --recover
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-Environment=HOME=/root
+Environment=HOME=%h
 PrivateTmp=yes
 ProtectHome=yes
 NoNewPrivileges=yes

@@ -430,9 +430,9 @@ fi
 # shellcheck disable=SC2016
 for systemd_line in \
     'UMask=0077' \
-    'RuntimeDirectory=monit' \
-    'StateDirectory=monit' \
-    'LogsDirectory=monit' \
+    'RuntimeDirectory=%p' \
+    'StateDirectory=%p' \
+    'LogsDirectory=%p' \
     'Restart=on-failure' \
     'ExecReload=/bin/kill -HUP $MAINPID'
 do
