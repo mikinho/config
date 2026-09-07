@@ -148,9 +148,11 @@ worker generations plus 16 helper tasks and retains the shared `TasksMax=4096`
 ceiling, which fits the shipped `aio threads` pool for up to 61 workers. Review
 worker/pool sizing if the calculated requirement exceeds the available budget:
 a ceiling that is too small surfaces as workers failing thread creation during
-a reload, not as a clean refusal. Overlapping more than one graceful reload
-needs additional headroom or operational serialization; this check is not a
-runtime guarantee.
+a reload, not as a clean refusal. `worker_shutdown_timeout 300s` in the shared
+configuration bounds each superseded generation, closing connections still
+open after five minutes; overlapping more than one graceful reload inside that
+window still needs additional headroom or operational serialization. This
+check is not a runtime guarantee.
 
 Applying host setup performs a planned restart to activate the installed
 systemd execution restrictions and can interrupt service. `ExecStartPost`

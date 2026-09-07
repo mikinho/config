@@ -106,14 +106,15 @@ runaway thread or process creation without forcing hosts with more CPUs than a
 An undersized ceiling does not fail safe: new workers that cannot create their
 pool threads exit and are respawned by the master until the previous generation
 drains, so the gate exists to keep that sizing mistake out of production. The
-model is headroom for **one** overlapping reload, not a bound on repeated
-reloads while old workers are still draining; without `worker_shutdown_timeout`
-in the nginx configuration, long-lived connections can keep an old generation
-alive indefinitely. Wait for the prior generation to exit, or bound it in the
-nginx configuration as a separately reviewed change. Do not remove the task cap
-to make preflight pass. Hosts needing more than 61 threaded workers pin
-`worker_processes` or take a larger ceiling as a separate reviewed unit change;
-these shared setup commands deliberately hold the 4096 ceiling.
+model is headroom for **one** overlapping reload. The shipped configuration
+sets `worker_shutdown_timeout 300s` so a superseded generation cannot outlive
+five minutes on long-lived connections; repeated reloads inside that window
+still stack generations, so serialize reloads or wait for the prior generation
+to exit. A site that raises the timeout must revisit the task budget with it.
+Do not remove the task cap to make preflight pass. Hosts needing more than 61
+threaded workers pin `worker_processes` or take a larger ceiling as a separate
+reviewed unit change; these shared setup commands deliberately hold the 4096
+ceiling.
 
 Use `nginx/setup --capacity-check --workers 4 --threads-per-worker 32
 --tasks-budget 512` only after confirming those illustrative values match the
