@@ -1,0 +1,181 @@
+#!/usr/bin/env sh
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
+# Exercise the container fixture's actual process checker without Linux,
+# privileges, a running nginx, or changes to the host's /proc filesystem.
+set -eu
+
+PROGRAM_NAME=${0##*/}
+SCRIPT_DIRECTORY=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/config-nginx-runtime-processes.XXXXXX")
+PROC_ROOT=$TEST_ROOT/proc
+
+cleanup() { rm -rf -- "$TEST_ROOT"; }
+fail() { printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2; exit 1; }
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+cat > "$TEST_ROOT/check" <<'EOF'
+set -eu
+PROC_ROOT=$1
+READ_BEHAVIOR=$2
+READ_TRACE=$3
+NGINX_PID=100
+fail() { printf '%s\n' "$*" >&2; exit 1; }
+cat() {
+    case "$1" in
+        "$PROC_ROOT/"*/status) printf '%s\n' "$1" >> "$READ_TRACE" ;;
+    esac
+    if [ "$1" = "$PROC_ROOT/101/status" ]; then
+        case "$READ_BEHAVIOR" in
+            vanished-before-read) rm -rf -- "$PROC_ROOT/101"; return 1 ;;
+            unreadable) return 1 ;;
+            captured-then-reaped)
+                command cat "$@"
+                rm -rf -- "$PROC_ROOT/101"
+                return 0
+                ;;
+            captured-then-mutated)
+                command cat "$@"
+                # The first snapshot was valid. A second read would inspect
+                # a different moment and must not decide this observation.
+                printf 'State:\tS (sleeping)\nUmask:\t0000\nCapBnd:\t00000000010804eb\n' > "$1"
+                return 0
+                ;;
+            master-disappears) rm -f -- "$PROC_ROOT/100/status" ;;
+        esac
+    fi
+    command cat "$@"
+}
+EOF
+sed -n '/^assert_process_masks() {/,/^}/p' "$SCRIPT_DIRECTORY/nginx-runtime" \
+    >> "$TEST_ROOT/check"
+printf '\nassert_process_masks\n' >> "$TEST_ROOT/check"
+
+write_status() {
+    fixture_pid=$1
+    fixture_state=$2
+    fixture_mask=$3
+    fixture_caps=$4
+    {
+        printf 'Name:\tnginx\nState:\t%s\n' "$fixture_state"
+        [ "$fixture_mask" = missing ] || printf 'Umask:\t%s\n' "$fixture_mask"
+        [ "$fixture_caps" = missing ] || printf 'CapBnd:\t%s\n' "$fixture_caps"
+    } > "$PROC_ROOT/$fixture_pid/status"
+}
+
+reset_fixture() {
+    rm -rf -- "$PROC_ROOT"
+    mkdir -p "$PROC_ROOT/100/task/100" "$PROC_ROOT/101" "$PROC_ROOT/102"
+    printf '101 102 ' > "$PROC_ROOT/100/task/100/children"
+    for fixture_pid in 100 101 102; do
+        write_status "$fixture_pid" S 0027 00000000010004eb
+        printf 'nginx: worker process\000' > "$PROC_ROOT/$fixture_pid/cmdline"
+    done
+    : > "$TEST_ROOT/read.trace"
+}
+
+run_check() {
+    sh "$TEST_ROOT/check" "$PROC_ROOT" "${1:-normal}" "$TEST_ROOT/read.trace" \
+        > "$TEST_ROOT/stdout" 2> "$TEST_ROOT/stderr"
+}
+
+expect_success() {
+    if ! run_check "${1:-normal}"; then
+        cat "$TEST_ROOT/stderr" >&2
+        fail "valid process observation was rejected: ${1:-normal}"
+    fi
+}
+
+expect_failure() {
+    expected_message=$1
+    if run_check "${2:-normal}"; then
+        fail "invalid process observation was accepted: $expected_message"
+    fi
+    grep -F -- "$expected_message" "$TEST_ROOT/stderr" >/dev/null \
+        || { cat "$TEST_ROOT/stderr" >&2; fail "missing diagnostic: $expected_message"; }
+}
+
+reset_fixture
+expect_success
+
+# A zombie can remain in the master's child list with a readable status file,
+# but Linux has already cleared its filesystem context and omits Umask.
+for terminal_state in Z X x; do
+    reset_fixture
+    write_status 101 "$terminal_state" missing 00000000010004eb
+    expect_success
+done
+
+for read_behavior in vanished-before-read captured-then-reaped captured-then-mutated; do
+    reset_fixture
+    expect_success "$read_behavior"
+    [ "$(grep -Fc -- "$PROC_ROOT/101/status" "$TEST_ROOT/read.trace")" -eq 1 ] \
+        || fail "$read_behavior read one process status more than once"
+done
+
+reset_fixture
+expect_failure 'cannot read nginx PID 101 status' unreadable
+
+reset_fixture
+write_status 101 S 0000 00000000010004eb
+expect_failure 'has unexpected Umask 0000; expected 0027'
+
+reset_fixture
+write_status 101 S missing 00000000010004eb
+expect_failure 'has unexpected Umask missing; expected 0027'
+
+reset_fixture
+printf 'Umask:\t0027\n' >> "$PROC_ROOT/101/status"
+expect_failure 'has unexpected Umask 0027; expected 0027'
+
+reset_fixture
+write_status 101 S 0027 00000000010804eb
+expect_failure 'retained the controller'
+
+reset_fixture
+write_status 101 S 0027 missing
+expect_failure 'has missing or invalid CapBnd: missing'
+
+reset_fixture
+write_status 101 S 0027 not-hexadecimal
+expect_failure 'has missing or invalid CapBnd: not-hexadecimal'
+
+reset_fixture
+write_status 101 unknown 0027 00000000010004eb
+expect_failure 'has missing or invalid state: unknown'
+
+reset_fixture
+write_status 101 Z missing 00000000010004eb
+write_status 102 Z missing 00000000010004eb
+expect_failure 'nginx has no observed live workers'
+
+reset_fixture
+for fixture_pid in 101 102; do
+    printf 'nginx: worker process is shutting down\000' > "$PROC_ROOT/$fixture_pid/cmdline"
+done
+expect_failure 'nginx has no observed live workers'
+
+# A live draining worker is still subject to the mask/capability policy.
+reset_fixture
+printf 'nginx: worker process is shutting down\000' > "$PROC_ROOT/101/cmdline"
+write_status 101 S 0000 00000000010004eb
+expect_failure 'has unexpected Umask 0000; expected 0027'
+
+reset_fixture
+rm "$PROC_ROOT/100/status"
+expect_failure 'cannot read nginx PID 100 status'
+
+reset_fixture
+write_status 100 Z missing 00000000010004eb
+expect_failure 'nginx master PID 100 exited (state=Z)'
+
+reset_fixture
+expect_failure 'nginx master PID 100 disappeared during process inspection' master-disappears
+
+printf 'Validated nginx process snapshots, exited workers, live policy failures, and master liveness.\n'

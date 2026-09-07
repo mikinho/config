@@ -95,6 +95,7 @@ if command -v shellcheck >/dev/null 2>&1; then
         "$REPOSITORY_ROOT/tests/host-setup" \
         "$REPOSITORY_ROOT/tests/nginx-setup" \
         "$REPOSITORY_ROOT/tests/nginx-runtime" \
+        "$REPOSITORY_ROOT/tests/nginx-runtime-processes" \
         "$REPOSITORY_ROOT/tests/nginx-runtime-verifier" \
         "$REPOSITORY_ROOT/tests/nginx-systemd-runtime" \
         "$REPOSITORY_ROOT/tests/mongodb" \
@@ -160,6 +161,7 @@ node --test "$REPOSITORY_ROOT/tests/nginx-node-echo.test.mjs"
 
 step "Running isolated nginx capacity and restart regression tests..."
 "$REPOSITORY_ROOT/tests/nginx-setup"
+"$REPOSITORY_ROOT/tests/nginx-runtime-processes"
 "$REPOSITORY_ROOT/tests/nginx-runtime-verifier"
 "$REPOSITORY_ROOT/tests/nginx-systemd-runtime" --check
 

@@ -8,6 +8,7 @@ set -eu
 
 PROGRAM_NAME=${0##*/}
 SCRIPT_DIRECTORY=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+PROC_ROOT=/proc
 NGINX_PREFIX=${1:-/tmp/nginx-safe}
 NGINX_CONFIGURATION=nginx.conf
 NGINX_PID_FILE=/run/nginx/nginx.pid
@@ -171,22 +172,60 @@ start_nginx() {
 }
 
 assert_process_masks() {
-    mask_children=$(cat "/proc/$NGINX_PID/task/$NGINX_PID/children")
+    mask_children=$(cat "$PROC_ROOT/$NGINX_PID/task/$NGINX_PID/children" 2>/dev/null) \
+        || fail "cannot inspect nginx master PID $NGINX_PID children"
+    active_workers=0
     for inspected_pid in "$NGINX_PID" $mask_children; do
-        if ! awk '$1 == "Umask:" && $2 == "0027" { found = 1 } END { exit !found }' \
-            "/proc/$inspected_pid/status" 2>/dev/null; then
-            # A draining worker may disappear during the observation.
-            [ "$inspected_pid" != "$NGINX_PID" ] && [ ! -e "/proc/$inspected_pid/status" ] \
-                || fail "nginx PID $inspected_pid lost Umask 0027"
+        # One captured status supplies state, mask and capabilities. A second
+        # read can race exit/reaping after the first check has succeeded.
+        if ! process_status=$(cat "$PROC_ROOT/$inspected_pid/status" 2>/dev/null); then
+            [ "$inspected_pid" != "$NGINX_PID" ] \
+                && [ ! -e "$PROC_ROOT/$inspected_pid/status" ] && continue
+            fail "cannot read nginx PID $inspected_pid status"
         fi
-        if [ -e "/proc/$inspected_pid/status" ]; then
-            awk '$1 == "CapBnd:" {
-                found = 1
-                if (substr($2, length($2) - 4, 1) ~ /[89a-fA-F]/) exit 1
-            } END { if (!found) exit 1 }' "/proc/$inspected_pid/status" \
-                || fail "nginx PID $inspected_pid retained the controller's CAP_SYS_PTRACE"
+        process_state=$(printf '%s\n' "$process_status" | awk '$1 == "State:" { print $2 }')
+        case "$process_state" in
+            Z | X | x)
+                # Linux clears task->fs before reaping: zombies still have a
+                # status file, but no Umask field. They are not live workers.
+                [ "$inspected_pid" != "$NGINX_PID" ] && continue
+                fail "nginx master PID $NGINX_PID exited (state=$process_state)"
+                ;;
+            R | S | D | T | t | I | P) ;;
+            *)
+                [ "$inspected_pid" != "$NGINX_PID" ] \
+                    && [ ! -e "$PROC_ROOT/$inspected_pid/status" ] && continue
+                fail "nginx PID $inspected_pid has missing or invalid state: ${process_state:-missing}"
+                ;;
+        esac
+        if ! process_error=$(printf '%s\n' "$process_status" | awk '
+            $1 == "Umask:" { mask = $2; masks++ }
+            $1 == "CapBnd:" { caps = $2; capability_fields++ }
+            END {
+                if (masks != 1 || mask != "0027") {
+                    printf "has unexpected Umask %s; expected 0027", (mask == "" ? "missing" : mask)
+                    exit 1
+                }
+                if (capability_fields != 1 || length(caps) != 16 || caps ~ /[^0-9a-fA-F]/) {
+                    printf "has missing or invalid CapBnd: %s", (caps == "" ? "missing" : caps)
+                    exit 1
+                }
+                if (substr(caps, length(caps) - 4, 1) ~ /[89a-fA-F]/) {
+                    printf "retained the controller\047s CAP_SYS_PTRACE (CapBnd=%s)", caps
+                    exit 1
+                }
+            }'); then
+            fail "nginx PID $inspected_pid $process_error (state=$process_state)"
+        fi
+        if [ "$inspected_pid" != "$NGINX_PID" ]; then
+            worker_title=$(tr '\000' ' ' 2>/dev/null < "$PROC_ROOT/$inspected_pid/cmdline" | sed 's/ *$//')
+            [ "$worker_title" != 'nginx: worker process' ] \
+                || active_workers=$((active_workers + 1))
         fi
     done
+    [ -e "$PROC_ROOT/$NGINX_PID/status" ] \
+        || fail "nginx master PID $NGINX_PID disappeared during process inspection"
+    [ "$active_workers" -gt 0 ] || fail 'nginx has no observed live workers during process inspection'
 }
 
 workers_reopened_log() {
@@ -513,9 +552,19 @@ done
 old_workers=$(cat "/proc/$NGINX_PID/task/$NGINX_PID/children")
 kill -HUP "$NGINX_PID"
 retry_count=0
-while [ "$(cat "/proc/$NGINX_PID/task/$NGINX_PID/children")" = "$old_workers" ]; do
+while :; do
+    reload_children=$(cat "/proc/$NGINX_PID/task/$NGINX_PID/children")
+    old_generation_present=no
+    replacement_present=no
+    for inspected_pid in $reload_children; do
+        case " $old_workers " in
+            *" $inspected_pid "*) old_generation_present=yes ;;
+            *) replacement_present=yes ;;
+        esac
+    done
+    [ "$old_generation_present" = no ] && [ "$replacement_present" = yes ] && break
     retry_count=$((retry_count + 1))
-    [ "$retry_count" -lt 100 ] || fail 'nginx did not replace workers after reload'
+    [ "$retry_count" -lt 100 ] || fail 'nginx did not replace and drain its old workers after reload'
     sleep 0.1
 done
 [ "$(cat "$NGINX_PID_FILE")" = "$NGINX_PID" ] || fail 'reload replaced the foreground master'
