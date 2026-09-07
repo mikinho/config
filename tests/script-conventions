@@ -29,7 +29,24 @@ read_line() {
     sed -n "${line_number}p" "$checked_file"
 }
 
-trap cleanup EXIT HUP INT TERM
+require_terminating_signal_traps() {
+    # A trap action that only cleans up leaves the shell running after the
+    # signal: a SIGTERM delivered to the shell alone (timeout, KillMode=mixed)
+    # removes the working files and then continues into later steps, and a
+    # terminal interrupt runs cleanup twice. Cleanup belongs on EXIT; HUP, INT,
+    # and TERM must exit with the conventional 128+signal status so EXIT fires
+    # once and the caller sees the interruption. Resets (`trap -`) are allowed.
+    if LC_ALL=C grep -nE '^[[:space:]]*trap[[:space:]].*[[:space:]](HUP|INT|TERM)([[:space:]]|$)' "$1" \
+        | LC_ALL=C grep -vE "^[0-9]+:[[:space:]]*trap[[:space:]]+(-|'exit [0-9]+')[[:space:]]" >/dev/null
+    then
+        fail "signal trap must exit after cleanup; trap cleanup on EXIT and 'exit 128+N' on HUP/INT/TERM: $2"
+    fi
+}
+
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 git -C "$REPOSITORY_ROOT" ls-files --cached --others --exclude-standard \
     > "$SCAN_LIST"
@@ -62,6 +79,11 @@ while IFS= read -r relative_file; do
                 '#!/usr/bin/env node') comment_marker=// ;;
                 *) comment_marker='#' ;;
             esac
+            case $first_line in
+                '#!/usr/bin/env sh' | '#!/usr/bin/env bash')
+                    require_terminating_signal_traps "$checked_file" "$relative_file"
+                    ;;
+            esac
 
             [ -z "$(read_line 2 "$checked_file")" ] \
                 || fail "author block lacks a blank line above it: $relative_file"
@@ -77,4 +99,4 @@ while IFS= read -r relative_file; do
     esac
 done < "$SCAN_LIST"
 
-printf 'Validated extensionless executable shell commands, env shebangs, and author blocks.\n'
+printf 'Validated extensionless executable shell commands, env shebangs, author blocks, and terminating signal traps.\n'

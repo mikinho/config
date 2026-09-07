@@ -97,7 +97,10 @@ done
     || fail "refusing to overwrite repository path: $REPOSITORY_PATH"
 
 TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/config-redis-package.XXXXXX")
-trap cleanup EXIT HUP INT TERM
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 umask 077
 
 dnf install --assumeyes ca-certificates curl-minimal dnf-plugins-core gnupg2 openssl

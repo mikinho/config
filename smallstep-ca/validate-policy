@@ -82,7 +82,10 @@ for input_path in "$@"; do
 done
 umask 077
 TEMPORARY_DIRECTORY=$(mktemp -d "${TMPDIR:-/tmp}/config-step-ca-policy.XXXXXX")
-trap cleanup EXIT HUP INT TERM
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 if [ -n "$CONFIGURATION_FILE" ]; then
     jq -s 'if length == 1 then .[0] |
             {authority: {policy: .authority.policy, provisioners: .authority.provisioners}}

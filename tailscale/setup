@@ -253,7 +253,10 @@ cleanup() {
     fi
 }
 
-trap cleanup EXIT HUP INT TERM
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 require_effective_native_denial() {
     for denied_user in $DENY_NATIVE_USERS; do

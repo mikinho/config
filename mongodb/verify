@@ -520,7 +520,10 @@ validate_password_file "administrative password file" "$ADMIN_PASSWORD_FILE"
 validate_password_file "application password file" "$APPLICATION_PASSWORD_FILE"
 TEMPORARY_DIRECTORY=$(mktemp -d "${TMPDIR:-/tmp}/config-mongodb-verify.XXXXXX")
 umask 077
-trap cleanup EXIT HUP INT TERM
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 verify_installed_package_set
 mongod --version 2>/dev/null | grep -Eq 'db version v8\.0\.29([.-]|$)' \

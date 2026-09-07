@@ -77,7 +77,10 @@ umask 077
 TEMPORARY_DIRECTORY=$(mktemp -d \
     "${TMPDIR:-/tmp}/config-terminal-readiness.XXXXXX") \
     || fail "cannot create a temporary verification directory"
-trap cleanup EXIT HUP INT TERM
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 source_file=$TEMPORARY_DIRECTORY/$TERMINFO_ENTRY.src
 compiled_directory=$TEMPORARY_DIRECTORY/compiled

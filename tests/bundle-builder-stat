@@ -22,7 +22,10 @@ fail() {
     exit 1
 }
 
-trap cleanup EXIT HUP INT TERM
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 mkdir "$TEST_ROOT/gnu-bin" "$TEST_ROOT/bsd-bin"
 cat > "$TEST_ROOT/gnu-bin/stat" <<'EOF'

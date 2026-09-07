@@ -78,7 +78,10 @@ fail() {
 cleanup() {
     [ -z "$SCRATCH_DIRECTORY" ] || rm -rf -- "$SCRATCH_DIRECTORY"
 }
-trap cleanup EXIT HUP INT TERM
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 validate_regular_source() {
     nginx_source=$1

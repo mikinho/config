@@ -63,7 +63,10 @@ write_os_release() {
         "$release_id" "$release_name" "$release_version" > "$release_path"
 }
 
-trap cleanup EXIT HUP INT TERM
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 redis_validate_minimum_tls_seconds 300
 redis_validate_minimum_tls_seconds 3600

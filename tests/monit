@@ -76,7 +76,10 @@ make_os_release() {
     } > "$output_path"
 }
 
-trap cleanup EXIT HUP INT TERM
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 make_os_release "$TEST_ROOT/rocky9" rocky 'Rocky Linux 9.6' 9.6
 make_os_release "$TEST_ROOT/centos10" centos 'CentOS Stream 10' 10

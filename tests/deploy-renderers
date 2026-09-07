@@ -34,7 +34,10 @@ expect_failure() {
         || fail "command failed without expected message: $expected_message"
 }
 
-trap cleanup EXIT HUP INT TERM
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 expect_failure \
     'invalid output directory' \

@@ -109,7 +109,10 @@ redis-server --version 2>/dev/null | grep -Eq 'v=8\.[0-9]+\.' \
 
 TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/config-redis-runtime.XXXXXX")
 REDIS_SOCKET=$TEST_ROOT/redis.sock
-trap cleanup EXIT HUP INT TERM
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 umask 077
 
 if [ "$MODEL:$DATA_PROFILE" = local:cache ]; then

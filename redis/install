@@ -299,7 +299,10 @@ done
 
 TEMPORARY_DIRECTORY=$(mktemp -d "${TMPDIR:-/tmp}/config-redis-install.XXXXXX")
 umask 077
-trap cleanup EXIT HUP INT TERM
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 dnf install --assumeyes ca-certificates curl gnupg2 openssl
 curl --fail --location --silent --show-error \

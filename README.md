@@ -740,6 +740,13 @@ hosts. It covers process masks, effective overrides, log rotation, certificate
 renewal, recovery evidence, and operational audit controls. Markdown is the
 canonical guidance; PDF snapshots are generated or refreshed only on request.
 
+`tests/script-conventions` enforces the shell contract for every script:
+extensionless executables, `/usr/bin/env` shebangs, the author block, and
+signal handling that terminates. Cleanup belongs on `EXIT`; `HUP`, `INT`, and
+`TERM` exit with `128+N`, so a command interrupted by `timeout`, a service
+manager, or a terminal never continues past its own cleanup, and cleanup runs
+once.
+
 GitHub Actions validates deployment profile coverage, exercises the installer,
 runs `nginx -t` against stable and mainline nginx.org packages on Rocky Linux
 9, exercises security and failure behavior against a running nginx, including

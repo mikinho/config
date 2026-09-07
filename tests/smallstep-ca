@@ -71,7 +71,10 @@ setup_plan() {
         --network-controls-confirmed "$@"
 }
 
-trap cleanup EXIT HUP INT TERM
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 for entry_point in "$INSTALLER" "$SETUP" "$VERIFIER"; do
     [ -x "$entry_point" ] || fail "entry point is not executable: $entry_point"

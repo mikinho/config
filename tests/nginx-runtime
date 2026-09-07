@@ -211,7 +211,10 @@ request_rotation_canary() {
     done
 }
 
-trap cleanup EXIT HUP INT TERM
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 [ "$(uname -s)" = Linux ] && [ "$(id -u)" -eq 0 ] \
     || fail 'runtime checks require the isolated Linux CI container as root'

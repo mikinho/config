@@ -46,7 +46,10 @@ extract_function() {
     sed -n "/^${function_name}() {/,/^}/p" "$source_file"
 }
 
-trap cleanup EXIT HUP INT TERM
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 command -v jq >/dev/null 2>&1 || fail "jq is required for health-verifier tests"
 command -v openssl >/dev/null 2>&1 || fail "openssl is required for health-verifier tests"

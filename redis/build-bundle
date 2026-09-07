@@ -153,7 +153,10 @@ printf '%s\n' "$source_revision" | grep -Eq '^[0-9a-f]{40}$' \
 
 STAGING_DIRECTORY=$(mktemp -d "$output_parent/.config-redis-bundle.XXXXXX") \
     || fail "cannot create bundle staging directory"
-trap cleanup EXIT HUP INT TERM
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 chmod 0755 "$STAGING_DIRECTORY"
 while IFS= read -r relative_path; do
     install_payload "$relative_path"

@@ -39,7 +39,10 @@ expect_failure() {
         || fail "command failed without expected message: $expected_message"
 }
 
-trap cleanup EXIT HUP INT TERM
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 [ -x "$SHELL_SETUP" ] || fail "shell setup is not executable"
 [ -f "$POLICY_SOURCE" ] && [ ! -L "$POLICY_SOURCE" ] \

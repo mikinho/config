@@ -11,7 +11,10 @@ set -f
 SCRIPT_DIRECTORY=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 REPOSITORY_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIRECTORY/.." && pwd)
 TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/config-unit-policy-tests.XXXXXX")
-trap 'rm -rf -- "$TEST_ROOT"' EXIT HUP INT TERM
+trap 'rm -rf -- "$TEST_ROOT"' EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 fail() { printf '%s\n' "$*" >&2; exit 1; }
 # shellcheck disable=SC1091

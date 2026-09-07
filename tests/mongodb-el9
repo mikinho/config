@@ -96,7 +96,10 @@ printf '%s\n' "$installed_signature" | grep -qi 'Key ID 41DE058A4E7DCA05' \
     || fail "installed mongodb-org-server RSA header does not identify the reviewed key"
 
 TEST_OUTPUT=$(mktemp "${TMPDIR:-/tmp}/config-mongodb-el9.XXXXXX")
-trap cleanup EXIT HUP INT TERM
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 unit_suffix=$$
 run_connection_test "config-mongodb-control-$unit_suffix.service" \
     || fail "loopback control connection to port $LOOPBACK_PORT failed"
