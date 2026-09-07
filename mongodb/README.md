@@ -222,7 +222,9 @@ controls before exposing a listener:
 2. A CA-issued server certificate whose SAN covers that name, stored with its
    matching, unencrypted private key in one `mongod:mongod` mode `0400` PEM
    file. The certificate must have more than the selected acceptance margin of
-   validity remaining: one hour by default, supporting 24-hour service leaves.
+   validity remaining: by default the greater of one hour and one tenth of
+   its own validity period, so 24-hour service leaves need 2.4 hours and
+   90-day certificates need 9 days.
    Filesystem protection replaces an interactive passphrase because systemd
    must start unattended. Short-lived certificates require automated renewal
    early enough to preserve the selected acceptance margin.
@@ -293,11 +295,14 @@ MongoDB-supported migration path.
 
 ## Verification and operations
 
-Network setup and verification accept `--minimum-tls-seconds` (default `3600`,
-range `300` through `2592000`). Setup forwards the selected margin to the
-verifier. This margin is an acceptance floor; certificate renewal must run well
-before it, with independent expiry alerts and enough time for retries and
-operator recovery. Retain the chosen value in the private deployment procedure.
+Network setup and verification accept `--minimum-tls-seconds` (range `300`
+through `2592000`). When omitted, the margin is the greater of `3600` seconds
+and one tenth of the certificate's validity period, read from the certificate
+itself. Setup forwards an explicit selection to the verifier. This margin is an
+acceptance floor; certificate renewal must run well before it, with independent
+expiry alerts and enough time for retries and operator recovery. Retain the
+chosen value, or the decision to rely on the proportional default, in the
+private deployment procedure.
 
 MongoDB's vendor unit is retained without a repository UMask override. MongoDB
 defaults to `honorSystemUmask=false` and a `processUmask` of octal `0077`, masking

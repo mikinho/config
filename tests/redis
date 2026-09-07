@@ -227,6 +227,59 @@ assert_contains "$TEST_ROOT/reload-tls.plan" \
     'prove the Redis process ID did not change'
 assert_contains "$TEST_ROOT/reload-tls.plan" \
     'no password file was read'
+
+# Without an explicit margin the plan states the proportional rule, and the
+# margin function derives it from the certificate's own validity period: one
+# tenth of the lifetime, never less than one hour. openssl is mocked so the
+# validity bounds are exact and the check runs without generating keys.
+"$TLS_RELOADER" --plan \
+    --admin-user redis_admin \
+    --admin-password-file /root/redis-admin.password \
+    --server-host redis.internal.example \
+    --tls-certificate-file /etc/pki/redis/server.crt \
+    --tls-private-key-file /etc/pki/redis/server.key \
+    --tls-ca-file /etc/pki/redis/ca-chain.crt \
+    > "$TEST_ROOT/reload-tls-default.plan"
+assert_contains "$TEST_ROOT/reload-tls-default.plan" \
+    'the greater of 3600 seconds and one tenth of the certificate lifetime remaining'
+margin_check='
+    fail() { printf "%s\n" "$*" >&2; exit 1; }
+    . "$1/lib/common.sh"
+    openssl() { printf "notBefore=%s\nnotAfter=%s\n" "$MOCK_NOT_BEFORE" "$MOCK_NOT_AFTER"; }
+    certificate_required_remaining_seconds /fixture/server.crt "$2"'
+expected_margin() {
+    observed_margin=$(env MOCK_NOT_BEFORE="$1" MOCK_NOT_AFTER="$2" \
+        sh -c "$margin_check" margin-test "$REDIS_DIRECTORY" "$3")
+    [ "$observed_margin" = "$4" ] \
+        || fail "certificate margin for [$1 .. $2] with explicit '$3' was $observed_margin, expected $4"
+}
+expected_margin 'Sep  6 00:00:00 2026 GMT' 'Sep  7 00:00:00 2026 GMT' '' 8640
+expected_margin 'Sep  6 00:00:00 2026 GMT' 'Dec  5 00:00:00 2026 GMT' '' 777600
+expected_margin 'Sep  6 00:00:00 2026 GMT' 'Sep  6 05:00:00 2026 GMT' '' 3600
+expected_margin 'Sep  6 00:00:00 2026 GMT' 'Sep  6 10:00:00 2026 GMT' '' 3600
+expected_margin 'Sep  6 00:00:00 2026 GMT' 'Sep  6 10:00:10 2026 GMT' '' 3601
+expected_margin 'Sep  6 00:00:00 2026 GMT' 'Dec  5 00:00:00 2026 GMT' 7200 7200
+expect_failure 'validity period is empty or inverted' \
+    env MOCK_NOT_BEFORE='Sep  7 00:00:00 2026 GMT' MOCK_NOT_AFTER='Sep  6 00:00:00 2026 GMT' \
+    sh -c "$margin_check" margin-test "$REDIS_DIRECTORY" ''
+expect_failure 'cannot interpret the certificate notAfter time' \
+    env MOCK_NOT_BEFORE='Sep  6 00:00:00 2026 GMT' MOCK_NOT_AFTER='never' \
+    sh -c "$margin_check" margin-test "$REDIS_DIRECTORY" ''
+if command -v openssl >/dev/null 2>&1; then
+    # The real tool's date format must parse too: a one-day certificate yields
+    # exactly 86400 seconds of validity and therefore an 8640-second margin.
+    openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=margin.fixture.invalid \
+        -keyout "$TEST_ROOT/margin.key" -out "$TEST_ROOT/margin.crt" >/dev/null 2>&1 \
+        || fail 'could not generate the one-day fixture certificate'
+    real_margin=$(certificate_required_remaining_seconds "$TEST_ROOT/margin.crt" '')
+    [ "$real_margin" = 8640 ] \
+        || fail "one-day fixture certificate produced margin $real_margin, expected 8640"
+fi
+expect_failure 'must be between 300 and 2592000' \
+    sh -c 'fail() { printf "%s\n" "$*" >&2; exit 1; }; . "$1/lib/common.sh"; redis_validate_minimum_tls_seconds 299' \
+    margin-test "$REDIS_DIRECTORY"
+sh -c 'fail() { printf "%s\n" "$*" >&2; exit 1; }; . "$1/lib/common.sh"; redis_validate_minimum_tls_seconds ""' \
+    margin-test "$REDIS_DIRECTORY"
 assert_contains "$REDIS_DIRECTORY/lib/common.sh" \
     'root:root:400:1 | root:root:600:1'
 assert_contains "$TLS_RELOADER" \

@@ -12,9 +12,57 @@ REDIS_LOCAL_TLS_PROBE_ADDRESS=127.0.0.1
 REDIS_TLS_PORT=6379
 
 redis_validate_minimum_tls_seconds() {
-    case "$1" in '' | *[!0-9]* | 0*) fail "--minimum-tls-seconds must be a positive decimal integer" ;; esac
+    # Empty selects the proportional default computed from the certificate.
+    [ -n "$1" ] || return 0
+    case "$1" in *[!0-9]* | 0*) fail "--minimum-tls-seconds must be a positive decimal integer" ;; esac
     [ "${#1}" -le 7 ] && [ "$1" -ge 300 ] && [ "$1" -le 2592000 ] \
         || fail "--minimum-tls-seconds must be between 300 and 2592000"
+}
+
+redis_describe_tls_margin() {
+    if [ -n "$1" ]; then
+        printf '%s seconds remaining' "$1"
+    else
+        printf 'the greater of 3600 seconds and one tenth of the certificate lifetime remaining'
+    fi
+}
+
+# The two functions below are kept byte-identical in redis/lib/common.sh,
+# mongodb/setup, and mongodb/verify; tests/mongodb enforces that.
+certificate_time_epoch() {
+    LC_ALL=C date -u -d "$1" +%s 2>/dev/null \
+        || LC_ALL=C date -u -j -f '%b %e %T %Y %Z' "$1" +%s 2>/dev/null
+}
+
+# Acceptance margin for a certificate: an explicit --minimum-tls-seconds value,
+# or by default the greater of one hour and one tenth of the certificate's own
+# validity period. A 24-hour leaf must therefore hold 2.4 hours and a 90-day
+# certificate 9 days, so one default serves short-lived and conventional
+# issuance without treating a nearly expired long-lived certificate as healthy.
+certificate_required_remaining_seconds() {
+    certificate_file=$1
+    explicit_seconds=$2
+    if [ -n "$explicit_seconds" ]; then
+        printf '%s\n' "$explicit_seconds"
+        return
+    fi
+    certificate_bounds=$(LC_ALL=C openssl x509 -in "$certificate_file" -noout -startdate -enddate 2>/dev/null) \
+        || fail "cannot read the certificate validity period: $certificate_file"
+    not_before=$(printf '%s\n' "$certificate_bounds" | sed -n 's/^notBefore=//p')
+    not_after=$(printf '%s\n' "$certificate_bounds" | sed -n 's/^notAfter=//p')
+    not_before_epoch=$(certificate_time_epoch "$not_before") \
+        || fail "cannot interpret the certificate notBefore time: $certificate_file"
+    not_after_epoch=$(certificate_time_epoch "$not_after") \
+        || fail "cannot interpret the certificate notAfter time: $certificate_file"
+    certificate_lifetime=$((not_after_epoch - not_before_epoch))
+    [ "$certificate_lifetime" -gt 0 ] \
+        || fail "certificate validity period is empty or inverted: $certificate_file"
+    proportional_seconds=$((certificate_lifetime / 10))
+    if [ "$proportional_seconds" -gt 3600 ]; then
+        printf '%s\n' "$proportional_seconds"
+    else
+        printf '3600\n'
+    fi
 }
 
 # systemd expands localhost/any and may omit /32 on individual IPv4 addresses.

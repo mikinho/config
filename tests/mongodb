@@ -195,6 +195,22 @@ assert_contains "$TEST_ROOT/add-local-user.plan" \
 assert_contains "$TEST_ROOT/expose-network.plan" '7200 seconds remaining'
 assert_contains "$TEST_ROOT/expose-network.plan" \
     'Install a TLS-required listener on 127.0.0.1,10.20.30.40'
+# Without an explicit margin the plan states the proportional default.
+"$SETUP" --plan --phase expose-network \
+    --replica-set example_rs \
+    --admin-user database_admin \
+    --admin-password-file /root/database-admin.password \
+    --application-user example_app \
+    --application-database example_database \
+    --application-password-file /root/example-app.password \
+    --bind-address 10.20.30.40 \
+    --member-host mongodb.internal.example \
+    --tls-certificate-key-file /etc/pki/mongodb/server.pem \
+    --tls-ca-file /etc/pki/mongodb/ca.pem \
+    --network-controls-confirmed \
+    > "$TEST_ROOT/expose-network-default.plan"
+assert_contains "$TEST_ROOT/expose-network-default.plan" \
+    'the greater of 3600 seconds and one tenth of the certificate lifetime remaining'
 assert_contains "$TEST_ROOT/expose-network.plan" \
     'Advertise mongodb.internal.example:27017 as the sole replica-set member'
 assert_contains "$TEST_ROOT/expose-network.plan" \
@@ -320,10 +336,26 @@ assert_contains "$INSTALLER" '%{RSAHEADER:pgpsig}'
 assert_contains "$INSTALLER" 'rpmkeys --checksig'
 assert_contains "$INSTALLER" 'enabled=0'
 assert_contains "$INSTALLER" 'Validated root-owned immutable MongoDB deployment bundle.'
-assert_contains "$SETUP" 'TLS_MINIMUM_REMAINING_SECONDS=3600'
+assert_contains "$SETUP" 'TLS_MINIMUM_REMAINING_SECONDS='
+if grep -E '^TLS_MINIMUM_REMAINING_SECONDS=[0-9]' "$SETUP" "$VERIFIER" >/dev/null 2>&1; then
+    fail 'MongoDB TLS margin must default to the proportional rule, not a fixed number of seconds'
+fi
+# The proportional margin functions are shared by copy with redis/lib/common.sh;
+# any drift between the three copies is a defect.
+extract_margin_functions() {
+    sed -n '/^certificate_time_epoch() {/,/^certificate_required_remaining_seconds() {/p' "$1"
+    sed -n '/^certificate_required_remaining_seconds() {/,/^}/p' "$1"
+}
+extract_margin_functions "$REPOSITORY_ROOT/redis/lib/common.sh" > "$TEST_ROOT/margin-reference"
+[ -s "$TEST_ROOT/margin-reference" ] || fail 'redis/lib/common.sh no longer defines the shared margin functions'
+for margin_copy in "$SETUP" "$VERIFIER"; do
+    extract_margin_functions "$margin_copy" > "$TEST_ROOT/margin-copy"
+    cmp -s "$TEST_ROOT/margin-reference" "$TEST_ROOT/margin-copy" \
+        || fail "certificate margin functions in $margin_copy differ from redis/lib/common.sh"
+done
 assert_contains "$SETUP" '--minimum-tls-seconds'
 assert_contains "$SETUP" "-untrusted \"\$TLS_CERTIFICATE_KEY_FILE\""
-assert_contains "$VERIFIER" 'TLS_MINIMUM_REMAINING_SECONDS=3600'
+assert_contains "$VERIFIER" 'TLS_MINIMUM_REMAINING_SECONDS='
 assert_contains "$VERIFIER" 'running MongoDB process must use umask 0077'
 assert_contains "$VERIFIER" "-untrusted \"\$TLS_CERTIFICATE_KEY_FILE\""
 # shellcheck disable=SC2016

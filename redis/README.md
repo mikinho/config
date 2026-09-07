@@ -326,13 +326,17 @@ tests in the private deployment evidence set.
 ## Zero-downtime TLS certificate adoption
 
 Setup, verification, and the reload helper accept `--minimum-tls-seconds`
-(default `3600`, allowed range `300` through `2592000`). This is the minimum
-remaining lifetime required for acceptance, not the certificate lifetime or a
-renewal trigger. The one-hour default supports the CA's 24-hour certificates.
-Renew well before that margin, allow for repeated failures and operator recovery,
-and alert independently of this acceptance check. Pass the same selected margin
-to deployment and renewal commands; do not lengthen leaf certificates merely to
-satisfy an acceptance threshold. Setup forwards the selection to verification.
+(allowed range `300` through `2592000`). This is the minimum remaining lifetime
+required for acceptance, not the certificate lifetime or a renewal trigger. When
+it is omitted, the margin is derived from the certificate itself: the greater
+of one hour and one tenth of its validity period, so a 24-hour CA leaf must
+hold 2.4 hours and a 90-day certificate 9 days. One default therefore serves
+short-lived and conventional issuance without accepting a long-lived
+certificate in its final hour. Renew well before the margin, allow for repeated
+failures and operator recovery, and alert independently of this acceptance
+check. Pass the same explicit margin to deployment and renewal commands when one
+is selected; do not lengthen leaf certificates merely to satisfy an acceptance
+threshold. Setup forwards an explicit selection to verification.
 
 Redis 8.2 can replace its in-memory OpenSSL context through the runtime
 `tls-cert-file` configuration without stopping its listeners or disconnecting

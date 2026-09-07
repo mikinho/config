@@ -46,7 +46,7 @@ SERVER_HOST=
 TLS_CERTIFICATE_FILE=
 TLS_PRIVATE_KEY_FILE=
 TLS_CA_FILE=
-MINIMUM_TLS_SECONDS=3600
+MINIMUM_TLS_SECONDS=
 ALLOWED_CLIENT_FILE=
 TEMPORARY_DIRECTORY=
 
@@ -64,8 +64,9 @@ Required verification options:
 
 For an exact configuration comparison, also supply --maxmemory-mib MIB.
 Network verification requires --server-host HOST and --tls-ca-file FILE.
---minimum-tls-seconds SECONDS selects the remaining lifetime margin (default:
-3600; range: 300-2592000), independently of expiry alerts and renewal scheduling.
+--minimum-tls-seconds SECONDS selects the remaining lifetime margin (default: the
+greater of 3600 and one tenth of the certificate lifetime; range: 300-2592000),
+independently of expiry alerts and renewal scheduling.
 Exact network-policy comparison additionally uses --bind-address,
 --tls-certificate-file, --tls-private-key-file, and --allowed-client-file.
 EOF
@@ -295,8 +296,10 @@ if [ -n "$ALLOWED_CLIENT_FILE" ]; then
 fi
 
 if [ "$MODEL" = network ]; then
-    openssl x509 -checkend "$MINIMUM_TLS_SECONDS" -noout -in "$TLS_CERTIFICATE_FILE" >/dev/null \
-        || fail "TLS certificate has less than $MINIMUM_TLS_SECONDS seconds remaining"
+    required_tls_seconds=$(certificate_required_remaining_seconds "$TLS_CERTIFICATE_FILE" "$MINIMUM_TLS_SECONDS") \
+        || exit 1
+    openssl x509 -checkend "$required_tls_seconds" -noout -in "$TLS_CERTIFICATE_FILE" >/dev/null \
+        || fail "TLS certificate has less than $required_tls_seconds seconds remaining"
     redis_verify_local_tls_service_identity \
         "$SERVER_HOST" "$TLS_CA_FILE" "$TLS_CERTIFICATE_FILE" \
         "$TEMPORARY_DIRECTORY/served-tls-transcript" \

@@ -16,7 +16,7 @@ esac
 
 CONFIGURATION_PATH=/etc/redis/redis.conf
 REDIS_SOCKET=/run/redis/redis.sock
-MINIMUM_REMAINING_SECONDS=3600
+MINIMUM_REMAINING_SECONDS=
 
 MODE=apply
 ADMIN_USER=
@@ -38,7 +38,7 @@ Options:
   --admin-user USER --admin-password-file FILE
   --server-host DNS_NAME
   --tls-certificate-file FILE --tls-private-key-file FILE --tls-ca-file FILE
-  --minimum-tls-seconds SECONDS (default: 3600; range: 300-2592000)
+  --minimum-tls-seconds SECONDS (default: the greater of 3600 and one tenth of the certificate lifetime; range: 300-2592000)
 
 Validates the installed network-model TLS material, authenticates over the
 root-controlled Redis Unix socket, atomically reloads Redis's TLS context, and
@@ -136,7 +136,7 @@ redis_validate_absolute_path "TLS CA file" "$TLS_CA_FILE"
 redis_validate_minimum_tls_seconds "$MINIMUM_REMAINING_SECONDS"
 
 if [ "$MODE" = plan ]; then
-    printf 'Certificate acceptance margin: %s seconds remaining.\n' "$MINIMUM_REMAINING_SECONDS"
+    printf 'Certificate acceptance margin: %s.\n' "$(redis_describe_tls_margin "$MINIMUM_REMAINING_SECONDS")"
     printf '1. Validate the installed certificate chain, hostname, lifetime, key match, and Redis-readable file identities.\n'
     printf '2. Authenticate administrative user %s over the root-controlled Redis Unix socket.\n' "$ADMIN_USER"
     printf '3. Reapply volatile tls-cert-file %s so Redis atomically replaces its in-memory TLS context.\n' \
@@ -201,9 +201,11 @@ openssl verify -purpose sslserver -CAfile "$TLS_CA_FILE" \
     || fail "TLS certificate chain verification failed"
 openssl x509 -checkhost "$SERVER_HOST" -noout -in "$TLS_CERTIFICATE_FILE" >/dev/null \
     || fail "TLS certificate does not identify --server-host"
-openssl x509 -checkend "$MINIMUM_REMAINING_SECONDS" -noout \
+required_tls_seconds=$(certificate_required_remaining_seconds "$TLS_CERTIFICATE_FILE" "$MINIMUM_REMAINING_SECONDS") \
+    || exit 1
+openssl x509 -checkend "$required_tls_seconds" -noout \
     -in "$TLS_CERTIFICATE_FILE" >/dev/null \
-    || fail "TLS certificate has less than $MINIMUM_REMAINING_SECONDS seconds remaining"
+    || fail "TLS certificate has less than $required_tls_seconds seconds remaining"
 openssl x509 -in "$TLS_CERTIFICATE_FILE" -pubkey -noout \
     > "$TEMPORARY_DIRECTORY/certificate-public-key.pem" \
     || fail "cannot read TLS certificate public key"

@@ -28,7 +28,7 @@ KEY_FILE_PATH=/etc/mongod.keyfile
 DATA_DIRECTORY=/var/lib/mongo
 LOG_DIRECTORY=/var/log/mongodb
 MONGODB_PORT=27017
-TLS_MINIMUM_REMAINING_SECONDS=3600
+TLS_MINIMUM_REMAINING_SECONDS=
 
 MODE=apply
 PHASE=
@@ -92,7 +92,7 @@ Expose-network options:
   --application-password-file FILE
   --bind-address PRIVATE_IPV4 --member-host TLS_DNS_NAME
   --tls-certificate-key-file FILE --tls-ca-file FILE
-  --minimum-tls-seconds SECONDS (default: 3600; range: 300-2592000)
+  --minimum-tls-seconds SECONDS (default: the greater of 3600 and one tenth of the certificate lifetime; range: 300-2592000)
   --network-controls-confirmed
 
 Initialize is intentionally limited to a new, empty data directory and creates
@@ -322,14 +322,62 @@ reject_initialize_only_options() {
         || fail "--network-controls-confirmed applies only to --phase expose-network"
 }
 
+describe_tls_margin() {
+    if [ -n "$1" ]; then
+        printf '%s seconds remaining' "$1"
+    else
+        printf 'the greater of 3600 seconds and one tenth of the certificate lifetime remaining'
+    fi
+}
+
+# Kept byte-identical with redis/lib/common.sh; tests/mongodb enforces that.
+certificate_time_epoch() {
+    LC_ALL=C date -u -d "$1" +%s 2>/dev/null \
+        || LC_ALL=C date -u -j -f '%b %e %T %Y %Z' "$1" +%s 2>/dev/null
+}
+
+# Acceptance margin for a certificate: an explicit --minimum-tls-seconds value,
+# or by default the greater of one hour and one tenth of the certificate's own
+# validity period. A 24-hour leaf must therefore hold 2.4 hours and a 90-day
+# certificate 9 days, so one default serves short-lived and conventional
+# issuance without treating a nearly expired long-lived certificate as healthy.
+certificate_required_remaining_seconds() {
+    certificate_file=$1
+    explicit_seconds=$2
+    if [ -n "$explicit_seconds" ]; then
+        printf '%s\n' "$explicit_seconds"
+        return
+    fi
+    certificate_bounds=$(LC_ALL=C openssl x509 -in "$certificate_file" -noout -startdate -enddate 2>/dev/null) \
+        || fail "cannot read the certificate validity period: $certificate_file"
+    not_before=$(printf '%s\n' "$certificate_bounds" | sed -n 's/^notBefore=//p')
+    not_after=$(printf '%s\n' "$certificate_bounds" | sed -n 's/^notAfter=//p')
+    not_before_epoch=$(certificate_time_epoch "$not_before") \
+        || fail "cannot interpret the certificate notBefore time: $certificate_file"
+    not_after_epoch=$(certificate_time_epoch "$not_after") \
+        || fail "cannot interpret the certificate notAfter time: $certificate_file"
+    certificate_lifetime=$((not_after_epoch - not_before_epoch))
+    [ "$certificate_lifetime" -gt 0 ] \
+        || fail "certificate validity period is empty or inverted: $certificate_file"
+    proportional_seconds=$((certificate_lifetime / 10))
+    if [ "$proportional_seconds" -gt 3600 ]; then
+        printf '%s\n' "$proportional_seconds"
+    else
+        printf '3600\n'
+    fi
+}
+
 validate_selection() {
-    case "$TLS_MINIMUM_REMAINING_SECONDS" in
-        '' | *[!0-9]* | 0*) fail "--minimum-tls-seconds must be a positive decimal integer" ;;
-    esac
-    [ "${#TLS_MINIMUM_REMAINING_SECONDS}" -le 7 ] \
-        && [ "$TLS_MINIMUM_REMAINING_SECONDS" -ge 300 ] \
-        && [ "$TLS_MINIMUM_REMAINING_SECONDS" -le 2592000 ] \
-        || fail "--minimum-tls-seconds must be between 300 and 2592000"
+    # Empty selects the proportional default computed from the certificate.
+    if [ -n "$TLS_MINIMUM_REMAINING_SECONDS" ]; then
+        case "$TLS_MINIMUM_REMAINING_SECONDS" in
+            *[!0-9]* | 0*) fail "--minimum-tls-seconds must be a positive decimal integer" ;;
+        esac
+        [ "${#TLS_MINIMUM_REMAINING_SECONDS}" -le 7 ] \
+            && [ "$TLS_MINIMUM_REMAINING_SECONDS" -ge 300 ] \
+            && [ "$TLS_MINIMUM_REMAINING_SECONDS" -le 2592000 ] \
+            || fail "--minimum-tls-seconds must be between 300 and 2592000"
+    fi
     case "$PHASE" in
         initialize)
             validate_common_identity_selection
@@ -394,7 +442,7 @@ validate_selection() {
 }
 
 print_plan() {
-    printf 'Certificate acceptance margin for network operations: %s seconds remaining.\n' "$TLS_MINIMUM_REMAINING_SECONDS"
+    printf 'Certificate acceptance margin for network operations: %s.\n' "$(describe_tls_margin "$TLS_MINIMUM_REMAINING_SECONDS")"
     case "$PHASE" in
         initialize)
             printf '1. Require MongoDB 8.0, an inactive and disabled service, and an empty %s.\n' "$DATA_DIRECTORY"
@@ -549,9 +597,8 @@ verify_local_model() {
 }
 
 verify_network_model() {
-    "$VERIFIER" \
+    set -- \
         --model network \
-        --minimum-tls-seconds "$TLS_MINIMUM_REMAINING_SECONDS" \
         --replica-set "$REPLICA_SET" \
         --admin-user "$ADMIN_USER" \
         --admin-password-file "$ADMIN_PASSWORD_FILE" \
@@ -562,6 +609,8 @@ verify_network_model() {
         --bind-address "$BIND_ADDRESS" \
         --tls-ca-file "$TLS_CA_FILE" \
         --tls-certificate-key-file "$TLS_CERTIFICATE_KEY_FILE"
+    [ -z "$TLS_MINIMUM_REMAINING_SECONDS" ] || set -- "$@" --minimum-tls-seconds "$TLS_MINIMUM_REMAINING_SECONDS"
+    "$VERIFIER" "$@"
 }
 
 initialize_new_replica_set() {
@@ -719,9 +768,11 @@ validate_tls_server_identity() {
         || fail "TLS server certificate and private key do not match"
     openssl x509 -in "$TLS_CERTIFICATE_KEY_FILE" -noout -checkhost "$MEMBER_HOST" >/dev/null \
         || fail "TLS certificate does not cover member host $MEMBER_HOST"
+    required_tls_seconds=$(certificate_required_remaining_seconds "$TLS_CERTIFICATE_KEY_FILE" "$TLS_MINIMUM_REMAINING_SECONDS") \
+        || exit 1
     openssl x509 -in "$TLS_CERTIFICATE_KEY_FILE" -noout \
-        -checkend "$TLS_MINIMUM_REMAINING_SECONDS" >/dev/null \
-        || fail "TLS server certificate has less than $TLS_MINIMUM_REMAINING_SECONDS seconds remaining"
+        -checkend "$required_tls_seconds" >/dev/null \
+        || fail "TLS server certificate has less than $required_tls_seconds seconds remaining"
 }
 
 expose_network_model() {

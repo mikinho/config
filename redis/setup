@@ -45,7 +45,7 @@ SERVER_HOST=
 TLS_CERTIFICATE_FILE=
 TLS_PRIVATE_KEY_FILE=
 TLS_CA_FILE=
-MINIMUM_TLS_SECONDS=3600
+MINIMUM_TLS_SECONDS=
 ALLOWED_CLIENT_FILE=
 ALLOWED_CLIENT_COUNT=0
 NETWORK_CONTROLS_CONFIRMED=no
@@ -89,7 +89,7 @@ Expose-network options:
   --tls-certificate-file FILE --tls-private-key-file FILE --tls-ca-file FILE
   --allowed-client-address PRIVATE_IPV4 (repeat for every exact application host)
   --network-controls-confirmed
-  --minimum-tls-seconds SECONDS (default: 3600; range: 300-2592000)
+  --minimum-tls-seconds SECONDS (default: the greater of 3600 and one tenth of the certificate lifetime; range: 300-2592000)
 
 Initialization is limited to an empty data directory and a disabled service.
 The restricted-network transition requires private DNS, a server certificate,
@@ -352,7 +352,7 @@ case "$PHASE" in
 esac
 
 if [ "$MODE" = plan ]; then
-    printf 'Certificate acceptance margin for network operations: %s seconds remaining.\n' "$MINIMUM_TLS_SECONDS"
+    printf 'Certificate acceptance margin for network operations: %s.\n' "$(redis_describe_tls_margin "$MINIMUM_TLS_SECONDS")"
     case "$PHASE" in
         initialize)
             printf '1. Require Redis %s, an inactive and disabled service, and an empty %s.\n' \
@@ -556,8 +556,10 @@ case "$PHASE" in
             || fail "TLS certificate chain verification failed"
         openssl x509 -checkhost "$SERVER_HOST" -noout -in "$TLS_CERTIFICATE_FILE" >/dev/null \
             || fail "TLS certificate does not identify --server-host"
-        openssl x509 -checkend "$MINIMUM_TLS_SECONDS" -noout -in "$TLS_CERTIFICATE_FILE" >/dev/null \
-            || fail "TLS certificate has less than $MINIMUM_TLS_SECONDS seconds remaining"
+        required_tls_seconds=$(certificate_required_remaining_seconds "$TLS_CERTIFICATE_FILE" "$MINIMUM_TLS_SECONDS") \
+            || exit 1
+        openssl x509 -checkend "$required_tls_seconds" -noout -in "$TLS_CERTIFICATE_FILE" >/dev/null \
+            || fail "TLS certificate has less than $required_tls_seconds seconds remaining"
         certificate_key=$(openssl x509 -in "$TLS_CERTIFICATE_FILE" -pubkey -noout \
             | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum | awk '{ print $1 }')
         private_key=$(openssl pkey -in "$TLS_PRIVATE_KEY_FILE" -pubout -outform DER 2>/dev/null \
@@ -614,12 +616,12 @@ if [ "$PHASE" = expose-network ]; then
     verification_model=network
 fi
 set -- "$VERIFIER" --model "$verification_model" --data-profile "$DATA_PROFILE" \
-    --minimum-tls-seconds "$MINIMUM_TLS_SECONDS" \
     --admin-user "$ADMIN_USER" --admin-password-file "$ADMIN_PASSWORD_FILE" \
     --application-user "$APPLICATION_USER" \
     --application-password-file "$APPLICATION_PASSWORD_FILE" \
     --application-key-prefix "$APPLICATION_KEY_PREFIX" \
     --application-channel-prefix "$APPLICATION_CHANNEL_PREFIX"
+[ -z "$MINIMUM_TLS_SECONDS" ] || set -- "$@" --minimum-tls-seconds "$MINIMUM_TLS_SECONDS"
 if [ "$PHASE" = initialize ]; then
     set -- "$@" --maxmemory-mib "$MAXMEMORY_MIB"
 elif [ "$PHASE" = expose-network ]; then
