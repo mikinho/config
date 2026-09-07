@@ -144,10 +144,13 @@ The three sizing values must match the selected configuration and available
 host/ancestor task capacity. They do not change nginx worker or pool settings.
 `worker_processes auto` requires reviewing the target host's CPU count; include
 all configured pools in the total threads per worker. Setup reserves two
-worker generations plus 16 helper tasks and retains the shared `TasksMax=512`
-ceiling. Review worker/pool sizing if the calculated requirement exceeds the
-available budget. Overlapping more than one graceful reload needs additional
-headroom or operational serialization; this check is not a runtime guarantee.
+worker generations plus 16 helper tasks and retains the shared `TasksMax=4096`
+ceiling, which fits the shipped `aio threads` pool for up to 61 workers. Review
+worker/pool sizing if the calculated requirement exceeds the available budget:
+a ceiling that is too small surfaces as workers failing thread creation during
+a reload, not as a clean refusal. Overlapping more than one graceful reload
+needs additional headroom or operational serialization; this check is not a
+runtime guarantee.
 
 Applying host setup performs a planned restart to activate the installed
 systemd execution restrictions and can interrupt service. `ExecStartPost`

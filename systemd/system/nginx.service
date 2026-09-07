@@ -80,9 +80,15 @@ RestrictSUIDSGID=yes
 SystemCallArchitectures=native
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 MemoryDenyWriteExecute=yes
-# Includes worker threads, not just processes. nginx/setup requires reviewed
-# worker/pool sizing with room for two generations and helpers before applying.
-TasksMax=512
+# Counts worker threads, not just processes: with the shipped `aio threads`
+# default pool each worker is 33 tasks, and a graceful reload doubles them
+# while the old generation drains. 4096 admits two generations for up to 61
+# workers (three for 41) yet stays below systemd's DefaultTasksMax of 15% of
+# kernel.pid_max, so runaway thread or process creation is still contained.
+# nginx/setup keeps SHARED_TASKS_MAX equal to this and refuses reviewed
+# worker/pool sizing that does not fit, instead of letting new workers fail
+# thread creation mid-reload.
+TasksMax=4096
 
 # The master binds privileged ports, changes worker identities, manages log
 # ownership, signals workers and sets rlimits. Workers drop effective caps.

@@ -86,8 +86,8 @@ case "$*" in
         else printf '%s\n' "${NGINX_TEST_LOAD:-loaded}"; fi ;;
     'show --property=NeedDaemonReload --value nginx.service') printf '%s\n' "${NGINX_TEST_STALE:-no}" ;;
     'show --property=TasksMax --value nginx.service')
-        if [ -f "$NGINX_TEST_ROOT/reloaded" ]; then printf '%s\n' "${NGINX_TEST_NEW_LIMIT:-512}";
-        else printf '%s\n' "${NGINX_TEST_LIMIT-512}"; fi ;;
+        if [ -f "$NGINX_TEST_ROOT/reloaded" ]; then printf '%s\n' "${NGINX_TEST_NEW_LIMIT:-4096}";
+        else printf '%s\n' "${NGINX_TEST_LIMIT-4096}"; fi ;;
     'show --property=MainPID --value nginx.service')
         if [ -f "$NGINX_TEST_ROOT/restarted" ]; then printf '%s\n' "${NGINX_TEST_NEW_PID:-201}";
         else printf '%s\n' "${NGINX_TEST_OLD_PID:-101}"; fi ;;
@@ -172,8 +172,14 @@ PATH=$TEST_ROOT/bin:$PATH
 export PATH
 
 # Keep the shared ceiling and implementation synchronized without weakening it.
-assert_contains "$FIXTURE_ROOT/systemd/system/nginx.service" 'TasksMax=512'
-assert_contains "$SETUP" 'SHARED_TASKS_MAX=512'
+# Read both values so a change to either side must be made in both places.
+unit_tasks_max=$(sed -n 's/^TasksMax=//p' "$FIXTURE_ROOT/systemd/system/nginx.service")
+setup_tasks_max=$(sed -n 's/^SHARED_TASKS_MAX=//p' "$SETUP")
+[ "$unit_tasks_max" = 4096 ] || fail "nginx.service TasksMax must be 4096, found: $unit_tasks_max"
+[ "$setup_tasks_max" = "$unit_tasks_max" ] \
+    || fail "nginx/setup SHARED_TASKS_MAX ($setup_tasks_max) must equal the unit TasksMax ($unit_tasks_max)"
+assert_contains "$SETUP" 'WORKER_GENERATIONS=2'
+assert_contains "$SETUP" 'HELPER_TASK_RESERVE=16'
 assert_contains "$FIXTURE_ROOT/systemd/system/nginx.service" 'ExecStartPost=!/usr/local/libexec/nginx-runtime-verify'
 assert_contains "$FIXTURE_ROOT/systemd/system/nginx.service" 'SupplementaryGroups=nginx'
 if grep '^User=' "$FIXTURE_ROOT/systemd/system/nginx.service" >/dev/null; then
@@ -212,12 +218,23 @@ expect_failure '--workers must be greater than zero' "$SETUP" --capacity-check \
 expect_failure '--tasks-budget must be greater than zero' "$SETUP" --capacity-check \
     --workers 1 --threads-per-worker 0 --tasks-budget 0
 
+# The shipped aio threads pool on ordinary eight-core hosts must fit the shared
+# ceiling: 2 × 8 × 33 + 16 = 544. Sixty-two such workers need 4108 and exceed
+# it, so the gate refuses before any host mutation instead of letting reload-time
+# thread creation fail.
 reset_fixture
-expect_failure 'requires at least 544 tasks' "$SETUP" \
-    --workers 8 --threads-per-worker 32 --tasks-budget 1024
+"$SETUP" --capacity-check --workers 8 --threads-per-worker 32 --tasks-budget 1024 \
+    > "$TEST_ROOT/stdout"
+assert_contains "$TEST_ROOT/stdout" 'required=544, budget=1024'
+"$SETUP" --capacity-check --workers 61 --threads-per-worker 32 --tasks-budget 8192 \
+    > "$TEST_ROOT/stdout"
+assert_contains "$TEST_ROOT/stdout" 'required=4042, budget=4096'
+expect_failure 'requires at least 4108 tasks (2 worker generations plus 16 helper tasks); shared TasksMax=4096' "$SETUP" \
+    --workers 62 --threads-per-worker 32 --tasks-budget 8192
+assert_contains "$TEST_ROOT/stderr" 'Pin worker_processes or reduce pool threads'
 assert_no_mutation
-expect_failure 'requires at least 1072 tasks' "$SETUP" --capacity-check \
-    --workers 16 --threads-per-worker 32 --tasks-budget 2048
+expect_failure 'requires at least 1072 tasks, but operator-reviewed --tasks-budget is 1024' "$SETUP" --capacity-check \
+    --workers 16 --threads-per-worker 32 --tasks-budget 1024
 expect_failure 'operator-reviewed --tasks-budget is 279' "$SETUP" --capacity-check \
     --workers 4 --threads-per-worker 32 --tasks-budget 279
 

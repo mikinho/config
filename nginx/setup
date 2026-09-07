@@ -31,9 +31,12 @@ NGINX_LOCK_DIRECTORY=/run/lock/nginx
 NGINX_STATE_DIRECTORY=/var/lib/nginx
 NGINX_LOG_DIRECTORY=/var/log/nginx
 SCRATCH_DIRECTORY=
-# Keep this in step with the shared unit. Host overrides may reduce this budget;
-# setup never assumes a larger local override is safe for a shared baseline.
-SHARED_TASKS_MAX=512
+# Keep this in step with the shared unit's TasksMax=. Host overrides may reduce
+# this budget; setup never assumes a larger local override is safe for a shared
+# baseline. Sizing assumes two worker generations (one graceful reload in
+# flight) plus a reserve for the master, cache processes, and service commands.
+SHARED_TASKS_MAX=4096
+WORKER_GENERATIONS=2
 HELPER_TASK_RESERVE=16
 
 MODE=apply
@@ -122,9 +125,9 @@ validate_capacity_inputs() {
     done
     [ "$WORKERS" -gt 0 ] || fail "--workers must be greater than zero"
     [ "$TASKS_BUDGET" -gt 0 ] || fail "--tasks-budget must be greater than zero"
-    REQUIRED_TASKS=$((2 * WORKERS * (1 + THREADS_PER_WORKER) + HELPER_TASK_RESERVE))
+    REQUIRED_TASKS=$((WORKER_GENERATIONS * WORKERS * (1 + THREADS_PER_WORKER) + HELPER_TASK_RESERVE))
     [ "$REQUIRED_TASKS" -le "$SHARED_TASKS_MAX" ] \
-        || fail "nginx requires at least $REQUIRED_TASKS tasks (two worker generations plus $HELPER_TASK_RESERVE helper tasks); shared TasksMax=$SHARED_TASKS_MAX. Review worker/thread-pool sizing before applying"
+        || fail "nginx requires at least $REQUIRED_TASKS tasks ($WORKER_GENERATIONS worker generations plus $HELPER_TASK_RESERVE helper tasks); shared TasksMax=$SHARED_TASKS_MAX. Pin worker_processes or reduce pool threads; a larger ceiling is a separately reviewed unit change"
     [ "$REQUIRED_TASKS" -le "$TASKS_BUDGET" ] \
         || fail "nginx requires at least $REQUIRED_TASKS tasks, but operator-reviewed --tasks-budget is $TASKS_BUDGET"
 }
@@ -158,7 +161,7 @@ check_live_capacity() {
             ;;
     esac
     [ "$REQUIRED_TASKS" -le "$capacity_budget" ] \
-        || fail "nginx requires at least $REQUIRED_TASKS tasks (two worker generations plus $HELPER_TASK_RESERVE helper tasks), but checked budget is $capacity_budget; review host task limits and worker/thread-pool sizing"
+        || fail "nginx requires at least $REQUIRED_TASKS tasks ($WORKER_GENERATIONS worker generations plus $HELPER_TASK_RESERVE helper tasks), but checked budget is $capacity_budget; review host task limits and worker/thread-pool sizing"
     printf 'Reviewed nginx sizing: workers=%s, threads-per-worker=%s, required=%s, budget=%s.\n' \
         "$WORKERS" "$THREADS_PER_WORKER" "$REQUIRED_TASKS" "$capacity_budget"
 }

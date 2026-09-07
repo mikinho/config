@@ -80,7 +80,7 @@ pool. Pass the reviewed values as `--workers` and `--threads-per-worker` to
 The third input, `--tasks-budget` (or `--nginx-tasks-budget`), is the operator's
 reviewed available task capacity after accounting for ancestor cgroup limits
 and other services sharing those limits. It does not change a limit. Setup
-uses the smallest of that assertion, the shared `TasksMax=512`, and the loaded
+uses the smallest of that assertion, the shared `TasksMax=4096`, and the loaded
 unit's `TasksMax` when present. Stale manager metadata and unknown loaded limits
 fail closed. The same check runs before mutation and after `daemon-reload`,
 before restart. Read-only planning does not certify the live host's capacity.
@@ -91,15 +91,29 @@ unknown unit state is rejected. The supported nginx binary and reviewed
 configuration must already be installed; this is not an nginx package installer.
 
 The sizing check requires `2 × workers × (1 + threads-per-worker) + 16` tasks:
-two worker generations plus a 16-task reserve for the master, helpers, and
-short-lived service commands. Four workers with one 32-thread pool require
-280 tasks; eight require 544 and fail the shared 512 ceiling. This is headroom
-for **one** overlapping reload, not a bound on repeated reloads while old
-workers are still draining. Wait for the prior generation to exit; increase
-the reviewed reserve/budget through a separately validated design if the host
-needs more. Do not remove the task cap to make preflight pass. A larger
-host-specific limit is a separate reviewed change; these shared setup commands
-deliberately retain their conservative 512 ceiling.
+two worker generations plus a 16-task reserve for the master, cache manager and
+loader, the startup checker's short pipelines, and `ExecReload`'s configuration
+test, all of which run inside the service cgroup. Four workers with one
+32-thread pool require 280 tasks, eight require 544, and sixty-two require
+4108, which exceeds the shared 4096 ceiling. That ceiling admits the shipped
+`aio threads` pool for two generations up to 61 workers, or three generations
+up to 41, while remaining below systemd's `DefaultTasksMax` of 15% of
+`kernel.pid_max` (about 629k with the 4194304 `pid_max` systemd installs, and
+still under the 4915 of a legacy 32768 `pid_max`), so it continues to contain
+runaway thread or process creation without forcing hosts with more CPUs than a
+512 ceiling allowed to disable `aio threads` or pin `worker_processes`.
+
+An undersized ceiling does not fail safe: new workers that cannot create their
+pool threads exit and are respawned by the master until the previous generation
+drains, so the gate exists to keep that sizing mistake out of production. The
+model is headroom for **one** overlapping reload, not a bound on repeated
+reloads while old workers are still draining; without `worker_shutdown_timeout`
+in the nginx configuration, long-lived connections can keep an old generation
+alive indefinitely. Wait for the prior generation to exit, or bound it in the
+nginx configuration as a separately reviewed change. Do not remove the task cap
+to make preflight pass. Hosts needing more than 61 threaded workers pin
+`worker_processes` or take a larger ceiling as a separate reviewed unit change;
+these shared setup commands deliberately hold the 4096 ceiling.
 
 Use `nginx/setup --capacity-check --workers 4 --threads-per-worker 32
 --tasks-budget 512` only after confirming those illustrative values match the
