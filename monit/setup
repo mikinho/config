@@ -402,29 +402,44 @@ restore_target() {
 
 rollback_transaction() {
     rollback_failed=no
+    files_restored=yes
     printf '%s: setup failed; restoring managed files and prior service state\n' \
         "$PROGRAM_NAME" >&2
     for rollback_target in $BACKED_UP_TARGETS; do
         if ! restore_target "$rollback_target"; then
             printf '%s: could not restore %s\n' "$PROGRAM_NAME" "$rollback_target" >&2
-            rollback_failed=yes
+            files_restored=no
         fi
     done
+    [ "$files_restored" = yes ] || rollback_failed=yes
     if ! systemctl daemon-reload; then
+        # The restored drop-in is on disk, but the manager still holds the
+        # transaction's unit properties until a reload succeeds. Report it
+        # without withdrawing monitoring: the configuration Monit reads is
+        # the original again, and stopping here would trade a reporting gap
+        # for an outage that the operator's daemon-reload does not need.
+        printf '%s: systemd daemon-reload failed; the restored unit drop-in is not loaded until it succeeds, then restart monit.service\n' \
+            "$PROGRAM_NAME" >&2
         rollback_failed=yes
     fi
-    if [ "$rollback_failed" = no ] && [ "$SERVICE_WAS_ACTIVE" = yes ]; then
-        if ! monit -t -c "$MONIT_MAIN" >/dev/null; then
-            rollback_failed=yes
-        elif [ "$SERVICE_RESTART_REQUIRED" = yes ]; then
-            systemctl restart monit.service || rollback_failed=yes
-        elif systemctl is-active --quiet monit.service; then
-            systemctl reload monit.service || rollback_failed=yes
-        else
-            systemctl start monit.service || rollback_failed=yes
-        fi
-    else
+    if [ "$files_restored" = no ]; then
+        # Never let Monit consume a partially restored tree.
         systemctl stop monit.service || rollback_failed=yes
+    elif [ "$SERVICE_WAS_ACTIVE" = no ]; then
+        systemctl stop monit.service || rollback_failed=yes
+    elif ! monit -t -c "$MONIT_MAIN" >/dev/null; then
+        # The restored files are what ran before this transaction. If they no
+        # longer validate, relaunching them is not safe and stopping is not
+        # justified either; leave the current process for the operator.
+        printf '%s: restored Monit configuration failed validation; service state left unchanged\n' \
+            "$PROGRAM_NAME" >&2
+        rollback_failed=yes
+    elif [ "$SERVICE_RESTART_REQUIRED" = yes ]; then
+        systemctl restart monit.service || rollback_failed=yes
+    elif systemctl is-active --quiet monit.service; then
+        systemctl reload monit.service || rollback_failed=yes
+    else
+        systemctl start monit.service || rollback_failed=yes
     fi
     if [ "$SERVICE_WAS_ENABLED" = yes ]; then
         systemctl enable monit.service || rollback_failed=yes

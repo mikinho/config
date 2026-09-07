@@ -280,8 +280,15 @@ Automatic rollback attempts every target and reports `rollback-incomplete` if
 any file or service restoration fails. The originals remain available after
 success, failure, or incomplete recovery; ordinary candidate cleanup does not
 remove them. An incomplete file restoration leaves Monit stopped when possible
-so it cannot consume a partially restored tree. Inspect the error and transaction
-records, repair the cause, and restore the recorded originals before activation.
+so it cannot consume a partially restored tree. Once every file is restored,
+the restored tree is authoritative: a failed `systemctl daemon-reload` or
+service command is still reported as `rollback-incomplete`, but rollback
+re-establishes the recorded service state rather than stopping a running
+daemon, and the operator completes recovery with `daemon-reload` followed by a
+restart or reload. If the restored configuration itself fails `monit -t`, the
+service state is left unchanged for the operator. Inspect the error and
+transaction records, repair the cause, and restore the recorded originals
+before activation.
 
 For a later operator rollback, use `targets` and the `present`/`absent` records
 to restore the previous files and remove targets that did not previously exist.

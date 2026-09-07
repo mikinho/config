@@ -523,19 +523,83 @@ TEMPORARY_DIRECTORY="$TEST_ROOT/cleanup-temporary" \
 assert_contains "$TEST_ROOT/retained-transaction/original" 'recovery original'
 assert_contains "$TEST_ROOT/cleanup.stderr" 'Retained root-only Monit transaction:'
 
-# A failed restoration is reported and retains the original for operator repair.
+# Rollback service handling. The mocks record every systemctl invocation so
+# each branch can prove which service commands ran and, as importantly, which
+# did not. MONIT_TEST_RESTORE_FAIL, MONIT_TEST_RELOAD_FAIL, and
+# MONIT_TEST_CONFIG_INVALID select the failing step.
 rollback_function=$(extract_function rollback_transaction "$SETUP")
+rollback_log=$TEST_ROOT/rollback-systemctl.log
 rollback_check="PROGRAM_NAME=monit-test
-    restore_target() { return 1; }
-    systemctl() { return 0; }
+    restore_target() { [ \"\${MONIT_TEST_RESTORE_FAIL:-no}\" = no ]; }
+    monit() { [ \"\${MONIT_TEST_CONFIG_INVALID:-no}\" = no ]; }
+    systemctl() {
+        printf '%s\\n' \"\$*\" >> '$rollback_log'
+        case \"\$1\" in
+            daemon-reload) [ \"\${MONIT_TEST_RELOAD_FAIL:-no}\" = no ] ;;
+            *) return 0 ;;
+        esac
+    }
     $rollback_function
     rollback_transaction"
-expect_failure 'rollback incomplete' \
+run_rollback() {
+    : > "$rollback_log"
     env BACKUP_DIRECTORY="$TEST_ROOT/retained-transaction" BACKED_UP_TARGETS=/test/target \
-    SERVICE_WAS_ACTIVE=yes SERVICE_WAS_ENABLED=yes SERVICE_RESTART_REQUIRED=no \
-    sh -c "$rollback_check"
+        MONIT_MAIN=/test/monitrc SERVICE_WAS_ENABLED=yes "$@" sh -c "$rollback_check"
+}
+assert_service_command() {
+    grep -x -- "$1 monit.service" "$rollback_log" >/dev/null \
+        || fail "rollback did not run: systemctl $1 monit.service"
+}
+refuse_service_command() {
+    if grep -x -- "$1 monit.service" "$rollback_log" >/dev/null; then
+        fail "rollback must not run: systemctl $1 monit.service"
+    fi
+}
+
+# A failed restoration is reported, stops the daemon so it cannot consume a
+# partially restored tree, and retains the original for operator repair.
+expect_failure 'rollback incomplete' run_rollback \
+    MONIT_TEST_RESTORE_FAIL=yes SERVICE_WAS_ACTIVE=yes SERVICE_RESTART_REQUIRED=no
 assert_contains "$TEST_ROOT/retained-transaction/status" rollback-incomplete
 assert_contains "$TEST_ROOT/retained-transaction/original" 'recovery original'
+assert_service_command stop
+refuse_service_command reload
+refuse_service_command restart
+
+# A failed daemon-reload after a complete file restoration is reported without
+# withdrawing monitoring: the restored files are authoritative, so the prior
+# service state is still re-established and the operator finishes the reload.
+expect_failure 'daemon-reload failed' run_rollback \
+    MONIT_TEST_RELOAD_FAIL=yes SERVICE_WAS_ACTIVE=yes SERVICE_RESTART_REQUIRED=no
+assert_contains "$TEST_ROOT/expected.stderr" 'rollback incomplete'
+assert_contains "$TEST_ROOT/retained-transaction/status" rollback-incomplete
+assert_service_command reload
+refuse_service_command stop
+expect_failure 'daemon-reload failed' run_rollback \
+    MONIT_TEST_RELOAD_FAIL=yes SERVICE_WAS_ACTIVE=yes SERVICE_RESTART_REQUIRED=yes
+assert_service_command restart
+refuse_service_command stop
+# An inactive prior state is still restored by stopping.
+expect_failure 'daemon-reload failed' run_rollback \
+    MONIT_TEST_RELOAD_FAIL=yes SERVICE_WAS_ACTIVE=no SERVICE_RESTART_REQUIRED=no
+assert_service_command stop
+refuse_service_command reload
+
+# Restored files that no longer validate are neither relaunched nor stopped.
+expect_failure 'restored Monit configuration failed validation' run_rollback \
+    MONIT_TEST_CONFIG_INVALID=yes SERVICE_WAS_ACTIVE=yes SERVICE_RESTART_REQUIRED=yes
+assert_contains "$TEST_ROOT/retained-transaction/status" rollback-incomplete
+refuse_service_command stop
+refuse_service_command restart
+refuse_service_command reload
+
+# A clean rollback re-establishes the prior state and records success.
+run_rollback SERVICE_WAS_ACTIVE=yes SERVICE_RESTART_REQUIRED=yes > "$TEST_ROOT/rollback.stdout" 2>&1
+assert_contains "$TEST_ROOT/retained-transaction/status" rolled-back
+grep -x daemon-reload "$rollback_log" >/dev/null || fail 'rollback did not reload the manager'
+assert_service_command restart
+assert_service_command enable
+refuse_service_command stop
 
 # Activate an existing daemon only as required by execution-policy changes.
 selection_function=$(extract_function select_activation_policy "$SETUP")
