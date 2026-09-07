@@ -10,6 +10,22 @@
     const role = environment.MONGODB_ROTATION_ROLE;
     const mode = environment.MONGODB_ROTATION_MODE;
     const expectedPrivileges = [{ resource: { cluster: true }, actions: ["rotateCertificates"] }];
+    // Only exact, fixed diagnostics from our checks may reach operator logs.
+    // Driver and filesystem errors can contain credentials or connection data.
+    const safeDiagnostics = new Set([
+        "Unsafe credential file",
+        "Invalid credential contents",
+        "Incomplete rotation selection",
+        "Administrative authentication failed",
+        "Unexpected replica-set primary",
+        "Rotation user already exists or cannot be inspected",
+        "Role inspection failed",
+        "Existing role has unexpected privileges",
+        "Rotation authentication failed",
+        "Rotation account is not restricted to the expected privilege",
+        "Certificate rotation failed",
+        "Connection continuity verification failed",
+    ]);
 
     const readPassword = (path) => {
         const identity = fs.lstatSync(path);
@@ -88,8 +104,10 @@
         }
         print(JSON.stringify({ rotationIdentityVerified: true,
             rotated: mode === "rotate", connectionPreserved: true }));
-    } catch {
-        print("MongoDB certificate operation failed; credential and driver details suppressed.");
+    } catch (error) {
+        const diagnostic = safeDiagnostics.has(error?.message)
+            ? error.message : "credential and driver details suppressed";
+        print(`MongoDB certificate operation failed; ${diagnostic}.`);
         quit(1);
     }
 })();

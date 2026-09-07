@@ -74,7 +74,7 @@ validate_root_source() {
         || fail "executable source must be a regular, non-symbolic-link file: $source_path"
     source_identity=$(stat -Lc '%U:%G:%a:%h' "$source_path")
     case "$source_identity" in root:root:644:1 | root:root:755:1) ;;
-        *) fail "executable source must be root:root 0644 or 0755 with one link: $source_path" ;;
+        *) fail "executable source must be root:root 0644 or 0755 with one link: $source_path; use the installed /usr/local/sbin/reload-mongodb-tls for apply mode" ;;
     esac
     parent_path=$(dirname -- "$source_path")
     while :; do
@@ -82,7 +82,7 @@ validate_root_source() {
         parent_identity=$(stat -Lc '%U:%G:%a' "$parent_path")
         parent_mode=${parent_identity##*:}
         [ "${parent_identity%:*}" = root:root ] && [ "$((0$parent_mode & 0022))" -eq 0 ] \
-            || fail "source parent must be root:root and non-writable: $parent_path"
+            || fail "source parent must be root:root and non-writable: $parent_path; use the installed /usr/local/sbin/reload-mongodb-tls for apply mode"
         [ "$parent_path" != / ] || break
         parent_path=$(dirname -- "$parent_path")
     done
@@ -177,7 +177,9 @@ fi
 for required_command in awk cmp getent grep ip mktemp mongod mongosh openssl rm sed sort stat systemctl timeout; do
     command -v "$required_command" >/dev/null 2>&1 || fail "required command not found: $required_command"
 done
-mongod --version 2>/dev/null | grep -Eq 'db version v8\.0\.29([.-]|$)' || fail "exact MongoDB 8.0.29 is required"
+# Patch upgrades must not prevent renewed certificate adoption. The verifier
+# retains the exact package-version check as the deployment acceptance gate.
+mongod --version 2>/dev/null | grep -Eq 'db version v8\.0\.' || fail "MongoDB 8.0 LTS is required"
 systemctl is-active --quiet mongod.service || fail "mongod.service must be active"
 pid_before=$(systemctl show mongod.service -p MainPID --value)
 case "$pid_before" in '' | 0 | *[!0-9]*) fail "cannot identify the running mongod PID" ;; esac

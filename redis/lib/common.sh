@@ -28,7 +28,7 @@ redis_describe_tls_margin() {
 }
 
 # The two functions below are kept byte-identical in redis/lib/common.sh,
-# mongodb/setup, and mongodb/verify; tests/mongodb enforces that.
+# mongodb/setup, mongodb/verify, and mongodb/lib/tls.sh; tests/mongodb enforces that.
 certificate_time_epoch() {
     LC_ALL=C date -u -d "$1" +%s 2>/dev/null \
         || LC_ALL=C date -u -j -f '%b %e %T %Y %Z' "$1" +%s 2>/dev/null

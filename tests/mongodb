@@ -349,14 +349,14 @@ if grep -E '^TLS_MINIMUM_REMAINING_SECONDS=[0-9]' "$SETUP" "$VERIFIER" >/dev/nul
     fail 'MongoDB TLS margin must default to the proportional rule, not a fixed number of seconds'
 fi
 # The proportional margin functions are shared by copy with redis/lib/common.sh;
-# any drift between the three copies is a defect.
+# any drift between the four copies is a defect.
 extract_margin_functions() {
     sed -n '/^certificate_time_epoch() {/,/^certificate_required_remaining_seconds() {/p' "$1"
     sed -n '/^certificate_required_remaining_seconds() {/,/^}/p' "$1"
 }
 extract_margin_functions "$REPOSITORY_ROOT/redis/lib/common.sh" > "$TEST_ROOT/margin-reference"
 [ -s "$TEST_ROOT/margin-reference" ] || fail 'redis/lib/common.sh no longer defines the shared margin functions'
-for margin_copy in "$SETUP" "$VERIFIER"; do
+for margin_copy in "$SETUP" "$VERIFIER" "$MONGODB_DIRECTORY/lib/tls.sh"; do
     extract_margin_functions "$margin_copy" > "$TEST_ROOT/margin-copy"
     cmp -s "$TEST_ROOT/margin-reference" "$TEST_ROOT/margin-copy" \
         || fail "certificate margin functions in $margin_copy differ from redis/lib/common.sh"

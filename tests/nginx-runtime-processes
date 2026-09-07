@@ -132,7 +132,7 @@ expect_failure 'has unexpected Umask missing; expected 0027'
 
 reset_fixture
 printf 'Umask:\t0027\n' >> "$PROC_ROOT/101/status"
-expect_failure 'has unexpected Umask 0027; expected 0027'
+expect_failure 'has duplicate Umask field'
 
 reset_fixture
 write_status 101 S 0027 00000000010804eb

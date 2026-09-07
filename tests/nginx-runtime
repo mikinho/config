@@ -202,6 +202,10 @@ assert_process_masks() {
             $1 == "Umask:" { mask = $2; masks++ }
             $1 == "CapBnd:" { caps = $2; capability_fields++ }
             END {
+                if (masks > 1) {
+                    printf "has duplicate Umask field"
+                    exit 1
+                }
                 if (masks != 1 || mask != "0027") {
                     printf "has unexpected Umask %s; expected 0027", (mask == "" ? "missing" : mask)
                     exit 1

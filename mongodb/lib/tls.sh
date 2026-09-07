@@ -4,8 +4,9 @@
 # Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
 #
 
-# Validation shared by the certificate-reload entry point. Certificate lifetime
-# calculations stay byte-identical to setup and verify. Caller supplies fail().
+# Validation shared by the certificate-reload entry point. The validators below
+# match setup and verify; tests/mongodb-certificate-rotation.mjs enforces that.
+# Caller supplies fail().
 
 validate_safe_name() {
     setup_label=$1
@@ -87,11 +88,17 @@ validate_member_host() {
     ' || fail "--member-host must be a stable DNS name with at least two labels"
 }
 
+# Kept byte-identical with redis/lib/common.sh; tests/mongodb enforces that.
 certificate_time_epoch() {
     LC_ALL=C date -u -d "$1" +%s 2>/dev/null \
         || LC_ALL=C date -u -j -f '%b %e %T %Y %Z' "$1" +%s 2>/dev/null
 }
 
+# Acceptance margin for a certificate: an explicit --minimum-tls-seconds value,
+# or by default the greater of one hour and one tenth of the certificate's own
+# validity period. A 24-hour leaf must therefore hold 2.4 hours and a 90-day
+# certificate 9 days, so one default serves short-lived and conventional
+# issuance without treating a nearly expired long-lived certificate as healthy.
 certificate_required_remaining_seconds() {
     certificate_file=$1
     explicit_seconds=$2

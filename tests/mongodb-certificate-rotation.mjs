@@ -12,6 +12,7 @@ const scriptSource = readFileSync(new URL("certificate-rotation.js", sourceRoot)
 const reloadSource = readFileSync(new URL("reload-tls", sourceRoot), "utf8");
 const librarySource = readFileSync(new URL("lib/tls.sh", sourceRoot), "utf8");
 const setupSource = readFileSync(new URL("setup", sourceRoot), "utf8");
+const verifySource = readFileSync(new URL("verify", sourceRoot), "utf8");
 const privilege = () => [{ resource: { cluster: true }, actions: ["rotateCertificates"] }];
 const selections = [
     "--rotation-user", "rotation_user", "--rotation-role", "rotation_role",
@@ -21,10 +22,23 @@ const selections = [
     "--tls-ca-file", "/etc/pki/mongodb/ca.pem", "--minimum-tls-seconds", "3600",
 ];
 
-test("certificate lifetime calculations match the existing setup acceptance policy", () => {
-    for (const name of ["certificate_time_epoch", "certificate_required_remaining_seconds"]) {
+test("shared validators match setup and verify", () => {
+    const extract = (source, name) => {
         const expression = new RegExp(`^${name}\\(\\) \\{[\\s\\S]*?^\\}`, "m");
-        assert.equal(librarySource.match(expression)?.[0], setupSource.match(expression)?.[0]);
+        const match = source.match(expression);
+        assert.ok(match, `missing validator: ${name}`);
+        return match[0];
+    };
+    for (const name of ["validate_safe_name", "validate_absolute_path", "validate_root_owned_parent_chain",
+        "validate_ipv4_address", "validate_member_host"]) {
+        const reference = extract(setupSource, name);
+        assert.equal(extract(librarySource, name), reference, `lib/tls.sh drifted: ${name}`);
+        // verify uses its own scratch-variable prefix and IPv4 function name.
+        const verifyName = name === "validate_ipv4_address" ? "validate_private_ipv4" : name;
+        const copy = extract(verifySource, verifyName)
+            .replaceAll("verify_label", "setup_label").replaceAll("verify_value", "setup_value")
+            .replaceAll("verify_path", "setup_path").replace("validate_private_ipv4()", "validate_ipv4_address()");
+        assert.equal(copy, reference, `verify drifted: ${name}`);
     }
 });
 
@@ -42,14 +56,14 @@ function executeOperation(options = {}) {
         createUser(value) { calls.push({ createUser: value }); },
         runCommand(command) {
             calls.push(command);
-            if (command.usersInfo) return { ok: 1, users: options.existingUser ? [{}] : [] };
-            if (command.rolesInfo) return { ok: 1, roles: options.existingRole ? [options.existingRole] : [] };
+            if (command.usersInfo) return { ok: options.usersOk ?? 1, users: options.existingUser ? [{}] : [] };
+            if (command.rolesInfo) return { ok: options.rolesOk ?? 1, roles: options.existingRole ? [options.existingRole] : [] };
             if (command.connectionStatus) return { ok: 1, authInfo: {
                 authenticatedUserRoles: options.roles ?? [{ role: "rotation_role", db: "admin" }],
                 authenticatedUserPrivileges: options.privileges ?? privilege(),
             } };
             if (command.rotateCertificates) {
-                if (options.throwRotation) throw new Error(`driver leaked ${secret}`);
+                if (options.throwRotation) throw new Error(options.driverMessage ?? `driver leaked ${secret}`);
                 return { ok: options.rotationOk ?? 1 };
             }
             if (command.hello) {
@@ -133,6 +147,38 @@ test("rotation failures and a replaced connection cannot be reported as success"
     }
 });
 
+test("fixed validation failures identify the failed check without exposing credentials", () => {
+    for (const [options, diagnostic] of [
+        [{ mode: 0o644 }, "Unsafe credential file"],
+        [{ secret: "one\ntwo" }, "Invalid credential contents"],
+        [{ operation: "unknown" }, "Incomplete rotation selection"],
+        [{ operation: "create", authResult: 0 }, "Administrative authentication failed"],
+        [{ primary: false }, "Unexpected replica-set primary"],
+        [{ operation: "create", usersOk: 0 }, "Rotation user already exists or cannot be inspected"],
+        [{ operation: "create", rolesOk: 0 }, "Role inspection failed"],
+        [{ operation: "create", existingRole: { roles: [], privileges: [] } }, "Existing role has unexpected privileges"],
+        [{ authResult: 0 }, "Rotation authentication failed"],
+        [{ privileges: [] }, "Rotation account is not restricted to the expected privilege"],
+        [{ rotationOk: 0 }, "Certificate rotation failed"],
+        [{ changedConnection: true }, "Connection continuity verification failed"],
+    ]) {
+        const result = executeOperation(options);
+        assert.equal(result.exit, 1);
+        assert.deepEqual(result.output, [`MongoDB certificate operation failed; ${diagnostic}.`]);
+    }
+});
+
+test("driver diagnostics stay suppressed even when they contain an allowed message", () => {
+    for (const driverMessage of [undefined,
+        "Certificate rotation failed: driver leaked private fixture password",
+        "Certificate rotation failed\nconnection details",
+    ]) {
+        const result = executeOperation({ throwRotation: true, driverMessage });
+        assert.equal(result.exit, 1);
+        assert.deepEqual(result.output, ["MongoDB certificate operation failed; credential and driver details suppressed."]);
+    }
+});
+
 test("creation grants exactly one custom action and SCRAM-SHA-256", () => {
     const result = executeOperation({ operation: "create" });
     assert.equal(result.exit, 0);
@@ -192,13 +238,13 @@ function withRuntime(callback) {
     writeFileSync(join(bin, "reload-tls"), source, { mode: 0o755 });
     command("id", "echo 0");
     command("stat", `for path do :; done
-        if [ -d "$path" ]; then case "$*" in *%U:%G:%a*) echo root:root:755;; *) echo root:755;; esac
+        if [ -d "$path" ]; then case "$*" in *%U:%G:%a*) echo "\${SOURCE_PARENT_IDENTITY:-root:root:755}";; *) echo root:755;; esac
         else case "$path" in
             *server.pem) echo mongod:mongod:400:1;;
             *.password) echo root:root:\${PASSWORD_MODE:-600}:1;;
-            *) echo root:root:644:1;;
+            *) echo "\${SOURCE_FILE_IDENTITY:-root:root:644:1}";;
         esac; fi`);
-    command("mongod", "echo 'db version v8.0.29'");
+    command("mongod", 'printf "db version %s\\n" "${MONGODB_VERSION:-v8.0.29}"');
     command("getent", "echo '10.20.30.40 STREAM fixture'");
     command("ip", "echo '1: eth0 inet 10.20.30.40/24 scope global eth0'");
     command("systemctl", `case "$*" in
@@ -251,6 +297,39 @@ test("runtime rotates a stale leaf and verifies two strict TLS handshakes withou
     assert.equal(readFileSync(certificate, "utf8"), "staged fixture");
     assert.ok(!readFileSync(join(root, "arguments"), "utf8").includes("private fixture"));
 }));
+
+test("MongoDB 8.0 patch upgrades still adopt renewed certificates", () => withRuntime(({ root, run }) => {
+    const result = run({ MONGODB_VERSION: "v8.0.30" });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(readFileSync(join(root, "operations"), "utf8"), "rotate\n");
+}));
+
+test("unsupported MongoDB series stop before TLS handshakes or database operations", () => {
+    for (const version of ["v7.0.29", "v8.1.0", "v8.2.0", "v9.0.0", "unknown"]) {
+        withRuntime(({ root, run }) => {
+            const result = run({ MONGODB_VERSION: version });
+            assert.notEqual(result.status, 0);
+            assert.match(result.stderr, /MongoDB 8\.0 LTS is required/);
+            assert.equal(existsSync(join(root, "handshakes")), false);
+            assert.equal(existsSync(join(root, "operations")), false);
+        });
+    }
+});
+
+test("unsafe executable sources direct operators to the installed helper", () => {
+    for (const environment of [
+        { SOURCE_PARENT_IDENTITY: "operator:operator:755" },
+        { SOURCE_PARENT_IDENTITY: "root:root:775" },
+        { SOURCE_FILE_IDENTITY: "operator:operator:644:1" },
+    ]) {
+        withRuntime(({ root, run }) => {
+            const result = run(environment);
+            assert.notEqual(result.status, 0);
+            assert.match(result.stderr, /use the installed .*\/reload-mongodb-tls for apply mode/);
+            assert.equal(existsSync(join(root, "operations")), false);
+        });
+    }
+});
 
 test("matching live certificate verifies the account but skips rotation", () => withRuntime(({ root, run }) => {
     const result = run({ LIVE_FINGERPRINT: "new" });
