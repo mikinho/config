@@ -73,18 +73,29 @@ try {
     writeFileSync(configurationFile, JSON.stringify(configuration), { mode: 0o600 });
     const validated = execute(validator, ["--configuration-file", configurationFile, "--default-tls-hours", "1", "--max-tls-hours", "2"]);
     assert.equal(validated.status, 0, validated.stderr);
+    // Keep the CA's stderr so a startup failure explains itself instead of
+    // surfacing only as "exited before readiness".
+    let caDiagnostics = "";
     ca = spawn("step-ca", [configurationFile, "--password-file", passwordFile], {
         env: environment,
-        stdio: ["ignore", "ignore", "ignore"],
+        stdio: ["ignore", "ignore", "pipe"],
     });
+    ca.stderr.setEncoding("utf8");
+    ca.stderr.on("data", (chunk) => { caDiagnostics = `${caDiagnostics}${chunk}`.slice(-4096); });
     const rootPath = join(temporaryDirectory, "certs/root_ca.crt");
     const rootCertificate = readFileSync(rootPath);
     let response;
     for (let attempt = 0; attempt < 100; attempt++) {
-        assert.equal(ca.exitCode, null, "Fixture CA exited before readiness");
+        assert.equal(ca.exitCode, null, `Fixture CA exited before readiness: ${caDiagnostics}`);
         try { response = await request(port, rootCertificate, "/provisioners"); break; } catch { await delay(100); }
     }
-    assert.ok(response, "Fixture CA did not become ready");
+    assert.ok(response, `Fixture CA did not become ready: ${caDiagnostics}`);
+    // An empty list would satisfy every() vacuously; the disclosure check only
+    // means something once the fixture provisioner is actually listed.
+    assert.ok(Array.isArray(response.provisioners) && response.provisioners.length >= 1,
+        "Public provisioner endpoint listed no provisioners");
+    assert.ok(response.provisioners.some(({ name }) => name === "runtime-fixture"),
+        "Public provisioner endpoint did not list the fixture provisioner");
     assert.ok(response.provisioners.every(({ key }) => key && !Object.hasOwn(key, "d")), "Public provisioner endpoint exposed a private key");
     for (const hours of [1, 2, 3]) {
         const certificatePath = join(temporaryDirectory, `leaf-${hours}.crt`);

@@ -15,8 +15,9 @@ REPOSITORY_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIRECTORY/.." && pwd)
 TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/config-nginx-verifier.XXXXXX")
 export TEST_ROOT
 VERIFY=$TEST_ROOT/verify
-BASE_CAPABILITIES=00000000010004eb
-QUIC_CAPABILITIES=000000c0012014eb
+# The fixture's local @mount group, as systemd-analyze would report it. The
+# verifier expands the real group on the host, so this list is fixture data,
+# not a copy of a source constant.
 MOUNT_SYSCALLS='chroot fsconfig fsmount fsopen fspick mount mount_setattr move_mount open_tree pivot_root umount umount2'
 export MOUNT_SYSCALLS
 
@@ -26,6 +27,47 @@ trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 fail() { printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2; exit 1; }
+
+# The expected CapBnd values come from the unit files themselves, so the
+# verifier's constants are checked against the policy they claim to enforce
+# rather than against a second copy of the same hex.
+capability_bit() {
+    case "$1" in
+        CAP_CHOWN) printf 0 ;;
+        CAP_DAC_OVERRIDE) printf 1 ;;
+        CAP_FOWNER) printf 3 ;;
+        CAP_KILL) printf 5 ;;
+        CAP_SETGID) printf 6 ;;
+        CAP_SETUID) printf 7 ;;
+        CAP_NET_BIND_SERVICE) printf 10 ;;
+        CAP_NET_ADMIN) printf 12 ;;
+        CAP_SYS_ADMIN) printf 21 ;;
+        CAP_SYS_RESOURCE) printf 24 ;;
+        CAP_PERFMON) printf 38 ;;
+        CAP_BPF) printf 39 ;;
+        *) fail "capability without a known kernel bit in the unit files: $1" ;;
+    esac
+}
+capability_mask() {
+    capability_mask_value=0
+    for capability_unit in "$@"; do
+        for capability_name in $(sed -n 's/^CapabilityBoundingSet=//p' "$capability_unit"); do
+            capability_bit_value=$(capability_bit "$capability_name") || exit 1
+            capability_mask_value=$((capability_mask_value | (1 << capability_bit_value)))
+        done
+    done
+    printf '%016x\n' "$capability_mask_value"
+}
+BASE_CAPABILITIES=$(capability_mask "$REPOSITORY_ROOT/systemd/system/nginx.service")
+QUIC_CAPABILITIES=$(capability_mask "$REPOSITORY_ROOT/systemd/system/nginx.service" \
+    "$REPOSITORY_ROOT/nginx/templates/quic-bpf.service.conf")
+[ "$BASE_CAPABILITIES" != "$QUIC_CAPABILITIES" ] || fail 'the QUIC drop-in adds no capabilities'
+for constant_name in BASE_CAPABILITIES QUIC_CAPABILITIES; do
+    verifier_constant=$(sed -n "s/^$constant_name=//p" "$REPOSITORY_ROOT/nginx/verify-runtime")
+    eval "unit_constant=\$$constant_name"
+    [ "$verifier_constant" = "$unit_constant" ] \
+        || fail "nginx/verify-runtime $constant_name is $verifier_constant but the unit files require $unit_constant"
+done
 assert_contains() { grep -F -- "$2" "$1" >/dev/null || fail "missing expected text: $2"; }
 expect_failure() {
     expected_message=$1

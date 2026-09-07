@@ -31,9 +31,19 @@ assert_contains() {
     grep -F -- "$2" "$1" >/dev/null || fail "$1 is missing: $2"
 }
 
+# Every command the setup runs that changes host state, as the mocks log it.
+# Keep this list in step with apply_runtime: a mutation missing here would let
+# a preflight-ordering regression pass unnoticed. Component helpers are logged
+# as "helper PATH ARGS"; the renderer's --verify-host is the only read-only one.
+MUTATING_COMMAND_PATTERN='^(chgrp |install |restorecon |sysctl |systemctl (daemon-reload|restart|enable))'
+READ_ONLY_HELPER_PATTERN='/deploy/install-nginx --verify-host$'
+
 assert_no_mutation() {
-    if grep -E '^(chgrp |install |sysctl |systemctl (daemon-reload|restart|enable)|helper )' "$COMMAND_LOG" >/dev/null; then
-        fail 'preflight failure reached a mutating command'
+    if grep -E "$MUTATING_COMMAND_PATTERN" "$COMMAND_LOG" >/dev/null; then
+        fail "${1:-preflight failure reached a mutating command}"
+    fi
+    if grep -E '^helper ' "$COMMAND_LOG" | grep -v -E "$READ_ONLY_HELPER_PATTERN" | grep . >/dev/null; then
+        fail "${1:-preflight failure reached a mutating component helper}"
     fi
 }
 
@@ -320,9 +330,7 @@ assert_contains "$TEST_ROOT/stdout" 'Verified restarted nginx master PID 201'
 reset_fixture
 expect_failure 'pre-application validation' env NGINX_TEST_BAD_CONFIG=yes "$SETUP" \
     --workers 4 --threads-per-worker 32 --tasks-budget 512
-if grep -E '^(install |sysctl |systemctl (daemon-reload|restart|enable))' "$COMMAND_LOG" >/dev/null; then
-    fail 'invalid nginx configuration reached runtime mutation'
-fi
+assert_no_mutation 'invalid nginx configuration reached runtime mutation'
 
 reset_fixture
 expect_failure 'checked budget is 279' env NGINX_TEST_NEW_LIMIT=279 "$SETUP" \

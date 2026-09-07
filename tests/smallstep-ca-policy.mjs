@@ -33,26 +33,48 @@ const baseline = {
     },
 };
 
-/** Validate a fixture without printing input or secret material on failure. */
-function validateFixture(fixture, expectedSuccess, description) {
+const privateJwk = { ...privateKey.export({ format: "jwk" }), ...keyMetadata };
+// Every schema or policy violation is reported by the shared jq gate with one
+// diagnostic; only the curve-membership check runs later, in OpenSSL.
+const POLICY_DIAGNOSTIC = "issuance policy requires public-only P-256 JWKs";
+const CURVE_DIAGNOSTIC = "provisioner public key is not a valid P-256 curve point";
+
+/**
+ * Run the validator on a fixture. `expectedDiagnostic` is null for an accepted
+ * fixture, otherwise text the rejection must carry. A validator that could not
+ * run, was killed, or exited with an unexpected status is a test error, never a
+ * passing negative case. Key material must not appear in any output.
+ */
+function validateFixture(fixture, expectedDiagnostic, description) {
     writeFileSync(fixturePath, JSON.stringify(fixture), { mode: 0o600 });
     const result = spawnSync(validator, ["--configuration-file", fixturePath], {
         encoding: "utf8",
         timeout: 10000,
     });
-    assert.equal(result.status === 0, expectedSuccess, `${description}: ${result.stderr}`);
-    assert.equal(result.signal, null, `${description}: validator timed out`);
+    assert.equal(result.error, undefined, `${description}: validator could not run: ${result.error}`);
+    assert.equal(result.signal, null, `${description}: validator was terminated by ${result.signal}`);
+    for (const secret of [privateJwk.d, publicJwk.x, publicJwk.y]) {
+        assert.ok(!result.stdout.includes(secret) && !result.stderr.includes(secret),
+            `${description}: validator output disclosed key material`);
+    }
+    if (expectedDiagnostic === null) {
+        assert.equal(result.status, 0, `${description}: ${result.stderr}`);
+        return;
+    }
+    assert.equal(result.status, 1, `${description}: expected a rejection, got status ${result.status}: ${result.stderr}`);
+    assert.ok(result.stderr.includes(expectedDiagnostic),
+        `${description}: rejected for an unexpected reason: ${result.stderr}`);
 }
 
-/** Apply a single mutation to an otherwise valid baseline. */
-function rejectMutation(description, mutate) {
+/** Apply a single mutation to an otherwise valid baseline and require the stated diagnostic. */
+function rejectMutation(description, mutate, expectedDiagnostic = POLICY_DIAGNOSTIC) {
     const fixture = structuredClone(baseline);
     mutate(fixture.authority.provisioners[0], fixture);
-    validateFixture(fixture, false, description);
+    validateFixture(fixture, expectedDiagnostic, description);
 }
 
 try {
-    validateFixture(baseline, true, "valid public P-256 key");
+    validateFixture(baseline, null, "valid public P-256 key");
     const narrowed = structuredClone(baseline);
     narrowed.authority.provisioners[0].claims = {
         minTLSCertDuration: "10m",
@@ -62,14 +84,14 @@ try {
         allowRenewalAfterExpiry: false,
         disableSmallstepExtensions: false,
     };
-    validateFixture(narrowed, true, "claims narrow the authority limits");
+    validateFixture(narrowed, null, "claims narrow the authority limits");
     rejectMutation("private signing scalar", (provisioner) => {
         provisioner.key = { ...privateKey.export({ format: "jwk" }), ...keyMetadata };
     });
     rejectMutation("off-curve public point", (provisioner) => {
         provisioner.key.x = Buffer.alloc(32).toString("base64url");
         provisioner.key.y = Buffer.alloc(32).toString("base64url");
-    });
+    }, CURVE_DIAGNOSTIC);
     rejectMutation("noncanonical coordinate encoding", (provisioner) => {
         provisioner.key.x = `${provisioner.key.x.slice(0, -1)}B`;
     });
@@ -108,10 +130,13 @@ try {
         encoding: "utf8",
         timeout: 10000,
     });
+    assert.equal(separate.error, undefined, `separate policy inputs: validator could not run: ${separate.error}`);
     assert.equal(separate.status, 0, separate.stderr);
     writeFileSync(fixturePath, `${JSON.stringify(baseline)}\n${JSON.stringify(baseline)}\n`, { mode: 0o600 });
     const multiple = spawnSync(validator, ["--configuration-file", fixturePath], { encoding: "utf8", timeout: 10000 });
-    assert.notEqual(multiple.status, 0, "multiple JSON configuration values must be rejected");
+    assert.equal(multiple.error, undefined, `multiple values: validator could not run: ${multiple.error}`);
+    assert.equal(multiple.status, 1, "multiple JSON configuration values must be rejected");
+    assert.ok(multiple.stderr.includes("cannot parse the CA issuance policy"), multiple.stderr);
     for (const entryPoint of ["setup", "verify"]) {
         assert.match(readFileSync(join(repository, "smallstep-ca", entryPoint), "utf8"), /"\$POLICY_VALIDATOR"/u);
     }

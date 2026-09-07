@@ -217,13 +217,31 @@ class RepositoryAuditTests(unittest.TestCase):
             self.assertNotIn("fixture-client.invalid", str(raised.exception))
 
     def test_pdf_reader_failure_does_not_silently_pass(self) -> None:
-        """PDF content requires successful text and metadata readers."""
+        """PDF content requires both readers to run and succeed, through the real process boundary."""
 
-        with mock.patch.object(SCANNER, "run_checked", side_effect=[b"text", b"metadata"]):
-            self.assertEqual(SCANNER.content_text(b"%PDF-fixture"), "textmetadata")
-        with mock.patch.object(SCANNER, "run_checked", side_effect=ValueError("reader failed")):
-            with self.assertRaisesRegex(ValueError, "reader failed"):
-                SCANNER.content_text(b"%PDF-fixture")
+        with tempfile.TemporaryDirectory() as directory:
+            stubs = Path(directory)
+            for reader, output in (("pdftotext", "text"), ("pdfinfo", "metadata")):
+                stub = stubs / reader
+                stub.write_text(
+                    "#!/usr/bin/env sh\n"
+                    f"[ \"${{FIXTURE_READER_FAILS:-}}\" != {reader} ] || exit 1\n"
+                    f"printf '%s' {output}\n"
+                )
+                stub.chmod(0o700)
+            search_path = f"{stubs}{os.pathsep}{os.environ.get('PATH', os.defpath)}"
+            with mock.patch.dict(os.environ, {"PATH": search_path}):
+                self.assertEqual(SCANNER.content_text(b"%PDF-fixture"), "textmetadata")
+                self.assertEqual(SCANNER.content_text(b"plain fixture"), "plain fixture")
+                for failing_reader in ("pdftotext", "pdfinfo"):
+                    with self.subTest(reader=failing_reader), mock.patch.dict(
+                        os.environ, {"FIXTURE_READER_FAILS": failing_reader}
+                    ), self.assertRaisesRegex(ValueError, "reader failed"):
+                        SCANNER.content_text(b"%PDF-fixture")
+            # A reader that is not installed at all must be a failure, not a skip.
+            with mock.patch.dict(os.environ, {"PATH": str(stubs / "missing")}):
+                with self.assertRaisesRegex(ValueError, "could not execute a required reader"):
+                    SCANNER.content_text(b"%PDF-fixture")
 
 
 if __name__ == "__main__":

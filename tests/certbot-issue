@@ -96,6 +96,10 @@ assert_not_contains "$TEST_ROOT/production.plan" '--domain example.com --dry-run
 # Exercise the real command construction and issuance sequence with a recording
 # Certbot boundary. Only host validation and the HTTP-01 probe are stubbed out;
 # no certificate authority, system service, or production directory is touched.
+# The function definitions end where argument parsing begins; the marker must
+# be unique or the slice silently drops or keeps the wrong code.
+[ "$(grep -c -x 'while \[ "\$#" -gt 0 \]; do' "$ISSUER")" -eq 1 ] \
+    || fail 'cannot isolate the issuer function definitions: parse-loop marker is not unique'
 sed '/^while \[ "\$#" -gt 0 \]; do/,$d' "$ISSUER" > "$TEST_ROOT/issuer-functions"
 cat > "$TEST_ROOT/record-certbot" <<'EOF'
 #!/usr/bin/env sh

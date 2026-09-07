@@ -131,7 +131,7 @@ class CanonicalBoundaryTests(unittest.TestCase):
         """A configured synthetic identifier is rejected without disclosing it."""
 
         blocks = RENDERER.parse_markdown(minimal_standard(SYNTHETIC_IDENTIFIER))
-        with self.assertRaises(ValueError) as raised:
+        with self.assertRaisesRegex(ValueError, "client identifiers") as raised:
             RENDERER.validate_blocks(blocks)
         self.assertNotIn(SYNTHETIC_IDENTIFIER, str(raised.exception))
         self.assertNotIn(SYNTHETIC_PATTERN, str(raised.exception))
@@ -141,7 +141,7 @@ class CanonicalBoundaryTests(unittest.TestCase):
 
         table = f"| Name | Value |\n| --- | --- |\n| Endpoint | {SYNTHETIC_IDENTIFIER} |\n"
         blocks = RENDERER.parse_markdown(minimal_standard(table))
-        with self.assertRaises(ValueError) as raised:
+        with self.assertRaisesRegex(ValueError, "client identifiers") as raised:
             RENDERER.validate_blocks(blocks)
         self.assertNotIn(SYNTHETIC_IDENTIFIER, str(raised.exception))
 
