@@ -96,6 +96,50 @@ reopening after USR1, continued writes to the current log only, missing-file
 recreation at `0640`, and mask retention across HUP. The container does not run
 the full systemd sandbox or enforcing SELinux.
 
+## Compression on privileged locations
+
+Review HTTP response compression per application and privileged `location`
+(account, administration, authenticated API, and token-bearing form routes).
+A scanner detecting compression alone does not establish an exploitable
+[BREACH vulnerability](https://www.breachattack.com/): the response must combine
+attacker-controlled reflected input with a secret in the same compressed body,
+and the attacker must be able to induce repeated victim requests and observe
+response-size differences. Review public forms too when they contain secrets.
+
+For each relevant location:
+
+- Inspect actual response bodies, including validation and error responses,
+  for reflected input alongside CSRF tokens or other secrets. Choose a verified
+  application mitigation, such as framework-supported CSRF token masking, or
+  disable response compression there. Token masking protects that token; assess
+  other secrets in the response separately. Keep compression on public pages
+  and static assets that do not expose this combination.
+- Apply the decision in the existing location that ultimately serves the
+  response, accounting for regex locations, `try_files`, and internal redirects
+  to a front controller. Preserve its access controls and proxy/FastCGI routing;
+  adding an otherwise empty privileged-path location can change request handling.
+- To disable nginx compression there, set `gzip off;` and, when the `gzip`
+  profile is selected, `gzip_static off;` to disable its precompressed-file
+  serving too. With the `brotli` profile loaded, also set `brotli off;` and
+  `brotli_static off;`; do not add Brotli directives on hosts without those
+  modules. Removing HTML from
+  [`gzip_types`](https://nginx.org/en/docs/http/ngx_http_gzip_module.html#gzip_types)
+  cannot exclude it while gzip is enabled. See the separate
+  [gzip static](https://nginx.org/en/docs/http/ngx_http_gzip_static_module.html)
+  and [Brotli](https://github.com/google/ngx_brotli#configuration-directives)
+  controls.
+- Check application/upstream and CDN compression as well. After `nginx -t`,
+  verify representative authenticated responses through the public endpoint
+  while advertising supported encodings; when disabling compression, confirm
+  the delivered response has no compressed `Content-Encoding`. Use real body
+  responses rather than HEAD alone. Record the route-specific decision and
+  validation in private deployment documentation, and revisit it when templates,
+  tokens, routing, or compression layers change.
+
+This review concerns HTTP response bodies. TLS
+[`ssl_certificate_compression`](https://nginx.org/en/docs/http/ngx_http_ssl_module.html#ssl_certificate_compression)
+compresses handshake certificates and is a separate feature.
+
 ## Host runtime setup
 
 After a reviewed render has been assembled at `/etc/nginx` and the exact live
