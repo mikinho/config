@@ -172,7 +172,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image: ["rockylinux:9", "rockylinux:10"]
+        # RESF publishes maintained images here; Docker's legacy library image
+        # stopped receiving updates and has no Rocky Linux 10 tag.
+        image: ["rockylinux/rockylinux:9", "rockylinux/rockylinux:10"]
 
     steps:
       - name: Check out repository
@@ -204,7 +206,7 @@ jobs:
       matrix:
         platform:
           - name: Rocky Linux 9
-            image: rockylinux:9
+            image: rockylinux/rockylinux:9
           - name: CentOS Stream 9
             image: quay.io/centos/centos:stream9
 
@@ -471,14 +473,17 @@ jobs:
 
       - name: Test nginx configuration and Node Unix-socket runtime
         run: |
+          # Only the fixture controller inspects cross-UID worker descriptors;
+          # tests/nginx-runtime drops this capability before launching nginx.
           docker run --rm \
+            --cap-add SYS_PTRACE \
             --env EXPECTED_NGINX_VERSION="${{ matrix.version }}" \
             --env NGINX_REPOSITORY="${{ matrix.repository }}" \
             --volume "$PWD:/workspace:ro" \
             --volume "$PWD/build/ci-safe:/profile-safe:ro" \
             --volume "$PWD/build/ci-cache:/profile-cache:ro" \
             --volume "$PWD/build/ci-safe/quic_host.key:/etc/nginx/quic_host.key:ro" \
-            rockylinux:9 \
+            rockylinux/rockylinux:9 \
             /bin/bash -euxo pipefail -c '
               printf "%s\n" \
                 "[nginx]" \
@@ -587,7 +592,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - image: rockylinux:9
+          - image: rockylinux/rockylinux:9
             target: Rocky Linux 9
           - image: quay.io/centos/centos:stream10
             target: CentOS Stream 10
@@ -862,7 +867,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - image: rockylinux:9
+          - image: rockylinux/rockylinux:9
             target: Rocky Linux 9
           - image: quay.io/centos/centos:stream10
             target: CentOS Stream 10
@@ -971,7 +976,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - image: rockylinux:9
+          - image: rockylinux/rockylinux:9
             target: Rocky Linux 9
           - image: quay.io/centos/centos:stream10
             target: CentOS Stream 10
@@ -1021,7 +1026,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - image: rockylinux:9
+          - image: rockylinux/rockylinux:9
             target: Rocky Linux 9
           - image: quay.io/centos/centos:stream10
             target: CentOS Stream 10
@@ -1068,7 +1073,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - image: rockylinux:9
+          - image: rockylinux/rockylinux:9
             target: Rocky Linux 9
           - image: quay.io/centos/centos:stream10
             target: CentOS Stream 10
@@ -1124,7 +1129,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - image: rockylinux:9
+          - image: rockylinux/rockylinux:9
             target: Rocky Linux 9
           - image: quay.io/centos/centos:stream10
             target: CentOS Stream 10

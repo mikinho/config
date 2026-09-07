@@ -18,6 +18,9 @@ TEST_DIRECTORY=
 UNIT_NAME=
 UNIT_PATH=
 UNIT_INSTALLED=no
+DRAIN_CLIENT_PID=
+DRAIN_MASTER_PID=
+DRAIN_OLD_WORKERS=
 
 usage() {
     cat <<EOF
@@ -35,6 +38,7 @@ EOF
 fail() { printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2; exit 1; }
 
 cleanup() {
+    stop_drain_client
     if [ "$UNIT_INSTALLED" = yes ]; then
         systemctl stop "$UNIT_NAME" >/dev/null 2>&1 || :
         systemctl clean --what=runtime,state,logs "$UNIT_NAME" >/dev/null 2>&1 || :
@@ -63,6 +67,78 @@ journal_snapshot() {
 
 need_daemon_reload() {
     systemctl show "$UNIT_NAME" --property=NeedDaemonReload --value 2>/dev/null
+}
+
+stop_drain_client() {
+    if [ -n "$DRAIN_CLIENT_PID" ]; then
+        kill -TERM "$DRAIN_CLIENT_PID" 2>/dev/null || :
+        wait "$DRAIN_CLIENT_PID" 2>/dev/null || :
+        DRAIN_CLIENT_PID=
+    fi
+}
+
+start_drain_client() {
+    DRAIN_MASTER_PID=$(systemctl show "$UNIT_NAME" --property=MainPID --value)
+    DRAIN_OLD_WORKERS=$(cat "/proc/$DRAIN_MASTER_PID/task/$DRAIN_MASTER_PID/children")
+    [ -n "$DRAIN_OLD_WORKERS" ] || fail 'drain fixture has no original workers'
+    : > "$TEST_DIRECTORY/drain.body"
+    curl --fail --silent --show-error --no-buffer --connect-timeout 2 --max-time 20 \
+        --unix-socket "/run/$fixture_name/http.sock" \
+        --dump-header "$TEST_DIRECTORY/drain.headers" \
+        --output "$TEST_DIRECTORY/drain.body" http://localhost/slow.txt \
+        2> "$TEST_DIRECTORY/drain.stderr" &
+    DRAIN_CLIENT_PID=$!
+    drain_attempt=0
+    until [ -s "$TEST_DIRECTORY/drain.body" ]; do
+        kill -0 "$DRAIN_CLIENT_PID" 2>/dev/null || {
+            cat "$TEST_DIRECTORY/drain.stderr" >&2
+            fail 'slow drain request exited before receiving its response body'
+        }
+        drain_attempt=$((drain_attempt + 1))
+        [ "$drain_attempt" -lt 50 ] || fail 'slow drain response did not start'
+        sleep 0.1
+    done
+    assert_contains "$TEST_DIRECTORY/drain.headers" '200 OK'
+}
+
+read_drain_children() {
+    drain_children=$(cat "/proc/$DRAIN_MASTER_PID/task/$DRAIN_MASTER_PID/children") \
+        || fail 'drain fixture master exited unexpectedly'
+}
+
+old_generation_present() {
+    read_drain_children
+    for drain_worker in $DRAIN_OLD_WORKERS; do
+        case " $drain_children " in *" $drain_worker "*) return 0 ;; esac
+    done
+    return 1
+}
+
+wait_for_replacement_workers() {
+    drain_attempt=0
+    while :; do
+        read_drain_children
+        replacement_count=0
+        for drain_worker in $drain_children; do
+            case " $DRAIN_OLD_WORKERS " in *" $drain_worker "*) continue ;; esac
+            drain_title=$(tr '\000' ' ' < "/proc/$drain_worker/cmdline" | sed 's/ *$//')
+            [ "$drain_title" != 'nginx: worker process' ] \
+                || replacement_count=$((replacement_count + 1))
+        done
+        [ "$replacement_count" -eq 2 ] && return 0
+        drain_attempt=$((drain_attempt + 1))
+        [ "$drain_attempt" -lt 50 ] || fail 'reload did not create two replacement workers'
+        sleep 0.1
+    done
+}
+
+wait_for_old_generation_exit() {
+    drain_attempt=0
+    while old_generation_present; do
+        drain_attempt=$((drain_attempt + 1))
+        [ "$drain_attempt" -lt 50 ] || fail 'superseded workers did not finish draining'
+        sleep 0.1
+    done
 }
 
 expect_wrong_worker_count() {
@@ -129,6 +205,7 @@ sed \
 chmod 0755 "$TEST_DIRECTORY/verify"
 sed \
     -e 's|/usr/sbin/%p|/usr/sbin/nginx|g' \
+    -e "s|/usr/sbin/nginx |/usr/sbin/nginx -e /var/log/$fixture_name/bootstrap.log |g" \
     -e "s|%E/%p/%p.conf|$TEST_DIRECTORY/nginx.conf|g" \
     -e "s|/usr/local/libexec/nginx-runtime-verify|$TEST_DIRECTORY/verify|g" \
     -e "s|%p|$fixture_name|g" \
@@ -137,17 +214,31 @@ sed \
 cat > "$TEST_DIRECTORY/nginx.conf" <<EOF
 user nginx nginx;
 worker_processes 2;
+# drain-timeout-fixture
 pid /run/$fixture_name/nginx.pid;
 error_log /var/log/$fixture_name/error.log warn;
 events { worker_connections 16; }
 http {
     access_log off;
+    # Override every package default: the fixture's StateDirectory is the
+    # writable state root under ProtectSystem=strict, not /var/lib/nginx.
+    client_body_temp_path /var/lib/$fixture_name/client_body;
+    proxy_temp_path /var/lib/$fixture_name/proxy;
+    fastcgi_temp_path /var/lib/$fixture_name/fastcgi;
+    uwsgi_temp_path /var/lib/$fixture_name/uwsgi;
+    scgi_temp_path /var/lib/$fixture_name/scgi;
     server {
         listen unix:/run/$fixture_name/http.sock;
+        location = /slow.txt {
+            root $TEST_DIRECTORY;
+            limit_rate 1024;
+        }
         location / { return 200 "fixture-ready\\n"; }
     }
 }
 EOF
+dd if=/dev/zero of="$TEST_DIRECTORY/slow.txt" bs=1024 count=64 2>/dev/null
+chmod 0644 "$TEST_DIRECTORY/slow.txt"
 install -m 0644 "$TEST_DIRECTORY/positive.service" "$UNIT_PATH"
 UNIT_INSTALLED=yes
 systemctl daemon-reload
@@ -163,6 +254,36 @@ curl --fail --silent --show-error --max-time 5 \
     --unix-socket "/run/$fixture_name/http.sock" http://localhost/ \
     > "$TEST_DIRECTORY/http.stdout"
 assert_contains "$TEST_DIRECTORY/http.stdout" 'fixture-ready'
+
+# The timeout belongs to each worker's configuration generation. Adding it
+# through HUP cannot impose a deadline on workers created without it.
+start_drain_client
+sed 's/^# drain-timeout-fixture$/worker_shutdown_timeout 2s;/' \
+    "$TEST_DIRECTORY/nginx.conf" > "$TEST_DIRECTORY/with-timeout.conf"
+assert_contains "$TEST_DIRECTORY/with-timeout.conf" 'worker_shutdown_timeout 2s;'
+mv "$TEST_DIRECTORY/with-timeout.conf" "$TEST_DIRECTORY/nginx.conf"
+systemctl reload "$UNIT_NAME"
+wait_for_replacement_workers
+sleep 3
+old_generation_present || fail 'adding the timeout retroactively bounded the original generation'
+kill -0 "$DRAIN_CLIENT_PID" 2>/dev/null || fail 'the pre-timeout request ended before its control observation'
+stop_drain_client
+wait_for_old_generation_exit
+
+# The replacement workers inherited 2s. A second reload must close their slow
+# response and retire that generation within the five-second polling budget.
+start_drain_client
+systemctl reload "$UNIT_NAME"
+wait_for_replacement_workers
+wait_for_old_generation_exit
+drain_client_status=0
+wait "$DRAIN_CLIENT_PID" || drain_client_status=$?
+DRAIN_CLIENT_PID=
+[ "$drain_client_status" -eq 18 ] \
+    || fail "the timed drain must truncate its slow response (curl 18), received $drain_client_status"
+[ "$(wc -c < "$TEST_DIRECTORY/drain.body")" -lt 65536 ] \
+    || fail 'the slow response finished instead of exercising the shutdown timeout'
+"$TEST_DIRECTORY/verify" --workers 2 --timeout-seconds 0
 
 # Editing the unit on disk without daemon-reload must not turn the next
 # restart into an outage: the loaded policy is what the new master received.
@@ -245,4 +366,4 @@ fi
 journal_snapshot "$TEST_DIRECTORY/mount-journal"
 assert_contains "$TEST_DIRECTORY/mount-journal" 'SystemCallFilter does not deny required mount syscalls:'
 
-printf 'Validated nginx startup, worker counts, stale-metadata start-gate tolerance, checker credentials, and mandatory mount denial despite retained QUIC capabilities and Seccomp=2.\n'
+printf 'Validated nginx startup, worker counts, drain-timeout adoption, stale-metadata start-gate tolerance, checker credentials, and mandatory mount denial despite retained QUIC capabilities and Seccomp=2.\n'

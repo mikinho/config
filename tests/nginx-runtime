@@ -107,7 +107,8 @@ NODE
 }
 
 start_node() {
-    node "$SCRIPT_DIRECTORY/fixtures/nginx-node-echo.mjs" "$NODE_SOCKET" \
+    setpriv --bounding-set=-sys_ptrace \
+        node "$SCRIPT_DIRECTORY/fixtures/nginx-node-echo.mjs" "$NODE_SOCKET" \
         >"$TEST_ROOT/node.log" 2>&1 &
     NODE_PID=$!
     retry_count=0
@@ -152,7 +153,10 @@ start_nginx() {
     # Container execution does not validate its systemd capability/seccomp set.
     (
         umask 0027
+        # Only the test controller needs cross-UID descriptor access. Remove
+        # that inspection capability from nginx before executing it.
         exec setpriv --reuid 0 --regid nginx --init-groups --no-new-privs \
+            --bounding-set=-sys_ptrace \
             /usr/sbin/nginx -p "$NGINX_PREFIX/" -c "$NGINX_CONFIGURATION" -g 'daemon off;'
     ) &
     NGINX_PID=$!
@@ -175,6 +179,13 @@ assert_process_masks() {
             [ "$inspected_pid" != "$NGINX_PID" ] && [ ! -e "/proc/$inspected_pid/status" ] \
                 || fail "nginx PID $inspected_pid lost Umask 0027"
         fi
+        if [ -e "/proc/$inspected_pid/status" ]; then
+            awk '$1 == "CapBnd:" {
+                found = 1
+                if (substr($2, length($2) - 4, 1) ~ /[89a-fA-F]/) exit 1
+            } END { if (!found) exit 1 }' "/proc/$inspected_pid/status" \
+                || fail "nginx PID $inspected_pid retained the controller's CAP_SYS_PTRACE"
+        fi
     done
 }
 
@@ -185,12 +196,25 @@ workers_reopened_log() {
         worker_title=$(tr '\000' ' ' 2>/dev/null < "/proc/$inspected_pid/cmdline" | sed 's/ *$//')
         [ "$worker_title" = 'nginx: worker process' ] || continue
         worker_reopened=no
+        readable_descriptors=0
         for worker_fd in /proc/"$inspected_pid"/fd/*; do
-            if [ "$(readlink "$worker_fd" 2>/dev/null)" = "$NODE_ACCESS_LOG" ]; then
+            [ -L "$worker_fd" ] || continue
+            if ! worker_target=$(readlink "$worker_fd" 2> "$TEST_ROOT/descriptor.stderr"); then
+                # An unrelated descriptor may close during enumeration. A
+                # link that still exists but cannot be read is an inspection
+                # failure, not evidence that nginx failed to reopen its log.
+                [ -L "$worker_fd" ] || continue
+                cat "$TEST_ROOT/descriptor.stderr" >&2
+                fail "cannot read worker PID $inspected_pid descriptor links; verify the test controller's proc access"
+            fi
+            readable_descriptors=$((readable_descriptors + 1))
+            if [ "$worker_target" = "$NODE_ACCESS_LOG" ]; then
                 worker_reopened=yes
                 break
             fi
         done
+        [ "$readable_descriptors" -gt 0 ] \
+            || fail "cannot enumerate worker PID $inspected_pid descriptors; verify the test controller's proc access"
         [ "$worker_reopened" = yes ] || return 1
         reopened_workers=$((reopened_workers + 1))
     done
@@ -224,6 +248,12 @@ case $NGINX_PREFIX in
     /tmp/nginx-safe | /tmp/nginx-cache) ;;
     *) fail 'runtime checks only operate on the disposable CI profile paths' ;;
 esac
+# /proc/PID/fd dereferences require ptrace access even when ordinary status
+# fields are readable. The isolated Docker job grants this to its controller;
+# start_nginx drops it from nginx. Dumpability or UID coincidence is not assumed.
+awk '$1 == "CapEff:" && substr($2, length($2) - 4, 1) ~ /[89a-fA-F]/ { found = 1 }
+    END { exit !found }' /proc/self/status \
+    || fail 'descriptor inspection requires CAP_SYS_PTRACE on the disposable test controller; run its Docker job with --cap-add SYS_PTRACE'
 
 install -d -m 0755 "$SAMPLE_ROOT"
 printf '%s\n' '<?php echo "application";' >"$SAMPLE_ROOT/index.php"
@@ -455,6 +485,8 @@ fi
 start_node
 start_nginx
 request_rotation_canary rotation_before
+workers_reopened_log \
+    || fail 'worker descriptor preflight could not find the current access log before rotation'
 for rotation_case in created recreated; do
     rotated_log=$NODE_ACCESS_LOG.$rotation_case
     mv "$NODE_ACCESS_LOG" "$rotated_log"
