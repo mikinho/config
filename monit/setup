@@ -80,13 +80,21 @@ validate_source() {
         || fail "repository dependency must be a regular file: $setup_source"
 }
 
+require_unspaced_path() {
+    # Fragment lists are newline-delimited and later word-split, so any
+    # whitespace, including an embedded newline, must be rejected as a whole
+    # string rather than line by line.
+    case "$2" in
+        *[[:space:]]*) fail "$1 must not contain whitespace: $2" ;;
+    esac
+}
+
 validate_fragment_source() {
     fragment_source=$1
+    # Validate the name before anything reads the file, so the content check
+    # only ever runs on a path that is already safe to list and copy.
     validate_source "$fragment_source"
-    monit_require_flat_fragment "$fragment_source"
-    if printf '%s' "$fragment_source" | grep '[[:space:]]' >/dev/null 2>&1; then
-        fail "fragment paths must not contain whitespace: $fragment_source"
-    fi
+    require_unspaced_path 'fragment paths' "$fragment_source"
     fragment_name=${fragment_source##*/}
     case "$fragment_name" in
         10-system.conf)
@@ -101,6 +109,7 @@ validate_fragment_source() {
     if printf '%s\n' "$FRAGMENT_NAMES" | grep -Fx "$fragment_name" >/dev/null 2>&1; then
         fail "duplicate fragment basename: $fragment_name"
     fi
+    monit_require_flat_fragment "$fragment_source"
     FRAGMENT_SOURCES=$(append_line "$FRAGMENT_SOURCES" "$fragment_source")
     FRAGMENT_NAMES=$(append_line "$FRAGMENT_NAMES" "$fragment_name")
 }
@@ -644,9 +653,7 @@ for fragment_source in $FRAGMENT_SOURCES; do
     # symlink. All source ancestors must be trusted too.
     canonical_fragment=$(readlink -f -- "$fragment_source") \
         || fail "cannot resolve adoption source: $fragment_source"
-    if printf '%s' "$canonical_fragment" | grep '[[:space:]]' >/dev/null 2>&1; then
-        fail "canonical fragment paths must not contain whitespace: $fragment_source"
-    fi
+    require_unspaced_path 'canonical fragment paths' "$canonical_fragment"
     monit_require_adoption_source "$canonical_fragment"
     source_parent=${canonical_fragment%/*}
     while [ -n "$source_parent" ]; do

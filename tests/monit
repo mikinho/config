@@ -299,6 +299,27 @@ expect_failure 'duplicate fragment basename' \
     --fragment "$TEST_ROOT/fragments-b/70-example.conf"
 expect_failure 'fragment name is reserved' \
     "$SETUP" --plan --fragment "$MONIT_DIRECTORY/conf.d/10-system.conf"
+
+# Whitespace anywhere in a fragment path is rejected as a whole string before
+# the newline-delimited list is word-split. A newline inside a directory
+# component is the case a line-oriented check lets through.
+newline_directory="$TEST_ROOT/frag$(printf '\nments')"
+install -d "$newline_directory"
+cp "$TEST_ROOT/fragments-a/70-example.conf" "$newline_directory/70-example.conf"
+expect_failure 'fragment paths must not contain whitespace' \
+    "$SETUP" --plan --fragment "$newline_directory/70-example.conf"
+
+# The include scan must read the fragment itself, never standard input: awk
+# treats a relative operand shaped like NAME=value as a variable assignment.
+install -d "$TEST_ROOT/dir=evil"
+printf '%s\n' 'include /etc/monit.d/*.conf' > "$TEST_ROOT/dir=evil/70-nested.conf"
+expect_failure 'nested include directives are unsupported' \
+    sh -c "cd '$TEST_ROOT' && exec '$SETUP' --plan --fragment 'dir=evil/70-nested.conf' </dev/null"
+
+# Name validation runs before any content is inspected.
+printf '%s\n' 'include /etc/monit.d/*.conf' > "$TEST_ROOT/fragments-a/70-example.conf.conf"
+expect_failure 'invalid fragment basename' \
+    "$SETUP" --plan --fragment "$TEST_ROOT/fragments-a/70-example.conf.conf"
 expect_failure 'output path already exists' \
     "$SETUP" --output "$TEST_ROOT/rendered"
 expect_failure '--replace-main is not valid with --output' \

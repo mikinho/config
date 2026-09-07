@@ -57,8 +57,12 @@ monit_require_adoption_source() {
 # outside quoted strings/comments, including mixed-case and inline directives.
 # Flattening keeps the complete effective tree enumerable without implementing
 # a second Monit glob/parser or following deployment-controlled external paths.
+# The file reaches awk through a redirection, never as an operand: awk reads a
+# relative operand shaped like NAME=value as a variable assignment and then
+# waits on standard input, which would inspect nothing.
 monit_require_flat_fragment() {
     monit_flat_path=$1
+    [ -r "$monit_flat_path" ] || fail "cannot read Monit fragment: $monit_flat_path"
     if awk '
         function finish_token() {
             if (tolower(token) == "include") found = 1
@@ -87,7 +91,7 @@ monit_require_flat_fragment() {
             escaped = 0
         }
         END { exit found ? 1 : 0 }
-    ' "$monit_flat_path"
+    ' < "$monit_flat_path"
     then
         return 0
     fi
