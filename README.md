@@ -55,6 +55,14 @@ policy does not replace the optional `post-quantum` profile's functional
 OpenSSL 3.5.1 floor: when that profile is selected, the TLS provider used by
 nginx must expose `X25519MLKEM768` or `nginx -t` will fail.
 
+The shared TLS stub enables server certificate compression for supporting
+TLS 1.3 clients. With OpenSSL, this requires version 3.2 or newer and enabled
+certificate-compression algorithms; nginx's HTTP Brotli modules do not supply
+TLS compression support. Unsupported builds warn and ignore the directive,
+so review `nginx -t` output and verify a compressed handshake on the target
+host before recording the feature as active. See nginx's
+[`ssl_certificate_compression` documentation](https://nginx.org/en/docs/http/ngx_http_ssl_module.html#ssl_certificate_compression).
+
 NGINX Plus is not required. The configuration works with an appropriately
 built nginx Open Source binary and does not rely on Plus-only directives.
 
