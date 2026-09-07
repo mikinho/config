@@ -201,10 +201,58 @@ resolve_user_config() {
     USER_CERTBOT_CONFIG=$certbot_user_directory/letsencrypt/cli.ini
 }
 
+path_identity() {
+    # Owner UID and permission bits of the path itself, never of a link target.
+    # GNU stat serves the target hosts; the BSD form keeps local tests honest.
+    stat -c '%u:%a' "$1" 2>/dev/null || stat -f '%u:%Lp' "$1" 2>/dev/null
+}
+
+require_trusted_path() {
+    trusted_path=$1
+    trusted_kind=$2
+    trusted_identity=$(path_identity "$trusted_path") \
+        || fail "cannot inspect inherited Certbot configuration $trusted_kind: $trusted_path"
+    trusted_owner=${trusted_identity%%:*}
+    trusted_mode=${trusted_identity#*:}
+    case "$trusted_mode" in
+        [0-7][0-7][0-7] | [0-7][0-7][0-7][0-7]) ;;
+        *) fail "cannot interpret inherited Certbot configuration $trusted_kind mode: $trusted_path" ;;
+    esac
+    [ "$trusted_owner" = 0 ] \
+        || fail "inherited Certbot configuration $trusted_kind must be owned by root: $trusted_path"
+    [ "$((0$trusted_mode & 0022))" -eq 0 ] \
+        || fail "inherited Certbot configuration $trusted_kind must not be writable by group or other: $trusted_path"
+}
+
+require_trusted_configuration_source() {
+    inherited_source=$1
+    if [ ! -e "$inherited_source" ] && [ ! -L "$inherited_source" ]; then
+        return
+    fi
+    # Certbot runs here as root and executes any pre-, post-, or deploy-hook a
+    # default file names, so only a file no other account can write or replace
+    # is a trusted default. That includes every directory above it: a writable
+    # ancestor lets its owner swap the file between this check and Certbot's
+    # read, whatever the file's own ownership says.
+    [ -f "$inherited_source" ] && [ ! -L "$inherited_source" ] \
+        || fail "inherited Certbot configuration must be a regular file, not a symbolic link: $inherited_source"
+    require_trusted_path "$inherited_source" file
+    inherited_parent=${inherited_source%/*}
+    while [ -n "$inherited_parent" ]; do
+        [ -d "$inherited_parent" ] && [ ! -L "$inherited_parent" ] \
+            || fail "inherited Certbot configuration ancestor must be a real directory: $inherited_parent"
+        require_trusted_path "$inherited_parent" directory
+        inherited_parent=${inherited_parent%/*}
+    done
+}
+
 validate_inherited_config() {
     resolve_user_config
-    validate_inherited_config_file "$SYSTEM_CERTBOT_CONFIG"
-    validate_inherited_config_file "$USER_CERTBOT_CONFIG"
+    # Establish who controls each default file before reading its content.
+    for inherited_config_path in "$SYSTEM_CERTBOT_CONFIG" "$USER_CERTBOT_CONFIG"; do
+        require_trusted_configuration_source "$inherited_config_path"
+        validate_inherited_config_file "$inherited_config_path"
+    done
 }
 
 run_certbot() {
@@ -327,6 +375,7 @@ verify_local_webroot() {
 print_plan() {
     printf 'Certbot first-lineage plan: environment=%s, backend=%s, primary=%s\n' \
         "$ENVIRONMENT" "$BACKEND" "$PRIMARY_DOMAIN"
+    printf '+ require root-owned, non-writable system and user cli.ini defaults with root-controlled ancestors\n'
     printf '+ reject staging, test-cert, and dry-run directives in system and user cli.ini defaults before Certbot runs\n'
     printf '+ verify active nginx serves %s/.well-known/acme-challenge/ through %s for every requested name\n' \
         "$ACME_WEBROOT" "$HTTP_PROBE_ADDRESS"

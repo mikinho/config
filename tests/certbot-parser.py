@@ -282,7 +282,8 @@ class CertbotParserTests(unittest.TestCase):
                     [
                         "sh",
                         "-c",
-                        '. "$1"; SYSTEM_CERTBOT_CONFIG=$2; validate_inherited_config',
+                        '. "$1"; require_trusted_configuration_source() { :; }; '
+                        "SYSTEM_CERTBOT_CONFIG=$2; validate_inherited_config",
                         "certbot-parser-test",
                         str(self.functions),
                         str(self.system_config),

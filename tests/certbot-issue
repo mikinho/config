@@ -146,6 +146,7 @@ for selected_environment in staging production; do
             SYSTEM_CERTBOT_CONFIG=$1/cli.ini
             USER_CERTBOT_CONFIG=$1/user-cli.ini
             resolve_user_config() { :; }
+            require_trusted_configuration_source() { :; }
             validate_selection
             validate_live_host() { :; }
             verify_local_webroot() { :; }
@@ -207,6 +208,62 @@ if [ "$(id -u)" -ne 0 ]; then
     chmod 0600 "$TEST_ROOT/unreadable.ini"
 fi
 
+# Certbot runs as root and executes hooks named in cli.ini, so a default file is
+# trusted only when root owns it and every directory above it, and none of them
+# is writable by group or other. Identities come from a mock so the check is
+# exercised regardless of who runs the tests or where TMPDIR lives.
+mkdir -p "$TEST_ROOT/trusted/letsencrypt"
+printf 'server = https://acme.example.invalid/directory\n' > "$TEST_ROOT/trusted/letsencrypt/cli.ini"
+ln -s "$TEST_ROOT/trusted/letsencrypt/cli.ini" "$TEST_ROOT/trusted/letsencrypt/link.ini"
+trust_check='
+    . "$1/issuer-functions"
+    TRUST_ROOT=$1
+    path_identity() {
+        case "$1" in
+            "$TRUST_ROOT/trusted/letsencrypt/cli.ini") printf "%s\n" "$FILE_IDENTITY" ;;
+            "$TRUST_ROOT/trusted/letsencrypt") printf "%s\n" "$DIRECTORY_IDENTITY" ;;
+            "$TRUST_ROOT/trusted") printf "%s\n" "$PARENT_IDENTITY" ;;
+            *) printf "0:755\n" ;;
+        esac
+    }
+    require_trusted_configuration_source "$1/$2"'
+run_trust_check() {
+    env FILE_IDENTITY="$1" DIRECTORY_IDENTITY="$2" PARENT_IDENTITY="$3" \
+        sh -c "$trust_check" config-test "$TEST_ROOT" "$4"
+}
+run_trust_check 0:600 0:700 0:755 trusted/letsencrypt/cli.ini
+run_trust_check 0:644 0:755 0:1755 trusted/letsencrypt/cli.ini
+run_trust_check 1000:666 1000:777 1000:1777 absent/cli.ini
+expect_failure 'configuration file must be owned by root' \
+    run_trust_check 1000:600 0:700 0:755 trusted/letsencrypt/cli.ini
+for writable_mode in 620 602 666; do
+    expect_failure 'configuration file must not be writable by group or other' \
+        run_trust_check "0:$writable_mode" 0:700 0:755 trusted/letsencrypt/cli.ini
+done
+expect_failure 'configuration directory must be owned by root' \
+    run_trust_check 0:600 1000:700 0:755 trusted/letsencrypt/cli.ini
+expect_failure 'configuration directory must not be writable by group or other' \
+    run_trust_check 0:600 0:770 0:755 trusted/letsencrypt/cli.ini
+# A sticky world-writable ancestor such as /tmp is still writable by other.
+expect_failure 'configuration directory must not be writable by group or other' \
+    run_trust_check 0:600 0:700 0:1777 trusted/letsencrypt/cli.ini
+expect_failure 'cannot interpret inherited Certbot configuration file mode' \
+    run_trust_check 0:rw-r--r-- 0:700 0:755 trusted/letsencrypt/cli.ini
+expect_failure 'must be a regular file, not a symbolic link' \
+    run_trust_check 0:600 0:700 0:755 trusted/letsencrypt/link.ini
+# Ownership is established before any content is parsed.
+printf 'staging = true\n' > "$TEST_ROOT/trusted/letsencrypt/untrusted-staging.ini"
+expect_failure 'configuration file must be owned by root' \
+    sh -c '
+        . "$1/issuer-functions"
+        path_identity() { printf "1000:600\n"; }
+        SYSTEM_CERTBOT_CONFIG=$1/trusted/letsencrypt/untrusted-staging.ini
+        USER_CERTBOT_CONFIG=$1/absent-user.ini
+        resolve_user_config() { :; }
+        validate_inherited_config
+    ' config-test "$TEST_ROOT"
+assert_not_contains "$TEST_ROOT/command.stderr" 'remove staging, test-cert, and dry-run settings'
+
 for config_source in system user; do
     printf 'staging = true\n' > "$TEST_ROOT/$config_source-conflict.ini"
     expect_failure 'remove staging, test-cert, and dry-run settings' \
@@ -219,6 +276,7 @@ for config_source in system user; do
                 user) USER_CERTBOT_CONFIG=$1/user-conflict.ini ;;
             esac
             resolve_user_config() { :; }
+            require_trusted_configuration_source() { :; }
             CERTBOT_BINARY=$1/not-an-executable
             run_certbot certonly
         ' config-test "$TEST_ROOT" "$config_source"
