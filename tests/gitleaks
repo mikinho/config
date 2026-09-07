@@ -1,0 +1,155 @@
+#!/usr/bin/env sh
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
+set -eu
+set -f
+umask 077
+
+PROGRAM_NAME=${0##*/}
+SCRIPT_DIRECTORY=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+REPOSITORY_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIRECTORY/.." && pwd)
+CONFIGURATION=$REPOSITORY_ROOT/.gitleaks.toml
+GITLEAKS_BIN=${GITLEAKS_BIN:-gitleaks}
+
+fail() {
+    printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2
+    exit 1
+}
+
+for required_command in awk jq mktemp openssl; do
+    command -v "$required_command" >/dev/null 2>&1 || fail "required command not found: $required_command"
+done
+GITLEAKS_BIN=$(command -v "$GITLEAKS_BIN") || fail 'set GITLEAKS_BIN to an installed Gitleaks executable'
+case "$GITLEAKS_BIN" in
+    /*) ;;
+    *) GITLEAKS_BIN=$(CDPATH='' cd -- "$(dirname -- "$GITLEAKS_BIN")" && pwd)/${GITLEAKS_BIN##*/} ;;
+esac
+SCANNER_VERSION=$("$GITLEAKS_BIN" version)
+TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/config-gitleaks-tests.XXXXXX")
+CORPUS=$TEST_ROOT/corpus
+REPORT=$TEST_ROOT/report.json
+DEFAULT_CONFIGURATION=$TEST_ROOT/default.toml
+SCAN_STATUS=0
+
+cleanup() {
+    rm -rf -- "$TEST_ROOT"
+}
+
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+read_public_pin() {
+    awk -F= -v name="$2" '
+        $1 == name { gsub(/["\047]/, "", $2); print $2; count++ }
+        END { if (count != 1) exit 1 }
+    ' "$1" || fail "cannot read public pin $2"
+}
+
+# Use the canonical public pins without embedding secret-shaped assignments in
+# the test source. A changed upstream pin requires a fresh allowlist review.
+redis_pin=$(read_public_pin "$REPOSITORY_ROOT/redis/install" REDIS_KEY_FINGERPRINT)
+mongodb_pin=$(read_public_pin "$REPOSITORY_ROOT/mongodb/install" MONGODB_KEY_FINGERPRINT)
+rsync_pin=$(read_public_pin "$REPOSITORY_ROOT/packages/rsync/build-el9" 'readonly SIGNER_FINGERPRINT')
+rsync_digest=$(read_public_pin "$REPOSITORY_ROOT/packages/rsync/build-el9" 'readonly SIGNER_BLOB_SHA256')
+# This deterministic synthetic value is never a usable credential. Constructing
+# it at runtime avoids adding a deliberate secret-scan finding to the repository.
+synthetic_value=$(printf '%s' 'public config secret-scanner regression fixture' | openssl dgst -sha256 | awk '{print $NF}')
+printf '[extend]\nuseDefault = true\n' > "$DEFAULT_CONFIGURATION"
+
+write_public_fixtures() {
+    rm -rf -- "$CORPUS"
+    mkdir -p "$CORPUS/redis" "$CORPUS/mongodb" "$CORPUS/tests" "$CORPUS/packages/rsync"
+    printf 'REDIS_KEY_FINGERPRINT=%s\n' "$redis_pin" > "$CORPUS/redis/install"
+    cp "$CORPUS/redis/install" "$CORPUS/tests/redis-package-el9"
+    printf 'MONGODB_KEY_FINGERPRINT=%s\n' "$mongodb_pin" > "$CORPUS/mongodb/install"
+    printf 'readonly SIGNING_KEY_SHA256=%s\nreadonly SIGNING_KEY_FINGERPRINT=%s\n' \
+        "$rsync_digest" "$rsync_pin" > "$CORPUS/packages/rsync/build-el9"
+}
+
+scan_fixture() {
+    selected_configuration=$1
+    if (cd "$CORPUS" && "$GITLEAKS_BIN" dir . --config "$selected_configuration" \
+        --redact --no-banner --log-level error --exit-code 42 \
+        --report-format json --report-path "$REPORT") > "$TEST_ROOT/scan.log" 2>&1
+    then
+        SCAN_STATUS=0
+    else
+        SCAN_STATUS=$?
+    fi
+    case "$SCAN_STATUS" in
+        0 | 42) ;;
+        *) cat "$TEST_ROOT/scan.log" >&2; fail "scanner failed with status $SCAN_STATUS" ;;
+    esac
+}
+
+assert_finding() {
+    expected_path=$1
+    expected_rule=$2
+    [ "$SCAN_STATUS" -eq 42 ] || fail "$expected_rule fixture was suppressed in $expected_path"
+    jq -e --arg path "$expected_path" --arg rule "$expected_rule" \
+        'any(.[]; .File == $path and .RuleID == $rule)' "$REPORT" >/dev/null \
+        || fail "expected $expected_rule finding was absent from $expected_path"
+}
+
+write_public_fixtures
+scan_fixture "$CONFIGURATION"
+[ "$SCAN_STATUS" -eq 0 ] || fail 'reviewed public signing pins were not accepted'
+
+# An AND condition is essential: no reviewed path may suppress another token.
+for approved_path in redis/install mongodb/install packages/rsync/build-el9 tests/redis-package-el9; do
+    write_public_fixtures
+    printf 'API_TOKEN=%s\n' "$synthetic_value" >> "$CORPUS/$approved_path"
+    scan_fixture "$CONFIGURATION"
+    assert_finding "$approved_path" generic-api-key
+done
+
+# Exact public bytes do not exempt other assignment names, and a public pin
+# beside another token must not hide its sibling finding on the same line.
+write_public_fixtures
+printf 'API_TOKEN=%s\n' "$redis_pin" >> "$CORPUS/redis/install"
+scan_fixture "$CONFIGURATION"
+assert_finding redis/install generic-api-key
+printf 'REDIS_KEY_FINGERPRINT=%s; API_TOKEN=%s\n' "$redis_pin" "$synthetic_value" \
+    > "$CORPUS/redis/install"
+scan_fixture "$CONFIGURATION"
+assert_finding redis/install generic-api-key
+jq -e 'any(.[]; .File == "redis/install" and (.Match | contains("API_TOKEN=")))' \
+    "$REPORT" >/dev/null || fail 'a public pin hid a secret-shaped sibling on the same line'
+
+# Check exact value and path boundaries against the same version's defaults.
+# Newer built-in rules may already ignore fingerprint labels. The CI version
+# must detect these controls; neither version may lose a default finding.
+for boundary in value path; do
+    write_public_fixtures
+    if [ "$boundary" = value ]; then
+        printf 'REDIS_KEY_FINGERPRINT=%s\n' "$synthetic_value" > "$CORPUS/redis/install"
+    else
+        mkdir -p "$CORPUS/unreviewed"
+        cp "$CORPUS/redis/install" "$CORPUS/unreviewed/install"
+    fi
+    scan_fixture "$DEFAULT_CONFIGURATION"
+    baseline_status=$SCAN_STATUS
+    [ "$SCANNER_VERSION" != 8.24.3 ] || [ "$baseline_status" -eq 42 ] \
+        || fail "CI scanner did not detect the $boundary boundary control"
+    scan_fixture "$CONFIGURATION"
+    [ "$SCAN_STATUS" -eq "$baseline_status" ] \
+        || fail "allowlist changed default coverage at the $boundary boundary"
+done
+
+# Rule-specific exceptions must leave other built-in detectors active, even in
+# an approved file. This marker is a synthetic invalid key, not private data.
+write_public_fixtures
+{
+    printf '%s%s\n' '-----BEGIN OPENSSH ' 'PRIVATE KEY-----'
+    printf '%s\n' "$synthetic_value" "$synthetic_value"
+    printf '%s%s\n' '-----END OPENSSH ' 'PRIVATE KEY-----'
+} >> "$CORPUS/redis/install"
+scan_fixture "$CONFIGURATION"
+assert_finding redis/install private-key
+
+printf 'Validated narrow public-key exceptions and secret detection with Gitleaks %s.\n' "$SCANNER_VERSION"

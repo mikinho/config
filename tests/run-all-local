@@ -91,6 +91,7 @@ if command -v shellcheck >/dev/null 2>&1; then
         "$REPOSITORY_ROOT/tests/config-conventions" \
         "$REPOSITORY_ROOT/tests/deploy-renderers" \
         "$REPOSITORY_ROOT/tests/fail2ban-installer" \
+        "$REPOSITORY_ROOT/tests/gitleaks" \
         "$REPOSITORY_ROOT/tests/health-verifiers" \
         "$REPOSITORY_ROOT/tests/host-setup" \
         "$REPOSITORY_ROOT/tests/nginx-setup" \
@@ -132,6 +133,13 @@ step "Validating repository configuration conventions..."
 step "Validating private audit configuration and client-neutral tracked content..."
 PYTHONDONTWRITEBYTECODE=1 python3 "$REPOSITORY_ROOT/tests/private-identifiers.py"
 PYTHONDONTWRITEBYTECODE=1 python3 "$REPOSITORY_ROOT/tests/client-neutrality.py"
+
+step "Validating public signing-key secret-scan exceptions..."
+if [ -n "${GITLEAKS_BIN:-}" ] || command -v gitleaks >/dev/null 2>&1; then
+    "$REPOSITORY_ROOT/tests/gitleaks"
+else
+    printf 'Notice: gitleaks is unavailable; the dedicated CI secret-scan job runs this gate.\n'
+fi
 
 step "Validating gold application deployment profiles..."
 python3 "$REPOSITORY_ROOT/tests/application-deployment-standard.py"

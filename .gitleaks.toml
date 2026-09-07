@@ -1,0 +1,46 @@
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
+title = "Public configuration standards: reviewed upstream signing pins"
+
+[extend]
+useDefault = true
+
+# Keep all built-in detectors. These exceptions apply only to the generic API
+# key detector, an exact repository path, and an exact historical assignment.
+# Never replace AND with OR or extend these to arbitrary key names/hex values.
+[[rules]]
+id = "generic-api-key"
+
+# Verified against https://packages.redis.io/gpg on 2026-09-07.
+# Upstream: https://redis.io/docs/latest/operate/oss_and_stack/install/install-stack/apt/
+[[rules.allowlists]]
+description = "Redis public repository signing-key fingerprint"
+condition = "AND"
+regexTarget = "match"
+paths = ['''^(redis/install|tests/redis-package-el9)$''']
+regexes = ['''^REDIS_KEY_FINGERPRINT=54318FA4052D1E61A6B6F7BB5F4349D6BF53AA0C$''']
+
+# Verified against https://pgp.mongodb.com/server-8.0.asc on 2026-09-07.
+# Upstream: https://www.mongodb.com/docs/v8.0/tutorial/install-mongodb-enterprise-on-ubuntu/
+[[rules.allowlists]]
+description = "MongoDB 8.0 public release signing-key fingerprint"
+condition = "AND"
+regexTarget = "match"
+paths = ['''^mongodb/install$''']
+regexes = ['''^MONGODB_KEY_FINGERPRINT=4B0752C1BCA238C0B4EE14DC41DE058A4E7DCA05$''']
+
+# Both the public key's primary fingerprint and the SHA-256 of its downloaded
+# armored bytes were verified on 2026-09-07. Neither value is a private key.
+# Upstream: https://rsync.samba.org/download.html (The GPG Signing Key)
+# Key: https://keys.openpgp.org/vks/v1/by-fingerprint/9FEF112DCE19A0DC7E882CB81BB24997A8535F6F
+[[rules.allowlists]]
+description = "rsync public release signing-key fingerprint and file digest"
+condition = "AND"
+regexTarget = "match"
+paths = ['''^packages/rsync/build-el9$''']
+regexes = [
+  '''^SIGNING_KEY_FINGERPRINT=9FEF112DCE19A0DC7E882CB81BB24997A8535F6F$''',
+  '''^SIGNING_KEY_SHA256=4129e90b0b62e915a453f071641f363e8b07d888c763be00f83128fd63447a6f$''',
+]
