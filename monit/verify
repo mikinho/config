@@ -49,6 +49,7 @@ BACKUP_ROOT=$TRANSACTION_STORE/backups
 RETAINED_TRANSACTION_WARNING=5
 
 MODE=verify
+SETUP_TRANSACTION=
 
 usage() {
     cat <<EOF
@@ -216,6 +217,36 @@ verify_managed_files() {
         || fail "installed systemd policy differs from repository policy"
 }
 
+verify_setup_transaction() {
+    [ -n "$SETUP_TRANSACTION" ] || return 0
+    # This internal context is valid only for an immediate child of the setup
+    # process recorded in this exact root-only transaction, never an arbitrary
+    # retained record or a traversal/alias of one.
+    [ "${SETUP_TRANSACTION%/*}" = "$BACKUP_ROOT" ] \
+        || fail "setup transaction must be directly under $BACKUP_ROOT"
+    setup_transaction_name=${SETUP_TRANSACTION##*/}
+    case "$setup_transaction_name" in
+        transaction.*) setup_transaction_suffix=${setup_transaction_name#transaction.} ;;
+        *) fail "invalid setup transaction name" ;;
+    esac
+    case "$setup_transaction_suffix" in
+        '' | *[!A-Za-z0-9]*) fail "invalid setup transaction name" ;;
+    esac
+    [ "${#setup_transaction_suffix}" -eq 8 ] || fail "invalid setup transaction name"
+    require_directory_identity "$SETUP_TRANSACTION" root:root:700
+    require_regular_file_identity "$SETUP_TRANSACTION/status" root:root:600:1
+    require_regular_file_identity "$SETUP_TRANSACTION/setup-pid" root:root:600:1
+    [ "$(cat "$SETUP_TRANSACTION/status")" = applying ] \
+        || fail "setup transaction must still be applying"
+    setup_pid=$(cat "$SETUP_TRANSACTION/setup-pid")
+    case "$setup_pid" in
+        '' | *[!0-9]* | 0 | 1) fail "invalid setup transaction process identity" ;;
+    esac
+    setup_parent=$(ps -o ppid= -p "$$" | awk '{$1 = $1; print}')
+    [ "$setup_pid" = "$setup_parent" ] \
+        || fail "setup transaction does not belong to the verifier's live parent"
+}
+
 verify_transaction_evidence() {
     # Setup retains every transaction, including copies of /etc/monitrc and its
     # control credential, under a root-only store. The store must stay private,
@@ -223,22 +254,37 @@ verify_transaction_evidence() {
     # complete is unfinished recovery work that acceptance must not overlook.
     require_directory_identity "$TRANSACTION_STORE" root:root:700
     require_directory_identity "$BACKUP_ROOT" root:root:700
+    verify_setup_transaction
     retained_transactions=0
     unresolved_transactions=0
-    for transaction_directory in "$BACKUP_ROOT"/transaction.*; do
-        [ -e "$transaction_directory" ] || continue
+    setup_transaction_seen=no
+    # Globbing is disabled for this script. Read find's list without a pipeline
+    # so counts and the current transaction remain visible after the loop.
+    transaction_directories=$(find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 \
+        -name 'transaction.*' -print) || fail "cannot enumerate Monit transactions"
+    while IFS= read -r transaction_directory; do
+        [ -n "$transaction_directory" ] || continue
         require_directory_identity "$transaction_directory" root:root:700
-        retained_transactions=$((retained_transactions + 1))
         transaction_status=$(cat "$transaction_directory/status" 2>/dev/null) || transaction_status=missing
+        if [ "$transaction_directory" = "$SETUP_TRANSACTION" ]; then
+            [ "$transaction_status" = applying ] \
+                || fail "setup transaction must still be applying"
+            setup_transaction_seen=yes
+            continue
+        fi
         case "$transaction_status" in
-            committed | rolled-back) ;;
+            committed | rolled-back) retained_transactions=$((retained_transactions + 1)) ;;
             *)
                 unresolved_transactions=$((unresolved_transactions + 1))
                 printf '%s: unresolved Monit transaction (%s): %s\n' \
                     "$PROGRAM_NAME" "$transaction_status" "$transaction_directory" >&2
                 ;;
         esac
-    done
+    done <<EOF
+$transaction_directories
+EOF
+    [ -z "$SETUP_TRANSACTION" ] || [ "$setup_transaction_seen" = yes ] \
+        || fail "setup transaction disappeared during verification"
     [ "$unresolved_transactions" -eq 0 ] \
         || fail "$unresolved_transactions retained Monit transaction(s) are unresolved; complete recovery and record the retention decision before acceptance"
     [ "$retained_transactions" -le "$RETAINED_TRANSACTION_WARNING" ] \
@@ -343,8 +389,16 @@ while [ "$#" -gt 0 ]; do
     case "$1" in
         --check)
             [ "$MODE" = verify ] || fail "select exactly one mode"
+            [ -z "$SETUP_TRANSACTION" ] || fail "setup transaction requires an acceptance audit"
             MODE=check
             shift
+            ;;
+        --setup-transaction)
+            [ "$MODE" = verify ] || fail "setup transaction requires an acceptance audit"
+            [ -z "$SETUP_TRANSACTION" ] || fail "setup transaction may be supplied only once"
+            [ "$#" -ge 2 ] && [ -n "$2" ] || fail "--setup-transaction requires a directory"
+            SETUP_TRANSACTION=$2
+            shift 2
             ;;
         --help | -h)
             usage

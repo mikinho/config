@@ -106,7 +106,7 @@ validate_fragment_source() {
         *.conf) ;;
         *) fail "fragment basename must end in .conf: $fragment_name" ;;
     esac
-    if printf '%s\n' "$FRAGMENT_NAMES" | grep -Fx "$fragment_name" >/dev/null 2>&1; then
+    if printf '%s\n' "$FRAGMENT_NAMES" | grep -Fx -- "$fragment_name" >/dev/null 2>&1; then
         fail "duplicate fragment basename: $fragment_name"
     fi
     monit_require_flat_fragment "$fragment_source"
@@ -188,12 +188,12 @@ copy_existing_fragments() {
             # validated staged source; never load its untrusted live original.
             if [ "${live_fragment##*/}" = 10-system.conf ] \
                 || printf '%s\n' "$FRAGMENT_NAMES" \
-                    | grep -Fx "${live_fragment##*/}" >/dev/null 2>&1
+                    | grep -Fx -- "${live_fragment##*/}" >/dev/null 2>&1
             then
                 continue
             fi
             monit_require_private_fragment "$live_fragment"
-            install -m 0600 "$live_fragment" \
+            install -m 0600 -- "$live_fragment" \
                 "$staged_fragment_directory/${live_fragment##*/}"
         done
 }
@@ -202,7 +202,7 @@ copy_requested_fragments() {
     staged_fragment_directory=$1
     for fragment_source in $FRAGMENT_SOURCES; do
         fragment_name=${fragment_source##*/}
-        install -m 0600 "$fragment_source" \
+        install -m 0600 -- "$fragment_source" \
             "$staged_fragment_directory/$fragment_name"
     done
 }
@@ -426,6 +426,7 @@ restore_target() {
 rollback_transaction() {
     rollback_failed=no
     files_restored=yes
+    restored_unit_loaded=yes
     printf '%s: setup failed; restoring managed files and prior service state\n' \
         "$PROGRAM_NAME" >&2
     for rollback_target in $BACKED_UP_TARGETS; do
@@ -436,13 +437,11 @@ rollback_transaction() {
     done
     [ "$files_restored" = yes ] || rollback_failed=yes
     if ! systemctl daemon-reload; then
-        # The restored drop-in is on disk, but the manager still holds the
-        # transaction's unit properties until a reload succeeds. Report it
-        # without withdrawing monitoring: the configuration Monit reads is
-        # the original again, and stopping here would trade a reporting gap
-        # for an outage that the operator's daemon-reload does not need.
-        printf '%s: systemd daemon-reload failed; the restored unit drop-in is not loaded until it succeeds, then restart monit.service\n' \
+        # A failed reload cannot establish which unit properties the manager
+        # holds. Do not start or restart a daemon under that unresolved policy.
+        printf '%s: systemd daemon-reload failed; restored unit policy is unresolved; retry daemon-reload before starting or restarting monit.service\n' \
             "$PROGRAM_NAME" >&2
+        restored_unit_loaded=no
         rollback_failed=yes
     fi
     if [ "$files_restored" = no ]; then
@@ -457,6 +456,23 @@ rollback_transaction() {
         printf '%s: restored Monit configuration failed validation; service state left unchanged\n' \
             "$PROGRAM_NAME" >&2
         rollback_failed=yes
+    elif [ "$restored_unit_loaded" = no ]; then
+        if systemctl is-active --quiet monit.service; then
+            # Address the running main process directly: a cached ExecReload
+            # may belong to the failed transaction. HUP rereads Monit config
+            # without re-executing it under stale systemd execution policy.
+            if systemctl kill --kill-who=main --signal=SIGHUP monit.service; then
+                printf '%s: sent the active Monit process SIGHUP without restarting; restored execution policy still requires daemon-reload and a controlled restart\n' \
+                    "$PROGRAM_NAME" >&2
+            else
+                printf '%s: could not signal the active Monit process to reload its restored configuration\n' \
+                    "$PROGRAM_NAME" >&2
+                rollback_failed=yes
+            fi
+        else
+            printf '%s: Monit is inactive; automatic start deferred until restored unit policy is loaded\n' \
+                "$PROGRAM_NAME" >&2
+        fi
     elif [ "$SERVICE_RESTART_REQUIRED" = yes ]; then
         systemctl restart monit.service || rollback_failed=yes
     elif systemctl is-active --quiet monit.service; then
@@ -476,6 +492,16 @@ rollback_transaction() {
         return 1
     fi
     printf '%s\n' rolled-back > "$BACKUP_DIRECTORY/status"
+}
+
+verify_and_commit_transaction() {
+    # The verifier may exempt only this live setup's applying record. Record
+    # the parent identity in the private transaction; every other unfinished
+    # transaction remains an acceptance failure, including on standalone runs.
+    printf '%s\n' "$$" > "$BACKUP_DIRECTORY/setup-pid"
+    "$VERIFIER_SOURCE" --setup-transaction "$BACKUP_DIRECTORY" >/dev/null
+    printf '%s\n' committed > "$BACKUP_DIRECTORY/status"
+    TRANSACTION_COMMITTED=yes
 }
 
 cleanup() {
@@ -753,8 +779,5 @@ systemctl is-active --quiet monit.service \
     || fail "monit.service is not active after setup"
 wait_for_control_plane \
     || fail "Monit local control-plane health check failed"
-"$VERIFIER_SOURCE" >/dev/null
-
-printf '%s\n' committed > "$BACKUP_DIRECTORY/status"
-TRANSACTION_COMMITTED=yes
+verify_and_commit_transaction
 printf 'Applied and verified Monit baseline; monit.service is active and enabled.\n'

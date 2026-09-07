@@ -315,7 +315,7 @@ esac
 
 # Verification audits the transaction store: private identities, no unresolved
 # transactions, and a warning once completed ones accumulate.
-transaction_functions=$(extract_function warn "$VERIFIER"; extract_function verify_transaction_evidence "$VERIFIER")
+transaction_functions=$(extract_function warn "$VERIFIER"; extract_function verify_setup_transaction "$VERIFIER"; extract_function verify_transaction_evidence "$VERIFIER")
 evidence_store=$TEST_ROOT/evidence
 make_transaction() {
     install -d "$evidence_store/backups/transaction.$1"
@@ -323,8 +323,9 @@ make_transaction() {
 }
 run_evidence_check() {
     env TRANSACTION_STORE="$evidence_store" BACKUP_ROOT="$evidence_store/backups" \
-        RETAINED_TRANSACTION_WARNING=5 PROGRAM_NAME=monit-test \
-        sh -c "fail() { printf '%s\\n' \"\$*\" >&2; exit 1; }
+        RETAINED_TRANSACTION_WARNING=5 PROGRAM_NAME=monit-test SETUP_TRANSACTION='' \
+        sh -c "set -eu; set -f
+            fail() { printf '%s\\n' \"\$*\" >&2; exit 1; }
             require_directory_identity() { printf 'identity %s\\n' \"\$1\" >> '$TEST_ROOT/identity-checks'; }
             $transaction_functions
             verify_transaction_evidence"
@@ -356,6 +357,148 @@ make_transaction 00000006 committed
 run_evidence_check 2> "$TEST_ROOT/evidence.stderr"
 assert_contains "$TEST_ROOT/evidence.stderr" 'warning: 6 completed Monit transactions are retained'
 
+# Run the actual finalization and cleanup functions against a child verifier
+# using the production argument parser, evidence checks, and shell options.
+# Ownership and ACL enforcement require a Linux root fixture; these portable
+# identity stubs still check actual types, modes, and hardlink counts.
+transaction_verifier=$TEST_ROOT/transaction-verifier
+{
+    printf '%s\n' '#!/usr/bin/env sh' 'set -eu' 'set -f' \
+        'PROGRAM_NAME=monit-test' 'MODE=verify' 'SETUP_TRANSACTION=' \
+        'RETAINED_TRANSACTION_WARNING=5'
+    extract_function fail "$VERIFIER"
+    extract_function assert_mode "$0"
+    cat <<'EOF'
+require_directory_identity() {
+    [ -d "$1" ] && [ ! -L "$1" ] || fail "invalid transaction directory: $1"
+    assert_mode "$1" 700
+}
+require_regular_file_identity() {
+    [ -f "$1" ] && [ ! -L "$1" ] || fail "invalid transaction file: $1"
+    assert_mode "$1" 600
+    file_links=$(stat -c '%h' "$1" 2>/dev/null || stat -f '%l' "$1")
+    [ "$file_links" -eq 1 ] || fail "transaction file has aliases: $1"
+}
+# Sandboxed macOS may deny ps. The shell's real parent identity gives the same
+# fixture relationship without permitting a caller-provided expected PID.
+ps() {
+    [ "$*" = "-o ppid= -p $$" ] || fail "unexpected process query: $*"
+    printf '%s\n' "$PPID"
+}
+EOF
+    printf '%s\n' "$transaction_functions"
+    sed -n '/^while \[ "\$#" -gt 0 \]; do/,/^done$/p' "$VERIFIER"
+    cat <<'EOF'
+verify_transaction_evidence
+[ "${MONIT_TEST_FINAL_AUDIT_FAIL:-no}" = no ] || fail "later acceptance check failed"
+EOF
+} > "$transaction_verifier"
+chmod 0700 "$transaction_verifier"
+transaction_commit=$TEST_ROOT/transaction-commit
+{
+    printf '%s\n' '#!/usr/bin/env sh' 'set -eu' 'set -f' 'umask 077' \
+        'PROGRAM_NAME=monit-test' 'CHANGES_STARTED=yes' 'TRANSACTION_COMMITTED=no' \
+        'TEMPORARY_DIRECTORY=' 'PENDING_STAGE=' 'BACKED_UP_TARGETS=/test/target' \
+        'MONIT_MAIN=/test/monitrc' 'SERVICE_WAS_ENABLED=yes' 'SERVICE_WAS_ACTIVE=yes' \
+        'SERVICE_RESTART_REQUIRED=no'
+    extract_function rollback_transaction "$SETUP"
+    extract_function cleanup "$SETUP"
+    extract_function verify_and_commit_transaction "$SETUP"
+    cat <<'EOF'
+restore_target() { printf 'restored\n' >> "$MONIT_TEST_ROLLBACK_LOG"; }
+monit() { return 0; }
+systemctl() { printf '%s\n' "$*" >> "$MONIT_TEST_ROLLBACK_LOG"; }
+trap 'cleanup "$?"' EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+verify_and_commit_transaction
+EOF
+} > "$transaction_commit"
+reset_commit_fixture() {
+    rm -rf "$evidence_store"
+    install -d -m 0700 "$evidence_store" "$evidence_store/backups" \
+        "$evidence_store/backups/transaction.00000001"
+    printf '%s\n' applying > "$evidence_store/backups/transaction.00000001/status"
+    chmod 0600 "$evidence_store/backups/transaction.00000001/status"
+    : > "$TEST_ROOT/commit-rollback.log"
+}
+run_commit_fixture() {
+    env TRANSACTION_STORE="$evidence_store" BACKUP_ROOT="$evidence_store/backups" \
+        BACKUP_DIRECTORY="$evidence_store/backups/transaction.00000001" \
+        VERIFIER_SOURCE="$transaction_verifier" \
+        MONIT_TEST_ROLLBACK_LOG="$TEST_ROOT/commit-rollback.log" \
+        "$@" sh "$transaction_commit"
+}
+# Arguments are supplied indirectly through expect_failure below.
+# shellcheck disable=SC2120
+run_transaction_verifier() {
+    env TRANSACTION_STORE="$evidence_store" BACKUP_ROOT="$evidence_store/backups" \
+        "$transaction_verifier" "$@"
+}
+reset_commit_fixture
+if ! run_commit_fixture MONIT_TEST_FINAL_AUDIT_FAIL=no \
+    > "$TEST_ROOT/commit.stdout" 2> "$TEST_ROOT/commit.stderr"
+then
+    cat "$TEST_ROOT/commit.stderr" >&2
+    fail 'setup acceptance did not commit its own applying transaction'
+fi
+assert_contains "$evidence_store/backups/transaction.00000001/status" committed
+assert_mode "$evidence_store/backups/transaction.00000001/setup-pid" 600
+[ ! -s "$TEST_ROOT/commit-rollback.log" ] || fail 'successful acceptance rolled back setup'
+# Exercise standalone acceptance with no internal context.
+# shellcheck disable=SC2119
+run_transaction_verifier
+
+reset_commit_fixture
+make_transaction 00000002 applying
+chmod 0700 "$evidence_store/backups/transaction.00000002"
+chmod 0600 "$evidence_store/backups/transaction.00000002/status"
+expect_failure '1 retained Monit transaction(s) are unresolved' run_commit_fixture
+assert_contains "$evidence_store/backups/transaction.00000001/status" rolled-back
+assert_contains "$evidence_store/backups/transaction.00000002/status" applying
+assert_contains "$TEST_ROOT/commit-rollback.log" restored
+
+reset_commit_fixture
+expect_failure 'later acceptance check failed' run_commit_fixture MONIT_TEST_FINAL_AUDIT_FAIL=yes
+assert_contains "$evidence_store/backups/transaction.00000001/status" rolled-back
+assert_contains "$TEST_ROOT/commit-rollback.log" restored
+
+reset_commit_fixture
+current_transaction=$evidence_store/backups/transaction.00000001
+expect_failure '1 retained Monit transaction(s) are unresolved' run_transaction_verifier
+printf '%s\n' 2147483647 > "$current_transaction/setup-pid"
+chmod 0600 "$current_transaction/setup-pid"
+expect_failure "does not belong to the verifier's live parent" \
+    run_transaction_verifier --setup-transaction "$current_transaction"
+chmod 0644 "$current_transaction/setup-pid"
+expect_failure 'mode is 644, expected 600' \
+    run_transaction_verifier --setup-transaction "$current_transaction"
+chmod 0600 "$current_transaction/setup-pid"
+ln "$current_transaction/setup-pid" "$evidence_store/pid-alias"
+expect_failure 'transaction file has aliases' \
+    run_transaction_verifier --setup-transaction "$current_transaction"
+rm "$evidence_store/pid-alias"
+expect_failure 'setup transaction must be directly under' \
+    run_transaction_verifier --setup-transaction "$evidence_store/backups/../backups/transaction.00000001"
+ln -s "$current_transaction" "$evidence_store/backups/transaction.00000002"
+expect_failure 'invalid transaction directory' \
+    run_transaction_verifier --setup-transaction "$evidence_store/backups/transaction.00000002"
+rm "$evidence_store/backups/transaction.00000002"
+printf '%s\n' committed > "$current_transaction/status"
+expect_failure 'setup transaction must still be applying' \
+    run_transaction_verifier --setup-transaction "$current_transaction"
+for mode_order in before after; do
+    if [ "$mode_order" = before ]; then
+        set -- --check --setup-transaction "$current_transaction"
+    else
+        set -- --setup-transaction "$current_transaction" --check
+    fi
+    expect_failure 'setup transaction requires an acceptance audit' "$VERIFIER" "$@"
+done
+expect_failure 'setup transaction may be supplied only once' "$VERIFIER" \
+    --setup-transaction "$current_transaction" --setup-transaction "$current_transaction"
+
 install -d "$TEST_ROOT/fragments-a" "$TEST_ROOT/fragments-b"
 printf '%s\n' 'check process example with pidfile /run/example.pid' \
     > "$TEST_ROOT/fragments-a/70-example.conf"
@@ -372,6 +515,19 @@ expect_failure 'duplicate fragment basename' \
     "$SETUP" --plan \
     --fragment "$TEST_ROOT/fragments-a/70-example.conf" \
     --fragment "$TEST_ROOT/fragments-b/70-example.conf"
+cp "$TEST_ROOT/fragments-a/70-example.conf" "$TEST_ROOT/fragments-a/-example.conf"
+cp "$TEST_ROOT/fragments-b/70-example.conf" "$TEST_ROOT/fragments-b/-example.conf"
+expect_failure 'duplicate fragment basename: -example.conf' \
+    "$SETUP" --output "$TEST_ROOT/duplicate-dash-render" \
+    --fragment "$TEST_ROOT/fragments-a/-example.conf" \
+    --fragment "$TEST_ROOT/fragments-b/-example.conf"
+[ ! -e "$TEST_ROOT/duplicate-dash-render" ] || fail 'duplicate fragments produced an output tree'
+(
+    cd "$TEST_ROOT/fragments-a"
+    "$SETUP" --output "$TEST_ROOT/dash-render" --fragment -example.conf
+)
+cmp -s "$TEST_ROOT/fragments-a/-example.conf" "$TEST_ROOT/dash-render/etc/monit.d/-example.conf" \
+    || fail 'a leading-dash fragment was not rendered exactly'
 expect_failure 'fragment name is reserved' \
     "$SETUP" --plan --fragment "$MONIT_DIRECTORY/conf.d/10-system.conf"
 
@@ -561,6 +717,15 @@ cmp -s "$TEST_ROOT/adoption-live/50-private.conf" "$TEST_ROOT/adoption-stage/50-
     || fail 'explicit fragment adoption changed its reviewed contents'
 assert_mode "$TEST_ROOT/adoption-live/50-private.conf" 644
 assert_mode "$TEST_ROOT/adoption-stage/50-private.conf" 600
+chmod 0600 "$TEST_ROOT/adoption-live/50-private.conf"
+cp "$security_fixture" "$TEST_ROOT/adoption-live/-private.conf"
+chmod 0644 "$TEST_ROOT/adoption-live/-private.conf"
+MONIT_FRAGMENT_DIRECTORY="$TEST_ROOT/adoption-live" FRAGMENT_NAMES=-private.conf \
+    FRAGMENT_SOURCES="$TEST_ROOT/adoption-live/-private.conf" \
+    PATH="$TEST_ROOT/security-bin:$PATH" sh -c "$copy_check"
+cmp -s "$TEST_ROOT/adoption-live/-private.conf" "$TEST_ROOT/adoption-stage/-private.conf" \
+    || fail 'explicit leading-dash fragment adoption changed its reviewed contents'
+assert_mode "$TEST_ROOT/adoption-stage/-private.conf" 600
 chmod 0600 "$security_fixture"
 
 cat > "$security_fixture" <<'EOF'
@@ -625,13 +790,24 @@ assert_contains "$TEST_ROOT/cleanup.stderr" 'Retained root-only Monit transactio
 # MONIT_TEST_CONFIG_INVALID select the failing step.
 rollback_function=$(extract_function rollback_transaction "$SETUP")
 rollback_log=$TEST_ROOT/rollback-systemctl.log
+rollback_state=$TEST_ROOT/rollback-active
 rollback_check="PROGRAM_NAME=monit-test
+    set -eu; set -f
+    printf '%s\\n' \"\${MONIT_TEST_CURRENT_ACTIVE:-yes}\" > '$rollback_state'
     restore_target() { [ \"\${MONIT_TEST_RESTORE_FAIL:-no}\" = no ]; }
     monit() { [ \"\${MONIT_TEST_CONFIG_INVALID:-no}\" = no ]; }
     systemctl() {
         printf '%s\\n' \"\$*\" >> '$rollback_log'
         case \"\$1\" in
             daemon-reload) [ \"\${MONIT_TEST_RELOAD_FAIL:-no}\" = no ] ;;
+            is-active) [ \"\$(cat '$rollback_state')\" = yes ] ;;
+            stop) printf 'no\\n' > '$rollback_state' ;;
+            restart|start)
+                printf 'no\\n' > '$rollback_state'
+                [ \"\${MONIT_TEST_LAUNCH_FAIL:-no}\" = no ] || return 1
+                printf 'yes\\n' > '$rollback_state'
+                ;;
+            kill) [ \"\${MONIT_TEST_SIGNAL_FAIL:-no}\" = no ] ;;
             *) return 0 ;;
         esac
     }
@@ -663,18 +839,38 @@ refuse_service_command reload
 refuse_service_command restart
 
 # A failed daemon-reload after a complete file restoration is reported without
-# withdrawing monitoring: the restored files are authoritative, so the prior
-# service state is still re-established and the operator finishes the reload.
+# withdrawing monitoring. Signal the main process directly to avoid a cached
+# ExecReload, and defer launch commands until the restored unit policy loads.
 expect_failure 'daemon-reload failed' run_rollback \
     MONIT_TEST_RELOAD_FAIL=yes SERVICE_WAS_ACTIVE=yes SERVICE_RESTART_REQUIRED=no
 assert_contains "$TEST_ROOT/expected.stderr" 'rollback incomplete'
 assert_contains "$TEST_ROOT/retained-transaction/status" rollback-incomplete
-assert_service_command reload
+assert_service_command 'kill --kill-who=main --signal=SIGHUP'
+refuse_service_command reload
 refuse_service_command stop
 expect_failure 'daemon-reload failed' run_rollback \
-    MONIT_TEST_RELOAD_FAIL=yes SERVICE_WAS_ACTIVE=yes SERVICE_RESTART_REQUIRED=yes
-assert_service_command restart
+    MONIT_TEST_RELOAD_FAIL=yes SERVICE_WAS_ACTIVE=yes SERVICE_RESTART_REQUIRED=yes \
+    MONIT_TEST_LAUNCH_FAIL=yes
+assert_service_command 'kill --kill-who=main --signal=SIGHUP'
+refuse_service_command restart
+refuse_service_command start
+refuse_service_command reload
 refuse_service_command stop
+[ "$(cat "$rollback_state")" = yes ] || fail 'rollback interrupted an active monitor under unresolved unit policy'
+assert_contains "$TEST_ROOT/expected.stderr" 'restored execution policy still requires daemon-reload and a controlled restart'
+expect_failure 'Monit is inactive; automatic start deferred' run_rollback \
+    MONIT_TEST_RELOAD_FAIL=yes MONIT_TEST_CURRENT_ACTIVE=no \
+    SERVICE_WAS_ACTIVE=yes SERVICE_RESTART_REQUIRED=yes
+refuse_service_command restart
+refuse_service_command start
+refuse_service_command 'kill --kill-who=main --signal=SIGHUP'
+[ "$(cat "$rollback_state")" = no ] || fail 'rollback started Monit under unresolved unit policy'
+expect_failure 'could not signal the active Monit process' run_rollback \
+    MONIT_TEST_RELOAD_FAIL=yes MONIT_TEST_SIGNAL_FAIL=yes \
+    SERVICE_WAS_ACTIVE=yes SERVICE_RESTART_REQUIRED=yes
+refuse_service_command restart
+refuse_service_command stop
+assert_contains "$TEST_ROOT/retained-transaction/status" rollback-incomplete
 # An inactive prior state is still restored by stopping.
 expect_failure 'daemon-reload failed' run_rollback \
     MONIT_TEST_RELOAD_FAIL=yes SERVICE_WAS_ACTIVE=no SERVICE_RESTART_REQUIRED=no

@@ -207,7 +207,8 @@ path; deployment policy belongs in the directly included fragments.
 
 A deployment fragment must be non-symbolic, end in `.conf`, and use a basename
 containing only letters, numbers, dots, underscores, and hyphens. The reserved
-name `10-system.conf` cannot be supplied. Each fragment must be independently
+name `10-system.conf` cannot be supplied. Duplicate basenames are rejected,
+including names beginning with a hyphen. Each fragment must be independently
 meaningful and contain no nested `include` directive. Keep global notification
 policy in an earlier fragment and service checks in later clearly named
 fragments, but do not rely on wildcard include order for cross-file definitions:
@@ -272,7 +273,8 @@ Setup prints its retained transaction path under
 `/var/lib/config-monit/backups/transaction.*`. The directory is `root:root` mode
 `0700`; it contains protected originals under `files`, existence records under
 `present` and `absent`, a `targets` manifest, `service-state`, and a `status`
-record. GNU metadata-preserving copies retain modes, ownership, timestamps,
+record. Acceptance also records the live setup process ID in `setup-pid`.
+GNU metadata-preserving copies retain modes, ownership, timestamps,
 ACLs, and SELinux contexts. Restoration replaces files atomically and does not
 reconnect old hardlink aliases.
 
@@ -281,12 +283,18 @@ any file or service restoration fails. The originals remain available after
 success, failure, or incomplete recovery; ordinary candidate cleanup does not
 remove them. An incomplete file restoration leaves Monit stopped when possible
 so it cannot consume a partially restored tree. Once every file is restored,
-the restored tree is authoritative: a failed `systemctl daemon-reload` or
-service command is still reported as `rollback-incomplete`, but rollback
-re-establishes the recorded service state rather than stopping a running
-daemon, and the operator completes recovery with `daemon-reload` followed by a
-restart or reload. If the restored configuration itself fails `monit -t`, the
-service state is left unchanged for the operator. Inspect the error and
+the restored tree is authoritative. If `systemctl daemon-reload` fails,
+rollback sends an active Monit main process SIGHUP to reread that configuration
+without restarting it under unresolved unit policy. It defers starting an
+inactive daemon until the operator successfully reloads systemd and restores
+the recorded service state. This remains `rollback-incomplete`: a signal does
+not establish that the restored execution policy is loaded or running. After
+repairing the manager reload failure, run `daemon-reload`, validate the restored
+configuration, and use a controlled restart to apply the restored unit policy.
+A recorded inactive state is restored by stopping Monit. Failed service
+commands also leave `rollback-incomplete` evidence. If the restored
+configuration itself fails `monit -t`, the service state is left unchanged for
+the operator. Inspect the error and
 transaction records, repair the cause, and restore the recorded originals
 before activation.
 
@@ -312,7 +320,12 @@ must never be copied into this repository or ordinary audit output.
 retained transaction must be `root:root` mode `0700` without ACLs. A
 transaction whose `status` is not `committed` or `rolled-back` (still
 `applying`, `rollback-incomplete`, or missing) is unfinished recovery and fails
-verification until it is resolved and its retention decided. More than five
+standalone verification until it is resolved and its retention decided.
+During setup's final acceptance audit, only its own `applying` record is
+temporarily allowed: the internal verifier context must identify the exact
+private transaction and match its protected `setup-pid` to the verifier's live
+parent process. Other unfinished transactions still fail acceptance, and setup
+records `committed` only after every verifier check succeeds. More than five
 completed transactions produce a warning, because each holds a copy of
 `/etc/monitrc` with the control credential; the decision to keep or remove
 them stays with the operator and is never automated.
