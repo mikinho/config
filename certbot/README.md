@@ -127,10 +127,12 @@ text with LF or CRLF line endings so alternative Unicode whitespace or bare
 carriage-return separators cannot bypass the guard. Configuration
 files must be readable regular files, not symbolic links. Because Certbot runs
 here as root and executes any `pre-hook`, `post-hook`, or `deploy-hook` a
-default file names, each present `cli.ini` and every directory above it must be
-owned by root and not writable by group or other; a file another account could
-edit or replace is not a trusted default, whatever it currently says. That
-ownership check runs before the file's content is read. `HOME` (when XDG is
+default file names, each present `cli.ini` and every existing directory above it
+must be owned by root and not writable by group or other. This also applies when
+the file or intermediate directories are absent: another account must not be
+able to create a default between the check and Certbot's read. A file another
+account could create, edit, or replace is not a trusted default. That ownership
+check runs before the file's content is read. `HOME` (when XDG is
 unset) and any explicit `XDG_CONFIG_HOME` must identify absolute paths without
 glob characters; an empty explicit XDG value is rejected, and an XDG directory
 under another account's home fails the ownership check. The official classic

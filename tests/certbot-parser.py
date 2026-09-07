@@ -219,6 +219,40 @@ class CertbotParserTests(unittest.TestCase):
         self.assertNotEqual(self.guard(self.system_config).returncode, 0)
         self.assertNotEqual(self.guard(self.user_config).returncode, 0)
 
+    def test_missing_user_source_requires_trusted_ancestry(self) -> None:
+        """A user must not be able to add a hook after an absent-default check."""
+
+        self.assertFalse(self.user_config.exists())
+        # Model an unprivileged existing ancestor independently of the runner's
+        # UID. The production helper still inspects real file/path existence.
+        guarded = subprocess.run(
+            [
+                "sh",
+                "-c",
+                '. "$1"; UNTRUSTED_ROOT=$3; '
+                'path_identity() { case "$1" in '
+                '"$UNTRUSTED_ROOT") printf "1000:700\\n" ;; '
+                '*) printf "0:755\\n" ;; esac; }; '
+                'require_trusted_configuration_source "$2"',
+                "certbot-parser-test",
+                str(self.functions),
+                str(self.user_config),
+                str(self.root),
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=10,
+        )
+        self.assertEqual(guarded.returncode, 1)
+        self.assertIn("configuration directory must be owned by root", guarded.stderr)
+
+        # Demonstrate the parser boundary the guard protects. Construction of
+        # the parser accepts a newly created hook; no command handler runs it.
+        self.user_config.write_text("pre-hook = /usr/bin/true\n", encoding="utf-8")
+        parsed = self.parse(planned_commands("production")[0])
+        self.assertIn("/usr/bin/true", parsed.pre_hook)
+
     def test_user_source_resolution_matches_certbot(self) -> None:
         """Check actual HOME/XDG discovery without opening any host cli.ini file."""
 

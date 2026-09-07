@@ -14,6 +14,9 @@ SCRIPT_DIRECTORY=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 REPOSITORY_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIRECTORY/.." && pwd)
 ISSUER=$REPOSITORY_ROOT/certbot/issue
 TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/config-certbot-issue.XXXXXX")
+# The positive trust fixtures need real ancestors even when TMPDIR uses a
+# platform alias such as macOS /var. Deliberate symlink fixtures remain below.
+TEST_ROOT=$(CDPATH='' cd -- "$TEST_ROOT" && pwd -P)
 
 cleanup() {
     if [ -d "$TEST_ROOT" ]; then
@@ -219,6 +222,7 @@ fi
 mkdir -p "$TEST_ROOT/trusted/letsencrypt"
 printf 'server = https://acme.example.invalid/directory\n' > "$TEST_ROOT/trusted/letsencrypt/cli.ini"
 ln -s "$TEST_ROOT/trusted/letsencrypt/cli.ini" "$TEST_ROOT/trusted/letsencrypt/link.ini"
+ln -s "$TEST_ROOT/trusted/letsencrypt" "$TEST_ROOT/trusted/link-directory"
 trust_check='
     . "$1/issuer-functions"
     TRUST_ROOT=$1
@@ -237,7 +241,22 @@ run_trust_check() {
 }
 run_trust_check 0:600 0:700 0:755 trusted/letsencrypt/cli.ini
 run_trust_check 0:644 0:755 0:1755 trusted/letsencrypt/cli.ini
-run_trust_check 1000:666 1000:777 1000:1777 absent/cli.ini
+# Missing defaults and directories are accepted only beneath trusted ancestry.
+# The file identity is intentionally unsafe: an absent file has no owner yet.
+run_trust_check 1000:666 0:700 0:755 trusted/letsencrypt/absent.ini
+run_trust_check 1000:666 1000:777 0:755 trusted/missing/nested/cli.ini
+expect_failure 'configuration directory must be owned by root' \
+    run_trust_check 0:600 1000:700 0:755 trusted/letsencrypt/absent.ini
+expect_failure 'configuration directory must not be writable by group or other' \
+    run_trust_check 0:600 0:770 0:755 trusted/letsencrypt/absent.ini
+expect_failure 'configuration directory must be owned by root' \
+    run_trust_check 0:600 0:700 1000:700 trusted/missing/nested/cli.ini
+expect_failure 'configuration directory must not be writable by group or other' \
+    run_trust_check 0:600 0:700 0:1777 trusted/missing/nested/cli.ini
+expect_failure 'configuration ancestor must be a real directory' \
+    run_trust_check 0:600 0:700 0:755 trusted/link-directory/missing/cli.ini
+expect_failure 'configuration ancestor must be a real directory' \
+    run_trust_check 0:600 0:700 0:755 trusted/letsencrypt/cli.ini/missing/cli.ini
 expect_failure 'configuration file must be owned by root' \
     run_trust_check 1000:600 0:700 0:755 trusted/letsencrypt/cli.ini
 for writable_mode in 620 602 666; do
@@ -267,6 +286,26 @@ expect_failure 'configuration file must be owned by root' \
         validate_inherited_config
     ' config-test "$TEST_ROOT"
 assert_not_contains "$TEST_ROOT/command.stderr" 'remove staging, test-cert, and dry-run settings'
+
+# A missing user default must stop the real invocation gate before Certbot can
+# start and discover a file created by that directory's unprivileged owner.
+mkdir "$TEST_ROOT/untrusted"
+expect_failure 'configuration directory must be owned by root' \
+    sh -c '
+        . "$1/issuer-functions"
+        TRUST_ROOT=$1
+        path_identity() {
+            case "$1" in
+                "$TRUST_ROOT/untrusted") printf "1000:700\n" ;;
+                *) printf "0:755\n" ;;
+            esac
+        }
+        SYSTEM_CERTBOT_CONFIG=$1/trusted/letsencrypt/absent.ini
+        USER_CERTBOT_CONFIG=$1/untrusted/missing/cli.ini
+        resolve_user_config() { :; }
+        CERTBOT_BINARY=$1/not-an-executable
+        run_certbot certonly
+    ' config-test "$TEST_ROOT"
 
 for config_source in system user; do
     printf 'staging = true\n' > "$TEST_ROOT/$config_source-conflict.ini"

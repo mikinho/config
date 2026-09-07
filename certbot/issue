@@ -226,23 +226,34 @@ require_trusted_path() {
 
 require_trusted_configuration_source() {
     inherited_source=$1
-    if [ ! -e "$inherited_source" ] && [ ! -L "$inherited_source" ]; then
-        return
-    fi
+    case "$inherited_source" in
+        /*) ;;
+        *) fail "inherited Certbot configuration path must be absolute" ;;
+    esac
     # Certbot runs here as root and executes any pre-, post-, or deploy-hook a
     # default file names, so only a file no other account can write or replace
     # is a trusted default. That includes every directory above it: a writable
     # ancestor lets its owner swap the file between this check and Certbot's
     # read, whatever the file's own ownership says.
-    [ -f "$inherited_source" ] && [ ! -L "$inherited_source" ] \
-        || fail "inherited Certbot configuration must be a regular file, not a symbolic link: $inherited_source"
-    require_trusted_path "$inherited_source" file
+    if [ -e "$inherited_source" ] || [ -L "$inherited_source" ]; then
+        [ -f "$inherited_source" ] && [ ! -L "$inherited_source" ] \
+            || fail "inherited Certbot configuration must be a regular file, not a symbolic link: $inherited_source"
+        require_trusted_path "$inherited_source" file
+    fi
+    # A missing file is safe only if another account cannot create it before
+    # Certbot reads its defaults. Walk through missing directories to the
+    # existing ancestors, including /, and establish the same trust boundary.
     inherited_parent=${inherited_source%/*}
-    while [ -n "$inherited_parent" ]; do
-        [ -d "$inherited_parent" ] && [ ! -L "$inherited_parent" ] \
-            || fail "inherited Certbot configuration ancestor must be a real directory: $inherited_parent"
-        require_trusted_path "$inherited_parent" directory
+    [ -n "$inherited_parent" ] || inherited_parent=/
+    while :; do
+        if [ -e "$inherited_parent" ] || [ -L "$inherited_parent" ]; then
+            [ -d "$inherited_parent" ] && [ ! -L "$inherited_parent" ] \
+                || fail "inherited Certbot configuration ancestor must be a real directory: $inherited_parent"
+            require_trusted_path "$inherited_parent" directory
+        fi
+        [ "$inherited_parent" != / ] || break
         inherited_parent=${inherited_parent%/*}
+        [ -n "$inherited_parent" ] || inherited_parent=/
     done
 }
 
