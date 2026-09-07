@@ -242,6 +242,8 @@ assert_contains "$TEST_ROOT/reload-tls.plan" \
     > "$TEST_ROOT/reload-tls-default.plan"
 assert_contains "$TEST_ROOT/reload-tls-default.plan" \
     'the greater of 3600 seconds and one tenth of the certificate lifetime remaining'
+# Expand these positional and fixture variables inside the child shell.
+# shellcheck disable=SC2016
 margin_check='
     fail() { printf "%s\n" "$*" >&2; exit 1; }
     . "$1/lib/common.sh"
@@ -275,6 +277,8 @@ if command -v openssl >/dev/null 2>&1; then
     [ "$real_margin" = 8640 ] \
         || fail "one-day fixture certificate produced margin $real_margin, expected 8640"
 fi
+# This snippet also expands its positional parameters inside the child shell.
+# shellcheck disable=SC2016
 expect_failure 'must be between 300 and 2592000' \
     sh -c 'fail() { printf "%s\n" "$*" >&2; exit 1; }; . "$1/lib/common.sh"; redis_validate_minimum_tls_seconds 299' \
     margin-test "$REDIS_DIRECTORY"

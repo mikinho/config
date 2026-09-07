@@ -30,9 +30,12 @@ chmodSync(temporaryDirectory, 0o700);
 const environment = { ...process.env, STEPPATH: temporaryDirectory };
 let ca;
 
-/** Run a fixture command, retaining diagnostics without exposing its inputs. */
+/** Require normal fixture-command completion before interpreting its exit status. */
 function execute(command, arguments_) {
-    return spawnSync(command, arguments_, { env: environment, encoding: "utf8", timeout: 30000 });
+    const result = spawnSync(command, arguments_, { env: environment, encoding: "utf8", timeout: 30000 });
+    assert.equal(result.error, undefined, `Fixture ${command} command could not complete normally`);
+    assert.equal(result.signal, null, `Fixture ${command} command was terminated by a signal`);
+    return result;
 }
 
 /** Reserve a transient loopback port without touching installed services. */
@@ -102,7 +105,7 @@ try {
         const issuance = execute("step", ["ca", "certificate", "audit.internal.example.invalid", certificatePath,
             join(temporaryDirectory, `leaf-${hours}.key`), "--ca-url", `https://127.0.0.1:${port}`, "--root", rootPath,
             "--provisioner", "runtime-fixture", "--provisioner-password-file", passwordFile, "--not-after", `${hours}h`]);
-        assert.equal(issuance.status === 0, hours <= 2, `Unexpected ${hours}-hour certificate issuance result`);
+        assert.equal(issuance.status, hours <= 2 ? 0 : 1, `Unexpected ${hours}-hour certificate issuance result`);
         if (hours <= 2) {
             const certificate = new X509Certificate(readFileSync(certificatePath));
             const duration = Date.parse(certificate.validTo) - Date.parse(certificate.validFrom);
