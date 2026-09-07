@@ -4,8 +4,10 @@
 # Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
 #
 
-# Exercise the read-only verifier against kernel-shaped fixtures. No systemd,
-# Linux namespaces, service users, or host permission changes are simulated.
+# Exercise the read-only verifier against kernel-shaped fixtures, including a
+# fixture monotonic clock so window and retry behavior is exact and instant. No
+# systemd, Linux namespaces, service users, or host permission changes are
+# simulated.
 set -eu
 PROGRAM_NAME=${0##*/}
 SCRIPT_DIRECTORY=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
@@ -27,6 +29,12 @@ expect_failure() {
     shift
     if "$@" > "$TEST_ROOT/stdout" 2> "$TEST_ROOT/stderr"; then fail 'invalid runtime unexpectedly passed'; fi
     assert_contains "$TEST_ROOT/stderr" "$expected_message"
+}
+expect_success() {
+    if ! "$@" > "$TEST_ROOT/stdout" 2> "$TEST_ROOT/stderr"; then
+        cat "$TEST_ROOT/stderr" >&2
+        fail 'valid runtime unexpectedly failed'
+    fi
 }
 
 write_process() {
@@ -66,9 +74,22 @@ reset_fixture() {
     printf 'nginx: cache manager process\000' > "$TEST_ROOT/proc/301/cmdline"
     printf 'nginx: worker process is shutting down\000' > "$TEST_ROOT/proc/401/cmdline"
     printf '201 202 301 401\n' > "$TEST_ROOT/proc/101/task/101/children"
+    # The verifier's deadline reads this fixture clock; mocked sleeps and
+    # stalled manager queries advance it, so no test waits in real time.
+    printf '1000.00 4000.00\n' > "$TEST_ROOT/proc/uptime"
     printf '101\n' > "$TEST_ROOT/nginx.pid"
-    rm -f "$TEST_ROOT/slept"
+    rm -f "$TEST_ROOT/slept" "$TEST_ROOT/stalls"
     : > "$TEST_ROOT/commands"
+}
+
+stall_manager_queries() {
+    # The next N timeout-wrapped manager queries miss their five-second
+    # deadline; each consumes the deadline plus the one-second kill grace.
+    printf '%s\n' "$1" > "$TEST_ROOT/stalls"
+}
+
+count_commands() {
+    grep -c -x -- "$1" "$TEST_ROOT/commands" || :
 }
 
 replace_status() {
@@ -104,11 +125,17 @@ cat > "$TEST_ROOT/bin/setpriv" <<'MOCK'
 printf 'worker traversal\n' >> "$TEST_ROOT/commands"
 [ "${TEST_TRAVERSAL_DENIED:-no}" = no ]
 MOCK
+cat > "$TEST_ROOT/advance-clock" <<'MOCK'
+#!/usr/bin/env sh
+read -r fixture_seconds _ < "$TEST_ROOT/proc/uptime"
+printf '%s.00 4000.00\n' "$((${fixture_seconds%%.*} + $1))" > "$TEST_ROOT/proc/uptime"
+MOCK
 cat > "$TEST_ROOT/bin/sleep" <<'MOCK'
 #!/usr/bin/env sh
 [ "$*" = 1 ] || exit 1
 printf 'wait\n' >> "$TEST_ROOT/commands"
 : > "$TEST_ROOT/slept"
+"$TEST_ROOT/advance-clock" 1
 if [ "${TEST_DELAYED_WORKERS:-no}" = yes ]; then
     printf '201 202\n' > "$TEST_ROOT/proc/101/task/101/children"
 fi
@@ -117,6 +144,16 @@ cat > "$TEST_ROOT/bin/timeout" <<'MOCK'
 #!/usr/bin/env sh
 [ "$1 $2" = '--kill-after=1 5' ] || exit 1
 shift 2
+if [ -f "$TEST_ROOT/stalls" ]; then
+    read -r remaining_stalls < "$TEST_ROOT/stalls"
+    if [ "$remaining_stalls" -gt 0 ]; then
+        printf '%s\n' "$((remaining_stalls - 1))" > "$TEST_ROOT/stalls"
+        printf 'stall %s\n' "$1" >> "$TEST_ROOT/commands"
+        "$TEST_ROOT/advance-clock" 6
+        exit 124
+    fi
+fi
+printf 'query %s\n' "$1" >> "$TEST_ROOT/commands"
 exec "$@"
 MOCK
 cat > "$TEST_ROOT/bin/systemctl" <<'MOCK'
@@ -138,7 +175,7 @@ fi
 printf '@mount\n    # Mounting and unmounting of file systems\n'
 for syscall in $MOUNT_SYSCALLS; do printf '    %s\n' "$syscall"; done
 MOCK
-chmod 0755 "$TEST_ROOT/bin/"*
+chmod 0755 "$TEST_ROOT/bin/"* "$TEST_ROOT/advance-clock"
 PATH=$TEST_ROOT/bin:$PATH
 export PATH
 
@@ -161,12 +198,69 @@ expect_failure 'cannot traverse' env TEST_TRAVERSAL_DENIED=yes "$VERIFY" --timeo
 "$VERIFY" --policy-only > "$TEST_ROOT/stdout"
 assert_contains "$TEST_ROOT/stdout" 'composed mount-syscall denial'
 expect_failure 'does not accept process assertions' "$VERIFY" --policy-only --workers 1
+expect_failure 'does not accept process assertions or --startup' "$VERIFY" --policy-only --startup
+# A manager that answers wrongly fails at once; one that cannot answer is
+# retried until the window closes, then reported with the attempt count.
+reset_fixture
 expect_failure 'cannot inspect the composed' env TEST_MANAGER_UNAVAILABLE=yes "$VERIFY" --policy-only
+assert_contains "$TEST_ROOT/stderr" 'systemctl show exited with status 1 after 11 attempt(s) within the 10-second window'
+[ "$(count_commands wait)" -eq 10 ] || fail 'an unavailable manager was not retried across the default window'
+reset_fixture
 expect_failure 'must be loaded' env TEST_UNIT_LOAD=not-found "$VERIFY" --policy-only
-expect_failure 'metadata is stale or unknown' env TEST_UNIT_STALE=yes "$VERIFY" --policy-only
-expect_failure 'cannot expand the local' env TEST_ANALYZE_UNAVAILABLE=yes "$VERIFY" --policy-only
+[ ! -f "$TEST_ROOT/slept" ] || fail 'an unloaded unit was retried'
+expect_failure 'manager metadata is stale' env TEST_UNIT_STALE=yes "$VERIFY" --policy-only
+assert_contains "$TEST_ROOT/stderr" 'run systemctl daemon-reload, then restart nginx.service'
+expect_failure 'manager metadata is unknown' env TEST_UNIT_STALE=maybe "$VERIFY" --policy-only
+reset_fixture
+expect_failure 'cannot expand the local' env TEST_ANALYZE_UNAVAILABLE=yes "$VERIFY" --policy-only --timeout-seconds 3
+assert_contains "$TEST_ROOT/stderr" 'systemd-analyze exited with status 1 after 4 attempt(s) within the 3-second window'
 expect_failure 'cannot interpret the local' env TEST_ANALYZE_MALFORMED=yes "$VERIFY" --policy-only
 expect_failure 'must retain SystemCallErrorNumber=EPERM' env TEST_SYSCALL_ERRNO=0 "$VERIFY" --policy-only
+# Stalled queries consume their deadline and kill grace on the fixture clock:
+# two stalls fit a twenty-second window, exhaust a ten-second one, and a
+# zero-second window makes exactly one attempt.
+reset_fixture
+stall_manager_queries 2
+expect_success "$VERIFY" --timeout-seconds 20
+assert_contains "$TEST_ROOT/stdout" 'master PID 101 and 2 active worker(s)'
+[ "$(count_commands 'stall systemctl')" -eq 2 ] || fail 'stalled manager queries were not retried'
+[ "$(count_commands wait)" -eq 2 ] || fail 'manager retries did not pause between attempts'
+reset_fixture
+stall_manager_queries 2
+expect_failure 'systemctl show did not answer within 5 seconds' "$VERIFY" --timeout-seconds 10
+assert_contains "$TEST_ROOT/stderr" 'after 2 attempt(s) within the 10-second window'
+reset_fixture
+stall_manager_queries 1
+expect_failure 'did not answer within 5 seconds' "$VERIFY" --timeout-seconds 0
+[ ! -f "$TEST_ROOT/slept" ] || fail 'a zero-second window must not wait'
+reset_fixture
+stall_manager_queries 1
+expect_success "$VERIFY" --policy-only --timeout-seconds 10
+assert_contains "$TEST_ROOT/stdout" 'composed mount-syscall denial'
+# The @mount expansion is cached once obtained; only systemctl is re-queried.
+reset_fixture
+: > "$TEST_ROOT/proc/101/task/101/children"
+expect_success env TEST_DELAYED_WORKERS=yes "$VERIFY" --workers 2 --timeout-seconds 2
+[ "$(count_commands 'query systemd-analyze')" -eq 1 ] || fail 'the mount group expansion was not cached across retries'
+[ "$(count_commands 'query systemctl')" -eq 2 ] || fail 'the composed policy was not re-read on every attempt'
+# Policy violations never consume the window, even when it is open.
+reset_fixture
+expect_failure 'must retain SystemCallErrorNumber=EPERM' env TEST_SYSCALL_ERRNO=0 "$VERIFY" --timeout-seconds 5
+[ ! -f "$TEST_ROOT/slept" ] || fail 'a policy violation was retried'
+# Only the unit's own start gate tolerates on-disk changes that daemon-reload
+# has not activated, and it says so exactly once.
+reset_fixture
+: > "$TEST_ROOT/proc/101/task/101/children"
+expect_success env TEST_UNIT_STALE=yes TEST_DELAYED_WORKERS=yes "$VERIFY" --startup --workers 2 --timeout-seconds 2
+assert_contains "$TEST_ROOT/stdout" 'master PID 101 and 2 active worker(s)'
+assert_contains "$TEST_ROOT/stderr" 'warning: nginx.service was started from its loaded configuration'
+assert_contains "$TEST_ROOT/stderr" 'run systemctl daemon-reload and restart nginx.service'
+[ "$(grep -c 'warning:' "$TEST_ROOT/stderr")" -eq 1 ] || fail 'the stale metadata warning was not reported exactly once'
+[ -f "$TEST_ROOT/slept" ] || fail 'the start gate did not retry delayed workers'
+reset_fixture
+expect_failure 'manager metadata is stale' env TEST_UNIT_STALE=yes "$VERIFY" --timeout-seconds 0
+expect_failure 'manager metadata is unknown' env TEST_UNIT_STALE=maybe "$VERIFY" --startup --timeout-seconds 0
+expect_failure 'must be loaded' env TEST_UNIT_LOAD=not-found "$VERIFY" --startup --timeout-seconds 0
 # Ordering, redundant entries, additional restrictions, and denying errno
 # suffixes do not weaken the mandatory set.
 env TEST_SYSCALL_FILTER="~umount2 mount:EPERM $MOUNT_SYSCALLS reboot:kill" \
@@ -236,4 +330,4 @@ done
 expect_failure 'timeout must be from 0 to 300' "$VERIFY" --timeout-seconds 301
 expect_failure 'workers must be from 1 to 32767' "$VERIFY" --workers 0
 
-printf 'Validated nginx runtime identity, mask, capability, directory, and bounded readiness checks with isolated fixtures.\n'
+printf 'Validated nginx runtime identity, mask, capability, directory, monotonic-window retry, and start-gate checks with isolated fixtures.\n'

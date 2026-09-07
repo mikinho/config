@@ -54,6 +54,17 @@ assert_contains() {
     grep -F -- "$2" "$1" >/dev/null || fail "$1 is missing: $2"
 }
 
+journal_snapshot() {
+    # Stream output from Exec* commands reaches journald asynchronously; flush
+    # before reading so an assertion never races the entry it looks for.
+    journalctl --sync
+    journalctl --no-pager -u "$UNIT_NAME" -o cat > "$1"
+}
+
+need_daemon_reload() {
+    systemctl show "$UNIT_NAME" --property=NeedDaemonReload --value 2>/dev/null
+}
+
 expect_wrong_worker_count() {
     asserted_count=$1
     if "$TEST_DIRECTORY/verify" --workers "$asserted_count" --timeout-seconds 0 \
@@ -75,7 +86,7 @@ done
 [ -x "$VERIFIER_SOURCE" ] || fail 'runtime verifier source must be executable'
 # The literal systemd variable is part of the source contract, not this shell.
 # shellcheck disable=SC2016
-assert_contains "$UNIT_SOURCE" 'ExecStartPost=!/usr/local/libexec/nginx-runtime-verify --master-pid $MAINPID'
+assert_contains "$UNIT_SOURCE" 'ExecStartPost=!/usr/local/libexec/nginx-runtime-verify --master-pid $MAINPID --startup'
 assert_contains "$UNIT_SOURCE" 'Group=nginx'
 assert_contains "$UNIT_SOURCE" 'ProtectProc=invisible'
 if grep -E '^CapabilityBoundingSet=.*CAP_SYS_PTRACE' "$UNIT_SOURCE" >/dev/null; then
@@ -150,6 +161,28 @@ curl --fail --silent --show-error --max-time 5 \
     > "$TEST_DIRECTORY/http.stdout"
 assert_contains "$TEST_DIRECTORY/http.stdout" 'fixture-ready'
 
+# Editing the unit on disk without daemon-reload must not turn the next
+# restart into an outage: the loaded policy is what the new master received.
+# The unit's own --startup gate warns once; an operator run still fails closed
+# on the same drift, and daemon-reload clears it.
+printf '# on-disk drift fixture\n' >> "$UNIT_PATH"
+[ "$(need_daemon_reload)" = yes ] || fail 'the drift fixture did not produce stale manager metadata'
+if ! systemctl restart "$UNIT_NAME"; then
+    diagnostics
+    fail 'stale manager metadata turned a restart into a startup failure'
+fi
+systemctl is-active --quiet "$UNIT_NAME" || fail 'fixture is not active after the drift restart'
+journal_snapshot "$TEST_DIRECTORY/drift-journal"
+assert_contains "$TEST_DIRECTORY/drift-journal" "warning: $UNIT_NAME was started from its loaded configuration"
+if "$TEST_DIRECTORY/verify" --workers 2 --timeout-seconds 0 \
+    > "$TEST_DIRECTORY/drift.stdout" 2> "$TEST_DIRECTORY/drift.stderr"; then
+    fail 'operator verification accepted stale manager metadata'
+fi
+assert_contains "$TEST_DIRECTORY/drift.stderr" 'manager metadata is stale'
+systemctl daemon-reload
+[ "$(need_daemon_reload)" = no ] || fail 'daemon-reload did not clear the drift fixture'
+"$TEST_DIRECTORY/verify" --workers 2 --timeout-seconds 0
+
 # Removing ! must reproduce the cross-UID /proc failure. This makes the test
 # fail if ProtectProc is ignored, root group membership accidentally bypasses
 # it, or the test environment otherwise fails to exercise the actual boundary.
@@ -162,7 +195,7 @@ if systemctl start "$UNIT_NAME"; then
     diagnostics
     fail 'removing the checker credential exception unexpectedly passed startup'
 fi
-journalctl --no-pager -u "$UNIT_NAME" -o cat > "$TEST_DIRECTORY/journal"
+journal_snapshot "$TEST_DIRECTORY/journal"
 assert_contains "$TEST_DIRECTORY/journal" 'nginx has 0 active workers; expected at least 1'
 
 # Simulate a later site drop-in clearing @mount, while retaining the optional
@@ -206,7 +239,7 @@ if systemctl start "$UNIT_NAME"; then
     diagnostics
     fail 'startup accepted a QUIC-capable master without the mount barrier'
 fi
-journalctl --no-pager -u "$UNIT_NAME" -o cat > "$TEST_DIRECTORY/mount-journal"
+journal_snapshot "$TEST_DIRECTORY/mount-journal"
 assert_contains "$TEST_DIRECTORY/mount-journal" 'SystemCallFilter does not deny required mount syscalls:'
 
-printf 'Validated nginx startup, worker counts, checker credentials, and mandatory mount denial despite retained QUIC capabilities and Seccomp=2.\n'
+printf 'Validated nginx startup, worker counts, stale-metadata start-gate tolerance, checker credentials, and mandatory mount denial despite retained QUIC capabilities and Seccomp=2.\n'

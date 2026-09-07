@@ -181,10 +181,12 @@ adds a directive must stay within the root README's syntax floor or advance
 it deliberately.
 
 `tests/nginx-runtime-verifier` covers the actual read-only checker with isolated
-process-status fixtures, including startup delay, timeout, unexpected masks or
-capabilities, missing workers, and log-directory traversal denial. It also
-rejects cleared, partial, or allow-list replacements of the composed mount
-filter while the fixture retains QUIC capabilities and `Seccomp: 2`.
+process-status fixtures and a fixture monotonic clock, including startup delay,
+window expiry, stalled and recovering manager queries, the `--startup` gate's
+single stale-metadata warning, unexpected masks or capabilities, missing
+workers, and log-directory traversal denial. It also rejects cleared, partial,
+or allow-list replacements of the composed mount filter while the fixture
+retains QUIC capabilities and `Seccomp: 2`.
 `tests/nginx-setup` covers the setup flow with privileged commands mocked,
 including preservation of existing cache descendants during parent-group
 migration. Neither substitutes for a booted Linux unit test. On a target host,
@@ -201,7 +203,11 @@ target's own `systemd-analyze syscall-filter @mount` group. Every member must
 remain denied, and `SystemCallErrorNumber=EPERM` must remain set. This gate
 applies to ordinary and QUIC BPF profiles; other seccomp restrictions do not
 substitute for mount denial. `--policy-only` checks the composed policy without
-requiring a running master. Stale manager metadata and unavailable policy
-inspection fail closed. The installed host verifier invokes the same check.
-The helper uses `systemctl`, `systemd-analyze`, and coreutils `timeout`, with
-five-second command deadlines and one additional second before forced cleanup.
+requiring a running master. A manager query that misses its deadline is retried
+within the run's monotonic window, then fails closed; stale manager metadata
+fails closed everywhere except the unit's own `--startup` gate, which logs a
+warning because the loaded policy is what the new master received (see the
+[systemd runtime contract](../systemd/README.md)). The installed host verifier
+invokes the same check without `--startup`. The helper uses `systemctl`,
+`systemd-analyze`, and coreutils `timeout`, with five-second command deadlines
+and one additional second before forced cleanup.

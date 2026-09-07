@@ -160,13 +160,29 @@ only the nginx supplementary group. See the
 root:root credentials, retaining its other sandbox and capability restrictions.
 Group zero lets that checker inspect workers through `ProtectProc=invisible`;
 the nginx master remains root:nginx without extra ptrace capability or root
-supplementary-group access. The verifier waits up to
-ten seconds for the managed PID file and at least one active worker, checking
+supplementary-group access. The verifier runs inside one ten-second window on
+the monotonic clock (`/proc/uptime`, so a wall-clock step cannot shorten or
+stretch it). Within that window it retries once per second for the managed PID
+file, at least one active worker, and any service-manager query that did not
+answer within five seconds; policy violations fail immediately. It checks
 master/worker identity, effective mask, capability sets, `NoNewPrivs`, seccomp
-activation, and nginx's ability to traverse the root-owned log directory.
-Failure fails service startup, so ordered dependents do not mistake successful
-`execve` for readiness. The helper needs `setpriv` from `util-linux`, coreutils
-`timeout`, systemd's inspection tools, and ordinary Linux `/proc` access.
+activation, the composed mount denial, and nginx's ability to traverse the
+root-owned log directory. Failure fails service startup, so ordered dependents
+do not mistake successful `execve` for readiness. `TimeoutStartSec=60s`
+budgets the configuration test, `execve`, that window, and at most one
+in-flight manager query with its one-second kill grace. The helper needs
+`setpriv` from `util-linux`, coreutils `timeout`, systemd's inspection tools,
+and ordinary Linux `/proc` access.
+
+The unit passes `--startup` to mark its own gate. If the on-disk unit or
+drop-ins changed after the manager loaded them (`NeedDaemonReload=yes`), the
+gate logs one warning and continues: the loaded configuration is exactly what
+the new master received, so the inspected policy is accurate, and failing there
+would turn a forgotten `daemon-reload` into an outage that `Restart=on-failure`
+can only repeat. Run `systemctl daemon-reload` and restart nginx to activate
+the changed files. Operator invocations and `deploy/verify-deployment` omit
+`--startup` and fail closed on that drift, because they certify the reviewed
+on-disk policy rather than the process in front of them.
 Setup additionally checks a fresh master and exactly the
 reviewed worker count: an explicit `--workers N` rejects both missing and extra
 workers, while the default startup check requires at least one. Setup also
@@ -177,11 +193,15 @@ symbolic links fail setup before host mutation.
 The helper separately reads PID 1's composed `SystemCallFilter` and requires
 its deny-list to contain every member of the local `@mount` syscall group,
 expanded using `systemd-analyze syscall-filter @mount`. Empty filters, partial
-groups, allow-list replacements, changed `SystemCallErrorNumber=EPERM`, and
-stale manager metadata fail verification even if `/proc` reports `Seccomp: 2`.
+groups, allow-list replacements, and a changed `SystemCallErrorNumber=EPERM`
+fail verification even if `/proc` reports `Seccomp: 2`; stale manager metadata
+fails every invocation except the unit's own `--startup` gate described above.
 `nginx/setup` invokes `--policy-only` after daemon-reload and before stopping
 the existing master; startup and the installed host verifier repeat this check.
-Policy commands have five-second deadlines and a one-second forced-kill grace.
+Policy commands have five-second deadlines and a one-second forced-kill grace,
+and a query that misses its deadline is retried within the same window rather
+than failing on the first attempt. The expanded `@mount` group is deterministic
+and is read once per run; the composed unit policy is re-read on every attempt.
 
 These are targeted observations, not proof of every sandbox or SELinux rule.
 The checker reads the composed policy rather than dumping a running process's
@@ -191,8 +211,11 @@ upstream connections, plus graceful reload and rotation under real traffic.
 
 The `nginx-systemd-runtime` CI job runs the real unit and verifier on a
 disposable Linux host using fixture-only paths and a Unix HTTP socket. It
-checks successful startup and exact worker-count assertions, then removes only
-the checker's `!` prefix and requires the cross-UID `/proc` failure. This
+checks successful startup and exact worker-count assertions, then edits the
+unit on disk without `daemon-reload` and requires the restart to succeed with
+the gate's warning while an operator run rejects the same drift. It then
+removes only the checker's `!` prefix and requires the cross-UID `/proc`
+failure. This
 negative case prevents a host that ignores `ProtectProc` from producing a
 false pass. A second negative fixture retains QUIC capabilities and active
 seccomp filtering while a later assignment clears the mount denial; both

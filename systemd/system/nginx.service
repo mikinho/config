@@ -37,14 +37,20 @@ ExecStart=/usr/sbin/%p -c /etc/%p/%p.conf -g "daemon off;"
 # can inspect cross-UID worker /proc entries with ProtectProc=invisible; the
 # ! prefix preserves the other sandbox/capability controls. nginx stays
 # root:nginx and receives neither CAP_SYS_PTRACE nor supplementary group root.
-ExecStartPost=!/usr/local/libexec/nginx-runtime-verify --master-pid $MAINPID
+# --startup marks this as the unit's own gate: the loaded policy is what this
+# master received, so unit files edited without daemon-reload log a warning
+# instead of turning the start into a failure. Operator runs still fail closed.
+ExecStartPost=!/usr/local/libexec/nginx-runtime-verify --master-pid $MAINPID --startup
 ExecReload=/usr/sbin/%p -t -q -c /etc/%p/%p.conf -g "daemon off;"
 ExecReload=/bin/kill -s HUP $MAINPID
 
 KillSignal=SIGQUIT
 KillMode=mixed
 TimeoutStopSec=60s
-TimeoutStartSec=30s
+# Start budget: the configuration test, execve, then the checker's ten-second
+# monotonic window plus at most one in-flight five-second manager query and
+# its one-second kill grace. The remainder absorbs slow configuration loads.
+TimeoutStartSec=60s
 Restart=on-failure
 RestartSec=5s
 

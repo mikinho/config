@@ -72,6 +72,11 @@ directory, capability, cgroup, or SELinux contract.
   verifier to reject it. Test both removed restrictions and broadened allowed
   networks: a default-deny property alone does not prove the allowed set is
   correct. Remove the test override and revalidate before accepting the host.
+- For nginx, edit the unit or a drop-in without `systemctl daemon-reload` and
+  restart the service. The start must succeed with the gate's stale-metadata
+  warning in the journal, and `verify-deployment` must fail until
+  `daemon-reload` and a further restart activate the reviewed change. A start
+  gate that fails here converts an operator omission into an outage.
 - Rotate nginx logs while requests are arriving. Prove new files receive
   records and old inodes stop growing. Verify log-consumer continuity and
   repeat after a service restart. Signal success alone is insufficient.

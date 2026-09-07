@@ -15,6 +15,7 @@ NGINX_LOG_DIRECTORY=/var/log/nginx
 NGINX_SYSTEMD_UNIT=nginx.service
 TEST_BINARY=/usr/bin/test
 MODE=runtime
+STARTUP_GATE=no
 POLICY_COMMAND_TIMEOUT=5
 MASTER_PID=
 PREVIOUS_MASTER_PID=
@@ -26,26 +27,80 @@ QUIC_BPF=${NGINX_QUIC_BPF:-no}
 BASE_CAPABILITIES=00000000010004eb
 QUIC_CAPABILITIES=000000c0012014eb
 LAST_ERROR='nginx startup has not been inspected'
+MONOTONIC_SECONDS=0
+STALE_METADATA_WARNED=no
+required_syscalls=
 
 usage() {
     cat <<EOF
 Usage: $PROGRAM_NAME [--master-pid PID] [--previous-master-pid PID]
-       [--workers N] [--timeout-seconds N] [--quic-bpf]
-       $PROGRAM_NAME --policy-only
+       [--workers N] [--timeout-seconds N] [--quic-bpf] [--startup]
+       $PROGRAM_NAME --policy-only [--timeout-seconds N]
 
 Checks the live Linux nginx master, active workers, effective process security,
 and root-owned log-directory traversal without changing service or file state.
 Run as root. Defaults to the managed PID file, at least one active worker, and
-ten seconds of startup polling. --workers requires exactly the reviewed count,
-not merely a minimum, so extra workers cannot bypass the reviewed task budget.
-The QUIC BPF expectation can also come from the managed service environment.
+a ten-second window. --workers requires exactly the reviewed count, not merely
+a minimum, so extra workers cannot bypass the reviewed task budget. The QUIC
+BPF expectation can also come from the managed service environment.
+
 Every invocation requires the loaded unit to deny the complete local @mount
 syscall group. --policy-only checks that composed policy before service start.
+
+--timeout-seconds bounds the whole check on the monotonic clock, covering
+readiness polling and service-manager queries alike. Conditions that resolve on
+their own (a PID file or worker not yet present, a manager query that did not
+answer within $POLICY_COMMAND_TIMEOUT seconds) are retried once per second until the
+window closes; policy violations fail immediately. 0 performs a single attempt.
+
+--startup marks the unit's own ExecStartPost invocation. The loaded policy it
+inspects is exactly what the new master received, so on-disk unit changes that
+daemon-reload has not activated are reported as a warning instead of failing
+the start. Operator and host-acceptance invocations keep failing closed.
 EOF
 }
 
 fail() { printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2; exit 1; }
+warn() { printf '%s: warning: %s\n' "$PROGRAM_NAME" "$*" >&2; }
 pending() { LAST_ERROR=$*; return 1; }
+
+read_monotonic_seconds() {
+    # /proc/uptime follows CLOCK_BOOTTIME, so a wall-clock step during startup
+    # can neither shorten nor stretch the verification window.
+    read -r MONOTONIC_SECONDS _ < "$PROC_ROOT/uptime" \
+        || fail "cannot read the monotonic clock from $PROC_ROOT/uptime"
+    MONOTONIC_SECONDS=${MONOTONIC_SECONDS%%.*}
+    case "$MONOTONIC_SECONDS" in
+        '' | *[!0-9]*) fail "cannot interpret the monotonic clock from $PROC_ROOT/uptime" ;;
+    esac
+}
+
+manager_query() {
+    # Bound every service-manager round trip so this check can never hang the
+    # start job. The caller decides whether a missed deadline is retryable.
+    LC_ALL=C SYSTEMD_COLORS=0 timeout --kill-after=1 "$POLICY_COMMAND_TIMEOUT" "$@" 2>/dev/null
+}
+
+describe_query_status() {
+    case "$1" in
+        124) printf 'did not answer within %s seconds' "$POLICY_COMMAND_TIMEOUT" ;;
+        137) printf 'ignored its %s-second deadline and was killed' "$POLICY_COMMAND_TIMEOUT" ;;
+        *) printf 'exited with status %s' "$1" ;;
+    esac
+}
+
+report_stale_metadata() {
+    # The loaded unit is what the running master received, so the inspected
+    # policy is accurate even when the on-disk files have moved on. Only the
+    # unit's own start gate tolerates that drift: failing there would turn a
+    # forgotten daemon-reload into an outage that Restart= cannot clear.
+    # Operator and host-acceptance runs certify the on-disk policy and fail.
+    [ "$STARTUP_GATE" = yes ] \
+        || fail "$NGINX_SYSTEMD_UNIT manager metadata is stale; review the on-disk unit and drop-ins, run systemctl daemon-reload, then restart $NGINX_SYSTEMD_UNIT"
+    [ "$STALE_METADATA_WARNED" = no ] || return 0
+    STALE_METADATA_WARNED=yes
+    warn "$NGINX_SYSTEMD_UNIT was started from its loaded configuration, but its on-disk unit or drop-ins have changed since; run systemctl daemon-reload and restart $NGINX_SYSTEMD_UNIT to activate reviewed changes"
+}
 
 validate_number() {
     case "$2" in
@@ -67,36 +122,17 @@ unit_property() {
     '
 }
 
-check_systemd_policy() {
-    # Inspect PID 1's composed policy, including later site drop-ins. Seccomp=2
-    # alone also occurs when unrelated settings install filters but @mount was
-    # cleared. Bound manager access; this check must not hang host verification.
-    unit_policy=$(LC_ALL=C SYSTEMD_COLORS=0 timeout --kill-after=1 "$POLICY_COMMAND_TIMEOUT" \
-        systemctl --no-pager show \
-        --property=LoadState,NeedDaemonReload,SystemCallFilter,SystemCallErrorNumber,MainPID \
-        "$NGINX_SYSTEMD_UNIT" 2>/dev/null) \
-        || fail "cannot inspect the composed $NGINX_SYSTEMD_UNIT mount policy within $POLICY_COMMAND_TIMEOUT seconds"
-    [ "$(unit_property LoadState)" = loaded ] \
-        || fail "$NGINX_SYSTEMD_UNIT must be loaded for mount-policy verification"
-    [ "$(unit_property NeedDaemonReload)" = no ] \
-        || fail "$NGINX_SYSTEMD_UNIT manager metadata is stale or unknown; review and reload systemd before verification"
-    composed_filter=$(unit_property SystemCallFilter) \
-        || fail "$NGINX_SYSTEMD_UNIT has no readable SystemCallFilter property"
-    case "$composed_filter" in
-        '~'*) denied_syscalls=${composed_filter#\~} ;;
-        *) fail "$NGINX_SYSTEMD_UNIT must use a SystemCallFilter deny-list containing the complete @mount group; allow-list replacements require separate review" ;;
-    esac
-    [ "$(unit_property SystemCallErrorNumber)" = 1 ] \
-        || fail "$NGINX_SYSTEMD_UNIT must retain SystemCallErrorNumber=EPERM"
-    SYSTEMD_MASTER_PID=$(unit_property MainPID) \
-        || fail "$NGINX_SYSTEMD_UNIT has no readable MainPID property"
-
+expand_mount_group() {
     # systemctl resolves groups to syscall names. Expand the local systemd
     # group's definition too, rather than pinning a list that can miss new
     # mount APIs after an operating-system update. Unknown output fails closed.
-    mount_group=$(LC_ALL=C SYSTEMD_COLORS=0 timeout --kill-after=1 "$POLICY_COMMAND_TIMEOUT" \
-        systemd-analyze syscall-filter @mount 2>/dev/null) \
-        || fail "cannot expand the local @mount syscall group within $POLICY_COMMAND_TIMEOUT seconds"
+    # The expansion is deterministic, so one successful result serves every
+    # retry of the surrounding check.
+    [ -z "$required_syscalls" ] || return 0
+    query_status=0
+    mount_group=$(manager_query systemd-analyze syscall-filter @mount) || query_status=$?
+    [ "$query_status" -eq 0 ] \
+        || { pending "cannot expand the local @mount syscall group: systemd-analyze $(describe_query_status "$query_status")"; return 1; }
     required_syscalls=$(printf '%s\n' "$mount_group" | awk '
         $0 == "@mount" { header++; next }
         /^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
@@ -109,6 +145,37 @@ check_systemd_policy() {
         { invalid = 1 }
         END { if (invalid || header != 1 || !names["mount"] || !names["umount2"] || !names["pivot_root"]) exit 1 }
     ') || fail 'cannot interpret the local @mount syscall group'
+}
+
+check_systemd_policy() {
+    # Inspect PID 1's composed policy, including later site drop-ins. Seccomp=2
+    # alone also occurs when unrelated settings install filters but @mount was
+    # cleared. A manager that does not answer in time is a retryable condition;
+    # a policy that answers wrongly is not.
+    query_status=0
+    unit_policy=$(manager_query systemctl --no-pager show \
+        --property=LoadState,NeedDaemonReload,SystemCallFilter,SystemCallErrorNumber,MainPID \
+        "$NGINX_SYSTEMD_UNIT") || query_status=$?
+    [ "$query_status" -eq 0 ] \
+        || { pending "cannot inspect the composed $NGINX_SYSTEMD_UNIT mount policy: systemctl show $(describe_query_status "$query_status")"; return 1; }
+    [ "$(unit_property LoadState)" = loaded ] \
+        || fail "$NGINX_SYSTEMD_UNIT must be loaded for mount-policy verification"
+    case "$(unit_property NeedDaemonReload)" in
+        no) ;;
+        yes) report_stale_metadata ;;
+        *) fail "$NGINX_SYSTEMD_UNIT manager metadata is unknown; review and reload systemd before verification" ;;
+    esac
+    composed_filter=$(unit_property SystemCallFilter) \
+        || fail "$NGINX_SYSTEMD_UNIT has no readable SystemCallFilter property"
+    case "$composed_filter" in
+        '~'*) denied_syscalls=${composed_filter#\~} ;;
+        *) fail "$NGINX_SYSTEMD_UNIT must use a SystemCallFilter deny-list containing the complete @mount group; allow-list replacements require separate review" ;;
+    esac
+    [ "$(unit_property SystemCallErrorNumber)" = 1 ] \
+        || fail "$NGINX_SYSTEMD_UNIT must retain SystemCallErrorNumber=EPERM"
+    SYSTEMD_MASTER_PID=$(unit_property MainPID) \
+        || fail "$NGINX_SYSTEMD_UNIT has no readable MainPID property"
+    expand_mount_group || return 1
     missing_syscalls=$(printf '%s\n' "$denied_syscalls" | awk -v required="$required_syscalls" '
         {
             for (i = 1; i <= NF; i++) {
@@ -229,6 +296,13 @@ inspect_runtime() {
         || { pending 'nginx master changed or exited during inspection'; return 1; }
 }
 
+inspect_service() {
+    # Re-read the composed policy on every attempt so the master compared
+    # against MainPID is the one the manager reports right now.
+    check_systemd_policy || return 1
+    [ "$MODE" = policy ] || inspect_runtime
+}
+
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --master-pid | --previous-master-pid | --workers | --timeout-seconds)
@@ -248,6 +322,7 @@ while [ "$#" -gt 0 ]; do
             ;;
         --quic-bpf) QUIC_BPF=yes; shift ;;
         --policy-only) MODE=policy; shift ;;
+        --startup) STARTUP_GATE=yes; shift ;;
         --help | -h) usage; exit 0 ;;
         *) fail "unknown argument: $1" ;;
     esac
@@ -262,22 +337,28 @@ for required_command in awk cat id setpriv stat tr sed sleep systemctl systemd-a
 done
 [ "$(id -u)" -eq 0 ] || fail 'run as root to inspect nginx process security'
 if [ "$MODE" = policy ]; then
-    [ -z "$MASTER_PID$PREVIOUS_MASTER_PID" ] && [ "$EXACT_WORKERS" = no ] \
-        || fail '--policy-only does not accept process assertions'
+    [ -z "$MASTER_PID$PREVIOUS_MASTER_PID" ] && [ "$EXACT_WORKERS" = no ] && [ "$STARTUP_GATE" = no ] \
+        || fail '--policy-only does not accept process assertions or --startup'
+else
+    NGINX_UID=$(id -u nginx) || fail 'nginx user is unavailable'
+    NGINX_GID=$(id -g nginx) || fail 'nginx group is unavailable'
 fi
-check_systemd_policy
+
+# One monotonic deadline covers manager queries and process inspection, so the
+# unit's TimeoutStartSec= budget stays predictable however many attempts run.
+read_monotonic_seconds
+deadline=$((MONOTONIC_SECONDS + TIMEOUT_SECONDS))
+attempts=1
+while ! inspect_service; do
+    read_monotonic_seconds
+    [ "$MONOTONIC_SECONDS" -lt "$deadline" ] \
+        || fail "$LAST_ERROR after $attempts attempt(s) within the $TIMEOUT_SECONDS-second window"
+    attempts=$((attempts + 1))
+    sleep 1
+done
 if [ "$MODE" = policy ]; then
     printf 'Verified %s composed mount-syscall denial.\n' "$NGINX_SYSTEMD_UNIT"
     exit 0
 fi
-NGINX_UID=$(id -u nginx) || fail 'nginx user is unavailable'
-NGINX_GID=$(id -g nginx) || fail 'nginx group is unavailable'
-
-remaining_attempts=$TIMEOUT_SECONDS
-while ! inspect_runtime; do
-    [ "$remaining_attempts" -gt 0 ] || fail "$LAST_ERROR"
-    remaining_attempts=$((remaining_attempts - 1))
-    sleep 1
-done
 printf 'Verified nginx master PID %s and %s active worker(s): Umask 0027, identities, process restrictions, composed mount-syscall denial, and log-directory traversal.\n' \
     "$observed_pid" "$active_workers"
