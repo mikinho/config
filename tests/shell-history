@@ -17,6 +17,7 @@ SHELL_SETUP=$REPOSITORY_ROOT/shell/setup
 POLICY_SOURCE=$REPOSITORY_ROOT/shell/profile.d/90-no-persistent-history.sh
 UMASK_SOURCE=$REPOSITORY_ROOT/shell/profile.d/80-admin-umask.sh
 PROMPT_SOURCE=$REPOSITORY_ROOT/shell/profile.d/70-managed-environment-prompt.sh
+HOST_VERIFIER=$REPOSITORY_ROOT/deploy/verify-deployment
 
 cleanup() {
     if [ -d "$TEST_ROOT" ]; then
@@ -139,13 +140,110 @@ HOME=$TEST_ROOT/home bash --noprofile --norc -ic '
     . "$1"
     [ "$HISTFILE" = /dev/null ]
     [ "$HISTSIZE" = 41 ]
-    readonly -p HISTFILE >/dev/null 2>&1
+    case $(declare -p HISTFILE 2>/dev/null) in
+        "declare -"*r*" HISTFILE="*) ;;
+        *) exit 1 ;;
+    esac
     history -s "config-shell-history-test"
     history -w
 ' sh "$POLICY_SOURCE" >/dev/null 2>&1 \
     || fail "policy did not retain in-session history without persistence"
 [ ! -e "$TEST_ROOT/home/.bash_history" ] \
     || fail "interactive policy created a persistent Bash history file"
+
+# Run the actual host check with controlled startup files and real interactive
+# Bash parsing. The wrapper replaces login startup discovery, so these tests
+# never source or change the developer's profile or history files.
+mkdir -p "$TEST_ROOT/bin"
+cat > "$TEST_ROOT/bin/bash" <<'EOF'
+#!/bin/sh
+case "$1" in
+    -lic) SHELL_TEST_LEVEL=login ;;
+    -ic) SHELL_TEST_LEVEL=child ;;
+    *) exit 2 ;;
+esac
+shift
+export SHELL_TEST_LEVEL
+exec "$REAL_BASH" --noprofile --rcfile "$SHELL_TEST_RC" -ic "$@"
+EOF
+chmod 0755 "$TEST_ROOT/bin/bash"
+cat > "$TEST_ROOT/controlled.bashrc" <<'EOF'
+umask 0022
+HISTFILE=$HOME/.bash_history
+HISTSIZE=1000
+. "$UMASK_SOURCE"
+case "$SHELL_TEST_CASE" in
+    persistent-history) ;;
+    writable-history)
+        HISTFILE=/dev/null
+        export HISTFILE
+        trap 'declare -p HISTFILE > "$SHELL_ATTRIBUTE_TRACE"' EXIT
+        ;;
+    *) . "$POLICY_SOURCE" ;;
+esac
+PS1="[$EXPECTED_MANAGED_ENVIRONMENT ROOT] \\u@\\h:\\w# "
+case "$SHELL_TEST_CASE:$SHELL_TEST_LEVEL" in
+    weak-login-mask:login | weak-child-mask:child) umask 0022 ;;
+    empty-history:*) HISTSIZE=0 ;;
+    wrong-prompt:*) PS1='unclassified prompt' ;;
+esac
+EOF
+cat > "$TEST_ROOT/host-shell-harness" <<'EOF'
+set -eu
+set -f
+FAILED_CHECKS=0
+fail_msg() { FAILED_CHECKS=$((FAILED_CHECKS + 1)); }
+pass_msg() { :; }
+# Map the isolated fixture's ownership to the host's required root identity.
+stat() { printf 'root:root:644\n'; }
+EOF
+sed -n '/^check_shell_history() {/,/^}/p' "$HOST_VERIFIER" \
+    >> "$TEST_ROOT/host-shell-harness"
+printf '%s\n' 'check_shell_history' '[ "$FAILED_CHECKS" -eq 0 ]' \
+    >> "$TEST_ROOT/host-shell-harness"
+printf '%s\n' 'set -eu' 'set -f' 'fail() { exit 1; }' \
+    > "$TEST_ROOT/setup-shell-harness"
+sed -n '/^validate_login_behavior() {/,/^}/p' "$SHELL_SETUP" \
+    >> "$TEST_ROOT/setup-shell-harness"
+printf '%s\n' 'validate_login_behavior' >> "$TEST_ROOT/setup-shell-harness"
+
+run_shell_check() {
+    shell_test_case=$1
+    env PATH="$TEST_ROOT/bin:$PATH" HOME="$TEST_ROOT/home" \
+        REAL_BASH="$(command -v bash)" \
+        SHELL_TEST_RC="$TEST_ROOT/controlled.bashrc" \
+        SHELL_TEST_CASE="$shell_test_case" \
+        SHELL_ATTRIBUTE_TRACE="$TEST_ROOT/history-attributes" \
+        ENVIRONMENT="$shell_test_environment" \
+        SHELL_ENVIRONMENT="$TEST_ROOT/managed-environment" \
+        SHELL_PROMPT_POLICY="$PROMPT_SOURCE" \
+        SHELL_UMASK_POLICY="$UMASK_SOURCE" \
+        SHELL_HISTORY_POLICY="$POLICY_SOURCE" \
+        UMASK_SOURCE="$UMASK_SOURCE" POLICY_SOURCE="$POLICY_SOURCE" \
+        sh "$TEST_ROOT/$shell_test_harness-shell-harness" > "$TEST_ROOT/host-shell.stdout" \
+        2> "$TEST_ROOT/host-shell.stderr"
+}
+
+for shell_test_harness in host setup; do
+    for shell_test_environment in PROD TEST; do
+        printf '%s\n' "$shell_test_environment" > "$TEST_ROOT/managed-environment"
+        run_shell_check valid \
+            || fail "$shell_test_harness rejected valid $shell_test_environment shell policies"
+        for shell_test_case in weak-login-mask weak-child-mask empty-history \
+            persistent-history wrong-prompt writable-history
+        do
+            if run_shell_check "$shell_test_case"; then
+                fail "$shell_test_harness accepted $shell_test_environment $shell_test_case"
+            fi
+            if [ "$shell_test_case" = writable-history ]; then
+                grep -Fx 'declare -x HISTFILE="/dev/null"' \
+                    "$TEST_ROOT/history-attributes" >/dev/null \
+                    || fail "$shell_test_harness modified the HISTFILE read-only attribute"
+                rm "$TEST_ROOT/history-attributes"
+            fi
+        done
+    done
+done
 
 fixture_root=$TEST_ROOT/repository
 mkdir -p "$fixture_root/shell/profile.d"
@@ -158,6 +256,12 @@ cp "$PROMPT_SOURCE" \
     "$fixture_root/shell/profile.d/70-managed-environment-prompt.sh"
 expect_failure \
     'repository source must be a regular file' \
+    "$fixture_root/shell/setup" --check
+rm "$fixture_root/shell/profile.d/90-no-persistent-history.sh"
+sed '/^[[:space:]]*readonly HISTFILE$/d' "$POLICY_SOURCE" \
+    > "$fixture_root/shell/profile.d/90-no-persistent-history.sh"
+expect_failure \
+    'repository shell policy does not enforce non-persistent interactive history' \
     "$fixture_root/shell/setup" --check
 
 printf 'Validated administrative Bash umask, history, and setup boundaries.\n'

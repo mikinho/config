@@ -98,7 +98,10 @@ validate_source() {
         . "$1"
         [ "$HISTFILE" = /dev/null ]
         [ "$HISTSIZE" = 73 ]
-        readonly -p HISTFILE >/dev/null 2>&1
+        case $(declare -p HISTFILE 2>/dev/null) in
+            "declare -"*r*" HISTFILE="*) ;;
+            *) exit 1 ;;
+        esac
     ' sh "$HISTORY_SOURCE" >/dev/null 2>&1 \
         || fail "repository shell policy does not enforce non-persistent interactive history"
 }
@@ -218,7 +221,10 @@ validate_login_behavior() {
         "EXPECTED_MANAGED_ENVIRONMENT=$ENVIRONMENT" bash -lic '
         [ "${HISTFILE:-}" = /dev/null ] || exit 1
         [ "${HISTSIZE:-0}" -gt 0 ] 2>/dev/null || exit 1
-        readonly -p HISTFILE >/dev/null 2>&1 || exit 1
+        case $(declare -p HISTFILE 2>/dev/null) in
+            "declare -"*r*" HISTFILE="*) ;;
+            *) exit 1 ;;
+        esac
         managed_login_umask=$(umask)
         managed_login_umask=${managed_login_umask#0}
         [ "$((8#$managed_login_umask & 8#027))" -eq "$((8#027))" ] || exit 1
