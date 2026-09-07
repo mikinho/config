@@ -386,6 +386,20 @@ backup_target() {
     BACKED_UP_TARGETS=$(append_line "$BACKED_UP_TARGETS" "$backup_target_path")
 }
 
+stage_path() {
+    # A staged copy is created beside its target so the final rename is atomic
+    # on the same filesystem. logrotate parses every file in its include
+    # directory except those carrying a taboo extension, so a plain staging
+    # name there is read as a duplicate policy for the copy's duration;
+    # ".disabled" is on logrotate's default taboo list. Monit and systemd load
+    # only *.conf from their directories and /etc/monitrc is read by name, so
+    # the plain suffix cannot be picked up anywhere else.
+    case "$1" in
+        */logrotate.d/*) mktemp "$1.$2.XXXXXX.disabled" ;;
+        *) mktemp "$1.$2.XXXXXX" ;;
+    esac
+}
+
 restore_target() {
     restore_target_path=$1
     restore_relative_path=${restore_target_path#/}
@@ -393,7 +407,7 @@ restore_target() {
     restore_present=$BACKUP_DIRECTORY/present/$restore_relative_path
     restore_absent=$BACKUP_DIRECTORY/absent/$restore_relative_path
     if [ -f "$restore_present" ]; then
-        restore_stage=$(mktemp "$restore_target_path.rollback.XXXXXX") || return 1
+        restore_stage=$(stage_path "$restore_target_path" rollback) || return 1
         if ! cp --preserve=mode,ownership,timestamps,xattr,context -- "$restore_file" "$restore_stage" \
             || ! mv -f -- "$restore_stage" "$restore_target_path"
         then
@@ -486,7 +500,7 @@ install_managed_file() {
     staged_source=$1
     live_target=$2
     live_mode=$3
-    PENDING_STAGE=$(mktemp "$live_target.tmp.XXXXXX")
+    PENDING_STAGE=$(stage_path "$live_target" tmp)
     install -o root -g root -m "$live_mode" "$staged_source" "$PENDING_STAGE"
     mv -f -- "$PENDING_STAGE" "$live_target"
     PENDING_STAGE=

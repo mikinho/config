@@ -155,6 +155,9 @@ step "Running Fail2ban installer routing tests..."
 step "Running component and host setup tests..."
 "$REPOSITORY_ROOT/tests/host-setup"
 
+step "Running the nginx Node Unix-socket echo fixture tests..."
+node --test "$REPOSITORY_ROOT/tests/nginx-node-echo.test.mjs"
+
 step "Running isolated nginx capacity and restart regression tests..."
 "$REPOSITORY_ROOT/tests/nginx-setup"
 "$REPOSITORY_ROOT/tests/nginx-runtime-verifier"

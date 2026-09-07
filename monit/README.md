@@ -308,6 +308,20 @@ checks, and the rollback retention decision have been recorded privately;
 remove it only after that decision. Backup contents can include secrets and
 must never be copied into this repository or ordinary audit output.
 
+`monit/verify` audits the store: `/var/lib/config-monit`, `backups`, and every
+retained transaction must be `root:root` mode `0700` without ACLs. A
+transaction whose `status` is not `committed` or `rolled-back` (still
+`applying`, `rollback-incomplete`, or missing) is unfinished recovery and fails
+verification until it is resolved and its retention decided. More than five
+completed transactions produce a warning, because each holds a copy of
+`/etc/monitrc` with the control credential; the decision to keep or remove
+them stays with the operator and is never automated.
+
+Setup stages each managed file beside its target and renames it into place.
+Under `/etc/logrotate.d` the staged name ends in `.disabled`, one of
+logrotate's default taboo extensions, so a rotation that coincides with an
+apply never parses the half-copied policy as a duplicate.
+
 If Monit was a fresh deployment and must be removed from service, disable and
 stop `monit.service` first. Package removal is a separate reviewed action; do
 not delete state, logs, fragments, or evidence until their retention decision

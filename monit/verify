@@ -42,6 +42,11 @@ MONIT_RUNTIME_DIRECTORY=/run/monit
 PACKAGE_UNIT=/usr/lib/systemd/system/monit.service
 PACKAGE_BINARY=/usr/bin/monit
 MANAGED_MARKER='Managed by mikinho/config monit/setup.'
+TRANSACTION_STORE=/var/lib/config-monit
+BACKUP_ROOT=$TRANSACTION_STORE/backups
+# Completed transactions beyond this count are reported so retention decisions
+# are recorded rather than deferred indefinitely; the copies hold credentials.
+RETAINED_TRANSACTION_WARNING=5
 
 MODE=verify
 
@@ -61,6 +66,10 @@ EOF
 fail() {
     printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2
     exit 1
+}
+
+warn() {
+    printf '%s: warning: %s\n' "$PROGRAM_NAME" "$*" >&2
 }
 
 validate_source() {
@@ -207,6 +216,35 @@ verify_managed_files() {
         || fail "installed systemd policy differs from repository policy"
 }
 
+verify_transaction_evidence() {
+    # Setup retains every transaction, including copies of /etc/monitrc and its
+    # control credential, under a root-only store. The store must stay private,
+    # and a transaction that is still applying or whose rollback could not
+    # complete is unfinished recovery work that acceptance must not overlook.
+    require_directory_identity "$TRANSACTION_STORE" root:root:700
+    require_directory_identity "$BACKUP_ROOT" root:root:700
+    retained_transactions=0
+    unresolved_transactions=0
+    for transaction_directory in "$BACKUP_ROOT"/transaction.*; do
+        [ -e "$transaction_directory" ] || continue
+        require_directory_identity "$transaction_directory" root:root:700
+        retained_transactions=$((retained_transactions + 1))
+        transaction_status=$(cat "$transaction_directory/status" 2>/dev/null) || transaction_status=missing
+        case "$transaction_status" in
+            committed | rolled-back) ;;
+            *)
+                unresolved_transactions=$((unresolved_transactions + 1))
+                printf '%s: unresolved Monit transaction (%s): %s\n' \
+                    "$PROGRAM_NAME" "$transaction_status" "$transaction_directory" >&2
+                ;;
+        esac
+    done
+    [ "$unresolved_transactions" -eq 0 ] \
+        || fail "$unresolved_transactions retained Monit transaction(s) are unresolved; complete recovery and record the retention decision before acceptance"
+    [ "$retained_transactions" -le "$RETAINED_TRANSACTION_WARNING" ] \
+        || warn "$retained_transactions completed Monit transactions are retained under $BACKUP_ROOT; each holds a control-credential copy, so record retention decisions and remove those no longer needed"
+}
+
 verify_log_rotation() {
     for logrotate_line in \
         '/var/log/monit/monit.log {' \
@@ -347,6 +385,7 @@ verify_package_integrity
 verify_version_floor
 verify_control_file
 verify_managed_files
+verify_transaction_evidence
 verify_log_rotation
 verify_systemd_policy
 verify_listener

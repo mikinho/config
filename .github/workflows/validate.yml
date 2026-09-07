@@ -95,10 +95,22 @@ jobs:
             exit 1
           fi
 
+      # The container jobs pin nodejs:22; the hosted executor's Node is set here
+      # so the local suite runs the same major everywhere. Caching is disabled:
+      # nothing here installs packages, and restored caches are a poisoning path.
+      - name: Install the pinned Node.js major
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          package-manager-cache: false
+
       - name: Validate installer and profile coverage
         run: |
           actionlint -color
-          node --test tests/nginx-node-echo.test.mjs
+          node --version | grep -E '^v22\.' || {
+            echo 'the hosted executor must run Node.js 22 to match the container jobs' >&2
+            exit 1
+          }
           tests/run-all-local
 
       - name: Exercise a full profile render
@@ -388,6 +400,15 @@ jobs:
             's/server_name example.com www.example.com;/server_name node.example.com www.node.example.com;/' \
             nginx/sites/sample_node.conf.example \
             > build/ci-safe/sites/sample_node.conf
+          # A no-op rewrite would leave two servers claiming example.com; fail
+          # here rather than in a later, less specific nginx error.
+          grep --fixed-strings \
+            'server_name node.example.com www.node.example.com;' \
+            build/ci-safe/sites/sample_node.conf
+          if grep --fixed-strings 'server_name example.com' build/ci-safe/sites/sample_node.conf; then
+            echo 'the Node sample still carries the WordPress sample server_name' >&2
+            exit 1
+          fi
           printf '%s\n' \
             'server {' \
             '    listen 127.0.0.1:8080;' \

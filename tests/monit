@@ -253,7 +253,7 @@ touch -t 202001020304 "$rollback_file"
 : > "$rollback_present"
 printf '%s\n' 'managed replacement' > "$rollback_target"
 chmod 0644 "$rollback_target"
-restore_target_function=$(extract_function restore_target "$SETUP")
+restore_target_function=$(extract_function stage_path "$SETUP"; extract_function restore_target "$SETUP")
 [ -n "$restore_target_function" ] \
     || fail 'cannot extract Monit rollback restore function'
 # Production rollback uses GNU cp to preserve SELinux contexts and ACLs too.
@@ -283,6 +283,78 @@ BACKUP_DIRECTORY=$rollback_root PATH="$TEST_ROOT/metadata-bin:$PATH" sh -c "$res
     restore_target '$rollback_target'"
 assert_contains "$TEST_ROOT/rollback-alias" 'later mutation'
 assert_contains "$rollback_target" 'package original'
+
+# Staged copies live beside their target for an atomic rename. Under a
+# logrotate include directory the staging name must carry a taboo extension,
+# or logrotate would parse the half-copied file as a duplicate policy; other
+# targets are read by exact name or *.conf glob and need only a plain suffix.
+stage_path_function=$(extract_function stage_path "$SETUP")
+install -d "$TEST_ROOT/stage/etc/logrotate.d" "$TEST_ROOT/stage/etc/monit.d"
+if command -v mktemp >/dev/null 2>&1 && mktemp "$TEST_ROOT/stage/probe.XXXXXX.suffix" >/dev/null 2>&1; then
+    rm -f "$TEST_ROOT/stage"/probe.*.suffix
+    logrotate_stage=$(sh -c "$stage_path_function
+        stage_path '$TEST_ROOT/stage/etc/logrotate.d/monit' tmp")
+    case "$logrotate_stage" in
+        "$TEST_ROOT/stage/etc/logrotate.d/monit.tmp."??????.disabled) ;;
+        *) fail "logrotate staging name lacks the taboo extension: $logrotate_stage" ;;
+    esac
+    [ -f "$logrotate_stage" ] || fail 'logrotate staging file was not created'
+else
+    printf 'Skipping the logrotate staging-suffix case: mktemp lacks suffix support here.\n'
+fi
+fragment_stage=$(sh -c "$stage_path_function
+    stage_path '$TEST_ROOT/stage/etc/monit.d/70-example.conf' rollback")
+case "$fragment_stage" in
+    "$TEST_ROOT/stage/etc/monit.d/70-example.conf.rollback."??????) ;;
+    *) fail "fragment staging name is not the plain suffix form: $fragment_stage" ;;
+esac
+case "$fragment_stage" in
+    *.conf) fail 'a staged fragment must not match the *.conf include glob' ;;
+esac
+[ -f "$fragment_stage" ] || fail 'fragment staging file was not created'
+
+# Verification audits the transaction store: private identities, no unresolved
+# transactions, and a warning once completed ones accumulate.
+transaction_functions=$(extract_function warn "$VERIFIER"; extract_function verify_transaction_evidence "$VERIFIER")
+evidence_store=$TEST_ROOT/evidence
+make_transaction() {
+    install -d "$evidence_store/backups/transaction.$1"
+    printf '%s\n' "$2" > "$evidence_store/backups/transaction.$1/status"
+}
+run_evidence_check() {
+    env TRANSACTION_STORE="$evidence_store" BACKUP_ROOT="$evidence_store/backups" \
+        RETAINED_TRANSACTION_WARNING=5 PROGRAM_NAME=monit-test \
+        sh -c "fail() { printf '%s\\n' \"\$*\" >&2; exit 1; }
+            require_directory_identity() { printf 'identity %s\\n' \"\$1\" >> '$TEST_ROOT/identity-checks'; }
+            $transaction_functions
+            verify_transaction_evidence"
+}
+rm -rf "$evidence_store"; : > "$TEST_ROOT/identity-checks"
+install -d "$evidence_store/backups"
+run_evidence_check 2> "$TEST_ROOT/evidence.stderr"
+[ ! -s "$TEST_ROOT/evidence.stderr" ] || fail 'an empty transaction store produced diagnostics'
+assert_contains "$TEST_ROOT/identity-checks" "identity $evidence_store"
+assert_contains "$TEST_ROOT/identity-checks" "identity $evidence_store/backups"
+make_transaction 00000001 committed
+make_transaction 00000002 rolled-back
+: > "$TEST_ROOT/identity-checks"
+run_evidence_check 2> "$TEST_ROOT/evidence.stderr"
+[ ! -s "$TEST_ROOT/evidence.stderr" ] || fail 'completed transactions produced diagnostics'
+assert_contains "$TEST_ROOT/identity-checks" "identity $evidence_store/backups/transaction.00000002"
+for unresolved_status in applying preparing rollback-incomplete; do
+    make_transaction 00000003 "$unresolved_status"
+    expect_failure '1 retained Monit transaction(s) are unresolved' run_evidence_check
+    assert_contains "$TEST_ROOT/expected.stderr" "unresolved Monit transaction ($unresolved_status)"
+done
+rm -f "$evidence_store/backups/transaction.00000003/status"
+expect_failure 'unresolved Monit transaction (missing)' run_evidence_check
+rm -rf "$evidence_store/backups/transaction.00000003"
+for transaction_index in 3 4 5; do make_transaction "0000000$transaction_index" committed; done
+run_evidence_check 2> "$TEST_ROOT/evidence.stderr"
+[ ! -s "$TEST_ROOT/evidence.stderr" ] || fail 'five completed transactions must not warn'
+make_transaction 00000006 committed
+run_evidence_check 2> "$TEST_ROOT/evidence.stderr"
+assert_contains "$TEST_ROOT/evidence.stderr" 'warning: 6 completed Monit transactions are retained'
 
 install -d "$TEST_ROOT/fragments-a" "$TEST_ROOT/fragments-b"
 printf '%s\n' 'check process example with pidfile /run/example.pid' \
