@@ -50,6 +50,9 @@ to persistent storage.
 
 The read-only variable prevents accidental reversal in later login startup
 files; exported `HISTFILE` carries `/dev/null` into interactive child shells.
+Bash does not inherit the read-only attribute, so descendant startup files
+must source the managed policy again. Verification checks the attribute in
+both a fresh login and its interactive child without changing either variable.
 It does not prevent a root user from starting Bash without system profiles or
 otherwise bypassing the policy. Bash does not itself read `/etc/profile.d` for
 an independently launched non-login shell; distribution-default user

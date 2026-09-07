@@ -505,6 +505,10 @@ check_shell_history() {
         bash -ic "
             [ \"\${HISTFILE:-}\" = /dev/null ] || exit 1
             [ \"\${HISTSIZE:-0}\" -gt 0 ] 2>/dev/null || exit 1
+            case \$(declare -p HISTFILE 2>/dev/null) in
+                \"declare -\"*r*\" HISTFILE=\"*) ;;
+                *) exit 1 ;;
+            esac
             managed_verify_child_umask=\$(umask)
             managed_verify_child_umask=\${managed_verify_child_umask#0}
             [ \"\$((8#\$managed_verify_child_umask & 8#027))\" -eq \"\$((8#027))\" ]

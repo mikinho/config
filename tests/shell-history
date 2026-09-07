@@ -172,9 +172,9 @@ umask 0022
 HISTFILE=$HOME/.bash_history
 HISTSIZE=1000
 . "$UMASK_SOURCE"
-case "$SHELL_TEST_CASE" in
-    persistent-history) ;;
-    writable-history)
+case "$SHELL_TEST_CASE:$SHELL_TEST_LEVEL" in
+    persistent-history:*) ;;
+    writable-history:* | child-writable-history:child)
         HISTFILE=/dev/null
         export HISTFILE
         trap 'declare -p HISTFILE > "$SHELL_ATTRIBUTE_TRACE"' EXIT
@@ -230,12 +230,13 @@ for shell_test_harness in host setup; do
         run_shell_check valid \
             || fail "$shell_test_harness rejected valid $shell_test_environment shell policies"
         for shell_test_case in weak-login-mask weak-child-mask empty-history \
-            persistent-history wrong-prompt writable-history
+            persistent-history wrong-prompt writable-history child-writable-history
         do
             if run_shell_check "$shell_test_case"; then
                 fail "$shell_test_harness accepted $shell_test_environment $shell_test_case"
             fi
-            if [ "$shell_test_case" = writable-history ]; then
+            if [ "$shell_test_case" = writable-history ] \
+                || [ "$shell_test_case" = child-writable-history ]; then
                 grep -Fx 'declare -x HISTFILE="/dev/null"' \
                     "$TEST_ROOT/history-attributes" >/dev/null \
                     || fail "$shell_test_harness modified the HISTFILE read-only attribute"
