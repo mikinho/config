@@ -1,0 +1,248 @@
+#!/usr/bin/env sh
+
+#
+# Author: Michael Welter <me@mikinho.com> - https://github.com/mikinho
+#
+
+set -eu
+set -f
+umask 077
+
+PROGRAM_NAME=${0##*/}
+SCRIPT_DIRECTORY=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+case "$SCRIPT_DIRECTORY" in
+    /usr/local/sbin) LIBRARY_DIRECTORY=/usr/local/libexec/config-mongodb ;;
+    *) LIBRARY_DIRECTORY=$SCRIPT_DIRECTORY ;;
+esac
+case "$SCRIPT_DIRECTORY" in
+    /usr/local/sbin) TLS_LIBRARY=$LIBRARY_DIRECTORY/tls.sh ;;
+    *) TLS_LIBRARY=$LIBRARY_DIRECTORY/lib/tls.sh ;;
+esac
+ROTATION_SCRIPT=$LIBRARY_DIRECTORY/certificate-rotation.js
+CONFIGURATION_PATH=/etc/mongod.conf
+MODE=apply
+CREATE_USER=no
+ROTATION_USER=
+ROTATION_ROLE=
+ROTATION_PASSWORD_FILE=
+ADMIN_USER=
+ADMIN_PASSWORD_FILE=
+REPLICA_SET=
+BIND_ADDRESS=
+MEMBER_HOST=
+TLS_CERTIFICATE_KEY_FILE=
+TLS_CA_FILE=
+TLS_MINIMUM_REMAINING_SECONDS=
+TEMPORARY_DIRECTORY=
+
+usage() {
+    cat <<EOF
+Usage:
+  sudo $PROGRAM_NAME OPTIONS
+  sudo $PROGRAM_NAME --create-user OPTIONS --admin-user USER --admin-password-file FILE
+  $PROGRAM_NAME --plan [--create-user] OPTIONS
+  $PROGRAM_NAME --check
+
+Options:
+  --rotation-user USER --rotation-role ROLE --rotation-password-file FILE
+  --replica-set NAME --bind-address PRIVATE_IPV4 --member-host DNS_NAME
+  --tls-certificate-key-file FILE --tls-ca-file FILE
+  --minimum-tls-seconds SECONDS (default: greater of 3600 and one tenth of certificate lifetime; range: 300-2592000)
+
+Validate installed TLS material, authenticate with only rotateCertificates,
+reload in-process when the served leaf differs, and verify fresh TLS plus PID
+and connection continuity. Run even when issuance is not due to retry adoption.
+--create-user creates a new SCRAM-SHA-256 identity with one custom rotation-only
+role, then verifies it in a fresh session. It never replaces an existing user.
+Passwords are read from protected files; --plan reads no credentials.
+This command never issues certificates, restarts mongod, or changes networking.
+EOF
+}
+
+fail() { printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2; exit 1; }
+
+cleanup() {
+    if [ -n "$TEMPORARY_DIRECTORY" ] && [ -d "$TEMPORARY_DIRECTORY" ]; then
+        rm -rf -- "$TEMPORARY_DIRECTORY"
+    fi
+}
+
+# Validate executable sources before sourcing a library or invoking a bundle.
+validate_root_source() {
+    source_path=$1
+    [ -f "$source_path" ] && [ ! -L "$source_path" ] \
+        || fail "executable source must be a regular, non-symbolic-link file: $source_path"
+    source_identity=$(stat -Lc '%U:%G:%a:%h' "$source_path")
+    case "$source_identity" in root:root:644:1 | root:root:755:1) ;;
+        *) fail "executable source must be root:root 0644 or 0755 with one link: $source_path" ;;
+    esac
+    parent_path=$(dirname -- "$source_path")
+    while :; do
+        [ -d "$parent_path" ] && [ ! -L "$parent_path" ] || fail "unsafe source parent: $parent_path"
+        parent_identity=$(stat -Lc '%U:%G:%a' "$parent_path")
+        parent_mode=${parent_identity##*:}
+        [ "${parent_identity%:*}" = root:root ] && [ "$((0$parent_mode & 0022))" -eq 0 ] \
+            || fail "source parent must be root:root and non-writable: $parent_path"
+        [ "$parent_path" != / ] || break
+        parent_path=$(dirname -- "$parent_path")
+    done
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --help | -h) usage; exit 0 ;;
+        --check | --plan)
+            [ "$MODE" = apply ] || fail "select exactly one mode"
+            MODE=${1#--}; shift ;;
+        --create-user)
+            [ "$CREATE_USER" = no ] || fail "--create-user may be supplied once"
+            CREATE_USER=yes; shift ;;
+        --rotation-user | --rotation-role | --rotation-password-file | --admin-user | --admin-password-file | \
+        --replica-set | --bind-address | --member-host | --tls-certificate-key-file | --tls-ca-file | --minimum-tls-seconds)
+            [ "$#" -ge 2 ] || fail "$1 requires a value"
+            case "$1" in
+                --rotation-user) ROTATION_USER=$2 ;;
+                --rotation-role) ROTATION_ROLE=$2 ;;
+                --rotation-password-file) ROTATION_PASSWORD_FILE=$2 ;;
+                --admin-user) ADMIN_USER=$2 ;;
+                --admin-password-file) ADMIN_PASSWORD_FILE=$2 ;;
+                --replica-set) REPLICA_SET=$2 ;;
+                --bind-address) BIND_ADDRESS=$2 ;;
+                --member-host) MEMBER_HOST=$2 ;;
+                --tls-certificate-key-file) TLS_CERTIFICATE_KEY_FILE=$2 ;;
+                --tls-ca-file) TLS_CA_FILE=$2 ;;
+                --minimum-tls-seconds) TLS_MINIMUM_REMAINING_SECONDS=$2 ;;
+            esac
+            shift 2 ;;
+        *) fail "unknown argument: $1" ;;
+    esac
+done
+
+for source_path in "$TLS_LIBRARY" "$ROTATION_SCRIPT"; do
+    [ -f "$source_path" ] && [ ! -L "$source_path" ] || fail "required source is missing: $source_path"
+done
+if [ "$MODE" = check ]; then
+    [ -z "$ROTATION_USER$ROTATION_ROLE$ROTATION_PASSWORD_FILE$ADMIN_USER$ADMIN_PASSWORD_FILE$REPLICA_SET$BIND_ADDRESS$MEMBER_HOST$TLS_CERTIFICATE_KEY_FILE$TLS_CA_FILE$TLS_MINIMUM_REMAINING_SECONDS" ] \
+        && [ "$CREATE_USER" = no ] || fail "--check does not accept runtime options"
+    sh -n "$TLS_LIBRARY"
+    printf 'Validated MongoDB live certificate-rotation sources.\n'
+    exit 0
+fi
+if [ "$MODE" = apply ]; then
+    [ "$(id -u)" -eq 0 ] || fail "run as root or use --plan"
+    for source_path in "$SCRIPT_DIRECTORY/${0##*/}" "$TLS_LIBRARY" "$ROTATION_SCRIPT"; do validate_root_source "$source_path"; done
+    if [ "$SCRIPT_DIRECTORY" != /usr/local/sbin ]; then
+        validate_root_source "$SCRIPT_DIRECTORY/install"
+        "$SCRIPT_DIRECTORY/install" --check-bundle >/dev/null
+    fi
+fi
+# shellcheck disable=SC1090
+. "$TLS_LIBRARY"
+
+validate_safe_name "rotation user" "$ROTATION_USER"
+validate_safe_name "rotation role" "$ROTATION_ROLE"
+validate_safe_name "replica-set name" "$REPLICA_SET"
+case "$REPLICA_SET" in *.* | *@*) fail "invalid replica-set name" ;; esac
+validate_member_host
+validate_ipv4_address
+validate_absolute_path "rotation password file" "$ROTATION_PASSWORD_FILE"
+validate_absolute_path "TLS certificate/key file" "$TLS_CERTIFICATE_KEY_FILE"
+validate_absolute_path "TLS CA file" "$TLS_CA_FILE"
+if [ -n "$TLS_MINIMUM_REMAINING_SECONDS" ]; then
+    case "$TLS_MINIMUM_REMAINING_SECONDS" in *[!0-9]* | 0*) fail "invalid --minimum-tls-seconds" ;; esac
+    [ "${#TLS_MINIMUM_REMAINING_SECONDS}" -le 7 ] && [ "$TLS_MINIMUM_REMAINING_SECONDS" -ge 300 ] \
+        && [ "$TLS_MINIMUM_REMAINING_SECONDS" -le 2592000 ] || fail "--minimum-tls-seconds must be between 300 and 2592000"
+fi
+if [ "$CREATE_USER" = yes ]; then
+    validate_safe_name "administrative user" "$ADMIN_USER"
+    validate_absolute_path "administrative password file" "$ADMIN_PASSWORD_FILE"
+    [ "$ADMIN_USER" != "$ROTATION_USER" ] && [ "$ADMIN_PASSWORD_FILE" != "$ROTATION_PASSWORD_FILE" ] \
+        || fail "administrative and rotation identities and credentials must be distinct"
+else
+    [ -z "$ADMIN_USER$ADMIN_PASSWORD_FILE" ] || fail "administrative options require --create-user"
+fi
+if [ "$MODE" = plan ]; then
+    if [ "$CREATE_USER" = yes ]; then
+        printf 'Create new identity %s with only rotateCertificates through role %s; refuse existing users.\n' "$ROTATION_USER" "$ROTATION_ROLE"
+    else
+        printf 'Verify identity %s has only rotateCertificates through role %s.\n' "$ROTATION_USER" "$ROTATION_ROLE"
+        printf 'Compare the live leaf with the configured TLS bundle; rotate in-process only when different.\n'
+    fi
+    printf 'Verify TLS CA, hostname %s, certificate/key match, lifetime, and same-host DNS %s.\n' "$MEMBER_HOST" "$BIND_ADDRESS"
+    printf 'Verify fresh TLS fingerprint, replica-set primary, connection continuity, and unchanged mongod PID.\n'
+    printf 'Plan complete; no host changes were made and no password file was read.\n'
+    exit 0
+fi
+
+for required_command in awk cmp getent grep ip mktemp mongod mongosh openssl rm sed sort stat systemctl timeout; do
+    command -v "$required_command" >/dev/null 2>&1 || fail "required command not found: $required_command"
+done
+mongod --version 2>/dev/null | grep -Eq 'db version v8\.0\.29([.-]|$)' || fail "exact MongoDB 8.0.29 is required"
+systemctl is-active --quiet mongod.service || fail "mongod.service must be active"
+pid_before=$(systemctl show mongod.service -p MainPID --value)
+case "$pid_before" in '' | 0 | *[!0-9]*) fail "cannot identify the running mongod PID" ;; esac
+validate_root_source "$CONFIGURATION_PATH"
+[ "$(awk '$1 == "certificateKeyFile:" {print $2}' "$CONFIGURATION_PATH")" = "$TLS_CERTIFICATE_KEY_FILE" ] \
+    && [ "$(awk '$1 == "CAFile:" {print $2}' "$CONFIGURATION_PATH")" = "$TLS_CA_FILE" ] \
+    && [ "$(awk '$1 == "mode:" {print $2}' "$CONFIGURATION_PATH")" = requireTLS ] \
+    && [ "$(awk '$1 == "bindIp:" {print $2}' "$CONFIGURATION_PATH")" = "127.0.0.1,$BIND_ADDRESS" ] \
+    && [ "$(awk '$1 == "port:" {print $2}' "$CONFIGURATION_PATH")" = 27017 ] \
+    || fail "TLS selection must match the installed managed network-model configuration"
+resolved_addresses=$(getent ahostsv4 "$MEMBER_HOST" | awk '{print $1}' | sort -u)
+[ "$resolved_addresses" = "$BIND_ADDRESS" ] || fail "member DNS must resolve uniquely to the selected private address"
+ip -o -4 address show | awk '{split($4, address, "/"); print address[1]}' | grep -Fx "$BIND_ADDRESS" >/dev/null \
+    || fail "selected private address is not assigned to this host"
+for password_path in "$ROTATION_PASSWORD_FILE" ${ADMIN_PASSWORD_FILE:+"$ADMIN_PASSWORD_FILE"}; do
+    validate_root_owned_parent_chain "$password_path"
+    [ -f "$password_path" ] && [ ! -L "$password_path" ] || fail "credential must be a regular non-symbolic-link file"
+    case "$(stat -Lc '%U:%G:%a:%h' "$password_path")" in root:root:600:1 | root:root:400:1) ;;
+        *) fail "credential must be one-link root:root mode 0600 or 0400" ;;
+    esac
+done
+
+TEMPORARY_DIRECTORY=$(mktemp -d "${TMPDIR:-/tmp}/config-mongodb-reload.XXXXXX")
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+validate_tls_server_identity
+expected_fingerprint=$(openssl x509 -in "$TLS_CERTIFICATE_KEY_FILE" -noout -fingerprint -sha256)
+
+read_live_fingerprint() {
+    timeout 15 openssl s_client -connect "$BIND_ADDRESS:27017" -servername "$MEMBER_HOST" \
+        -verify_hostname "$MEMBER_HOST" -CAfile "$TLS_CA_FILE" -verify_return_error -showcerts \
+        </dev/null > "$TEMPORARY_DIRECTORY/served.pem" 2> "$TEMPORARY_DIRECTORY/handshake.log" \
+        || fail "live MongoDB TLS verification failed; use reviewed recovery if the served leaf has expired"
+    live_fingerprint=$(openssl x509 -in "$TEMPORARY_DIRECTORY/served.pem" -noout -fingerprint -sha256) \
+        || fail "cannot inspect the live MongoDB certificate"
+}
+
+run_shell_operation() {
+    MONGODB_ROTATION_MODE=$1 MONGODB_ROTATION_USER=$ROTATION_USER MONGODB_ROTATION_ROLE=$ROTATION_ROLE \
+    MONGODB_ROTATION_PASSWORD_FILE=$ROTATION_PASSWORD_FILE MONGODB_ADMIN_USER=$ADMIN_USER \
+    MONGODB_ADMIN_PASSWORD_FILE=$ADMIN_PASSWORD_FILE MONGODB_REPLICA_SET=$REPLICA_SET \
+    MONGOSH_DISABLE_TELEMETRY=1 NODE_OPTIONS=--jitless \
+        timeout 45 mongosh \
+        "mongodb://$MEMBER_HOST:27017/admin?directConnection=true&replicaSet=$REPLICA_SET&maxPoolSize=1&serverSelectionTimeoutMS=5000&connectTimeoutMS=5000&socketTimeoutMS=10000&tls=true" \
+        --tlsCAFile "$TLS_CA_FILE" --quiet --norc --file "$ROTATION_SCRIPT" \
+        || fail "certificate operation failed; staged TLS files were left unchanged"
+}
+
+read_live_fingerprint
+if [ "$CREATE_USER" = yes ]; then
+    run_shell_operation create
+    # A separate process ensures no administrative authentication survives.
+    ADMIN_USER=
+    ADMIN_PASSWORD_FILE=
+    run_shell_operation verify
+else
+    if [ "$live_fingerprint" = "$expected_fingerprint" ]; then
+        run_shell_operation verify
+    else
+        run_shell_operation rotate
+    fi
+    read_live_fingerprint
+    [ "$live_fingerprint" = "$expected_fingerprint" ] || fail "served certificate differs from the staged leaf after rotation"
+fi
+[ "$(systemctl show mongod.service -p MainPID --value)" = "$pid_before" ] || fail "mongod PID changed during certificate operation"
+printf 'Verified MongoDB certificate operation without restarting mongod.\n'

@@ -14,6 +14,7 @@ INSTALLER=$MONGODB_DIRECTORY/install
 BUNDLE_BUILDER=$MONGODB_DIRECTORY/build-bundle
 SETUP=$MONGODB_DIRECTORY/setup
 VERIFIER=$MONGODB_DIRECTORY/verify
+TLS_RELOADER=$MONGODB_DIRECTORY/reload-tls
 EL9_TEST=$SCRIPT_DIRECTORY/mongodb-el9
 TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/config-mongodb-tests.XXXXXX")
 
@@ -79,7 +80,7 @@ trap 'exit 143' TERM
 
 assert_mongodb_logrotate_header
 
-for entry_point in "$BUNDLE_BUILDER" "$INSTALLER" "$SETUP" "$VERIFIER" "$EL9_TEST"; do
+for entry_point in "$BUNDLE_BUILDER" "$INSTALLER" "$SETUP" "$VERIFIER" "$TLS_RELOADER" "$EL9_TEST"; do
     [ -x "$entry_point" ] || fail "entry point is not executable: $entry_point"
     "$entry_point" --help >/dev/null
     "$entry_point" --check >/dev/null
@@ -89,6 +90,7 @@ for javascript_source in \
     "$MONGODB_DIRECTORY/bootstrap.js" \
     "$MONGODB_DIRECTORY/add-application-user.js" \
     "$MONGODB_DIRECTORY/create-backup-user.js" \
+    "$MONGODB_DIRECTORY/certificate-rotation.js" \
     "$MONGODB_DIRECTORY/reconfigure-member.js" \
     "$MONGODB_DIRECTORY/verify-backup.js" \
     "$MONGODB_DIRECTORY/verify-application.js" \
@@ -103,6 +105,7 @@ do
 done
 if command -v node >/dev/null 2>&1; then
     node "$SCRIPT_DIRECTORY/mongodb-mongosh-compatibility.mjs"
+    node --test "$SCRIPT_DIRECTORY/mongodb-certificate-rotation.mjs"
 fi
 
 write_os_release "$TEST_ROOT/rocky-9" rocky 'Rocky Linux 9.6' 9.6
@@ -145,6 +148,11 @@ git -C "$TEST_ROOT/bundle-source" \
     --output "$TEST_ROOT/built-bundle" > "$TEST_ROOT/build-bundle.stdout"
 assert_contains "$TEST_ROOT/built-bundle/BUNDLE-METADATA" 'schemaVersion=1'
 assert_contains "$TEST_ROOT/built-bundle/BUNDLE-METADATA" 'mongodbVersion=8.0.29'
+[ -x "$TEST_ROOT/built-bundle/mongodb/reload-tls" ] \
+    || fail 'certificate reloader is missing or not executable in the bundle'
+[ -f "$TEST_ROOT/built-bundle/mongodb/lib/tls.sh" ] \
+    && [ -f "$TEST_ROOT/built-bundle/mongodb/certificate-rotation.js" ] \
+    || fail 'certificate rotation dependencies are missing from the bundle'
 (cd "$TEST_ROOT/built-bundle" && sha256sum --strict --check SHA256SUMS >/dev/null) \
     || fail 'built MongoDB deployment bundle failed checksum verification'
 printf '\nDirty source sentinel.\n' >> "$TEST_ROOT/bundle-source/mongodb/README.md"

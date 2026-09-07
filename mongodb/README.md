@@ -73,7 +73,7 @@ design. Do not add an arbiter merely to claim an odd vote count.
   competing `mongodb-org` repository, preventing an unreviewed patch advance;
 - refuses an already installed non-8.0 server;
 - refuses package changes while `mongod.service` is active;
-- installs a root-owned verifier; and
+- installs a root-owned verifier and live TLS-reload helper; and
 - leaves a fresh `mongod.service` stopped and disabled, while preserving an
   already configured service's enabled state during reviewed stopped-service
   patch maintenance.
@@ -264,6 +264,105 @@ application source. Acceptance requires a successful TLS/authenticated test
 from each allowed application host and a failed TCP test from at least one
 representative denied host. Retain dated commands, source identities, and
 results outside this repository.
+
+## Automatic certificate adoption without a database restart
+
+Replacing the certificate file does not update the running database's TLS
+context. A renewal is complete only after MongoDB loads the new file and a
+fresh verified connection serves the expected certificate. MongoDB's
+[`rotateCertificates` command](https://www.mongodb.com/docs/manual/reference/command/rotateCertificates/)
+preserves existing connections and applies new certificates to new connections.
+It does not make a single-member replica set highly available during unrelated
+host or database maintenance.
+
+`mongodb/reload-tls` provides this adoption step for the managed network model.
+The package installer installs it as `/usr/local/sbin/reload-mongodb-tls` with
+its root-owned libraries. An already running host may invoke it directly from
+a verified immutable root-owned bundle; do not run the package installer merely
+to reload a certificate, since package installation requires a stopped database.
+
+First provision separate administrator and rotation password files using the
+credential boundary above. Choose a new rotation username and custom role name;
+the creation operation refuses to overwrite existing users or reuse a role
+with broader permissions. It creates only `rotateCertificates` on the cluster,
+with SCRAM-SHA-256, then verifies the new identity in a fresh TLS session:
+
+```sh
+mongodb/reload-tls --plan --create-user \
+    --admin-user ADMIN_USER --admin-password-file /root/mongodb-admin.password \
+    --rotation-user ROTATION_USER --rotation-role ROTATION_ROLE \
+    --rotation-password-file /root/mongodb-rotation.password \
+    --replica-set REPLICA_SET \
+    --bind-address PRIVATE_IPV4 --member-host mongodb.internal.example \
+    --tls-certificate-key-file /etc/pki/mongodb/server.pem \
+    --tls-ca-file /etc/pki/mongodb/ca.pem
+```
+
+Review the plan, then run the same arguments as root without `--plan`. Creation
+does not rotate certificates. If creation fails after adding the role or user,
+retain the supplied credential and inspect the identity before retrying; no
+automatic credential replacement or privilege expansion is performed.
+
+After the CA-specific renewal wrapper validates and atomically installs its
+new combined certificate/key file, invoke the adoption helper with only the
+rotation identity:
+
+```sh
+sudo /usr/local/sbin/reload-mongodb-tls \
+    --rotation-user ROTATION_USER --rotation-role ROTATION_ROLE \
+    --rotation-password-file /root/mongodb-rotation.password \
+    --replica-set REPLICA_SET \
+    --bind-address PRIVATE_IPV4 --member-host mongodb.internal.example \
+    --tls-certificate-key-file /etc/pki/mongodb/server.pem \
+    --tls-ca-file /etc/pki/mongodb/ca.pem
+```
+
+The helper checks the selected files against the managed database configuration,
+the local private address and unique DNS resolution, file ownership and modes,
+certificate chain, hostname, key match, and the same proportional acceptance
+margin used by setup. It authenticates with the exact rotation-only privilege,
+checks the expected writable replica-set primary, and rotates only if the
+served leaf differs. It then requires fresh CA/hostname verification, a matching
+SHA-256 certificate fingerprint, unchanged database PID, and preservation of
+the connection that performed rotation. BSON connection IDs are compared by
+value, not JavaScript object identity. A failed check is a nonzero result;
+the helper never changes certificate files, service state, or firewall rules.
+
+Integrate this into the private deployment's existing renewal job:
+
+1. Keep the CA, certificate lifetime, issuance threshold, server name, exact
+   local address, credential source, and timer policy in private configuration.
+2. Serialize issuance and adoption with one root-controlled lock. Validate the
+   replacement chain, hostname, lifetime, and key pair before replacing files.
+3. Invoke the adoption helper on every run, including the not-due path. This
+   retries a previously staged certificate that failed to load.
+4. Use systemd `LoadCredential` and pass the resulting credential **file path**
+   to `--rotation-password-file`. Root-owned, single-link mode `0400` credential
+   files and mode `0600` ordinary secret files are supported. Never put the
+   password value in a URI, argument, unit file, or log.
+5. Keep `MemoryDenyWriteExecute=yes`; the helper explicitly runs MongoDB Shell
+   with `NODE_OPTIONS=--jitless`. Keep deny-all egress and authorize only the CA
+   and the database host's own private address as needed. Review any required
+   service allowlist change explicitly. Do not disable TLS verification.
+6. Fail the renewal job when adoption fails. Preserve known certificate files
+   for reviewed recovery, alert before expiry, and allow time for repeated
+   attempts. A served certificate that already expired needs a separately
+   authorized recovery procedure; this helper intentionally refuses it.
+7. Prove a forced renewal through the real hardened service, same-connection
+   continuity, unchanged PID, fresh client TLS, and application readiness.
+   Remove any temporary force override and verify the normal timer path.
+
+CA issuance and scheduling are deliberately not installed by this component.
+Shared-CA renewals are supported; CA replacement, member-identity changes,
+revocation transitions, and already-expired certificate recovery require their
+own reviewed procedures. A MongoDB Shell warning that it cannot create its
+interactive history directory under `ProtectHome=yes` does not justify granting
+access to the administrator's home directory.
+
+Run `tests/mongodb` for the baseline, bundle, argument, and behavioral checks.
+Run `tests/mongodb-el9` in the supported Linux validation environment before
+promoting a new immutable bundle. Keep target-specific rollout evidence outside
+this public repository.
 
 ## Existing databases
 

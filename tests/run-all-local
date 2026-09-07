@@ -54,6 +54,8 @@ if command -v shellcheck >/dev/null 2>&1; then
         "$REPOSITORY_ROOT/mongodb/build-bundle" \
         "$REPOSITORY_ROOT/mongodb/setup" \
         "$REPOSITORY_ROOT/mongodb/verify" \
+        "$REPOSITORY_ROOT/mongodb/reload-tls" \
+        "$REPOSITORY_ROOT/mongodb/lib/tls.sh" \
         "$REPOSITORY_ROOT/monit/install" \
         "$REPOSITORY_ROOT/monit/lib/version.sh" \
         "$REPOSITORY_ROOT/monit/lib/security.sh" \

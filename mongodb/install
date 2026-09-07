@@ -17,6 +17,9 @@ APPLICATION_AUTH_SOURCE=$SCRIPT_DIRECTORY/verify-application.js
 UNAUTHENTICATED_SOURCE=$SCRIPT_DIRECTORY/verify-unauthenticated.js
 LOGROTATE_SOURCE=$SCRIPT_DIRECTORY/logrotate/mongodb
 PACKAGE_MANIFEST_SOURCE=$SCRIPT_DIRECTORY/packages-8.0.29.manifest
+TLS_RELOADER_SOURCE=$SCRIPT_DIRECTORY/reload-tls
+TLS_LIBRARY_SOURCE=$SCRIPT_DIRECTORY/lib/tls.sh
+ROTATION_SOURCE=$SCRIPT_DIRECTORY/certificate-rotation.js
 BUNDLE_METADATA=$REPOSITORY_ROOT/BUNDLE-METADATA
 BUNDLE_CHECKSUMS=$REPOSITORY_ROOT/SHA256SUMS
 
@@ -33,6 +36,7 @@ VERIFIER_TARGET=/usr/local/bin/verify-mongodb
 VERIFIER_LIBRARY_DIRECTORY=/usr/local/libexec/config-mongodb
 LOGROTATE_TARGET=/etc/logrotate.d/mongodb
 PACKAGE_MANIFEST_TARGET=$VERIFIER_LIBRARY_DIRECTORY/packages-8.0.29.manifest
+TLS_RELOADER_TARGET=/usr/local/sbin/reload-mongodb-tls
 
 MODE=install
 OS_RELEASE_FILE=/etc/os-release
@@ -133,6 +137,7 @@ validate_execution_bundle() {
         BUNDLE-METADATA deploy/lib/platform.sh mongodb/install mongodb/verify \
         mongodb/verify-auth.js mongodb/verify-application.js \
         mongodb/verify-unauthenticated.js mongodb/logrotate/mongodb \
+        mongodb/reload-tls mongodb/lib/tls.sh mongodb/certificate-rotation.js \
         mongodb/packages-8.0.29.manifest
     do
         awk -v expected="$bundle_required_path" \
@@ -146,7 +151,8 @@ validate_execution_bundle() {
 
 for install_source in \
     "$PLATFORM_LIBRARY" "$VERIFIER_SOURCE" "$AUTH_SOURCE" "$APPLICATION_AUTH_SOURCE" \
-    "$UNAUTHENTICATED_SOURCE" "$LOGROTATE_SOURCE" "$PACKAGE_MANIFEST_SOURCE"
+    "$UNAUTHENTICATED_SOURCE" "$LOGROTATE_SOURCE" "$PACKAGE_MANIFEST_SOURCE" \
+    "$TLS_RELOADER_SOURCE" "$TLS_LIBRARY_SOURCE" "$ROTATION_SOURCE"
 do
     validate_source "$install_source"
 done
@@ -252,6 +258,8 @@ if [ "$MODE" = plan ]; then
         "$LOGROTATE_SOURCE" "$LOGROTATE_TARGET"
     platform_print_command install -o root -g root -m 0755 \
         "$VERIFIER_SOURCE" "$VERIFIER_TARGET"
+    platform_print_command install -o root -g root -m 0755 \
+        "$TLS_RELOADER_SOURCE" "$TLS_RELOADER_TARGET"
     printf 'Plan complete; mongod.service would remain stopped and disabled.\n'
     exit 0
 fi
@@ -377,11 +385,16 @@ if [ ! -e "$VERIFIER_LIBRARY_DIRECTORY" ]; then
     install -d -o root -g root -m 0755 "$VERIFIER_LIBRARY_DIRECTORY"
 fi
 validate_root_directory "$VERIFIER_LIBRARY_DIRECTORY"
+if [ ! -e /usr/local/sbin ]; then
+    install -d -o root -g root -m 0755 /usr/local/sbin
+fi
+validate_root_directory /usr/local/sbin
 for verifier_library_target in \
     "$VERIFIER_LIBRARY_DIRECTORY/verify-auth.js" \
     "$VERIFIER_LIBRARY_DIRECTORY/verify-application.js" \
     "$VERIFIER_LIBRARY_DIRECTORY/verify-unauthenticated.js" \
-    "$PACKAGE_MANIFEST_TARGET"
+    "$PACKAGE_MANIFEST_TARGET" "$TLS_RELOADER_TARGET" \
+    "$VERIFIER_LIBRARY_DIRECTORY/tls.sh" "$VERIFIER_LIBRARY_DIRECTORY/certificate-rotation.js"
 do
     if [ -e "$verifier_library_target" ] || [ -L "$verifier_library_target" ]; then
         [ -f "$verifier_library_target" ] && [ ! -L "$verifier_library_target" ] \
@@ -395,6 +408,15 @@ install -o root -g root -m 0644 \
     "$UNAUTHENTICATED_SOURCE" "$VERIFIER_LIBRARY_DIRECTORY/verify-unauthenticated.js"
 install -o root -g root -m 0644 "$PACKAGE_MANIFEST_SOURCE" "$PACKAGE_MANIFEST_TARGET"
 install -o root -g root -m 0755 "$VERIFIER_SOURCE" "$VERIFIER_TARGET"
+install -o root -g root -m 0644 "$TLS_LIBRARY_SOURCE" "$VERIFIER_LIBRARY_DIRECTORY/tls.sh"
+install -o root -g root -m 0644 "$ROTATION_SOURCE" "$VERIFIER_LIBRARY_DIRECTORY/certificate-rotation.js"
+install -o root -g root -m 0755 "$TLS_RELOADER_SOURCE" "$TLS_RELOADER_TARGET"
+if ! cmp -s "$TLS_LIBRARY_SOURCE" "$VERIFIER_LIBRARY_DIRECTORY/tls.sh" \
+    || ! cmp -s "$ROTATION_SOURCE" "$VERIFIER_LIBRARY_DIRECTORY/certificate-rotation.js" \
+    || ! cmp -s "$TLS_RELOADER_SOURCE" "$TLS_RELOADER_TARGET"; then
+    fail "installed TLS rotation helpers differ from repository source"
+fi
+"$TLS_RELOADER_TARGET" --check >/dev/null
 cmp -s "$VERIFIER_SOURCE" "$VERIFIER_TARGET" \
     || fail "installed MongoDB verifier differs from repository source"
 cmp -s "$AUTH_SOURCE" "$VERIFIER_LIBRARY_DIRECTORY/verify-auth.js" \

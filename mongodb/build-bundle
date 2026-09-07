@@ -59,10 +59,13 @@ mongodb/README.md
 mongodb/add-application-user.js
 mongodb/bootstrap.js
 mongodb/create-backup-user.js
+mongodb/certificate-rotation.js
 mongodb/install
+mongodb/lib/tls.sh
 mongodb/logrotate/mongodb
 mongodb/packages-8.0.29.manifest
 mongodb/reconfigure-member.js
+mongodb/reload-tls
 mongodb/setup
 mongodb/templates/mongod-bootstrap.conf.in
 mongodb/templates/mongod-local.conf.in
@@ -102,7 +105,7 @@ install_payload() {
     mkdir -p "$target_parent"
     chmod 0755 "$target_parent"
     case "$relative_path" in
-        mongodb/install | mongodb/setup | mongodb/verify) payload_mode=0755 ;;
+        mongodb/install | mongodb/setup | mongodb/verify | mongodb/reload-tls) payload_mode=0755 ;;
         *) payload_mode=0644 ;;
     esac
     install -m "$payload_mode" "$source_path" "$target_path"
