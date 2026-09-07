@@ -18,6 +18,12 @@ from typing import Final
 PATTERN_VARIABLE: Final = "CONFIG_PRIVATE_IDENTIFIER_PATTERN"
 REPOSITORY_ROOT: Final = Path(__file__).resolve().parents[1]
 MAX_ENVIRONMENT_BYTES: Final = 64 * 1024
+# The pattern is queued in an anonymous pipe before grep starts reading, so it
+# must fit the smallest pipe either target platform allocates: one 4096-byte
+# page on Linux once a user's pipe-page soft limit is reached, 16 KiB on macOS.
+# One page less the terminating newline is that bound. It is a property of pipe
+# capacity, not of PIPE_BUF, which only governs write atomicity and is 512
+# bytes on macOS.
 MAX_PATTERN_BYTES: Final = 4095
 COMMAND_TIMEOUT_SECONDS: Final = 30
 ASSIGNMENT: Final = re.compile(r"(?:export[ \t]+)?([A-Za-z_][A-Za-z0-9_]*)[ \t]*=(.*)")
@@ -60,7 +66,9 @@ def load_private_pattern(repository_root: Path | None = None) -> str:
     if metadata.st_size > MAX_ENVIRONMENT_BYTES:
         raise ValueError("private audit .env exceeds the supported size")
     try:
-        content = environment_file.read_text(encoding="utf-8")
+        # Editors on the target desktops may prepend a byte-order mark; it is
+        # not part of the first assignment's name.
+        content = environment_file.read_text(encoding="utf-8-sig")
     except (OSError, UnicodeError):
         raise ValueError("private audit .env cannot be read as UTF-8") from None
     pattern: str | None = None
@@ -86,6 +94,9 @@ def matches_private_pattern(text: str, pattern: str) -> bool:
         return False
     if any(character in pattern for character in ("\x00", "\n", "\r")):
         raise ValueError("private audit pattern must occupy one line without NUL bytes")
+    payload = pattern.encode("utf-8") + b"\n"
+    if len(payload) > MAX_PATTERN_BYTES + 1:
+        raise ValueError(f"private audit pattern exceeds {MAX_PATTERN_BYTES} UTF-8 bytes")
     # Feed the expression through an anonymous pipe, not a command argument or
     # named file. The target platforms provide /dev/fd and grep -E -i -f.
     try:
@@ -93,14 +104,16 @@ def matches_private_pattern(text: str, pattern: str) -> bool:
     except OSError:
         raise ValueError("private audit matcher could not open its input pipe") from None
     try:
-        # An empty pipe accepts an atomic write up to its reported PIPE_BUF.
-        # Include the newline in that bound before starting the grep reader.
-        encoded = pattern.encode("utf-8")
-        pipe_capacity = os.fpathconf(write_fd, "PC_PIPE_BUF")
-        supported_bytes = min(MAX_PATTERN_BYTES, pipe_capacity - 1)
-        if len(encoded) > supported_bytes:
-            raise ValueError("private audit pattern exceeds the supported UTF-8 size")
-        os.write(write_fd, encoded + b"\n")
+        # No reader exists yet, so the write must never be allowed to block. A
+        # non-blocking write of at most one page fits the smallest pipe either
+        # platform allocates; a short or refused write is an error, not a wait.
+        os.set_blocking(write_fd, False)
+        try:
+            written = os.write(write_fd, payload)
+        except BlockingIOError:
+            written = 0
+        if written != len(payload):
+            raise ValueError("private audit matcher could not queue the pattern without blocking")
         os.close(write_fd)
         write_fd = -1
         result = subprocess.run(

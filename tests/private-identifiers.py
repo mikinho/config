@@ -112,13 +112,47 @@ class PrivatePatternTests(unittest.TestCase):
             validate_text("clean content", pattern=SYNTHETIC_PATTERN)
         self.assertNotIn(SYNTHETIC_PATTERN, " ".join(command.call_args.args[0]))
 
-    def test_pattern_write_respects_reported_pipe_limit(self) -> None:
-        """A smaller platform pipe limit fails before a blocking write can occur."""
+    def test_pattern_limit_is_a_fixed_byte_count(self) -> None:
+        """The same pattern is accepted on every platform up to the documented bound."""
 
-        with mock.patch("private_identifiers.os.fpathconf", return_value=512):
-            self.assertFalse(matches_private_pattern("clean", "x" * 511))
-            with self.assertRaisesRegex(ValueError, "supported UTF-8 size"):
-                matches_private_pattern("clean", "x" * 512)
+        # PIPE_BUF is 512 bytes on macOS and irrelevant to pipe capacity; the
+        # matcher must not consult it, or a pattern would pass in CI and fail
+        # on a developer machine.
+        with mock.patch("private_identifiers.os.fpathconf", side_effect=AssertionError("consulted PIPE_BUF")):
+            self.assertFalse(matches_private_pattern("clean", "x" * MAX_PATTERN_BYTES))
+            self.assertTrue(matches_private_pattern("x" * 600, "x" * 600))
+            with self.assertRaisesRegex(ValueError, f"{MAX_PATTERN_BYTES} UTF-8 bytes"):
+                matches_private_pattern("clean", "x" * (MAX_PATTERN_BYTES + 1))
+            # The bound counts encoded bytes, not characters.
+            two_byte_character = "é"
+            self.assertFalse(matches_private_pattern("clean", two_byte_character * (MAX_PATTERN_BYTES // 2)))
+            with self.assertRaisesRegex(ValueError, f"{MAX_PATTERN_BYTES} UTF-8 bytes"):
+                matches_private_pattern("clean", two_byte_character * (MAX_PATTERN_BYTES // 2 + 1))
+
+    def test_pattern_write_never_blocks_on_the_unread_pipe(self) -> None:
+        """A pipe that cannot take the whole expression fails instead of waiting."""
+
+        with self.subTest(outcome="refused"), mock.patch(
+            "private_identifiers.os.write", side_effect=BlockingIOError()
+        ), self.assertRaisesRegex(ValueError, "without blocking"):
+            matches_private_pattern("clean", SYNTHETIC_PATTERN)
+        with self.subTest(outcome="short"), mock.patch(
+            "private_identifiers.os.write", return_value=7
+        ), self.assertRaisesRegex(ValueError, "without blocking"):
+            matches_private_pattern("clean", SYNTHETIC_PATTERN)
+
+    def test_dotenv_byte_order_mark_and_comment_quoting(self) -> None:
+        """A BOM does not corrupt the first assignment; quoting protects ' #' in a pattern."""
+
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ, {}, clear=True):
+            root = Path(directory)
+            (root / ".env").write_text(f"{PATTERN_VARIABLE}='{SYNTHETIC_PATTERN}'\n", encoding="utf-8-sig")
+            self.assertEqual(load_private_pattern(root), SYNTHETIC_PATTERN)
+        # Unquoted, whitespace followed by '#' starts the comment, as documented;
+        # quoting keeps the bracket expression intact.
+        self.assertEqual(parse_pattern_value("[ #]x"), "[")
+        self.assertEqual(parse_pattern_value("'[ #]x'"), "[ #]x")
+        self.assertTrue(matches_private_pattern("#x", "[ #]x"))
 
     def test_reader_errors_do_not_expose_exception_chains(self) -> None:
         """Public generator tracebacks must hide private filesystem diagnostics."""
