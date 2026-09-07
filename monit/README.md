@@ -237,10 +237,15 @@ rotation does not restart the daemon or a monitored application.
 
 Setup restores the policy-default labels on configuration, systemd, state,
 runtime, and log paths. Run the verifier after first start and after adding a
-check that reads a new service-specific path. If it reports a denial, collect
+check that reads a new service-specific path. Its AVC query uses
+`ausearch --input-logs` to search the logs configured in `auditd.conf`, including
+when verification runs through SSH or a pipeline. It leaves the caller's
+standard input untouched. If it reports a denial, collect
 the exact AVC, confirm the intended read or action, and prefer an existing
 distribution label or interface. Do not use permissive mode as a deployment
-step.
+step. A raw no-match result must have status `1` and no records or diagnostics;
+missing or unreadable logs and configuration warnings fail acceptance. The
+verifier reports the failure without printing potentially private audit output.
 
 ## Verify and collect acceptance evidence
 
@@ -261,7 +266,7 @@ Acceptance additionally requires deployment-specific checks:
 4. Monit's main PID is unchanged by configuration-only promotion and log
    rotation. Execution-policy promotion changes Monit's PID and the new daemon
    reports `Umask: 0077`; monitored application PIDs remain unchanged.
-5. `ausearch -m AVC,USER_AVC -ts boot -c monit` returns no denial.
+5. `ausearch --input-logs -m AVC,USER_AVC -ts boot -c monit` returns no denial.
 6. The only TCP 2812 listener is `127.0.0.1:2812`; no host or cloud firewall
    rule exposes it.
 7. The private evidence record captures package NEVRA, policy revision,
@@ -365,4 +370,5 @@ legible.
 - [systemd execution environment and UMask](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html)
 - [Fedora package metadata for Monit](https://packages.fedoraproject.org/pkgs/monit/monit/)
 - [Red Hat SELinux administration](https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/9/html/using_selinux/index)
+- [Linux Audit ausearch manual](https://github.com/linux-audit/audit-userspace/blob/master/docs/ausearch.8)
 - [logrotate manual](https://man7.org/linux/man-pages/man8/logrotate.8.html)

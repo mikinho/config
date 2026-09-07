@@ -600,12 +600,101 @@ assert_contains "$SETUP" 'refusing modified unmanaged $MONIT_MAIN'
 # shellcheck disable=SC2016
 assert_contains "$SETUP" 'monit -t -c "$MONIT_MAIN"'
 assert_contains "$SETUP" 'systemctl reload monit.service'
-assert_contains "$VERIFIER" 'ausearch -m AVC,USER_AVC -ts boot -c monit --raw'
+assert_contains "$VERIFIER" 'ausearch --input-logs -m AVC,USER_AVC -ts boot -c monit --raw'
 assert_contains "$VERIFIER" 'must bind only to 127.0.0.1:2812'
 assert_contains "$VERSION_LIBRARY" 'MONIT_SUPPORTED_VERSION=5.35.2'
 assert_contains "$VERSION_LIBRARY" 'MONIT_PREFERRED_VERSION=6.0.0'
 assert_contains "$VERIFIER" \
     'is the supported compatibility release; prefer'
+
+# Exercise the real SELinux audit with a pipe still owned by its caller. The
+# ausearch mock models its input selection: absent --input-logs it drains stdin
+# and searches that content, so a flag-only or /dev/null workaround cannot make
+# these configured-log and byte-preservation cases pass.
+selinux_audit_fixture=$TEST_ROOT/selinux-audit
+{
+    printf '%s\n' '#!/usr/bin/env sh' 'set -eu' 'set -f' 'PROGRAM_NAME=monit-test' \
+        'MONIT_MAIN=/test/monitrc' 'MONIT_FRAGMENT_DIRECTORY=/test/monit.d' \
+        'LOGROTATE_TARGET=/test/logrotate' 'SYSTEMD_TARGET=/test/unit.conf' \
+        'MONIT_LOG_DIRECTORY=/test/log' 'MONIT_STATE_DIRECTORY=/test/state' \
+        'MONIT_RUNTIME_DIRECTORY=/test/run'
+    extract_function fail "$VERIFIER"
+    extract_function verify_selinux "$VERIFIER"
+    cat <<'EOF'
+getenforce() { printf 'Enforcing\n'; }
+matchpathcon() { return 0; }
+systemctl() { printf '123\n'; }
+ps() { printf 'system_u:system_r:monit_t:s0 123 monit\n'; }
+ausearch() {
+    [ "${LC_ALL:-}" = C ] || { printf 'audit locale is not C\n' >&2; return 2; }
+    audit_source=stdin
+    for audit_argument do
+        if [ "$audit_argument" = --input-logs ]; then audit_source=logs; fi
+    done
+    printf '%s\n' "$audit_source" > "$MONIT_TEST_AUDIT_SOURCE"
+    if [ "$audit_source" = logs ]; then
+        case "${MONIT_TEST_AUDIT_ERROR:-no}" in
+            no) ;;
+            missing)
+                printf 'Error opening /test/audit.log (No such file or directory)\n' >&2
+                return 1 ;;
+            unreadable)
+                printf 'Error opening /test/audit.log (Permission denied)\n' >&2
+                return 1 ;;
+            config)
+                printf 'NOTE - using built-in logs: /test/audit.log\n' >&2
+                return 1 ;;
+            empty-success) return 0 ;;
+            *) return 2 ;;
+        esac
+        audit_input=$(cat "$MONIT_TEST_AUDIT_LOG")
+    else
+        audit_input=$(cat)
+    fi
+    printf '%s\n' "$audit_input" | grep -E '^type=(AVC|USER_AVC) '
+}
+if (verify_selinux); then audit_status=0; else audit_status=$?; fi
+cat > "$MONIT_TEST_REMAINING_STDIN"
+exit "$audit_status"
+EOF
+} > "$selinux_audit_fixture"
+run_selinux_audit_fixture() {
+    cat "$TEST_ROOT/caller-input" | env MONIT_TEST_AUDIT_LOG="$TEST_ROOT/audit-log" \
+        MONIT_TEST_AUDIT_SOURCE="$TEST_ROOT/audit-source" \
+        MONIT_TEST_REMAINING_STDIN="$TEST_ROOT/remaining-input" \
+        "$@" sh "$selinux_audit_fixture"
+}
+assert_audit_input_preserved() {
+    assert_contains "$TEST_ROOT/audit-source" logs
+    cmp -s "$TEST_ROOT/caller-input" "$TEST_ROOT/remaining-input" \
+        || fail 'SELinux verification consumed the caller input pipe'
+}
+# A denial-shaped record on stdin must neither cause a false alarm nor be read.
+: > "$TEST_ROOT/audit-log"
+printf '%s\n' 'type=AVC caller-owned test input' 'remaining caller command' \
+    > "$TEST_ROOT/caller-input"
+run_selinux_audit_fixture MONIT_TEST_AUDIT_ERROR=no
+assert_audit_input_preserved
+
+# A denial in the configured logs must fail even when piped input has no AVC.
+printf '%s\n' 'type=AVC configured-log test denial' > "$TEST_ROOT/audit-log"
+printf '%s\n' 'remaining caller command' > "$TEST_ROOT/caller-input"
+expect_failure 'SELinux recorded a Monit AVC denial since boot' run_selinux_audit_fixture
+assert_audit_input_preserved
+expect_failure 'cannot query the audit log for Monit AVC denials' \
+    run_selinux_audit_fixture MONIT_TEST_AUDIT_ERROR=yes
+assert_audit_input_preserved
+for audit_error in missing unreadable config; do
+    expect_failure 'cannot query the audit log for Monit AVC denials' \
+        run_selinux_audit_fixture "MONIT_TEST_AUDIT_ERROR=$audit_error"
+    assert_audit_input_preserved
+    if grep -F /test/audit.log "$TEST_ROOT/expected.stderr" "$TEST_ROOT/unexpected.stdout" >/dev/null; then
+        fail 'SELinux verification exposed the audit diagnostic contents'
+    fi
+done
+expect_failure 'audit query returned success without records' \
+    run_selinux_audit_fixture MONIT_TEST_AUDIT_ERROR=empty-success
+assert_audit_input_preserved
 
 install -d "$TEST_ROOT/security-bin"
 cat > "$TEST_ROOT/security-bin/stat" <<'EOF'

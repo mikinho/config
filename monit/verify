@@ -375,12 +375,18 @@ verify_selinux() {
     case "$process_label" in
         *:unconfined_t:*) fail "Monit is running in the user unconfined_t domain" ;;
     esac
-    if avc_output=$(ausearch -m AVC,USER_AVC -ts boot -c monit --raw 2>/dev/null); then
-        [ -z "$avc_output" ] \
-            || fail "SELinux recorded a Monit AVC denial since boot"
+    # Without --input-logs, ausearch selects piped standard input instead of
+    # auditd's configured logs and can consume the caller's remaining script.
+    # Raw no-match output is empty with status 1, but log-open/configuration
+    # errors can also return 1. Capture diagnostics without exposing records,
+    # and do not treat a diagnostic-bearing result as an absence of denials.
+    if avc_output=$(LC_ALL=C ausearch --input-logs -m AVC,USER_AVC -ts boot -c monit --raw 2>&1); then
+        [ -n "$avc_output" ] \
+            || fail "audit query returned success without records; cannot establish absence of Monit AVC denials"
+        fail "SELinux recorded a Monit AVC denial since boot"
     else
         ausearch_status=$?
-        [ "$ausearch_status" -eq 1 ] \
+        [ "$ausearch_status" -eq 1 ] && [ -z "$avc_output" ] \
             || fail "cannot query the audit log for Monit AVC denials"
     fi
 }
