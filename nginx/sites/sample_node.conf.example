@@ -10,7 +10,9 @@
 #
 # Requires the baseline deployment profile and the nodejs-proxy profile.
 # The Node.js application service must provide its Unix socket at
-# /run/sample_node/sample_node.sock.
+# /run/sample_node/sample_node.sock. Select the zstd profile to prefer zstd
+# on the API location; without it the stubs/api include matches nothing and
+# the route keeps the http-level encoders.
 #
 
 server {
@@ -71,6 +73,20 @@ server {
     error_page 502 503 504 /maintenance.html;
 
     include includes/maintenance.conf;
+
+    # API routes are proxied directly and never resolved against the document
+    # root. Profile-selected stubs/api/*.conf fragments apply route policy such
+    # as the zstd preference; authenticated routes here still need the
+    # compression review in the nginx README. Keep a plain prefix location so
+    # the server's regex security guards also apply to API paths.
+    location /api/ {
+        limit_conn conn_general 20;
+        limit_req zone=req_general burst=30 nodelay;
+
+        include stubs/api/*.conf;
+
+        proxy_pass http://sample_node_upstream;
+    }
 
     # Static assets: served directly by nginx with fallback cache control.
     location ~* ^/(css|js|img|fonts|static)/ {

@@ -223,12 +223,15 @@ step "Exercising full profile render..."
     --profile quic-bpf \
     --profile trusted-proxy \
     --profile websocket \
-    --profile wordpress-cache >/dev/null
+    --profile wordpress-cache \
+    --profile zstd >/dev/null
 
 [ -s "$SCRATCH_DIR/nginx-full/quic_host.key" ] \
     || fail "QUIC host key was not generated in full render"
 [ -s "$SCRATCH_DIR/nginx-full/stubs/http/post-quantum.conf" ] \
     || fail "post-quantum stub was not installed in full render"
+[ -s "$SCRATCH_DIR/nginx-full/stubs/api/zstd.conf" ] \
+    || fail "zstd API location stub was not installed in full render"
 
 step "Exercising PHP site render..."
 "$REPOSITORY_ROOT/deploy/install-php-site" \

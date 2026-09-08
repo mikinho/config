@@ -99,9 +99,30 @@ if grep -Fq "map \$http_x_purge_key \$wp_has_purge_header" \
 fi
 
 
+grep -Fqx '    gzip_vary on;' "$REPOSITORY_ROOT/nginx/nginx.conf" \
+    || fail 'nginx.conf must set gzip_vary once for every compression encoder'
+if grep -rEq '^[[:space:]]*gzip_vary[[:space:]]' "$REPOSITORY_ROOT/nginx/stubs"; then
+    fail 'compression stubs must not repeat gzip_vary; nginx rejects the duplicate'
+fi
+
 "$REPOSITORY_ROOT/deploy/install-nginx" \
     --output "$TEST_ROOT/nginx-valid" \
     --profile gzip >/dev/null
+[ -d "$TEST_ROOT/nginx-valid/stubs/api" ] \
+    || fail 'render without the zstd profile must still create stubs/api for the site includes'
+if find "$TEST_ROOT/nginx-valid/stubs/api" -name '*.conf' -print | grep . >/dev/null; then
+    fail 'render without the zstd profile must leave stubs/api empty'
+fi
+
+"$REPOSITORY_ROOT/deploy/install-nginx" \
+    --output "$TEST_ROOT/nginx-zstd" \
+    --profile zstd >/dev/null
+for zstd_stub in stubs/zstd.conf stubs/http/zstd.conf stubs/api/zstd.conf; do
+    [ -s "$TEST_ROOT/nginx-zstd/$zstd_stub" ] \
+        || fail "zstd profile did not install $zstd_stub"
+done
+grep -Fq 'stub stubs/api/zstd.conf' "$TEST_ROOT/nginx-zstd/INSTALL-PROFILE" \
+    || fail 'INSTALL-PROFILE does not record the zstd API location stub'
 "$REPOSITORY_ROOT/deploy/install-php-site" \
     --output "$TEST_ROOT/php-valid" \
     --tag test_wp >/dev/null

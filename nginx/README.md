@@ -121,13 +121,17 @@ For each relevant location:
 - To disable nginx compression there, set `gzip off;` and, when the `gzip`
   profile is selected, `gzip_static off;` to disable its precompressed-file
   serving too. With the `brotli` profile loaded, also set `brotli off;` and
-  `brotli_static off;`; do not add Brotli directives on hosts without those
-  modules. Removing HTML from
+  `brotli_static off;`; with the `zstd` profile loaded, also set `zstd off;`
+  and `zstd_static off;`. If that same location already includes
+  `stubs/api/zstd.conf` through the API wildcard, remove the opt-in there
+  instead of appending a duplicate `zstd` directive; keep any other required
+  API fragments. Do not add Brotli or zstd directives on hosts
+  without those modules. Removing HTML from
   [`gzip_types`](https://nginx.org/en/docs/http/ngx_http_gzip_module.html#gzip_types)
   cannot exclude it while gzip is enabled. See the separate
-  [gzip static](https://nginx.org/en/docs/http/ngx_http_gzip_static_module.html)
-  and [Brotli](https://github.com/google/ngx_brotli#configuration-directives)
-  controls.
+  [gzip static](https://nginx.org/en/docs/http/ngx_http_gzip_static_module.html),
+  [Brotli](https://github.com/google/ngx_brotli#configuration-directives), and
+  [zstd](https://nginx-extras.getpagespeed.com/modules/zstd/) controls.
 - Check application/upstream and CDN compression as well. After `nginx -t`,
   verify representative authenticated responses through the public endpoint
   while advertising supported encodings; when disabling compression, confirm
@@ -147,6 +151,154 @@ compression policy. The dynamic modules must match the installed nginx build;
 verify the exact assembled tree with `nginx -t` after package changes. Keep
 `gzip` selected for clients that do not negotiate Brotli. `brotli_static on`
 serves existing `.br` siblings; it does not generate compressed assets.
+
+Select `zstd` to prefer zstd on API routes. The profile installs the module
+loaders, an `http`-level policy that keeps `zstd off`, and `stubs/api/zstd.conf`,
+which API locations pull in through `include stubs/api/*.conf;` as the Node
+sample does. Existing sites must add that include to each intended API
+location; selecting the profile alone does not enable zstd there. Locations
+without it retain the selected gzip/Brotli policy, and a render without the
+profile leaves the include empty. This is a route boundary: HTML returned by
+an opted-in API location is also eligible because `text/html` is implicit.
+Keep `gzip` and `brotli` selected for their fallbacks; `zstd` does not install
+either profile automatically.
+
+Level 3 is the configured dynamic-response baseline; the nginx module's
+default is 1. The 256-byte floor applies only when `Content-Length` is known.
+An unknown-length or chunked response bypasses that size check, but still
+needs an eligible content type, status, and client encoding. Measure CPU,
+latency, and transfer size with representative payloads before tuning the
+level; benchmark results are not universal performance guarantees. Client
+support depends on the browser/runtime version and build, so use the actual
+`Accept-Encoding` request header rather than assuming support from a name.
+
+The MIME lists include JSON, common JSON subtypes, NDJSON, and CSV in all
+three encoders so those responses have matching fallbacks. The lists do not
+include `text/event-stream`; review buffering and flush behavior separately
+before compressing streaming routes. Keep `zstd_static` at its default `off`
+until the asset pipeline produces `.zst` siblings. Then enable it only in
+static locations that have those files, use `on` to negotiate client support,
+and preserve the originals and fallback siblings. Loading the static module
+does not enable it or create compressed files. Leave `zstd_dict_file` unset
+for ordinary browser traffic.
+
+### Compression module order
+
+The effective main-context loader order is:
+
+```nginx
+# stubs/brotli.conf, included first
+load_module modules/ngx_http_brotli_filter_module.so;
+load_module modules/ngx_http_brotli_static_module.so;
+# stubs/zstd.conf, included afterward
+load_module modules/ngx_http_zstd_filter_module.so;
+load_module modules/ngx_http_zstd_static_module.so;
+```
+
+This is already supplied by `include stubs/*.conf;` before the `http` block;
+do not paste a second copy into `nginx.conf`. With the supported modules'
+ordering metadata, response filters run in reverse registration order, so an
+eligible, unencoded API response tries **zstd, then Brotli, then gzip**. The
+first filter to encode it sets `Content-Encoding`; subsequent compressors
+leave it alone. Preserve the relative loader filenames. Moving the `gzip`,
+`brotli`, or `zstd` directives inside `http`, changing `--profile` argument
+order, or reordering equally weighted `Accept-Encoding` tokens does not set
+server preference. Module build metadata can affect registration order, so
+repeat the GET matrix below after package or loader changes.
+
+This priority describes dynamic filters. Static handlers can serve an
+already-encoded sibling before those filters, and an upstream application
+can also supply `Content-Encoding`. The shared proxy policy forwards the
+client's `Accept-Encoding`; nginx does not transcode such upstream bodies to
+zstd. If nginx should own compression, configure the application to return
+uncompressed responses on those routes. Adding just one `proxy_set_header`
+inside a location replaces the inherited header set, so preserve the complete
+proxy header policy when making an nginx-side override.
+
+`gzip_vary on` is set once in `nginx.conf` for gzip/Brotli, including when the
+gzip profile is absent. GetPageSpeed zstd 0.2.2 and newer add
+`Vary: Accept-Encoding` independently and avoid duplicating an existing value;
+older zstd versions relied on core nginx's `gzip_vary` behavior.
+Verify both compressed and identity variants through any shared cache/CDN;
+upstream-encoded responses and intermediary cache behavior need their own
+correct `Vary` handling.
+
+### Compression verification on the target host
+
+Install the nginx/module pair from one compatible package family. For the
+GetPageSpeed zstd continuation, use 0.2.2 or newer, or a supported vendor build
+with equivalent fixes: [0.2.0 fixed `q=0` negotiation and static gzip fallback](https://github.com/GetPageSpeed/zstd-nginx-module/releases/tag/0.2.0),
+and [0.2.1 fixed dynamic linking to libzstd](https://github.com/GetPageSpeed/zstd-nginx-module/releases/tag/0.2.1).
+[0.2.2 fixes streaming truncation and emits its own Vary header](https://github.com/GetPageSpeed/zstd-nginx-module/releases/tag/0.2.2);
+the earlier version floor does not include those integrity fixes.
+The original tokers module and this continuation share directive names;
+that does not establish equivalent behavior.
+
+Public CI validates the zstd profile's rendered files. Its stock nginx
+syntax/runtime job omits the third-party modules, so it does **not** run
+`nginx -t` with zstd or establish its negotiation order. Check the assembled
+target configuration and installed package versions before activation:
+
+```sh
+rpm -q nginx nginx-module-brotli nginx-module-zstd
+sudo nginx -t
+sudo nginx -T 2>&1 | grep -E '(^# configuration file .*stubs/(brotli|zstd)\.conf:|^[[:space:]]*load_module)'
+```
+
+Use a real **GET** to a stable, eligible API response over 256 bytes with
+status 200 and `Content-Type: application/json`. HEAD may expose encoding
+metadata but carries no compressed body, so `curl -I` cannot establish body
+integrity or substitute for GET. Check that the intended config is
+active and the application has not already encoded the response. Supply any
+required authentication through your normal private test setup. With all
+three profiles selected, expect:
+
+| `Accept-Encoding` | Expected `Content-Encoding` |
+| --- | --- |
+| `zstd` | `zstd` |
+| `zstd, br, gzip` | `zstd` |
+| `gzip, br, zstd` | `zstd` |
+| `br, gzip` | `br` |
+| `gzip` | `gzip` |
+| `zstd;q=0, br, gzip` | `br` |
+| `zstd;q=0, br;q=0, gzip` | `gzip` |
+| `identity` or no header | absent |
+
+```sh
+api_url='https://example.com/api/replace-with-an-existing-endpoint'
+for encoding in 'zstd' 'zstd, br, gzip' 'gzip, br, zstd' 'br, gzip' 'gzip' \
+    'zstd;q=0, br, gzip' 'zstd;q=0, br;q=0, gzip' 'identity'; do
+    printf '\nAccept-Encoding: %s\n' "$encoding"
+    curl --fail --silent --show-error --dump-header - --output /dev/null \
+        --header "Accept-Encoding: $encoding" "$api_url"
+done
+# Explicitly omit the header for the last case.
+curl --fail --silent --show-error --dump-header - --output /dev/null \
+    --header 'Accept-Encoding:' "$api_url"
+```
+
+Inspect the status, `Content-Encoding`, and `Vary: Accept-Encoding` in every
+result, including identity responses. These requests discard the encoded
+body and do not require curl decoding support. Also verify a decoded GET
+using `curl --compressed` with a build whose `curl --version` lists zstd, or
+save the raw zstd response and decode it with `zstd -d` for content validation.
+Do not treat a header alone as proof that the response body is intact.
+
+Repeat for the API media types and statuses your application serves. Status
+eligibility differs by module version: 0.2.2 expands the earlier 200/403/404
+set to additional successful responses, while empty, partial, and server-error
+responses can bypass it. Test a known-length response below 256
+bytes, an unknown-length response, an excluded binary type, and a non-API
+route as separate scope checks. Recheck the
+[privileged-location compression review](#compression-on-privileged-locations)
+when testing authenticated or token-bearing endpoints.
+
+References: [GetPageSpeed configuration guide](https://www.getpagespeed.com/server-setup/nginx/nginx-zstd-compression),
+[zstd module directives](https://nginx-extras.getpagespeed.com/modules/zstd/),
+[Brotli filter ordering](https://github.com/google/ngx_brotli/blob/master/filter/config),
+and [zstd filter ordering](https://github.com/GetPageSpeed/zstd-nginx-module/blob/0.2.2/filter/config).
+
+### TLS and QUIC profiles
 
 TLS certificate compression in `stubs/http/tls.conf` is independent of HTTP
 response compression. The optional `post-quantum` profile selects hybrid TLS

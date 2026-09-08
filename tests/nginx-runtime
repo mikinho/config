@@ -417,6 +417,65 @@ const body = JSON.parse(readFileSync(process.argv[2], "utf8"));
 assert.equal(body.url, "/static/missing.css?retained=yes");
 NODE
 
+# The API location proxies even when a same-named file exists under the
+# document root, and the Vary policy set once in nginx.conf reaches it. The
+# padding header keeps the echoed body above the compressor's 256-byte floor.
+install -d -m 0755 "$NODE_ROOT/api"
+printf '%s\n' '{"shadow":true}' >"$NODE_ROOT/api/shadow.json"
+status=$(request node_api \
+    --compressed \
+    --insecure \
+    --interface 127.0.0.1 \
+    --resolve "node.example.com:443:$PUBLIC_EDGE_ADDRESS" \
+    --header "X-Api-Padding: $(printf '%0300d' 0)" \
+    'https://node.example.com/api/shadow.json')
+assert_status 200 "$status" node_api
+assert_echo node_api node.example.com https
+assert_header node_api 'Content-Encoding: gzip'
+assert_header node_api 'Vary: Accept-Encoding'
+node --input-type=module - "$TEST_ROOT/node_api.body" <<'NODE'
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+const body = JSON.parse(readFileSync(process.argv[2], "utf8"));
+assert.equal(body.url, "/api/shadow.json");
+assert.equal(body.shadow, undefined);
+NODE
+
+# API routing must preserve the server's regex guards. The echo upstream
+# returns 200 for these paths, so bypassing a guard cannot pass these checks.
+guard_case=0
+for guarded_path in /api/.env /api/data.sql; do
+    guard_case=$((guard_case + 1))
+    guard_name=node_api_hidden_$guard_case
+    status=$(request "$guard_name" \
+        --insecure \
+        --resolve "node.example.com:443:$PUBLIC_EDGE_ADDRESS" \
+        "https://node.example.com$guarded_path")
+    assert_status 404 "$status" "$guard_name"
+done
+
+for guarded_path in /api/package.json /api/probe.php /api/probe.cgi; do
+    guard_case=$((guard_case + 1))
+    guard_name=node_api_probe_$guard_case
+    # Under HTTP/1.1 nginx's 444 closes without a response: curl reports 52
+    # and status 000. Pin the protocol so HTTP/2 stream errors cannot vary it.
+    if status=$(request "$guard_name" \
+        --http1.1 \
+        --insecure \
+        --resolve "node.example.com:443:$PUBLIC_EDGE_ADDRESS" \
+        "https://node.example.com$guarded_path" \
+        2>"$TEST_ROOT/$guard_name.stderr"); then
+        fail "$guarded_path returned an HTTP response instead of being dropped"
+    else
+        guard_curl_status=$?
+    fi
+    [ "$guard_curl_status" -eq 52 ] \
+        || fail "$guarded_path failed with curl status $guard_curl_status; expected an empty reply (52)"
+    assert_status 000 "$status" "$guard_name"
+    [ ! -s "$TEST_ROOT/$guard_name.headers" ] \
+        || fail "$guarded_path returned headers despite its 444 guard"
+done
+
 stop_node
 status=$(request node_maintenance_missing \
     --insecure \

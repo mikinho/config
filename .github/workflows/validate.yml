@@ -123,8 +123,10 @@ jobs:
             --profile quic-bpf \
             --profile trusted-proxy \
             --profile websocket \
-            --profile wordpress-cache
+            --profile wordpress-cache \
+            --profile zstd
           test -s build/full/quic_host.key
+          test -s build/full/stubs/api/zstd.conf
           test -s build/full/stubs/http/post-quantum.conf
           test "$(stat --format='%a' build/full/quic_host.key)" = 600
           if deploy/install-nginx --output build/full; then
@@ -138,11 +140,14 @@ jobs:
             --output build/production \
             --profile gzip \
             --profile brotli \
+            --profile zstd \
             --profile quic-bpf \
             --profile websocket \
             --profile wordpress-cache
           grep --fixed-strings 'profile brotli' build/production/INSTALL-PROFILE
           grep --fixed-strings 'profile gzip' build/production/INSTALL-PROFILE
+          grep --fixed-strings 'profile zstd' build/production/INSTALL-PROFILE
+          test -e build/production/stubs/api/zstd.conf
           grep --fixed-strings 'profile quic-bpf' build/production/INSTALL-PROFILE
           grep --fixed-strings 'profile websocket' build/production/INSTALL-PROFILE
           grep --fixed-strings 'profile wordpress-cache' build/production/INSTALL-PROFILE
@@ -392,6 +397,7 @@ jobs:
             --profile websocket
           test ! -e build/ci-safe/stubs/http/fastcgi-cache.conf
           test ! -e build/ci-safe/stubs/http/post-quantum.conf
+          test ! -e build/ci-safe/stubs/api/zstd.conf
           test ! -e build/ci-safe/sites/sample_wp.conf.example
           install -m 0644 \
             nginx/sites/sample_wp.conf.example \
@@ -518,6 +524,7 @@ jobs:
                   "${nginx_prefix}/includes" \
                   "${nginx_prefix}/sites" \
                   "${nginx_prefix}/stubs/http" \
+                  "${nginx_prefix}/stubs/api" \
                   "${nginx_prefix}/upstreams" \
                   "${nginx_prefix}/trusted-proxies"
               done

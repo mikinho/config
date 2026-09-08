@@ -271,6 +271,7 @@ with:
 deploy/install-nginx --output nginx-production \
     --profile gzip \
     --profile brotli \
+    --profile zstd \
     --profile quic-bpf \
     --profile websocket \
     --profile wordpress-cache
@@ -281,6 +282,11 @@ Selection rationale, so the host's choices stay written down:
 - `gzip` + `brotli` — both compressors; the applications precompress their
   build outputs, so `gzip_static`/`brotli_static` serve siblings and the
   runtime compressors cover proxied HTML and legacy assets.
+- `zstd` — API locations include `stubs/api/*.conf`, so JSON responses go out
+  as zstd when eligible and fall back to Brotli or gzip otherwise. Routes
+  without the include retain their existing policy. Profile argument order
+  does not set encoder priority; see the
+  [module order and verification matrix](../nginx/README.md#compression-module-order).
 - `quic-bpf` — the host kernel supports the QUIC reuseport eBPF map.
 - `wordpress-cache` — the cache zone is available only to audited sites that
   explicitly include `wordpress-cache-by-tag.conf`; ordinary WordPress sites
@@ -308,9 +314,9 @@ packages on Rocky Linux 9. CI parses both the uncached and explicitly cached
 WordPress site variants. It also renders the documented production profile so
 profile drift is visible. RHEL-family jobs validate the two-stage effective
 sshd ports, firewalld definitions, SELinux assets, component plans, and
-rendered direct/proxied Fail2ban policy. The Brotli modules, `quic_bpf`
+rendered direct/proxied Fail2ban policy. The Brotli and zstd modules, `quic_bpf`
 kernel/SELinux path,
 and OpenSSL 3.5 hybrid group cannot be fully exercised by the stock CI
-environment, so `brotli`, `quic-bpf`, and `post-quantum` must be syntax- and
+environment, so `brotli`, `zstd`, `quic-bpf`, and `post-quantum` must be syntax- and
 runtime-tested with the exact modules, TLS provider, kernel, and policy on the
 target host.

@@ -156,6 +156,12 @@ validate_stub_entry() {
                 '' | */*) fail "invalid HTTP stub path in $origin_file: $entry" ;;
             esac
             ;;
+        stubs/api/*.conf)
+            entry_name=${entry#stubs/api/}
+            case "$entry_name" in
+                '' | */*) fail "invalid API location stub path in $origin_file: $entry" ;;
+            esac
+            ;;
         stubs/*.conf)
             entry_name=${entry#stubs/}
             case "$entry_name" in
@@ -245,6 +251,7 @@ copy_configuration() {
         "$STAGING_DIRECTORY/includes" \
         "$STAGING_DIRECTORY/sites" \
         "$STAGING_DIRECTORY/stubs/http" \
+        "$STAGING_DIRECTORY/stubs/api" \
         "$STAGING_DIRECTORY/upstreams" \
         "$STAGING_DIRECTORY/trusted-proxies"
 

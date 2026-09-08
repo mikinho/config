@@ -90,12 +90,14 @@ gzip, and limit-request modules must not have been disabled. Building nginx
 requires the corresponding OpenSSL, zlib, and PCRE2 (or compatible PCRE)
 development libraries.
 
-When Brotli is selected, the following dynamic modules must also be installed
-under nginx's module directory:
+When Brotli or zstd is selected, the corresponding dynamic modules must also
+be installed under nginx's module directory:
 
 ```text
 ngx_http_brotli_filter_module.so
 ngx_http_brotli_static_module.so
+ngx_http_zstd_filter_module.so
+ngx_http_zstd_static_module.so
 ```
 
 They must be built for the exact nginx binary and compatible configure
@@ -104,7 +106,11 @@ load even when the version number appears similar.
 
 [GetPageSpeed NGINX Extras](https://www.getpagespeed.com/) is an intended
 RHEL-family package source for deployments that need pre-built dynamic-module
-RPMs. Its `nginx-module-brotli` package provides both modules named above.
+RPMs. Its `nginx-module-brotli` and `nginx-module-zstd` packages provide the
+module pairs named above.
+For zstd, use the GetPageSpeed continuation 0.2.2 or newer, or equivalent
+vendor fixes for streaming integrity and `zstd;q=0` negotiation. See
+the [compression order and target-host verification](nginx/README.md#compression-module-order).
 Keep nginx and every dynamic module as one publisher-supported,
 binary-compatible package set; do not leave EPEL, nginx.org, or GetPageSpeed
 modules from a different nginx build installed alongside it.
@@ -181,6 +187,10 @@ TCP 443 so clients always have an HTTP/2 or HTTP/1.1 fallback.
   maps, cache zones, and rate-limit zones. `nginx.conf` loads every matching
   stub present on the deployed host, so the installer must copy only the
   features that host needs.
+- `nginx/stubs/api/*.conf` contains installer-selected `location {}` policy
+  for API routes. Site definitions include the whole directory from their API
+  locations, so a deselected feature leaves an empty include rather than an
+  unknown directive.
 - `nginx/sites/` contains public-safe site configuration.
 - `nginx/upstreams/` is reserved for deployment-specific upstream definitions.
   Its contents are ignored by Git, while its `.gitignore` keeps the empty
@@ -345,6 +355,7 @@ unselected stubs cannot silently survive inside a render.
 | `baseline` | Required privacy-minimized logging, rate-limit, security-header fallback, TLS, and persistent HTTP/3 key stubs. Always selected. |
 | `gzip` | gzip response compression. |
 | `brotli` | Paired Brotli module-loader and HTTP compression stubs. |
+| `zstd` | zstd module loaders, compression policy, and the API-location opt-in that prefers zstd on API routes. |
 | `websocket` | WebSocket connection-upgrade map. |
 | `nodejs-proxy` | Node.js reverse-proxy and WebSocket connection mapping. |
 | `wordpress-cache` | Opt-in WordPress FastCGI page-cache zone and conservative bypass maps. Ordinary WordPress routing needs no profile. |
@@ -357,6 +368,7 @@ The selected configuration has these stub dependencies:
 | Stub | Context | Install when |
 | --- | --- | --- |
 | `brotli.conf` | main | Brotli is selected; install together with `http/brotli.conf` and compatible dynamic modules. |
+| `zstd.conf` | main | zstd is selected; install together with `http/zstd.conf`, `api/zstd.conf`, and compatible dynamic modules. |
 | `quic-bpf.conf` | main | Linux 5.7+ eBPF acceleration for QUIC connection migration has been validated on the host. |
 | `http/quic.conf` | http | The provided HTTP/3 listener is installed. This is required by the `baseline` profile. |
 | `http/tls.conf` | http | Any selected site listens with `ssl`, including `_https_.conf`. This is required for HTTPS deployments. |
@@ -369,6 +381,8 @@ The selected configuration has these stub dependencies:
 | `http/realip.conf` | http | nginx receives traffic through explicitly trusted reverse proxies and rate limits must use the restored client address. |
 | `http/gzip.conf` | http | gzip response compression is desired. |
 | `http/brotli.conf` | http | Brotli response compression is desired; install together with `brotli.conf`. |
+| `http/zstd.conf` | http | zstd compression policy; install together with `zstd.conf` and `api/zstd.conf`. Compression stays off until a location opts in. |
+| `api/zstd.conf` | location | API locations should prefer zstd; the sites include `stubs/api/*.conf` there. |
 
 The installer generates `quic_host.key` with 80 bytes from the operating
 system random source and mode `0600`; it never prints the key. This is initial
@@ -770,12 +784,12 @@ compares the pinned Actionlint, ShellCheck, and rsync releases with their
 current upstream releases; the rsync job fails as soon as CentOS supplies an
 eligible replacement. GitHub's Ubuntu
 hosted runner is only the Docker and portable-tooling executor; it is not a
-supported deployment target. The third-party Brotli modules, `quic_bpf`
-kernel/SELinux path, and OpenSSL 3.5 hybrid group cannot be fully exercised by
-the stock CI environment. The `brotli`, `quic-bpf`, and `post-quantum` profiles
-are therefore profile-validated in public CI and must be syntax- and
-runtime-tested with the exact modules, kernel, policy, and TLS provider on the
-target host.
+supported deployment target. The third-party Brotli and zstd modules,
+`quic_bpf` kernel/SELinux path, and OpenSSL 3.5 hybrid group cannot be fully
+exercised by the stock CI environment. The `brotli`, `zstd`, `quic-bpf`, and
+`post-quantum` profiles are therefore profile-validated in public CI and must
+be syntax- and runtime-tested with the exact modules, kernel, policy, and TLS
+provider on the target host.
 
 Run these checks on the target host before calling the deployment complete.
 Run only the block for the selected Certbot backend:
@@ -875,6 +889,8 @@ This repository is available under the [MIT License](LICENSE).
 - [rsync security advisories](https://github.com/RsyncProject/rsync/security/advisories)
 - [RHEL 9 SELinux guidance](https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/9/html/using_selinux/configuring-selinux-for-applications-and-services-with-non-standard-configurations_using-selinux)
 - [ngx_brotli build instructions](https://github.com/google/ngx_brotli)
+- [zstd-nginx-module directives](https://nginx-extras.getpagespeed.com/modules/zstd/)
+- [GetPageSpeed zstd module guide](https://www.getpagespeed.com/server-setup/nginx/nginx-zstd-compression)
 - [Certbot automated renewal](https://eff-certbot.readthedocs.io/en/stable/using.html#setting-up-automated-renewal)
 - [Snap service controls](https://snapcraft.io/docs/how-to-guides/manage-snaps/control-services/)
 - [systemd timer units](https://www.freedesktop.org/software/systemd/man/systemd.timer.html)
